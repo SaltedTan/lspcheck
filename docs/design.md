@@ -72,7 +72,7 @@ whole, because a missing reply to it can't be told apart from a slow start.
 ### Lifecycle
 | ID | Basis | Check |
 |---|---|---|
-| L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification sent before it (`workspace/didChangeConfiguration`) is dropped without a reply. A server reads in order, so a reply to the notification arrives before the request's answer. |
+| L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification sent before it (`workspace/didChangeConfiguration`) is dropped without a reply: no response other than those two answers may arrive before the answer to `initialize`. |
 | L2 | MUST | `initialize` returns an object with `capabilities`; a chosen `positionEncoding` is one the client offered (offer `utf-8` first, `utf-16` last). |
 | L3 | POLICY | A second `initialize` gets an error and the server keeps serving: a plain request answered before it is answered after it too. |
 | L4 | MUST | `shutdown` returns `null` and the process keeps running until `exit`. |

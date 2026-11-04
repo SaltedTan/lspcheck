@@ -400,9 +400,11 @@ fn wrong_unknown_method_errors_fail_j4() {
 
 #[test]
 fn replying_to_a_notification_before_initialize_fails_l1() {
-    let r = fault("reply-to-pre-init-notification");
-    only_fails(&r, &["L1"]);
-    assert!(r.stdout.contains("a notification sent before initialize got a reply"), "{}", r.stdout);
+    for name in ["reply-to-pre-init-notification", "late-reply-to-pre-init-notification"] {
+        let r = fault(name);
+        only_fails(&r, &["L1"]);
+        assert!(r.stdout.contains("a notification sent before initialize got a reply"), "{name}\n{}", r.stdout);
+    }
 }
 
 #[test]

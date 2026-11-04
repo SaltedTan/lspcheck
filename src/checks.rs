@@ -506,7 +506,21 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
         ctx.report("L1", Verdict::Error, format!("could not send a notification: {e}"));
         return;
     }
-    match ctx.s.call("workspace/symbol", Some(json!({"query": ""})), t).await {
+    let request = ctx.s.call("workspace/symbol", Some(json!({"query": ""})), t).await;
+    // A reply to the notification can come after the request's answer, so
+    // look at everything read until the answer to initialize.
+    let init = ctx.initialize().await;
+    let reply = ctx.s.messages[before..].iter().find_map(|(_, x)| match &x.kind {
+        Kind::Response { id, outcome } if !ctx.s.sent(id) => {
+            Some(format!("{} with id {id}", describe_outcome(outcome)))
+        }
+        Kind::Invalid(_) if x.value.get("result").is_some() || x.value.get("error").is_some() => {
+            Some(format!("a response without an id: {}", session::preview(x.value.to_string().as_bytes())))
+        }
+        _ => None,
+    });
+    let replied = reply.map(|r| format!("a notification sent before initialize got a reply: {r}"));
+    match &request {
         Ok(m) => {
             let mut problems = Vec::new();
             match &m.kind {
@@ -518,31 +532,21 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
                 }
                 _ => unreachable!(),
             }
-            // A server reads in order, so a reply to the notification comes
-            // before the request's answer.
-            let answer = m.response_id();
-            let reply = ctx.s.messages[before..].iter().find_map(|(_, x)| match &x.kind {
-                Kind::Response { id, outcome } if Some(id) != answer => {
-                    Some(format!("{} with id {id}", describe_outcome(outcome)))
-                }
-                Kind::Invalid(_) if x.value.get("result").is_some() || x.value.get("error").is_some() => {
-                    Some(format!("a response without an id: {}", session::preview(x.value.to_string().as_bytes())))
-                }
-                _ => None,
-            });
-            if let Some(reply) = reply {
-                problems.push(format!("a notification sent before initialize got a reply: {reply}"));
-            }
+            problems.extend(replied);
             if problems.is_empty() {
                 ctx.pass("L1");
             } else {
                 ctx.fail("L1", problems.join("; "));
             }
         }
-        Err(e) => ctx.fail_call("L1", describe_call_error(&e, t), &e),
+        // The reply was seen, whatever happened to the request.
+        Err(e) => match replied {
+            Some(replied) => ctx.fail("L1", format!("{replied}; the request got {}", describe_call_error(e, t))),
+            None => ctx.fail_call("L1", describe_call_error(e, t), e),
+        },
     }
     // Leave politely so the server isn't killed mid-thought.
-    if ctx.initialize().await.is_ok() {
+    if init.is_ok() {
         let _ = ctx.s.call("shutdown", None, t).await;
         let _ = ctx.s.notify("exit", None).await;
         let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
