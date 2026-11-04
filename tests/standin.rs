@@ -21,6 +21,8 @@ struct Run {
     status: i32,
     verdicts: BTreeMap<String, String>,
     stdout: String,
+    /// What the server wrote to stderr, from every transcript.
+    server_stderr: String,
     took: Duration,
 }
 
@@ -72,16 +74,20 @@ fn run_command(lspcheck_args: &[&str], server: &[&str], cwd: Option<&std::path::
         .iter()
         .map(|r| (r["id"].as_str().unwrap().to_string(), r["verdict"].as_str().unwrap().to_string()))
         .collect();
+    let mut server_stderr = String::new();
     if let Ok(entries) = std::fs::read_dir(dir.path().join("t")) {
         for entry in entries {
             let path = entry.unwrap().path();
             for line in std::fs::read_to_string(&path).unwrap().lines() {
-                serde_json::from_str::<Value>(line)
+                let event = serde_json::from_str::<Value>(line)
                     .unwrap_or_else(|e| panic!("{}: bad transcript line {line}: {e}", path.display()));
+                if event["dir"] == "err" {
+                    server_stderr.push_str(event["data"].as_str().unwrap_or(""));
+                }
             }
         }
     }
-    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, took }
+    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, server_stderr, took }
 }
 
 fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
@@ -91,6 +97,20 @@ fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
 
 fn fault(name: &str) -> Run {
     run(&["--fault", name], &[])
+}
+
+/// Runs a fault whose effect depends on where the server's reads happen to
+/// end, until the stand-in says on stderr that it took effect. A stand-in
+/// descheduled for the whole of a split write reads it in one piece, so the
+/// fault can't act; that run says nothing either way and is repeated.
+fn fault_taking_effect(name: &str, marker: &str) -> Run {
+    for _ in 0..5 {
+        let r = fault(name);
+        if r.server_stderr.contains(marker) {
+            return r;
+        }
+    }
+    panic!("the {name} fault never took effect in 5 runs");
 }
 
 fn expect(run: &Run, id: &str, verdict: &str) {
@@ -118,7 +138,7 @@ fn the_clean_standin_passes_every_check() {
 
 #[test]
 fn lawful_variations_fail_nothing() {
-    for name in ["extension-header", "decimal-ids", "long-header", "answers-reordered", "slow-reads"] {
+    for name in ["extension-header", "decimal-ids", "long-header", "answers-reordered", "slow-reads", "no-open-close"] {
         let r = fault(name);
         only_fails(&r, &[]);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
@@ -198,9 +218,9 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
 #[test]
 fn input_split_across_writes_must_be_read() {
     // A reader that expects each header section in one read.
-    only_fails(&fault("split-header"), &["F3"]);
+    only_fails(&fault_taking_effect("split-header", "split-header dropped"), &["F3"]);
     // A reader that decodes each read on its own, so a character cut in two is mangled.
-    let r = fault("split-utf8");
+    let r = fault_taking_effect("split-utf8", "split-utf8 mangled");
     only_fails(&r, &["F3"]);
     assert!(r.stdout.contains("cut inside them"), "{}", r.stdout);
 }

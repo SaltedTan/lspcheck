@@ -12,7 +12,7 @@
 
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
-use crate::session::{self, CallError, Finish, Options, Problem, Session, WaitError};
+use crate::session::{self, CallError, Finish, Options, Problem, Session, WaitError, WriteError};
 use crate::transcript;
 use crate::transport;
 use serde::Serialize;
@@ -589,7 +589,15 @@ async fn back_in_step(ctx: &mut Ctx<'_>, after: &str) -> Option<String> {
         return Some(format!("the server exited after {after}"));
     }
     let t = ctx.cfg.request_timeout;
-    match ctx.s.call(PROBE, Some(json!({})), t).await {
+    let result = ctx.s.call(PROBE, Some(json!({})), t).await;
+    // A closed pipe usually means the server is exiting; give that a moment
+    // to be seen, so the reason given is the real one.
+    if matches!(result, Err(CallError::Write(WriteError::Closed) | CallError::Wait(WaitError::Closed)))
+        && ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await.is_some()
+    {
+        return Some(format!("the server exited after {after}"));
+    }
+    match result {
         Ok(_) => None,
         Err(e @ CallError::Wait(_)) => Some(format!(
             "after {after}, a plain request went unanswered ({}), so the input may be out of step",
@@ -618,14 +626,15 @@ async fn settle(ctx: &mut Ctx<'_>, id: &str, what: &str, outcome: Probe) -> Opti
 /// only while the stream is known to be in step.
 async fn framing(ctx: &mut Ctx<'_>) {
     const CHECKS: [&str; 5] = ["F4", "F6", "F7", "F3", "F5"];
-    if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
-        ctx.initialize().await
-    {
-        for id in CHECKS {
-            ctx.report(id, Verdict::Error, format!("initialize didn't succeed: {why}"));
+    let opens_documents = match ctx.initialize().await {
+        Ok(reply) => opens_documents(&reply),
+        Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
+            for id in CHECKS {
+                ctx.report(id, Verdict::Error, format!("initialize didn't succeed: {why}"));
+            }
+            return;
         }
-        return;
-    }
+    };
     let t = ctx.cfg.request_timeout;
     if let Err(e) = ctx.s.call(PROBE, Some(json!({})), t).await {
         let (verdict, why) = match &e {
@@ -707,16 +716,20 @@ async fn framing(ctx: &mut Ctx<'_>) {
         }
     }
 
-    // F5: a document with multibyte characters, then a request that also has some.
+    // F5: a document with multibyte characters, if the server asks for
+    // didOpen, then a request that also has some.
     let mut f5_passed = false;
     if !skip(ctx, "F5", &broken) {
-        let path = ctx.root.join("lspcheck-utf8.txt");
-        let text = format!("ASCII line\n{MULTIBYTE}\nlast line\n");
-        let _ = std::fs::write(&path, &text);
-        let open =
-            json!({"textDocument": {"uri": file_uri(&path), "languageId": "plaintext", "version": 1, "text": text}});
-        let what = "a didOpen whose text has 2-, 3- and 4-byte UTF-8 characters, then a request with some too";
-        let outcome = match ctx.s.notify("textDocument/didOpen", Some(open)).await {
+        let opened = if opens_documents {
+            let path = ctx.root.join("lspcheck-utf8.txt");
+            let text = format!("ASCII line\n{MULTIBYTE}\nlast line\n");
+            let _ = std::fs::write(&path, &text);
+            let doc = json!({"uri": file_uri(&path), "languageId": "plaintext", "version": 1, "text": text});
+            ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await.map_err(|e| e.to_string())
+        } else {
+            Ok(())
+        };
+        let outcome = match opened {
             Err(e) => Probe::Unsent(format!("didOpen: {e}")),
             Ok(()) => {
                 let (id, body) = probe(ctx, json!({"text": MULTIBYTE}));
@@ -724,7 +737,16 @@ async fn framing(ctx: &mut Ctx<'_>) {
             }
         };
         f5_passed = matches!(outcome, Probe::Answered);
-        broken = settle(ctx, "F5", what, outcome).await;
+        if f5_passed && !opens_documents {
+            ctx.pass_with("F5", "the server doesn't ask for didOpen, so only a request with such characters was sent");
+        } else {
+            let what = if opens_documents {
+                "a didOpen whose text has 2-, 3- and 4-byte UTF-8 characters, then a request with some too"
+            } else {
+                "a request with 2-, 3- and 4-byte UTF-8 characters (no didOpen: the server doesn't ask for it)"
+            };
+            broken = settle(ctx, "F5", what, outcome).await;
+        }
     }
 
     // F3, second part: writes that end inside multibyte characters. If F5
@@ -751,6 +773,17 @@ async fn framing(ctx: &mut Ctx<'_>) {
     if broken.is_none() && ctx.s.call("shutdown", None, t).await.is_ok() {
         let _ = ctx.s.notify("exit", None).await;
         let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    }
+}
+
+/// Whether the server asks for didOpen and didClose: a sync kind other than
+/// None, or `openClose: true`. Without it the client mustn't send them.
+fn opens_documents(reply: &Message) -> bool {
+    let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { return false };
+    match result.pointer("/capabilities/textDocumentSync") {
+        Some(Value::Number(kind)) => kind.as_i64().is_some_and(|k| k > 0),
+        Some(Value::Object(options)) => options.get("openClose") == Some(&Value::Bool(true)),
+        _ => false,
     }
 }
 

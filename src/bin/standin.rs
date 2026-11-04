@@ -49,6 +49,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("exit-on-content-type", "exit when an incoming frame has a Content-Type header"),
     ("ignore-unknown-requests", "never answer requests for unknown methods"),
     ("answers-reordered", "lawful: answer requests that arrive together in reverse order"),
+    ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
     ("escaped-child", "start a child in a new session, with a non-UTF-8 name, that outlives the server"),
@@ -113,6 +114,9 @@ fn main() {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
         let Some(id) = msg.get("id").cloned() else {
             // A notification.
+            if method == "textDocument/didOpen" && fault("no-open-close") {
+                std::process::exit(4);
+            }
             if method == "exit" && !fault("ignore-exit") {
                 if fault("big-frame-on-exit") {
                     let text = "x".repeat(2 * 1024 * 1024);
@@ -178,6 +182,9 @@ fn main() {
                 "capabilities": {"positionEncoding": encoding, "textDocumentSync": 1, "hoverProvider": true},
                 "serverInfo": {"name": "lspcheck-standin"}
             });
+            if fault("no-open-close") {
+                result["capabilities"]["textDocumentSync"] = json!({"openClose": false, "change": 0});
+            }
             if fault("no-capabilities") {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
             }
@@ -422,10 +429,14 @@ impl<R: Read> Input<R> {
             Ok(n) => n,
         };
         chunk.truncate(n);
+        // Each fault says on stderr when it took effect, since that depends
+        // on where the reads happened to end.
         if self.fault("split-header") && !self.buf.is_empty() && find(&self.buf, b"\r\n\r\n").is_none() {
+            eprintln!("standin: split-header dropped {} bytes", self.buf.len());
             self.buf.clear();
         }
-        if self.fault("split-utf8") {
+        if self.fault("split-utf8") && std::str::from_utf8(&chunk).is_err() {
+            eprintln!("standin: split-utf8 mangled a read");
             chunk = String::from_utf8_lossy(&chunk).into_owned().into_bytes();
         }
         self.buf.extend_from_slice(&chunk);

@@ -46,7 +46,7 @@ are to LSP 3.17 and JSON-RPC 2.0.
 | F2 | MUST | Each frame's `Content-Length` equals the body's length in **bytes**. `not-exercised` if no frame carried non-ASCII text. |
 | F3 | MUST | Input split across writes is read: a request whose header is written one byte per write and whose body is cut at seeded points, then (when F5 passed) one cut inside 2-, 3- and 4-byte characters. The writes are 10 ms apart, so a server reading promptly sees them separately. |
 | F4 | MUST | Several frames in one write are all read (two requests with a `$/setTrace` notification between them). |
-| F5 | MUST | A `didOpen` whose text has 2-, 3- and 4-byte UTF-8 characters keeps the stream in sync: a following request, with such characters too, is answered. |
+| F5 | MUST | A `didOpen` whose text has 2-, 3- and 4-byte UTF-8 characters keeps the stream in sync: a following request, with such characters too, is answered. The `didOpen` is sent only when the server asks for open and close notifications (`textDocumentSync` a kind other than None, or `openClose: true`). |
 | F6 | MUST | A `Content-Type: application/vscode-jsonrpc; charset=utf-8` header is accepted (it's an optional header the client may send). |
 | F7 | SHOULD | The legacy `charset=utf8` spelling is treated as UTF-8. |
 | F8 | SHOULD | A `Content-Type` the server sends declares UTF-8 (or the legacy `utf8`), the only supported charset. |
