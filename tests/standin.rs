@@ -138,7 +138,15 @@ fn the_clean_standin_passes_every_check() {
 
 #[test]
 fn lawful_variations_fail_nothing() {
-    for name in ["extension-header", "decimal-ids", "long-header", "answers-reordered", "slow-reads", "no-open-close"] {
+    for name in [
+        "extension-header",
+        "decimal-ids",
+        "long-header",
+        "answers-reordered",
+        "slow-reads",
+        "no-open-close",
+        "newline-after-body",
+    ] {
         let r = fault(name);
         only_fails(&r, &[]);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
@@ -216,6 +224,75 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
 }
 
 #[test]
+fn a_content_length_counted_in_characters_fails_f2() {
+    let r = fault("char-length");
+    // The frame can't be read either, so F1 fails too.
+    only_fails(&r, &["F1", "F2"]);
+    assert!(r.stdout.contains("counts characters, but"), "{}", r.stdout);
+    // Also with whitespace after the JSON, or an extension header before the next frame's Content-Length.
+    for other in ["newline-after-body", "extension-header", "long-header"] {
+        let r = run(&["--fault", "char-length", "--fault", other], &[]);
+        expect(&r, "F2", "fail");
+        assert!(r.stdout.contains("counts characters, but"), "{other}\n{}", r.stdout);
+    }
+}
+
+#[test]
+fn a_correctly_counted_body_that_isnt_json_fails_f1_not_f2() {
+    let r = fault("trailing-junk");
+    only_fails(&r, &["F1"]);
+}
+
+#[test]
+fn a_body_the_next_header_line_would_complete_fails_f1_not_f2() {
+    // Joined to the next frame's first header line, the body would be JSON,
+    // but the next header section starts where the body was declared to end.
+    only_fails(&fault("json-into-next-header"), &["F1"]);
+    // Even when that header line isn't valid.
+    only_fails(&fault("json-into-bad-header"), &["F1"]);
+}
+
+#[test]
+fn wrong_lengths_that_count_neither_characters_nor_code_units_fail_f1_not_f2() {
+    // Content-Length 1 for a long body, and one 10,000 bytes too long on the last frame.
+    for name in ["long-miscount", "overlong-last-frame"] {
+        let r = fault(name);
+        expect(&r, "F1", "fail");
+        expect(&r, "F2", "pass");
+    }
+}
+
+#[test]
+fn every_unreadable_body_is_examined_for_f2() {
+    // 70 unreadable bodies come before the miscounted ones in each scenario.
+    let r = run(&["--fault", "bad-bodies", "--fault", "char-length"], &[]);
+    expect(&r, "F2", "fail");
+}
+
+#[test]
+fn escaped_non_ascii_output_leaves_f2_not_exercised() {
+    let r = fault("ascii-escape");
+    expect(&r, "F2", "not-exercised");
+    for (id, v) in &r.verdicts {
+        if id != "F2" && !(id == "L9" && !cfg!(unix)) {
+            assert_eq!(v, "pass", "{id}\n{}", r.stdout);
+        }
+    }
+    assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn a_server_lost_on_the_f2_probe_doesnt_fail_what_follows() {
+    // The probe for F2's evidence has a string id, and this server exits on
+    // it. F3's last part comes after it, and isn't run.
+    let r = fault("exit-on-string-id");
+    expect(&r, "F2", "not-exercised");
+    expect(&r, "F3", "pass");
+    assert!(r.stdout.contains("the part that splits multibyte characters wasn't run"), "{}", r.stdout);
+    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+}
+
+#[test]
 fn input_split_across_writes_must_be_read() {
     // A reader that expects each header section in one read.
     only_fails(&fault_taking_effect("split-header", "split-header dropped"), &["F3"]);
@@ -235,7 +312,14 @@ fn frames_coalesced_in_one_write_must_all_be_read() {
 #[test]
 fn counting_incoming_characters_instead_of_bytes_fails_f5() {
     let r = fault("char-length-input");
-    only_fails(&r, &["F5"]);
+    expect(&r, "F5", "fail");
+    // The probe with non-ASCII output for F2 isn't sent to a server that can't read it.
+    expect(&r, "F2", "not-exercised");
+    for (id, v) in &r.verdicts {
+        if !["F2", "F5"].contains(&id.as_str()) && !(id == "L9" && !cfg!(unix)) {
+            assert_eq!(v, "pass", "{id}\n{}", r.stdout);
+        }
+    }
     // F3's multibyte part depends on F5, and says it wasn't run.
     assert!(r.stdout.contains("wasn't run, because F5 didn't pass"), "{}", r.stdout);
 }

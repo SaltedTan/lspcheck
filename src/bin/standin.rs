@@ -20,6 +20,15 @@ const FAULTS: &[(&str, &str)] = &[
     ("all-nul-headers", "put a NUL byte in every frame's Content-Type header"),
     ("bad-content-type", "send one notification whose Content-Type isn't a media type"),
     ("latin1", "declare charset=iso-8859-1 in a Content-Type header"),
+    ("char-length", "count the Content-Length of outgoing frames in characters, not bytes"),
+    ("trailing-junk", "send one non-ASCII notification whose body is JSON then a header and {}, correctly counted"),
+    ("newline-after-body", "lawful: end every outgoing body with a newline, counted in its Content-Length"),
+    ("bad-bodies", "on initialize, send 70 frames whose body isn't JSON"),
+    ("json-into-next-header", "send a correctly counted body that the next frame's first header line would complete"),
+    ("json-into-bad-header", "like json-into-next-header, with a space before that header line, making it invalid"),
+    ("long-miscount", "send one long non-ASCII log message declaring a Content-Length of 1"),
+    ("overlong-last-frame", "on exit, send a non-ASCII log message and newline declaring 10,000 bytes too many"),
+    ("ascii-escape", "lawful: escape non-ASCII text in outgoing frames as \\u sequences"),
     ("extension-header", "lawful: send an X-Trace header before Content-Length"),
     ("long-header", "lawful: send a 200 KiB X-Pad header with every frame"),
     ("decimal-ids", "lawful: spell numeric response ids with a fraction, as 2.0"),
@@ -48,6 +57,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("strict-charset", "ignore incoming frames whose charset isn't spelled utf-8"),
     ("exit-on-content-type", "exit when an incoming frame has a Content-Type header"),
     ("ignore-unknown-requests", "never answer requests for unknown methods"),
+    ("exit-on-string-id", "exit when a request has a string id"),
     ("answers-reordered", "lawful: answer requests that arrive together in reverse order"),
     ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
@@ -112,6 +122,9 @@ fn main() {
         }
         let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        if fault("exit-on-string-id") && msg.get("id").is_some_and(Value::is_string) {
+            std::process::exit(2);
+        }
         let Some(id) = msg.get("id").cloned() else {
             // A notification.
             if method == "textDocument/didOpen" && fault("no-open-close") {
@@ -121,6 +134,10 @@ fn main() {
                 if fault("big-frame-on-exit") {
                     let text = "x".repeat(2 * 1024 * 1024);
                     out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
+                }
+                if fault("overlong-last-frame") {
+                    let body = "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":4,\"message\":\"é\"}}\n";
+                    out.raw(format!("Content-Length: {}\r\n\r\n{body}", body.len() + 10_000).as_bytes());
                 }
                 if fault("exit-flood") {
                     let log =
@@ -152,6 +169,30 @@ fn main() {
                 let text = "x".repeat(size);
                 for _ in 0..count {
                     out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
+                }
+            }
+            if fault("trailing-junk") {
+                let body = "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":4,\"message\":\"é\"}}Content-Length: 2\r\n\r\n{}";
+                out.raw(format!("Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+            }
+            for (name, line) in [("json-into-next-header", "X: \"}}"), ("json-into-bad-header", " X: \"}}")] {
+                if fault(name) {
+                    let body =
+                        "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":4,\"message\":\"é";
+                    let next = format!("{line}\r\nContent-Length: 2\r\n\r\n{{}}");
+                    out.raw(format!("Content-Length: {}\r\n\r\n{body}{next}", body.len()).as_bytes());
+                }
+            }
+            if fault("long-miscount") {
+                let text = "é".repeat(100);
+                let body = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{{\"type\":4,\"message\":\"{text}\"}}}}"
+                );
+                out.raw(format!("Content-Length: 1\r\n\r\n{body}").as_bytes());
+            }
+            if fault("bad-bodies") {
+                for _ in 0..70 {
+                    out.raw(b"Content-Length: 1\r\n\r\n!");
                 }
             }
             if fault("nul-header") {
@@ -340,7 +381,25 @@ impl<W: Write> Writer<W> {
         {
             v["id"] = serde_json::from_str(&format!("{n}.0")).unwrap();
         }
-        let body = serde_json::to_vec(&v).unwrap();
+        let mut body = serde_json::to_vec(&v).unwrap();
+        if fault("ascii-escape") {
+            // Non-ASCII text can only be inside strings, so escaping it everywhere is safe.
+            let mut escaped = String::new();
+            for c in String::from_utf8(body).unwrap().chars() {
+                if c.is_ascii() {
+                    escaped.push(c);
+                } else {
+                    for unit in c.encode_utf16(&mut [0; 2]) {
+                        escaped.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+            }
+            body = escaped.into_bytes();
+        }
+        if fault("newline-after-body") {
+            body.push(b'\n');
+        }
+        let length = if fault("char-length") { String::from_utf8_lossy(&body).chars().count() } else { body.len() };
         let mut header = Vec::new();
         if fault("extension-header") {
             header.extend_from_slice(b"X-Trace: standin\r\n");
@@ -348,7 +407,7 @@ impl<W: Write> Writer<W> {
         if fault("long-header") {
             header.extend_from_slice(format!("X-Pad: {}\r\n", "p".repeat(200 * 1024)).as_bytes());
         }
-        header.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        header.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
         if fault("all-nul-headers") {
             header.extend_from_slice(b"Content-Type: application/vscode-jsonrpc\x00\r\n");
         }

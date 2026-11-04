@@ -179,6 +179,12 @@ struct Evidence {
     problems: Vec<(Duration, Problem)>,
     content_types: Vec<(Duration, String)>,
     limit: Option<(Duration, String)>,
+    /// When the first readable frame with non-ASCII text in its body arrived.
+    non_ascii: Option<Duration>,
+    /// Frames whose body isn't JSON: when, the Content-Length, and where the body starts.
+    unparsed: Vec<(Duration, usize, usize)>,
+    /// lspcheck stopped reading stdout into the transcript before it ended.
+    cut: bool,
     /// The stdout task has seen the end of the stream.
     done: bool,
 }
@@ -213,6 +219,14 @@ pub struct Finish {
     pub unmatched: Vec<(Duration, Id)>,
     /// `Content-Type` values the server sent.
     pub content_types: Vec<(Duration, String)>,
+    /// When the first readable frame with non-ASCII text in its body arrived.
+    pub non_ascii: Option<Duration>,
+    /// Frames whose Content-Length wasn't the length in bytes of the JSON
+    /// body that followed, which had non-ASCII text: when, and how.
+    pub miscounted: Vec<(Duration, String)>,
+    /// How many unreadable frames weren't checked for that, because the
+    /// work allowed for it ran out.
+    pub unchecked: usize,
 }
 
 type Transcript = Arc<Mutex<Vec<Event>>>;
@@ -807,6 +821,8 @@ impl Session {
             ));
         }
         let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
+        let whole = evidence.done && !evidence.cut;
+        let (miscounted, unchecked) = miscounted_frames(&evidence.unparsed, &transcript, whole);
         Finish {
             exit: if killed { None } else { self.exit },
             killed,
@@ -821,6 +837,9 @@ impl Session {
             problems: evidence.problems,
             unmatched: std::mem::take(&mut self.unmatched),
             content_types: evidence.content_types,
+            non_ascii: evidence.non_ascii,
+            miscounted,
+            unchecked,
         }
     }
 }
@@ -840,7 +859,10 @@ async fn read_stdout(
     let (mut total, mut stopped) = (0usize, false);
     let stop = |at: Duration, why: String| {
         record(&t, at, EventKind::Note(why.clone()));
-        evidence.lock().expect("evidence lock").limit.get_or_insert((at, why));
+        let mut ev = evidence.lock().expect("evidence lock");
+        ev.cut = true;
+        ev.limit.get_or_insert((at, why));
+        drop(ev);
         let _ = tx.send((at, Inbound::Stopped));
     };
     let deliver = |at: Duration, chunk: Chunk, stopped: &mut bool| {
@@ -852,14 +874,20 @@ async fn read_stdout(
             }
         };
         let problem = match chunk {
-            Chunk::Frame { headers, body } => {
+            Chunk::Frame { headers, body, start } => {
                 content_types(&mut ev, &headers);
                 match Message::parse(&body) {
                     Ok(m) => {
+                        if ev.non_ascii.is_none() && !body.is_ascii() {
+                            ev.non_ascii = Some(at);
+                        }
                         let _ = tx.send((at, Inbound::Message(m)));
                         return;
                     }
-                    Err(error) => Problem::NotJson { body, error },
+                    Err(error) => {
+                        ev.unparsed.push((at, body.len(), start));
+                        Problem::NotJson { body, error }
+                    }
                 }
             }
             Chunk::Oversized { headers, content_length, limit } => {
@@ -928,6 +956,50 @@ async fn read_stdout(
     record(&t, at, EventKind::StdoutClosed);
     evidence.lock().expect("evidence lock").done = true;
     let _ = tx.send((at, Inbound::Closed));
+}
+
+/// Frames whose body couldn't be read because their Content-Length wasn't
+/// counted in bytes, and how many couldn't be checked. The transcript holds
+/// every byte of stdout that was inspected; `whole` says whether that is all
+/// of it.
+fn miscounted_frames(
+    unparsed: &[(Duration, usize, usize)],
+    transcript: &[Event],
+    whole: bool,
+) -> (Vec<(Duration, String)>, usize) {
+    if unparsed.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let stdout: Vec<u8> = transcript
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Read(b) => Some(b.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    // Parsing reads at most about 4 × Content-Length bytes per frame, which
+    // is proportional to the output; looking for the header section after
+    // a candidate body is bounded by this budget. A few examples are enough.
+    let mut budget = 16 * 1024 * 1024;
+    let (mut found, mut unchecked) = (Vec::new(), 0);
+    for &(at, length, start) in unparsed {
+        if found.len() == 16 {
+            break;
+        }
+        let Some(rest) = stdout.get(start..) else { continue };
+        match transport::miscounted_length(rest, length, whole, &mut budget) {
+            transport::Count::Miscounted { bytes, counts } => {
+                found.push((
+                    at,
+                    format!("Content-Length {length} counts {counts}, but the JSON body that follows is {bytes} bytes"),
+                ));
+            }
+            transport::Count::Unknown => {}
+            transport::Count::Unchecked => unchecked += 1,
+        }
+    }
+    (found, unchecked)
 }
 
 fn parsed_event(chunk: &Chunk) -> EventKind {

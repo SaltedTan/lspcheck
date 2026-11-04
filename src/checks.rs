@@ -73,6 +73,7 @@ macro_rules! check {
 /// Every check lspcheck knows, in report order.
 pub const CATALOGUE: &[CheckInfo] = &[
     check!("F1", Framing, Must, "Every byte on stdout belongs to a well-formed frame", "baseProtocol"),
+    check!("F2", Framing, Must, "Content-Length counts the body's bytes, not its characters", "headerPart"),
     check!("F3", Framing, Must, "Input split across writes, down to single header bytes, is read", "baseProtocol"),
     check!("F4", Framing, Must, "Several frames in one write are all read", "baseProtocol"),
     check!("F5", Framing, Must, "Input with 2-, 3- and 4-byte UTF-8 characters keeps the stream in step", "headerPart"),
@@ -95,7 +96,7 @@ pub const CATALOGUE: &[CheckInfo] = &[
 ];
 
 /// Checks judged from every scenario's observations.
-pub const CROSS_CUTTING: &[&str] = &["F1", "F8", "L9"];
+pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "L9"];
 
 pub fn info(id: &str) -> &'static CheckInfo {
     CATALOGUE.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("unknown check {id}"))
@@ -166,6 +167,9 @@ pub struct Config {
 pub struct Observations {
     pub problems: Vec<(Duration, Problem)>,
     pub content_types: Vec<(Duration, String)>,
+    pub non_ascii: Option<Duration>,
+    pub miscounted: Vec<(Duration, String)>,
+    pub unchecked: usize,
     pub killed: bool,
     pub leftovers: Vec<ProcInfo>,
     pub coverage: Coverage,
@@ -209,7 +213,8 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
             runs.push(run_scenario(s, cfg).await?);
         }
     }
-    let cross: Vec<CheckResult> = [judge_f1(&runs), judge_f8(&runs), judge_l9(&runs)].into_iter().collect();
+    let cross: Vec<CheckResult> =
+        [judge_f1(&runs), judge_f2(&runs), judge_f8(&runs), judge_l9(&runs)].into_iter().collect();
     runs.push(ScenarioRun { name: "all", results: cross, observed: None, transcript: None });
     for run in &mut runs {
         run.results.retain(|r| wants(r.id));
@@ -299,6 +304,9 @@ fn observations(f: Finish) -> Observations {
     Observations {
         problems: f.problems,
         content_types: f.content_types,
+        non_ascii: f.non_ascii,
+        miscounted: f.miscounted,
+        unchecked: f.unchecked,
         killed: f.killed,
         leftovers: f.leftovers,
         coverage: f.coverage,
@@ -749,10 +757,24 @@ async fn framing(ctx: &mut Ctx<'_>) {
         }
     }
 
+    // Output with non-ASCII text for F2: a response must echo this string
+    // id. Sent only once the server is known to read such input.
+    if f5_passed {
+        let id = Id::Str(format!("lspcheck-é😀-{}", session::random_u64() % 1_000_000_000));
+        let deadline = Instant::now() + t;
+        let answered = ctx.s.request_with_id(&id, PROBE, Some(json!({"text": MULTIBYTE}))).await.is_ok()
+            && ctx.s.wait_response(&id, deadline).await.is_ok();
+        if !answered {
+            broken = back_in_step(ctx, "a request with a non-ASCII string id went unanswered").await;
+        }
+    }
+
     // F3, second part: writes that end inside multibyte characters. If F5
     // passed, the stream is in step and multibyte input is read correctly.
     if split_read && !f5_passed {
         ctx.pass_with("F3", "the part that splits multibyte characters wasn't run, because F5 didn't pass");
+    } else if let (true, Some(why)) = (split_read, &broken) {
+        ctx.pass_with("F3", format!("the part that splits multibyte characters wasn't run: {why}"));
     } else if split_read {
         let (id, body) = probe(ctx, json!({"text": MULTIBYTE}));
         let bytes = transport::encode(&body);
@@ -836,6 +858,40 @@ fn judge_f1(runs: &[ScenarioRun]) -> CheckResult {
         })
         .collect();
     cross("F1", runs, failures, "", true)
+}
+
+fn judge_f2(runs: &[ScenarioRun]) -> CheckResult {
+    let failures = observed(runs)
+        .filter_map(|(name, o)| {
+            let (at, what) = o.miscounted.first()?;
+            let more = o.miscounted.len() - 1;
+            let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+            Some(format!("in {name} at {} ms: {what}{tail}", at.as_millis()))
+        })
+        .collect();
+    let r = cross("F2", runs, failures, "", true);
+    if r.verdict == Verdict::Pass
+        && let Some((name, o)) = observed(runs).find(|(_, o)| o.unchecked > 0)
+    {
+        return result(
+            "all",
+            "F2",
+            Verdict::Error,
+            format!(
+                "inconclusive: in {name}, lspcheck couldn't finish checking {} unreadable frame(s) within its limits",
+                o.unchecked
+            ),
+        );
+    }
+    if r.verdict == Verdict::Pass && observed(runs).all(|(_, o)| o.non_ascii.is_none()) {
+        return result(
+            "all",
+            "F2",
+            Verdict::NotExercised,
+            "no frame the server sent had non-ASCII text in its body (escaping it as \\u is lawful)",
+        );
+    }
+    r
 }
 
 fn judge_f8(runs: &[ScenarioRun]) -> CheckResult {
@@ -987,6 +1043,9 @@ mod tests {
             observed: Some(Observations {
                 problems: Vec::new(),
                 content_types: Vec::new(),
+                non_ascii: None,
+                miscounted: Vec::new(),
+                unchecked: 0,
                 killed: false,
                 leftovers,
                 coverage: Coverage::GroupAndEscaped,

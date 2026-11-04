@@ -28,8 +28,9 @@ pub struct Header {
 /// What the reader found in the byte stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Chunk {
-    /// A complete frame: its headers and exactly `Content-Length` body bytes.
-    Frame { headers: Vec<Header>, body: Vec<u8> },
+    /// A complete frame: its headers, exactly `Content-Length` body bytes,
+    /// and where in the stream the body starts.
+    Frame { headers: Vec<Header>, body: Vec<u8>, start: usize },
     /// Bytes outside any frame, such as a log line written to stdout.
     Garbage(Vec<u8>),
     /// A header section that isn't valid. The reader skips past it.
@@ -56,7 +57,10 @@ pub struct FrameReader {
     max_body: usize,
     /// Whether the next byte should start a header section.
     synced: bool,
-    pending: Option<(Vec<Header>, usize)>,
+    /// The stream offset of `buf[0]`.
+    offset: usize,
+    /// A frame whose body is being read: its headers, length, and where the body starts.
+    pending: Option<(Vec<Header>, usize, usize)>,
     /// An oversized body being skipped: its headers, length, and bytes left.
     skipping: Option<(Vec<Header>, usize, usize)>,
     /// Set after [`Chunk::HeaderLimit`]: everything after is discarded.
@@ -71,7 +75,16 @@ impl Default for FrameReader {
 
 impl FrameReader {
     pub fn new(max_header: usize, max_body: usize) -> Self {
-        Self { buf: Vec::new(), max_header, max_body, synced: true, pending: None, skipping: None, stopped: false }
+        Self {
+            buf: Vec::new(),
+            max_header,
+            max_body,
+            synced: true,
+            offset: 0,
+            pending: None,
+            skipping: None,
+            stopped: false,
+        }
     }
 
     /// Adds bytes and returns every chunk they complete.
@@ -84,9 +97,10 @@ impl FrameReader {
         loop {
             if let Some((_, _, left)) = &mut self.skipping {
                 let n = (*left).min(self.buf.len());
-                self.buf.drain(..n);
                 *left -= n;
-                if *left > 0 {
+                let done = *left == 0;
+                self.take(n);
+                if !done {
                     break;
                 }
                 let (headers, content_length, _) = self.skipping.take().expect("skipping");
@@ -94,14 +108,14 @@ impl FrameReader {
                 self.synced = true;
                 continue;
             }
-            if let Some((_, len)) = &self.pending {
+            if let Some((_, len, _)) = &self.pending {
                 let len = *len;
                 if self.buf.len() < len {
                     break;
                 }
-                let (headers, _) = self.pending.take().expect("pending frame");
-                let body: Vec<u8> = self.buf.drain(..len).collect();
-                out.push(Chunk::Frame { headers, body });
+                let (headers, _, start) = self.pending.take().expect("pending frame");
+                let body = self.take(len);
+                out.push(Chunk::Frame { headers, body, start });
                 self.synced = true;
                 continue;
             }
@@ -125,18 +139,18 @@ impl FrameReader {
                 let keep = partial_anchor(&self.buf);
                 let cut = self.buf.len() - keep;
                 if cut > 0 {
-                    out.push(Chunk::Garbage(self.buf.drain(..cut).collect()));
+                    out.push(Chunk::Garbage(self.take(cut)));
                 }
                 break;
             };
             if start > 0 {
-                out.push(Chunk::Garbage(self.buf.drain(..start).collect()));
+                out.push(Chunk::Garbage(self.take(start)));
             }
             // A header section starts at the anchor; judge it as the in-step path does.
             let window = &self.buf[..self.buf.len().min(self.max_header)];
             match find(window, b"\r\n\r\n") {
                 Some(end) => {
-                    let block: Vec<u8> = self.buf.drain(..end + 4).collect();
+                    let block = self.take(end + 4);
                     match parse_header_block(&block[..end]) {
                         Ok((headers, len)) => self.start_body(headers, len),
                         Err(reason) => out.push(Chunk::BadHeader { block, reason }),
@@ -144,7 +158,8 @@ impl FrameReader {
                 }
                 None => match invalid_line_end(window) {
                     Some((end, reason)) => {
-                        out.push(Chunk::BadHeader { block: self.buf.drain(..end).collect(), reason })
+                        let block = self.take(end);
+                        out.push(Chunk::BadHeader { block, reason })
                     }
                     None if self.buf.len() >= self.max_header => {
                         out.push(self.stop());
@@ -161,8 +176,14 @@ impl FrameReader {
         if len > self.max_body {
             self.skipping = Some((headers, len, len));
         } else {
-            self.pending = Some((headers, len));
+            self.pending = Some((headers, len, self.offset));
         }
+    }
+
+    /// Removes the first `n` buffered bytes, keeping track of the stream offset.
+    fn take(&mut self, n: usize) -> Vec<u8> {
+        self.offset += n;
+        self.buf.drain(..n).collect()
     }
 
     fn stop(&mut self) -> Chunk {
@@ -178,7 +199,7 @@ impl FrameReader {
         match find(window, b"\r\n\r\n") {
             Some(end) => match parse_header_block(&self.buf[..end]) {
                 Ok((headers, len)) => {
-                    self.buf.drain(..end + 4);
+                    self.take(end + 4);
                     Here::Parsed(headers, len)
                 }
                 Err(_) => Here::NotAHeader,
@@ -198,7 +219,7 @@ impl FrameReader {
         let rest = std::mem::take(&mut self.buf);
         if let Some((headers, content_length, left)) = self.skipping.take() {
             out.push(Chunk::Truncated { headers, content_length, received: content_length - left });
-        } else if let Some((headers, content_length)) = self.pending.take() {
+        } else if let Some((headers, content_length, _)) = self.pending.take() {
             out.push(Chunk::Truncated { headers, content_length, received: rest.len() });
         } else if !rest.is_empty() {
             let header_like = (self.synced && invalid_line_end(&rest).is_none()) || find_anchor(&rest) == Some(0);
@@ -231,6 +252,87 @@ pub fn encode_with_type(body: &[u8], content_type: &str) -> Vec<u8> {
     let mut out = format!("Content-Length: {}\r\nContent-Type: {content_type}\r\n\r\n", body.len()).into_bytes();
     out.extend_from_slice(body);
     out
+}
+
+/// What [`miscounted_length`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Count {
+    /// Nothing about how the length was counted.
+    Unknown,
+    /// The body is `bytes` long, and the length counted `counts` instead.
+    Miscounted { bytes: usize, counts: &'static str },
+    /// The work allowed for looking had run out.
+    Unchecked,
+}
+
+/// Whether a complete, valid header section starts `after`, reading at most
+/// lspcheck's header inspection limit, charged to `budget`.
+fn header_section_at(after: &[u8], budget: &mut usize) -> Result<bool, Count> {
+    let scan = &after[..after.len().min(DEFAULT_MAX_HEADER_BYTES)];
+    let end = find(scan, b"\r\n\r\n");
+    *budget = budget.checked_sub(end.map_or(scan.len(), |e| e + 4)).ok_or(Count::Unchecked)?;
+    match end {
+        Some(end) => Ok(parse_header_block(&scan[..end]).is_ok()),
+        None if after.len() > scan.len() => Err(Count::Unchecked),
+        None => Ok(false),
+    }
+}
+
+/// Whether a complete frame whose body couldn't be read had its
+/// `Content-Length` counted in characters or UTF-16 code units rather than
+/// bytes.
+///
+/// `rest` is the stream from where the body starts; `whole` says whether its
+/// end is the end of the server's output (and not where lspcheck stopped
+/// reading). The evidence is a complete JSON value with non-ASCII text at the
+/// body's start (with any whitespace after it) such that:
+///
+/// - no header section, and not the end of the output, starts at the
+///   declared end (if one does, the stream was framed correctly and the body
+///   is just not JSON);
+/// - a valid header section or the end of the output follows the value;
+/// - the declared length is exactly the value's length in characters or in
+///   UTF-16 code units, and shorter than its length in bytes.
+///
+/// Any other wrong length breaks the framing and is F1's business; F2 is
+/// about this one mistake, so that a server whose bodies or headers are
+/// malformed in some other way can't be blamed for it by coincidence.
+///
+/// Parsing reads at most about 4 × `content_length` bytes, enough for any
+/// value of that many characters or code units. Looking for header sections
+/// reads up to lspcheck's header inspection limit each time, charged to
+/// `budget`; when that runs out first, the count couldn't be checked.
+pub fn miscounted_length(rest: &[u8], content_length: usize, whole: bool, budget: &mut usize) -> Count {
+    let frame_follows = |after: &[u8], budget: &mut usize| match after.is_empty() {
+        true => Ok(whole),
+        false => header_section_at(after, budget),
+    };
+    let Some(declared_end) = rest.get(content_length..) else { return Count::Unknown };
+    // A value of N characters or code units takes at most 4N bytes.
+    let window = &rest[..rest.len().min(content_length.saturating_mul(4).saturating_add(16))];
+    let mut values = serde_json::Deserializer::from_slice(window).into_iter::<serde::de::IgnoredAny>();
+    if !matches!(values.next(), Some(Ok(_))) {
+        return Count::Unknown;
+    }
+    let value_end = values.byte_offset();
+    let len = value_end + rest[value_end..].iter().take_while(|b| b" \t\r\n".contains(b)).count();
+    let Ok(text) = std::str::from_utf8(&rest[..len]) else { return Count::Unknown };
+    let counted = |t: &str| (t.chars().count() == content_length, t.encode_utf16().count() == content_length);
+    let counts = match [counted(text), counted(&text[..value_end])].into_iter().find(|(c, u)| *c || *u) {
+        Some((true, true)) => "characters (and UTF-16 code units)",
+        Some((true, false)) => "characters",
+        Some((false, true)) => "UTF-16 code units",
+        _ => return Count::Unknown,
+    };
+    if text.is_ascii() || content_length >= value_end {
+        return Count::Unknown;
+    }
+    // No frame starts at the declared end, and one starts right after the value.
+    match (frame_follows(declared_end, budget), frame_follows(&rest[len..], budget)) {
+        (Ok(false), Ok(true)) => Count::Miscounted { bytes: len, counts },
+        (Err(unchecked), _) | (_, Err(unchecked)) => unchecked,
+        _ => Count::Unknown,
+    }
 }
 
 /// The charset a `Content-Type` value declares, lowercased, if any. Invalid
@@ -473,6 +575,27 @@ mod tests {
     }
 
     #[test]
+    fn frames_say_where_their_bodies_start_however_the_bytes_arrive() {
+        let stream = [b"log\n".to_vec(), encode(b"{}"), encode(b"[1]")].concat();
+        for split in 0..=stream.len() {
+            let mut r = FrameReader::default();
+            let mut out = r.feed(&stream[..split]);
+            out.extend(r.feed(&stream[split..]));
+            let starts: Vec<usize> = out
+                .iter()
+                .filter_map(|c| match c {
+                    Chunk::Frame { start, body, .. } => {
+                        assert_eq!(&stream[*start..*start + body.len()], body.as_slice());
+                        Some(*start)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(starts, vec![4 + 21, 4 + 21 + 2 + 21], "split at {split}");
+        }
+    }
+
+    #[test]
     fn reads_one_byte_at_a_time() {
         let stream = [encode(b"{}"), encode(b"[]")].concat();
         let mut r = FrameReader::default();
@@ -504,9 +627,9 @@ mod tests {
             read_all(&stream),
             vec![
                 Chunk::Garbage(b"starting server\n".to_vec()),
-                Chunk::Frame { headers: cl("2"), body: b"{}".to_vec() },
+                Chunk::Frame { headers: cl("2"), body: b"{}".to_vec(), start: 37 },
                 Chunk::Garbage(b"oops".to_vec()),
-                Chunk::Frame { headers: cl("2"), body: b"[]".to_vec() },
+                Chunk::Frame { headers: cl("2"), body: b"[]".to_vec(), start: 64 },
             ]
         );
     }
@@ -615,6 +738,62 @@ mod tests {
             let out = read_all(stream.as_bytes());
             assert_eq!(frames(&out).len() == 1 && out.len() == 1, ok, "{value}: {out:?}");
         }
+    }
+
+    #[test]
+    fn content_lengths_counted_in_characters_are_recognised() {
+        let check = |rest: &[u8], n: usize, whole: bool| {
+            let mut budget = usize::MAX;
+            match miscounted_length(rest, n, whole, &mut budget) {
+                Count::Miscounted { bytes, counts } => Some((bytes, counts)),
+                Count::Unknown => None,
+                Count::Unchecked => unreachable!(),
+            }
+        };
+        let body = "{\"m\":\"é😀\"}".as_bytes();
+        let next = b"Content-Length: 2\r\n\r\n{}";
+        let stream = [body, next].concat();
+        // 10 characters, 11 UTF-16 code units, 14 bytes.
+        assert_eq!(check(&stream, 10, true), Some((14, "characters")));
+        assert_eq!(check(&stream, 11, true), Some((14, "UTF-16 code units")));
+        // At the end of the output, but not where lspcheck stopped reading.
+        assert_eq!(check(body, 10, true), Some((14, "characters")));
+        assert_eq!(check(body, 10, false), None);
+        // Whitespace after the value belongs to the body, and the next
+        // section may start with any header.
+        let spaced = [body, b"\n", b"X-Trace: a\r\n", next].concat();
+        assert_eq!(check(&spaced, 11, true), Some((15, "characters")));
+        // Any other wrong length is F1's business.
+        assert_eq!(check(&stream, 12, true), None);
+        assert_eq!(check(&stream, 14, true), None);
+        assert_eq!(check(&[body, b"\n"].concat(), 10_015, true), None);
+        // ASCII text, no JSON value there, or a JSON value followed by
+        // something other than a header section: nothing to say.
+        assert_eq!(check(b"{\"m\":\"e\"}Content-Length: 2\r\n\r\n{}", 5, true), None);
+        assert_eq!(check("{\"m\":\"é".as_bytes(), 5, true), None);
+        for junk in [&b"junk"[..], b"Content-Length: not-a-header", next, b"Content-Length: 2\r\nX Y\r\n\r\n"] {
+            let rest = [body, junk].concat();
+            let shown = String::from_utf8_lossy(junk);
+            assert_eq!(check(&rest, rest.len(), true), None, "{shown:?}");
+            assert_eq!(check(&[&rest[..], next].concat(), rest.len(), true), None, "{shown:?}");
+        }
+        assert_eq!(check(&[body, b"junk"].concat(), 10, true), None);
+        // A correctly counted prefix of a value, completed by the next
+        // frame's first header line, valid or not.
+        let prefix = "{\"m\":\"é".as_bytes();
+        for line in [&b"X: \"}\r\n"[..], b" X: \"}\r\n"] {
+            let rest = [prefix, line, next].concat();
+            assert_eq!(check(&rest, prefix.len(), true), None, "{:?}", String::from_utf8_lossy(line));
+        }
+        // A value longer than the parse window can't have that few characters.
+        let mut wide = b"{\"m\":\"".to_vec();
+        wide.extend("é".repeat(100).as_bytes());
+        wide.extend(b"\"}");
+        assert_eq!(check(&[&wide[..], next].concat(), 1, true), None);
+        // Looking for the next header section is bounded.
+        assert_eq!(miscounted_length(&stream, 10, true, &mut 4), Count::Unchecked);
+        let long = [body, b"X-Pad: ", &vec![b'p'; DEFAULT_MAX_HEADER_BYTES][..], b"\r\n", next].concat();
+        assert_eq!(miscounted_length(&long, 10, true, &mut { usize::MAX }), Count::Unchecked);
     }
 
     #[test]
