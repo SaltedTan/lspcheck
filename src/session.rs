@@ -358,10 +358,17 @@ impl Session {
         record(&self.transcript, self.start.elapsed(), EventKind::Note(text.into()));
     }
 
-    /// Why evidence is incomplete so far, if it is: stdout's or lspcheck's own.
-    pub fn limit(&self) -> Option<String> {
+    /// Why evidence is incomplete so far, if it is: an inspection limit,
+    /// frames that couldn't be read, or lspcheck's own side of the
+    /// conversation. Any of these could explain a response that didn't come.
+    pub fn incomplete(&self) -> Option<String> {
         let ev = self.evidence.lock().expect("evidence lock");
-        ev.limit.as_ref().or(self.own_limit.as_ref()).map(|(_, why)| why.clone())
+        let unread = ev.problems.iter().any(|(_, p)| !matches!(p, Problem::Garbage(_)));
+        ev.limit
+            .as_ref()
+            .or(self.own_limit.as_ref())
+            .map(|(_, why)| why.clone())
+            .or_else(|| unread.then(|| "some of the server's frames couldn't be read (see F1)".to_string()))
     }
 
     /// Writes bytes exactly as given, within the write timeout.
@@ -372,26 +379,57 @@ impl Session {
     /// Writes bytes by `deadline` (or the write timeout, if sooner), recording
     /// exactly how many reached the pipe.
     async fn write_until(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), WriteError> {
+        self.write_split(bytes, &[], Duration::ZERO, deadline).await
+    }
+
+    /// Writes bytes as separate writes cut at `cuts` (ascending offsets into
+    /// `bytes`), flushing each piece and pausing `pause` before the next, so a
+    /// server reading promptly sees them one at a time. Everything happens by
+    /// `deadline` (or the write timeout, if sooner), and each piece is recorded
+    /// as it reached the pipe. `bytes` should hold whole frames: if the write
+    /// stops partway through, lspcheck sends nothing more.
+    pub async fn write_split(
+        &mut self,
+        bytes: &[u8],
+        cuts: &[usize],
+        pause: Duration,
+        deadline: Instant,
+    ) -> Result<(), WriteError> {
         let deadline = deadline.min(Instant::now() + self.opts.write_timeout);
         if self.abandoned {
             return Err(WriteError::Abandoned);
         }
         let Some(stdin) = self.stdin.as_mut() else { return Err(WriteError::Closed) };
-        let at = self.start.elapsed();
-        let mut written = 0usize;
+        let (t, start) = (&self.transcript, self.start);
+        let ends: Vec<usize> =
+            cuts.iter().copied().filter(|&c| c > 0 && c < bytes.len()).chain([bytes.len()]).collect();
+        // The piece being written: where it starts and when it began.
+        let (mut written, mut piece, mut piece_at) = (0usize, 0usize, start.elapsed());
         let result = timeout_at(deadline, async {
-            while written < bytes.len() {
-                let n = stdin.write(&bytes[written..]).await?;
-                if n == 0 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            for (i, &end) in ends.iter().enumerate() {
+                if end <= written {
+                    continue;
                 }
-                written += n;
+                if i > 0 && !pause.is_zero() {
+                    sleep(pause).await;
+                }
+                piece_at = start.elapsed();
+                while written < end {
+                    let n = stdin.write(&bytes[written..end]).await?;
+                    if n == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                    }
+                    written += n;
+                }
+                stdin.flush().await?;
+                record(t, piece_at, EventKind::Sent(bytes[piece..written].to_vec()));
+                piece = written;
             }
-            stdin.flush().await
+            Ok(())
         })
         .await;
-        if written > 0 {
-            record(&self.transcript, at, EventKind::Sent(bytes[..written].to_vec()));
+        if written > piece {
+            record(&self.transcript, piece_at, EventKind::Sent(bytes[piece..written].to_vec()));
         }
         let outcome = match result {
             Ok(Ok(())) => Ok(()),
@@ -465,6 +503,18 @@ impl Session {
         params: Option<Value>,
         deadline: Instant,
     ) -> Result<(), WriteError> {
+        self.begin_request(id, deadline).await?;
+        let result = self.send_until(&message::request(id, method, params), deadline).await;
+        if result.is_err() {
+            self.abort_request(id);
+        }
+        result
+    }
+
+    /// Registers a request about to be written some other way (split, with
+    /// other frames, or with extra headers), so only a later response can
+    /// answer it. If writing it fails, call [`Session::abort_request`].
+    pub async fn begin_request(&mut self, id: &Id, deadline: Instant) -> Result<(), WriteError> {
         if self.pending.contains_key(id) {
             return Err(WriteError::DuplicateId(id.to_string()));
         }
@@ -476,11 +526,12 @@ impl Session {
         self.used_ids.insert(id.clone());
         self.answers.remove(id);
         self.pending.insert(id.clone(), self.start.elapsed());
-        let result = self.send_until(&message::request(id, method, params), deadline).await;
-        if result.is_err() {
-            self.pending.remove(id);
-        }
-        result
+        Ok(())
+    }
+
+    /// Forgets a request registered with [`Session::begin_request`] that couldn't be written.
+    pub fn abort_request(&mut self, id: &Id) {
+        self.pending.remove(id);
     }
 
     pub async fn notify(&mut self, method: &str, params: Option<Value>) -> Result<(), WriteError> {
@@ -896,7 +947,7 @@ fn parsed_event(chunk: &Chunk) -> EventKind {
 }
 
 /// A random number, from the standard library's per-process hash keys.
-fn random_u64() -> u64 {
+pub fn random_u64() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

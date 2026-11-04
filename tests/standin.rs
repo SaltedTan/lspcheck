@@ -118,7 +118,7 @@ fn the_clean_standin_passes_every_check() {
 
 #[test]
 fn lawful_variations_fail_nothing() {
-    for name in ["extension-header", "decimal-ids", "long-header"] {
+    for name in ["extension-header", "decimal-ids", "long-header", "answers-reordered", "slow-reads"] {
         let r = fault(name);
         only_fails(&r, &[]);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
@@ -185,9 +185,68 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
     for id in ["J4", "L4", "L6"] {
         expect(&r, id, "error");
     }
+    // So can the plain request the framing checks start with, which can't
+    // then tell whether the server answers requests.
+    for id in ["F3", "F4", "F5", "F6", "F7"] {
+        expect(&r, id, "error");
+    }
     // exit reached its pipe there, and the server never read it: that's real.
     expect(&r, "L7", "fail");
     assert_eq!(r.status, 2, "no MUST failure\n{}", r.stdout);
+}
+
+#[test]
+fn input_split_across_writes_must_be_read() {
+    // A reader that expects each header section in one read.
+    only_fails(&fault("split-header"), &["F3"]);
+    // A reader that decodes each read on its own, so a character cut in two is mangled.
+    let r = fault("split-utf8");
+    only_fails(&r, &["F3"]);
+    assert!(r.stdout.contains("cut inside them"), "{}", r.stdout);
+}
+
+#[test]
+fn frames_coalesced_in_one_write_must_all_be_read() {
+    let r = fault("first-frame-per-read");
+    only_fails(&r, &["F4"]);
+    assert!(r.stdout.contains("1 of 2 requests went unanswered"), "{}", r.stdout);
+}
+
+#[test]
+fn counting_incoming_characters_instead_of_bytes_fails_f5() {
+    let r = fault("char-length-input");
+    only_fails(&r, &["F5"]);
+    // F3's multibyte part depends on F5, and says it wasn't run.
+    assert!(r.stdout.contains("wasn't run, because F5 didn't pass"), "{}", r.stdout);
+}
+
+#[test]
+fn rejecting_a_client_content_type_fails_f6_and_f7() {
+    only_fails(&fault("no-content-type"), &["F6", "F7"]);
+    let r = fault("strict-charset");
+    only_fails(&r, &["F7"]);
+    assert_eq!(r.status, 0, "F7 is a SHOULD check");
+}
+
+#[test]
+fn variants_after_the_server_stops_answering_are_inconclusive() {
+    // The server exits at F6; nothing after it can be judged.
+    let r = fault("exit-on-content-type");
+    expect(&r, "F4", "pass");
+    expect(&r, "F6", "fail");
+    for id in ["F7", "F3", "F5"] {
+        expect(&r, id, "error");
+    }
+    assert!(r.stdout.contains("the server exited after F6 didn't pass"), "{}", r.stdout);
+}
+
+#[test]
+fn framing_variants_are_not_exercised_when_plain_requests_go_unanswered() {
+    let r = run(&["--fault", "ignore-unknown-requests"], &["--timeout", "2"]);
+    expect(&r, "J4", "fail");
+    for id in ["F3", "F4", "F5", "F6", "F7"] {
+        expect(&r, id, "not-exercised");
+    }
 }
 
 #[test]

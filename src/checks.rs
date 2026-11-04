@@ -10,7 +10,7 @@
 //! lspcheck hit one of its own inspection limits is reported as an error,
 //! because the missing evidence might explain it.
 
-use crate::message::{Kind, Message, Outcome, codes};
+use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
 use crate::session::{self, CallError, Finish, Options, Problem, Session, WaitError};
 use crate::transcript;
@@ -73,6 +73,11 @@ macro_rules! check {
 /// Every check lspcheck knows, in report order.
 pub const CATALOGUE: &[CheckInfo] = &[
     check!("F1", Framing, Must, "Every byte on stdout belongs to a well-formed frame", "baseProtocol"),
+    check!("F3", Framing, Must, "Input split across writes, down to single header bytes, is read", "baseProtocol"),
+    check!("F4", Framing, Must, "Several frames in one write are all read", "baseProtocol"),
+    check!("F5", Framing, Must, "Input with 2-, 3- and 4-byte UTF-8 characters keeps the stream in step", "headerPart"),
+    check!("F6", Framing, Must, "A Content-Type header with charset=utf-8 from the client is accepted", "headerPart"),
+    check!("F7", Framing, Should, "The legacy charset=utf8 spelling from the client is accepted", "contentPart"),
     check!("F8", Framing, Should, "A Content-Type the server sends declares UTF-8", "contentPart"),
     check!(
         "J4",
@@ -190,6 +195,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "lifecycle", checks: &["L2", "J4", "L4", "L6"] },
     Scenario { name: "pre-initialize", checks: &["L1"] },
     Scenario { name: "exit-without-shutdown", checks: &["L7"] },
+    Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
 ];
 
 /// Runs the scenarios needed for `selected` (every check when empty) and
@@ -247,6 +253,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         "lifecycle" => lifecycle(&mut ctx).await,
         "pre-initialize" => pre_initialize(&mut ctx).await,
         "exit-without-shutdown" => exit_without_shutdown(&mut ctx).await,
+        "framing" => framing(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
     let Ctx { s, mut results, .. } = ctx;
@@ -331,6 +338,10 @@ impl Ctx<'_> {
 
     fn pass(&mut self, id: &str) {
         self.report(id, Verdict::Pass, "");
+    }
+
+    fn pass_with(&mut self, id: &str, detail: impl Into<String>) {
+        self.report(id, Verdict::Pass, detail);
     }
 
     fn fail(&mut self, id: &str, detail: impl Into<String>) {
@@ -504,6 +515,242 @@ async fn exit_without_shutdown(ctx: &mut Ctx<'_>) {
         Some(status) if status.code() == Some(1) => ctx.pass("L7"),
         Some(status) => ctx.fail("L7", format!("exited with {}", session::describe_status(status))),
         None => ctx.fail("L7", format!("still running {} s after exit", ctx.cfg.exit_timeout.as_secs())),
+    }
+}
+
+/// A request every server answers: an unknown method gets MethodNotFound
+/// (J4). The framing checks ask only whether a response arrived.
+const PROBE: &str = "lspcheck/probe";
+/// The pause between the pieces of a split write, so that a server reading
+/// promptly sees each piece on its own.
+const SPLIT_PAUSE: Duration = Duration::from_millis(10);
+/// Text with 2-, 3- and 4-byte UTF-8 characters and a combining mark.
+const MULTIBYTE: &str = "é ñ ü · € 中文 · 😀 𝄞 · e\u{301}";
+
+/// How one framing variant went.
+enum Probe {
+    /// Every request it carried was answered.
+    Answered,
+    /// A response that should have come didn't.
+    Missing(String),
+    /// lspcheck couldn't deliver it.
+    Unsent(String),
+}
+
+fn frame(value: &Value) -> Vec<u8> {
+    transport::encode(&serde_json::to_vec(value).expect("JSON values serialize"))
+}
+
+/// Writes `bytes`, which hold the requests `ids`, as separate writes cut at
+/// `cuts`, and waits for every response, all by one deadline.
+async fn exchange(ctx: &mut Ctx<'_>, ids: &[Id], bytes: &[u8], cuts: &[usize]) -> Probe {
+    let t = ctx.cfg.request_timeout;
+    let deadline = Instant::now() + t;
+    let started = ctx.s.messages.len();
+    for (i, id) in ids.iter().enumerate() {
+        if let Err(e) = ctx.s.begin_request(id, deadline).await {
+            ids[..i].iter().for_each(|id| ctx.s.abort_request(id));
+            return Probe::Unsent(e.to_string());
+        }
+    }
+    if let Err(e) = ctx.s.write_split(bytes, cuts, SPLIT_PAUSE, deadline).await {
+        ids.iter().for_each(|id| ctx.s.abort_request(id));
+        return Probe::Unsent(e.to_string());
+    }
+    let (mut missing, mut why) = (0, None);
+    for id in ids {
+        if let Err(e) = ctx.s.wait_response(id, deadline).await {
+            missing += 1;
+            why.get_or_insert(e);
+        }
+    }
+    let Some(e) = why else { return Probe::Answered };
+    let what = match e {
+        WaitError::Timeout => format!("no response within {} s", t.as_secs()),
+        WaitError::Closed => "the server closed its stdout without responding".into(),
+    };
+    let mut detail =
+        if ids.len() > 1 { format!("{missing} of {} requests went unanswered: {what}", ids.len()) } else { what };
+    // A server that couldn't read a frame often says so with an error whose id is null.
+    if let Some(Kind::Response { outcome, .. }) = ctx.s.messages[started..]
+        .iter()
+        .map(|(_, m)| &m.kind)
+        .find(|k| matches!(k, Kind::Response { id: Id::Null, .. }))
+    {
+        detail = format!("{detail}; the server sent {} with id null", describe_outcome(outcome));
+    }
+    Probe::Missing(detail)
+}
+
+/// Whether the server still answers a plain request after a variant that
+/// didn't pass; if not, why the rest of the scenario can't be judged.
+async fn back_in_step(ctx: &mut Ctx<'_>, after: &str) -> Option<String> {
+    if !ctx.s.is_alive() {
+        return Some(format!("the server exited after {after}"));
+    }
+    let t = ctx.cfg.request_timeout;
+    match ctx.s.call(PROBE, Some(json!({})), t).await {
+        Ok(_) => None,
+        Err(e @ CallError::Wait(_)) => Some(format!(
+            "after {after}, a plain request went unanswered ({}), so the input may be out of step",
+            describe_call_error(&e, t)
+        )),
+        Err(e) => Some(format!("after {after}, lspcheck couldn't send a plain request ({e})")),
+    }
+}
+
+/// Reports a framing variant. Returns why the stream can no longer be
+/// trusted, if it can't.
+async fn settle(ctx: &mut Ctx<'_>, id: &str, what: &str, outcome: Probe) -> Option<String> {
+    match outcome {
+        Probe::Answered => {
+            ctx.pass(id);
+            return None;
+        }
+        Probe::Missing(why) => ctx.fail_absent(id, format!("{what}: {why}")),
+        Probe::Unsent(why) => ctx.report(id, Verdict::Error, format!("{what}: {why}")),
+    }
+    back_in_step(ctx, &format!("{id} didn't pass")).await
+}
+
+/// Variations on how the client frames its input. A plain request answered
+/// first shows the server answers probes at all; each variant is then judged
+/// only while the stream is known to be in step.
+async fn framing(ctx: &mut Ctx<'_>) {
+    const CHECKS: [&str; 5] = ["F4", "F6", "F7", "F3", "F5"];
+    if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
+        ctx.initialize().await
+    {
+        for id in CHECKS {
+            ctx.report(id, Verdict::Error, format!("initialize didn't succeed: {why}"));
+        }
+        return;
+    }
+    let t = ctx.cfg.request_timeout;
+    if let Err(e) = ctx.s.call(PROBE, Some(json!({})), t).await {
+        let (verdict, why) = match &e {
+            CallError::Write(_) => (Verdict::Error, format!("lspcheck couldn't send a plain request: {e}")),
+            CallError::Wait(_) => {
+                let why = format!(
+                    "a plain request sent whole went unanswered ({}), so the variants have nothing to compare with",
+                    describe_call_error(&e, t)
+                );
+                match ctx.s.incomplete() {
+                    Some(limit) => (Verdict::Error, format!("inconclusive, because {limit}: {why}")),
+                    None => (Verdict::NotExercised, why),
+                }
+            }
+        };
+        for id in CHECKS {
+            ctx.report(id, verdict, why.clone());
+        }
+        return;
+    }
+
+    let probe = |ctx: &mut Ctx<'_>, params: Value| {
+        let id = ctx.s.fresh_id();
+        let body = serde_json::to_vec(&message::request(&id, PROBE, Some(params))).expect("JSON values serialize");
+        (id, body)
+    };
+    let mut broken: Option<String> = None;
+    let skip = |ctx: &mut Ctx<'_>, id: &str, broken: &Option<String>| match broken {
+        Some(why) => {
+            ctx.report(id, Verdict::Error, format!("not judged: {why}"));
+            true
+        }
+        None => false,
+    };
+
+    // F4: two requests and a notification in one write.
+    if !skip(ctx, "F4", &broken) {
+        let (a, first) = probe(ctx, json!({}));
+        let (b, second) = probe(ctx, json!({}));
+        let mut bytes = transport::encode(&first);
+        bytes.extend(frame(&message::notification("$/setTrace", Some(json!({"value": "off"})))));
+        bytes.extend(transport::encode(&second));
+        let outcome = exchange(ctx, &[a, b], &bytes, &[]).await;
+        broken = settle(ctx, "F4", "two requests and a notification written in one write", outcome).await;
+    }
+
+    // F6 and F7: a Content-Type header, in the current and the legacy spelling.
+    for (check, charset) in [("F6", "utf-8"), ("F7", "utf8")] {
+        if skip(ctx, check, &broken) {
+            continue;
+        }
+        let value = format!("application/vscode-jsonrpc; charset={charset}");
+        let (id, body) = probe(ctx, json!({}));
+        let bytes = transport::encode_with_type(&body, &value);
+        let outcome = exchange(ctx, &[id], &bytes, &[]).await;
+        broken = settle(ctx, check, &format!("a request with Content-Type: {value}"), outcome).await;
+    }
+
+    // F3, first part: every header byte in its own write, the body cut at seeded points.
+    let mut split_read = false;
+    if !skip(ctx, "F3", &broken) {
+        let (id, body) = probe(ctx, json!({"text": "written in pieces"}));
+        let bytes = transport::encode(&body);
+        let header = bytes.len() - body.len();
+        let seed = session::random_u64();
+        let mut body_cuts: Vec<usize> =
+            (0..3).map(|i| header + 1 + ((seed >> (i * 16)) as usize % (body.len() - 1))).collect();
+        body_cuts.sort_unstable();
+        body_cuts.dedup();
+        let cuts: Vec<usize> = (1..=header).chain(body_cuts.iter().copied()).collect();
+        let what = format!(
+            "a request written in {} pieces (each header byte alone, then the body cut at bytes {body_cuts:?})",
+            cuts.len() + 1
+        );
+        ctx.s.note(format!("F3: {what}"));
+        match exchange(ctx, &[id], &bytes, &cuts).await {
+            Probe::Answered => split_read = true,
+            outcome => broken = settle(ctx, "F3", &what, outcome).await,
+        }
+    }
+
+    // F5: a document with multibyte characters, then a request that also has some.
+    let mut f5_passed = false;
+    if !skip(ctx, "F5", &broken) {
+        let path = ctx.root.join("lspcheck-utf8.txt");
+        let text = format!("ASCII line\n{MULTIBYTE}\nlast line\n");
+        let _ = std::fs::write(&path, &text);
+        let open =
+            json!({"textDocument": {"uri": file_uri(&path), "languageId": "plaintext", "version": 1, "text": text}});
+        let what = "a didOpen whose text has 2-, 3- and 4-byte UTF-8 characters, then a request with some too";
+        let outcome = match ctx.s.notify("textDocument/didOpen", Some(open)).await {
+            Err(e) => Probe::Unsent(format!("didOpen: {e}")),
+            Ok(()) => {
+                let (id, body) = probe(ctx, json!({"text": MULTIBYTE}));
+                exchange(ctx, &[id], &transport::encode(&body), &[]).await
+            }
+        };
+        f5_passed = matches!(outcome, Probe::Answered);
+        broken = settle(ctx, "F5", what, outcome).await;
+    }
+
+    // F3, second part: writes that end inside multibyte characters. If F5
+    // passed, the stream is in step and multibyte input is read correctly.
+    if split_read && !f5_passed {
+        ctx.pass_with("F3", "the part that splits multibyte characters wasn't run, because F5 didn't pass");
+    } else if split_read {
+        let (id, body) = probe(ctx, json!({"text": MULTIBYTE}));
+        let bytes = transport::encode(&body);
+        let header = bytes.len() - body.len();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        // Inside a 2-, a 3- and a 4-byte character (twice).
+        let cuts: Vec<usize> = [("é", 1), ("€", 2), ("😀", 1), ("😀", 3)]
+            .iter()
+            .filter_map(|(c, k)| text.find(c).map(|at| header + at + k))
+            .collect();
+        let what = format!("a request with multibyte characters written in pieces cut inside them, at {cuts:?}");
+        ctx.s.note(format!("F3: {what}"));
+        let outcome = exchange(ctx, &[id], &bytes, &cuts).await;
+        broken = settle(ctx, "F3", &what, outcome).await;
+    }
+
+    // Leave politely so the server isn't killed mid-thought.
+    if broken.is_none() && ctx.s.call("shutdown", None, t).await.is_ok() {
+        let _ = ctx.s.notify("exit", None).await;
+        let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
     }
 }
 
