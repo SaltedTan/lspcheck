@@ -6,16 +6,18 @@
 //!
 //! Stdout and stderr are read by their own tasks for the whole session, so a
 //! server that writes a lot can never block on a full pipe while lspcheck is
-//! writing to it. Every write and every wait has an absolute deadline. Stdout
-//! is inspected up to an output budget; past it, lspcheck keeps reading and
+//! writing to it. The stdout task also parses frames and records framing
+//! evidence itself, so that evidence is complete even if nobody consumes the
+//! messages. Every write and every wait has an absolute deadline. Stdout is
+//! inspected up to an output budget; past it, lspcheck keeps reading and
 //! discarding so the server isn't blocked, and records that its evidence is
 //! incomplete.
 
 use crate::message::{self, Id, Kind, Message, codes};
 use crate::process::{self, Coverage, Group, ProcInfo, ServerCommand};
-use crate::transport::{self, Chunk, FrameReader};
+use crate::transport::{self, Chunk, FrameReader, Header};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -32,6 +34,8 @@ pub struct Options {
     pub sentinel: Option<PathBuf>,
     /// The longest any single write may take.
     pub write_timeout: Duration,
+    /// The longest header section inspected.
+    pub max_header: usize,
     /// The largest frame body inspected.
     pub max_body: usize,
     /// Stdout bytes inspected and kept per session.
@@ -49,6 +53,7 @@ impl Default for Options {
         Self {
             sentinel: None,
             write_timeout: Duration::from_secs(10),
+            max_header: transport::DEFAULT_MAX_HEADER_BYTES,
             max_body: transport::DEFAULT_MAX_BODY_BYTES,
             max_output: 256 * 1024 * 1024,
             stderr_limit: 1024 * 1024,
@@ -72,7 +77,7 @@ pub enum EventKind {
     Sent(Vec<u8>),
     /// Bytes exactly as read from the server's stdout.
     Read(Vec<u8>),
-    /// What the frame reader made of the bytes read so far.
+    /// How the frame reader split the bytes read so far.
     Parsed {
         kind: &'static str,
         detail: String,
@@ -108,12 +113,8 @@ impl std::fmt::Display for Problem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Problem::Garbage(b) => write!(f, "{} bytes outside any frame: {}", b.len(), preview(b)),
-            Problem::BadHeader { block, reason } => {
-                write!(f, "bad header ({reason}): {}", preview(block))
-            }
-            Problem::NotJson { body, error } => {
-                write!(f, "frame body is not JSON ({error}): {}", preview(body))
-            }
+            Problem::BadHeader { block, reason } => write!(f, "bad header ({reason}): {}", preview(block)),
+            Problem::NotJson { body, error } => write!(f, "frame body is not JSON ({error}): {}", preview(body)),
             Problem::Truncated { content_length, received } => {
                 write!(f, "stream ended {received} bytes into a {content_length}-byte body")
             }
@@ -134,7 +135,7 @@ pub fn preview(bytes: &[u8]) -> String {
 pub enum Recv {
     Message(Message),
     Problem(Problem),
-    /// Stdout has closed, or lspcheck stopped inspecting it (see [`Session::limit`]).
+    /// Stdout has closed, or lspcheck stopped inspecting it.
     Closed,
     Timeout,
 }
@@ -153,6 +154,8 @@ pub enum WriteError {
     Closed,
     Timeout,
     Io(String),
+    /// A request with this id is still waiting for its response.
+    DuplicateId(String),
 }
 
 impl std::fmt::Display for WriteError {
@@ -161,8 +164,19 @@ impl std::fmt::Display for WriteError {
             WriteError::Closed => f.write_str("the server's stdin is closed"),
             WriteError::Timeout => f.write_str("the server stopped reading its stdin"),
             WriteError::Io(e) => write!(f, "writing to the server failed: {e}"),
+            WriteError::DuplicateId(id) => write!(f, "a request with id {id} is still outstanding"),
         }
     }
+}
+
+/// What the stdout task observed, independently of what was consumed.
+#[derive(Debug, Default)]
+struct Evidence {
+    problems: Vec<(Duration, Problem)>,
+    content_types: Vec<(Duration, String)>,
+    limit: Option<String>,
+    /// The stdout task has seen the end of the stream.
+    done: bool,
 }
 
 /// What remains when a session ends.
@@ -180,12 +194,16 @@ pub struct Finish {
     pub scan_error: Option<String>,
     /// Processes lspcheck couldn't stop.
     pub not_stopped: Vec<ProcInfo>,
-    /// Why lspcheck's evidence for this session is incomplete, if it is.
+    /// Why lspcheck's inspection of stdout is incomplete, if it is.
     pub limit: Option<String>,
-    /// Whether stdout was still open when lspcheck gave up waiting for it to close.
-    pub stdout_left_open: bool,
+    /// Why lspcheck's own side of the conversation was incomplete (it
+    /// couldn't answer one of the server's requests), if it was. This can
+    /// explain a reply that never came, but not what stdout contained.
+    pub own_limit: Option<String>,
     pub transcript: Vec<Event>,
+    /// Every message the session consumed.
     pub messages: Vec<(Duration, Message)>,
+    /// Every stream problem in the whole of stdout.
     pub problems: Vec<(Duration, Problem)>,
     /// Responses that matched no outstanding request (unknown, early, or repeated ids).
     pub unmatched: Vec<(Duration, Id)>,
@@ -200,9 +218,10 @@ fn record(t: &Transcript, at: Duration, kind: EventKind) {
 }
 
 enum Inbound {
-    Chunk(Chunk),
-    /// The output budget ran out; nothing more will be forwarded.
-    Limit(String),
+    Message(Message),
+    Problem(Problem),
+    /// The output budget ran out or the reader stopped; nothing more will come.
+    Stopped,
     Closed,
 }
 
@@ -224,21 +243,19 @@ pub struct Session {
     stdout_closed: bool,
     start: Instant,
     transcript: Transcript,
-    /// Every message received, in order.
+    evidence: Arc<Mutex<Evidence>>,
+    /// Every message consumed, in order.
     pub messages: Vec<(Duration, Message)>,
-    /// Every stream problem seen, in order.
-    pub problems: Vec<(Duration, Problem)>,
-    /// Why evidence is incomplete, once it is.
-    pub limit: Option<String>,
+    /// Why this session's own actions left evidence incomplete.
+    own_limit: Option<String>,
     /// Requests sent and not yet answered, with when they were sent.
     pending: HashMap<Id, Duration>,
     /// Requests answered: the index of the response in `messages`.
     answers: HashMap<Id, usize>,
+    used_ids: HashSet<Id>,
     unmatched: Vec<(Duration, Id)>,
-    content_types: Vec<(Duration, String)>,
     group: Group,
     exit: Option<ExitStatus>,
-    next_id: i64,
     opts: Options,
     _registration: Registration,
 }
@@ -270,50 +287,11 @@ impl Session {
         let registration = Registration(own);
         let start = Instant::now();
         let transcript: Transcript = Arc::default();
+        let evidence: Arc<Mutex<Evidence>> = Arc::default();
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let t = transcript.clone();
-        let (max_body, max_output) = (opts.max_body, opts.max_output);
-        tokio::spawn(async move {
-            let mut reader = FrameReader::new(transport::DEFAULT_MAX_HEADER_BYTES, max_body);
-            let mut buf = vec![0u8; 64 * 1024];
-            let (mut total, mut over) = (0usize, false);
-            loop {
-                let n = match stdout.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                total += n;
-                if over {
-                    continue;
-                }
-                let at = start.elapsed();
-                if total > max_output {
-                    over = true;
-                    let why = format!(
-                        "the server wrote more than {max_output} bytes to stdout; lspcheck stopped inspecting it (--max-output-mib)"
-                    );
-                    record(&t, at, EventKind::Note(why.clone()));
-                    let _ = tx.send((at, Inbound::Limit(why)));
-                    continue;
-                }
-                record(&t, at, EventKind::Read(buf[..n].to_vec()));
-                for chunk in reader.feed(&buf[..n]) {
-                    record(&t, at, parsed_event(&chunk));
-                    let _ = tx.send((at, Inbound::Chunk(chunk)));
-                }
-            }
-            let at = start.elapsed();
-            if !over {
-                for chunk in reader.finish() {
-                    record(&t, at, parsed_event(&chunk));
-                    let _ = tx.send((at, Inbound::Chunk(chunk)));
-                }
-            }
-            record(&t, at, EventKind::StdoutClosed);
-            let _ = tx.send((at, Inbound::Closed));
-        });
+        let stdout = child.stdout.take().expect("piped stdout");
+        tokio::spawn(read_stdout(stdout, tx, transcript.clone(), evidence.clone(), start, opts.clone()));
 
         let mut stderr = child.stderr.take().expect("piped stderr");
         let t = transcript.clone();
@@ -347,16 +325,15 @@ impl Session {
             stdout_closed: false,
             start,
             transcript,
+            evidence,
             messages: Vec::new(),
-            problems: Vec::new(),
-            limit: None,
+            own_limit: None,
             pending: HashMap::new(),
             answers: HashMap::new(),
+            used_ids: HashSet::new(),
             unmatched: Vec::new(),
-            content_types: Vec::new(),
             group,
             exit: None,
-            next_id: 1,
             opts,
             _registration: registration,
         })
@@ -374,6 +351,11 @@ impl Session {
         record(&self.transcript, self.start.elapsed(), EventKind::Note(text.into()));
     }
 
+    /// Why evidence is incomplete so far, if it is: stdout's or lspcheck's own.
+    pub fn limit(&self) -> Option<String> {
+        self.evidence.lock().expect("evidence lock").limit.clone().or_else(|| self.own_limit.clone())
+    }
+
     /// Writes bytes exactly as given, within the write timeout.
     pub async fn write_raw(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
         self.write_until(bytes, Instant::now() + self.opts.write_timeout).await
@@ -383,9 +365,7 @@ impl Session {
     /// exactly how many reached the pipe.
     async fn write_until(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), WriteError> {
         let deadline = deadline.min(Instant::now() + self.opts.write_timeout);
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Err(WriteError::Closed);
-        };
+        let Some(stdin) = self.stdin.as_mut() else { return Err(WriteError::Closed) };
         let at = self.start.elapsed();
         let mut written = 0usize;
         let result = timeout_at(deadline, async {
@@ -427,11 +407,16 @@ impl Session {
         self.write_until(&transport::encode(&body), deadline).await
     }
 
-    /// The next integer id this session would use.
+    /// A fresh integer id in LSP's 32-bit range, unpredictable so that a
+    /// response can't be prepared before its request exists.
     pub fn fresh_id(&mut self) -> Id {
-        let id = Id::int(self.next_id);
-        self.next_id += 1;
-        id
+        loop {
+            let n = (random_u64() % (i32::MAX as u64)) as i64 + 1;
+            let id = Id::int(n);
+            if self.used_ids.insert(id.clone()) {
+                return id;
+            }
+        }
     }
 
     /// Sends a request, registering it so only a later response can answer it.
@@ -442,8 +427,29 @@ impl Session {
     }
 
     pub async fn request_with_id(&mut self, id: &Id, method: &str, params: Option<Value>) -> Result<(), WriteError> {
+        self.request_until(id, method, params, Instant::now() + self.opts.write_timeout).await
+    }
+
+    async fn request_until(
+        &mut self,
+        id: &Id,
+        method: &str,
+        params: Option<Value>,
+        deadline: Instant,
+    ) -> Result<(), WriteError> {
+        if self.pending.contains_key(id) {
+            return Err(WriteError::DuplicateId(id.to_string()));
+        }
+        // Responses already on their way can't answer this request.
+        self.absorb(deadline).await;
+        self.used_ids.insert(id.clone());
+        self.answers.remove(id);
         self.pending.insert(id.clone(), self.start.elapsed());
-        self.send(&message::request(id, method, params)).await
+        let result = self.send_until(&message::request(id, method, params), deadline).await;
+        if result.is_err() {
+            self.pending.remove(id);
+        }
+        result
     }
 
     pub async fn notify(&mut self, method: &str, params: Option<Value>) -> Result<(), WriteError> {
@@ -455,61 +461,54 @@ impl Session {
         self.stdin = None;
     }
 
+    /// Takes in everything that has already arrived, without waiting.
+    async fn absorb(&mut self, deadline: Instant) {
+        tokio::task::yield_now().await;
+        while !self.stdout_closed {
+            match self.rx.try_recv() {
+                Ok((at, inbound)) => {
+                    let _ = self.handle(at, inbound, deadline).await;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
     /// Receives the next message or stream problem, answering server requests
     /// on the way when `auto_respond` is set. Nothing is processed after `deadline`.
     pub async fn recv(&mut self, deadline: Instant) -> Recv {
-        loop {
-            if self.stdout_closed {
-                return Recv::Closed;
+        if self.stdout_closed {
+            return Recv::Closed;
+        }
+        if Instant::now() >= deadline {
+            return Recv::Timeout;
+        }
+        match timeout_at(deadline, self.rx.recv()).await {
+            Err(_) => Recv::Timeout,
+            Ok(None) => {
+                self.stdout_closed = true;
+                Recv::Closed
             }
-            if Instant::now() >= deadline {
-                return Recv::Timeout;
+            Ok(Some((at, inbound))) => self.handle(at, inbound, deadline).await,
+        }
+    }
+
+    async fn handle(&mut self, at: Duration, inbound: Inbound, deadline: Instant) -> Recv {
+        match inbound {
+            Inbound::Closed | Inbound::Stopped => {
+                self.stdout_closed = true;
+                Recv::Closed
             }
-            let (at, inbound) = match timeout_at(deadline, self.rx.recv()).await {
-                Err(_) => return Recv::Timeout,
-                Ok(None) | Ok(Some((_, Inbound::Closed))) => {
-                    self.stdout_closed = true;
-                    return Recv::Closed;
+            Inbound::Problem(p) => Recv::Problem(p),
+            Inbound::Message(m) => {
+                self.accept(at, &m);
+                if self.opts.auto_respond
+                    && let Kind::Request { id, method } = &m.kind
+                {
+                    self.answer(id, method, &m.value, deadline).await;
                 }
-                Ok(Some((_, Inbound::Limit(why)))) => {
-                    self.limit.get_or_insert(why);
-                    self.stdout_closed = true;
-                    return Recv::Closed;
-                }
-                Ok(Some((at, Inbound::Chunk(chunk)))) => (at, chunk),
-            };
-            let problem = match inbound {
-                Chunk::Frame { headers, body } => {
-                    for h in headers.iter().filter(|h| h.name.eq_ignore_ascii_case("content-type")) {
-                        self.content_types.push((at, h.value.clone()));
-                    }
-                    match Message::parse(&body) {
-                        Ok(m) => {
-                            self.accept(at, &m);
-                            if self.opts.auto_respond
-                                && let Kind::Request { id, method } = &m.kind
-                            {
-                                self.answer(id, method, &m.value, deadline).await;
-                            }
-                            return Recv::Message(m);
-                        }
-                        Err(error) => Problem::NotJson { body, error },
-                    }
-                }
-                Chunk::Oversized { content_length, limit, .. } => {
-                    let why = format!(
-                        "a {content_length}-byte frame is over lspcheck's {limit}-byte inspection limit (--max-frame-mib), so it wasn't checked"
-                    );
-                    self.note(why.clone());
-                    self.limit.get_or_insert(why);
-                    continue;
-                }
-                Chunk::Garbage(b) => Problem::Garbage(b),
-                Chunk::BadHeader { block, reason } => Problem::BadHeader { block, reason },
-                Chunk::Truncated { content_length, received, .. } => Problem::Truncated { content_length, received },
-            };
-            self.problems.push((at, problem.clone()));
-            return Recv::Problem(problem);
+                Recv::Message(m)
+            }
         }
     }
 
@@ -547,8 +546,15 @@ impl Session {
             | "workspace/semanticTokens/refresh" => message::response(id, Value::Null),
             _ => message::error_response(id, codes::METHOD_NOT_FOUND, "lspcheck does not handle this request"),
         };
-        if let Err(e) = self.send_until(&reply, deadline).await {
-            self.note(format!("couldn't answer the server's {method} request: {e}"));
+        if let Err(e) = self.send_until(&reply, deadline).await
+            && e != WriteError::Closed
+        {
+            // The server may be waiting for this answer, so what follows can't
+            // be blamed on it. (A closed stdin means the server is exiting or
+            // closed it itself; nothing more is expected of it.)
+            let why = format!("lspcheck couldn't answer the server's {method} request ({e})");
+            self.note(why.clone());
+            self.own_limit.get_or_insert(why);
         }
     }
 
@@ -566,10 +572,11 @@ impl Session {
         }
     }
 
-    /// Sends a request and waits for its response.
+    /// Sends a request and waits for its response, all by one deadline.
     pub async fn call(&mut self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Message, CallError> {
         let deadline = Instant::now() + timeout;
-        let id = self.request(method, params).await.map_err(CallError::Write)?;
+        let id = self.fresh_id();
+        self.request_until(&id, method, params, deadline).await.map_err(CallError::Write)?;
         self.wait_response(&id, deadline).await.map_err(CallError::Wait)
     }
 
@@ -665,9 +672,13 @@ impl Session {
         for p in &leftovers {
             self.note(format!("still running after the server exited: {p}"));
         }
-        // Stop what's left. Stopping an adopted process can orphan its own
-        // children, which are then adopted too, so repeat for up to two seconds.
+        // Stop what's left: the group by its id (safe while the sentinel holds
+        // it), and adopted processes, which are lspcheck's unreaped children
+        // and so can't have been replaced by another process. Stopping one can
+        // orphan its own children, which are then adopted too, so repeat for
+        // up to two seconds.
         let deadline = Instant::now() + Duration::from_secs(2);
+        let me = std::process::id() as i32;
         let mut not_stopped = Vec::new();
         loop {
             #[cfg(unix)]
@@ -680,7 +691,7 @@ impl Session {
                 not_stopped = left;
                 break;
             }
-            for p in &left {
+            for p in left.iter().filter(|p| p.ppid == me) {
                 if let Err(e) = process::kill_process(p) {
                     self.note(e);
                 }
@@ -691,9 +702,22 @@ impl Session {
             self.note(format!("lspcheck couldn't stop {p}"));
         }
 
-        self.drain(Instant::now() + Duration::from_millis(500)).await;
-        let stdout_left_open = !self.stdout_closed;
+        // Let the stdout task see the end of the stream, so its evidence is
+        // complete. Every process has been stopped, so only parsing what is
+        // already buffered remains; the bound covers a process lspcheck
+        // couldn't stop that still holds the pipe.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.evidence.lock().expect("evidence lock").done && Instant::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+        }
+        // Classify responses that arrived and weren't waited for, briefly.
+        self.drain(Instant::now() + Duration::from_millis(200)).await;
         self.group.close();
+        let mut evidence = std::mem::take(&mut *self.evidence.lock().expect("evidence lock"));
+        if !evidence.done && evidence.limit.is_none() {
+            evidence.limit =
+                Some("stdout stayed open after the server exited, so later output wasn't inspected".into());
+        }
         let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
         Finish {
             exit: if killed { None } else { self.exit },
@@ -702,15 +726,120 @@ impl Session {
             coverage,
             scan_error,
             not_stopped,
-            limit: self.limit.take(),
-            stdout_left_open,
+            limit: evidence.limit,
+            own_limit: self.own_limit.take(),
             transcript,
             messages: std::mem::take(&mut self.messages),
-            problems: std::mem::take(&mut self.problems),
+            problems: evidence.problems,
             unmatched: std::mem::take(&mut self.unmatched),
-            content_types: std::mem::take(&mut self.content_types),
+            content_types: evidence.content_types,
         }
     }
+}
+
+/// Reads and parses the server's stdout until it closes, recording every byte
+/// and all framing evidence.
+async fn read_stdout(
+    mut stdout: tokio::process::ChildStdout,
+    tx: mpsc::UnboundedSender<(Duration, Inbound)>,
+    t: Transcript,
+    evidence: Arc<Mutex<Evidence>>,
+    start: Instant,
+    opts: Options,
+) {
+    let mut reader = FrameReader::new(opts.max_header, opts.max_body);
+    let mut buf = vec![0u8; 64 * 1024];
+    let (mut total, mut stopped) = (0usize, false);
+    let stop = |at: Duration, why: String| {
+        record(&t, at, EventKind::Note(why.clone()));
+        evidence.lock().expect("evidence lock").limit.get_or_insert(why);
+        let _ = tx.send((at, Inbound::Stopped));
+    };
+    let deliver = |at: Duration, chunk: Chunk, stopped: &mut bool| {
+        record(&t, at, parsed_event(&chunk));
+        let mut ev = evidence.lock().expect("evidence lock");
+        let content_types = |ev: &mut Evidence, headers: &[Header]| {
+            for h in headers.iter().filter(|h| h.name.eq_ignore_ascii_case("content-type")) {
+                ev.content_types.push((at, h.value.clone()));
+            }
+        };
+        let problem = match chunk {
+            Chunk::Frame { headers, body } => {
+                content_types(&mut ev, &headers);
+                match Message::parse(&body) {
+                    Ok(m) => {
+                        let _ = tx.send((at, Inbound::Message(m)));
+                        return;
+                    }
+                    Err(error) => Problem::NotJson { body, error },
+                }
+            }
+            Chunk::Oversized { headers, content_length, limit } => {
+                content_types(&mut ev, &headers);
+                ev.limit.get_or_insert(format!(
+                    "a {content_length}-byte frame is over lspcheck's {limit}-byte inspection limit (--max-frame-mib), so it wasn't checked"
+                ));
+                return;
+            }
+            Chunk::HeaderLimit { limit } => {
+                drop(ev);
+                *stopped = true;
+                stop(
+                    at,
+                    format!(
+                        "a header section is longer than lspcheck's {limit}-byte inspection limit; lspcheck stopped inspecting stdout"
+                    ),
+                );
+                return;
+            }
+            Chunk::Garbage(b) => Problem::Garbage(b),
+            Chunk::BadHeader { block, reason } => Problem::BadHeader { block, reason },
+            Chunk::Truncated { headers, content_length, received } => {
+                content_types(&mut ev, &headers);
+                Problem::Truncated { content_length, received }
+            }
+        };
+        ev.problems.push((at, problem.clone()));
+        let _ = tx.send((at, Inbound::Problem(problem)));
+    };
+    loop {
+        let n = match stdout.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        total += n;
+        if stopped {
+            continue;
+        }
+        let at = start.elapsed();
+        if total > opts.max_output {
+            stopped = true;
+            stop(
+                at,
+                format!(
+                    "the server wrote more than {} bytes to stdout; lspcheck stopped inspecting it (--max-output-mib)",
+                    opts.max_output
+                ),
+            );
+            continue;
+        }
+        record(&t, at, EventKind::Read(buf[..n].to_vec()));
+        for chunk in reader.feed(&buf[..n]) {
+            deliver(at, chunk, &mut stopped);
+            if stopped {
+                break;
+            }
+        }
+    }
+    let at = start.elapsed();
+    if !stopped {
+        for chunk in reader.finish() {
+            deliver(at, chunk, &mut stopped);
+        }
+    }
+    record(&t, at, EventKind::StdoutClosed);
+    evidence.lock().expect("evidence lock").done = true;
+    let _ = tx.send((at, Inbound::Closed));
 }
 
 fn parsed_event(chunk: &Chunk) -> EventKind {
@@ -724,8 +853,19 @@ fn parsed_event(chunk: &Chunk) -> EventKind {
         Chunk::Truncated { content_length, received, .. } => {
             ("truncated", format!("{received} of {content_length} body bytes"))
         }
+        Chunk::HeaderLimit { limit } => ("header-limit", format!("header section longer than {limit} bytes")),
     };
     EventKind::Parsed { kind, detail }
+}
+
+/// A random number, from the standard library's per-process hash keys.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    h.finish()
 }
 
 /// Why [`Session::call`] got no response.

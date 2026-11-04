@@ -93,6 +93,10 @@ pub enum Coverage {
 
 static SUBREAPER: AtomicBool = AtomicBool::new(false);
 static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+/// Set once two sessions have run at the same time. Their descendants may then
+/// be adopted in either session's lifetime, so neither can tell whose an
+/// adopted process is, now or later.
+static OVERLAPPED: AtomicBool = AtomicBool::new(false);
 static SPAWNED: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 /// Makes this process a child subreaper where the OS supports it (Linux).
@@ -110,7 +114,10 @@ pub fn enable_subreaper() -> bool {
 pub fn coverage() -> Coverage {
     if !cfg!(unix) {
         Coverage::None
-    } else if SUBREAPER.load(Ordering::SeqCst) && ACTIVE_SESSIONS.load(Ordering::SeqCst) == 1 {
+    } else if SUBREAPER.load(Ordering::SeqCst)
+        && !OVERLAPPED.load(Ordering::SeqCst)
+        && ACTIVE_SESSIONS.load(Ordering::SeqCst) == 1
+    {
         Coverage::GroupAndEscaped
     } else {
         Coverage::GroupOnly
@@ -119,7 +126,9 @@ pub fn coverage() -> Coverage {
 
 /// Registers a running session and the processes it started.
 pub(crate) fn session_started(pids: &[i32]) {
-    ACTIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
+    if ACTIVE_SESSIONS.fetch_add(1, Ordering::SeqCst) >= 1 {
+        OVERLAPPED.store(true, Ordering::SeqCst);
+    }
     SPAWNED.lock().expect("spawned lock").extend_from_slice(pids);
 }
 
@@ -189,15 +198,10 @@ mod unix {
         pub fn close(&mut self) {
             if let Some(mut child) = self.sentinel.take() {
                 drop(child.stdin.take());
-                let deadline = Instant::now() + Duration::from_secs(1);
-                while Instant::now() < deadline {
-                    if let Ok(Some(_)) = child.try_wait() {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
+                if !reap_within(&mut child, Duration::from_secs(1)) {
+                    let _ = child.kill();
+                    reap_within(&mut child, Duration::from_secs(1));
                 }
-                let _ = child.kill();
-                let _ = child.wait();
             }
         }
     }
@@ -206,7 +210,20 @@ mod unix {
         fn drop(&mut self) {
             if let Some(mut child) = self.sentinel.take() {
                 let _ = child.kill();
-                let _ = child.wait();
+                reap_within(&mut child, Duration::from_secs(1));
+            }
+        }
+    }
+
+    /// Waits up to `limit` for a child to exit, reaping it. A child that
+    /// doesn't (one stuck in the kernel) is left rather than waited on forever.
+    fn reap_within(child: &mut Child, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return true,
+                Ok(None) if Instant::now() >= deadline => return false,
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             }
         }
     }
@@ -262,10 +279,13 @@ mod unix {
             .spawn()
             .map_err(|e| format!("can't run ps: {e}"))?;
         let mut stdout = child.stdout.take().expect("piped");
-        let reader = std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // A process ps starts could keep its stdout open after ps exits, so
+        // the reader is never joined, only waited for with a deadline.
+        std::thread::spawn(move || {
             let mut out = Vec::new();
             let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
-            out
+            let _ = tx.send(out);
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         let status = loop {
@@ -274,12 +294,14 @@ mod unix {
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
-                let _ = child.wait();
+                reap_within(&mut child, Duration::from_secs(1));
                 return Err("ps took more than 5 s".into());
             }
             std::thread::sleep(Duration::from_millis(5));
         };
-        let out = reader.join().unwrap_or_default();
+        let out = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(100)))
+            .map_err(|_| "ps's output didn't end".to_string())?;
         if !status.success() {
             return Err(format!("ps failed with {status}"));
         }

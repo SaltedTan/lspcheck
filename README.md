@@ -14,7 +14,7 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   FAIL  L1  SHOULD  A request before initialize gets ServerNotInitialized (-32002)
                      got result "[]" instead of ServerNotInitialized
   PASS  L2  MUST    initialize returns capabilities and an offered position encoding
-  PASS  L4  MUST    shutdown returns null and the server stays alive until exit
+  PASS  L4  MUST    shutdown returns null and the server keeps running until exit
   PASS  L6  SHOULD  exit after shutdown ends the process with status 0
   PASS  L7  SHOULD  exit without shutdown ends the process with status 1
   PASS  L9  POLICY  No descendant process outlives the server
@@ -52,13 +52,15 @@ directory. A server path with a directory part, such as `./my-server`, is resolv
 on `PATH`. Framing and leftover-process checks are judged across every scenario.
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
-stdin and the bytes read from its stdout, exactly as written and read, what lspcheck parsed them into, the first MiB of
+stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of
 stderr, and timestamps, so you can see what happened in a failing scenario.
 
 lspcheck inspects at most `--max-output-mib` (256) of stdout per scenario and frames of at most `--max-frame-mib` (64).
 These are lspcheck's own limits, not protocol rules: past them it keeps reading so the server isn't blocked, but stops
-inspecting, and failures it might have explained are reported as `ERROR` (inconclusive), not `FAIL`. The same happens
-when some of the server's frames can't be read at all.
+inspecting. A failure the missing frames might explain, such as a reply that never arrived, is then reported as
+`ERROR` (inconclusive), not `FAIL`; a failure lspcheck saw directly, such as a wrong result, stays `FAIL`. The same
+happens when some of the server's frames can't be read at all. A header section longer than 1 MiB also stops
+inspection.
 
 ### Verdicts
 

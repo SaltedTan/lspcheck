@@ -18,8 +18,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("preinit-banner", "print a line to stdout when a request arrives before initialize"),
     ("nul-header", "send one notification with a NUL byte in its Content-Type header"),
     ("all-nul-headers", "put a NUL byte in every frame's Content-Type header"),
+    ("bad-content-type", "send one notification whose Content-Type isn't a media type"),
     ("latin1", "declare charset=iso-8859-1 in a Content-Type header"),
     ("extension-header", "lawful: send an X-Trace header before Content-Length"),
+    ("long-header", "lawful: send a 200 KiB X-Pad header with every frame"),
     ("decimal-ids", "lawful: spell numeric response ids with a fraction, as 2.0"),
     ("flood", "write 2 MiB of log messages before replying to initialize"),
     ("big-frame", "lawful: send one 2 MiB log message before replying to initialize"),
@@ -28,11 +30,12 @@ const FAULTS: &[(&str, &str)] = &[
     ("no-pre-init-error", "answer requests before initialize normally"),
     ("bad-encoding", "choose a position encoding the client didn't offer"),
     ("no-capabilities", "leave capabilities out of the initialize result"),
-    ("early-replies", "answer the next two request ids before they are sent, then answer them wrongly"),
+    ("early-replies", "answer guessed request ids before they are sent, then answer unknown requests wrongly"),
     ("wrong-unknown-error", "answer unknown requests with InvalidRequest"),
     ("ignore-dollar-request", "never answer an unknown $/ request"),
     ("shutdown-result", "return {} from shutdown"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
+    ("exit-flood", "on exit, write 100,000 small log messages and then a line outside any frame"),
     ("exit-status", "exit with status 3 on exit"),
     ("ignore-exit", "ignore exit and stay running"),
     ("orphan-child", "start a child process that outlives the server"),
@@ -44,6 +47,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("--child") => return child(false),
         Some("--escaped-child") => return child(true),
+        Some("--relay") => return relay(args[1].parse().unwrap()),
         _ => {}
     }
     let mut faults = Vec::new();
@@ -77,6 +81,13 @@ fn main() {
         let Some(id) = msg.get("id").cloned() else {
             // A notification.
             if method == "exit" && !fault("ignore-exit") {
+                if fault("exit-flood") {
+                    let log =
+                        json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
+                    let mut bytes = out.encode(&log).repeat(100_000);
+                    bytes.extend_from_slice(b"goodbye\n");
+                    out.raw(&bytes);
+                }
                 let status = if fault("exit-status") {
                     3
                 } else if shut_down {
@@ -108,6 +119,11 @@ fn main() {
                     format!("Content-Length: {}\r\nContent-Type: application/vscode-jsonrpc\x00\r\n\r\n", body.len())
                         .as_bytes(),
                 );
+                out.raw(body);
+            }
+            if fault("bad-content-type") {
+                let body = br#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":4,"message":"x"}}"#;
+                out.raw(format!("Content-Length: {}\r\nContent-Type: utf-8\r\n\r\n", body.len()).as_bytes());
                 out.raw(body);
             }
             if fault("block-on-config") {
@@ -153,10 +169,21 @@ fn main() {
             "shutdown" => {
                 shut_down = true;
                 let result = if fault("shutdown-result") { json!({}) } else { Value::Null };
-                out.frame(&ok(&id, result));
                 if fault("exit-on-shutdown") {
+                    // Exit first and have a helper deliver the reply, so the
+                    // server is certainly gone by the time a client reads it.
+                    let mut helper = Command::new(std::env::current_exe().unwrap())
+                        .arg("--relay")
+                        .arg(std::process::id().to_string())
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap();
+                    helper.stdin.take().unwrap().write_all(&out.encode(&ok(&id, result))).unwrap();
                     std::process::exit(0);
                 }
+                out.frame(&ok(&id, result));
             }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
@@ -182,6 +209,27 @@ fn child(escape: bool) {
     println!("ready");
     let _ = std::io::stdout().flush();
     std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+/// Writes its input to stdout once `parent` has exited.
+fn relay(parent: u32) {
+    let mut bytes = Vec::new();
+    std::io::stdin().read_to_end(&mut bytes).unwrap();
+    #[cfg(unix)]
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while nix::unistd::getppid().as_raw() as u32 == parent && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let mut out = std::io::stdout().lock();
+    out.write_all(&bytes).unwrap();
+    out.flush().unwrap();
 }
 
 /// Starts a leftover child and waits until it has set itself up.
@@ -211,6 +259,13 @@ impl<W: Write> Writer<W> {
     }
 
     fn frame(&mut self, v: &Value) {
+        let bytes = self.encode(v);
+        self.out.write_all(&bytes).unwrap();
+        self.out.flush().unwrap();
+    }
+
+    /// A frame with the header variants the faults ask for.
+    fn encode(&self, v: &Value) -> Vec<u8> {
         let fault = |name: &str| self.faults.iter().any(|f| f == name);
         let mut v = v.clone();
         if fault("decimal-ids")
@@ -224,6 +279,9 @@ impl<W: Write> Writer<W> {
         if fault("extension-header") {
             header.extend_from_slice(b"X-Trace: standin\r\n");
         }
+        if fault("long-header") {
+            header.extend_from_slice(format!("X-Pad: {}\r\n", "p".repeat(200 * 1024)).as_bytes());
+        }
         header.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
         if fault("all-nul-headers") {
             header.extend_from_slice(b"Content-Type: application/vscode-jsonrpc\x00\r\n");
@@ -232,9 +290,8 @@ impl<W: Write> Writer<W> {
             header.extend_from_slice(b"Content-Type: application/vscode-jsonrpc; charset=iso-8859-1\r\n");
         }
         header.extend_from_slice(b"\r\n");
-        self.out.write_all(&header).unwrap();
-        self.out.write_all(&body).unwrap();
-        self.out.flush().unwrap();
+        header.extend_from_slice(&body);
+        header
     }
 }
 

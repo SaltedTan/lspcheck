@@ -83,7 +83,7 @@ pub const CATALOGUE: &[CheckInfo] = &[
     ),
     check!("L1", Lifecycle, Should, "A request before initialize gets ServerNotInitialized (-32002)", "initialize"),
     check!("L2", Lifecycle, Must, "initialize returns capabilities and an offered position encoding", "initialize"),
-    check!("L4", Lifecycle, Must, "shutdown returns null and the server stays alive until exit", "shutdown"),
+    check!("L4", Lifecycle, Must, "shutdown returns null and the server keeps running until exit", "shutdown"),
     check!("L6", Lifecycle, Should, "exit after shutdown ends the process with status 0", "exit"),
     check!("L7", Lifecycle, Should, "exit without shutdown ends the process with status 1", "exit"),
     check!("L9", Lifecycle, Policy, "No descendant process outlives the server", "exit"),
@@ -133,6 +133,10 @@ pub struct CheckResult {
     pub detail: String,
     /// The scenario the evidence came from, or "all" for cross-cutting checks.
     pub scenario: &'static str,
+    /// A failure because something expected never arrived, which evidence
+    /// lspcheck didn't see could explain. A failure seen directly isn't one.
+    #[serde(skip)]
+    pub absence: bool,
 }
 
 /// How a run is set up.
@@ -251,17 +255,18 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
             results.push(result(name, id, Verdict::Error, "the scenario ended before reaching this check"));
         }
     }
-    // A failure might be explained by evidence lspcheck didn't see: frames it
-    // skipped, or frames it couldn't read (a log line loses nothing, so it
-    // doesn't count).
+    // A failure because something never arrived might be explained by
+    // evidence lspcheck didn't see: frames it skipped, or frames it couldn't
+    // read (a log line loses nothing, so it doesn't count). A failure seen
+    // directly, such as a wrong result, stands.
     let unread = finish.problems.iter().any(|(_, p)| !matches!(p, Problem::Garbage(_)));
-    let why = match &finish.limit {
+    let why = match finish.limit.as_ref().or(finish.own_limit.as_ref()) {
         Some(limit) => Some(limit.clone()),
         None if unread => Some("some of the server's frames couldn't be read (see F1)".to_string()),
         None => None,
     };
     if let Some(why) = why {
-        for r in results.iter_mut().filter(|r| r.verdict == Verdict::Fail) {
+        for r in results.iter_mut().filter(|r| r.verdict == Verdict::Fail && r.absence) {
             r.verdict = Verdict::Error;
             r.detail = format!("inconclusive, because {why}: {}", r.detail);
         }
@@ -292,7 +297,7 @@ fn observations(f: Finish) -> Observations {
 }
 
 fn result(scenario: &'static str, id: &str, verdict: Verdict, detail: impl Into<String>) -> CheckResult {
-    CheckResult { id: info(id).id, verdict, detail: detail.into(), scenario }
+    CheckResult { id: info(id).id, verdict, detail: detail.into(), scenario, absence: false }
 }
 
 struct Ctx<'a> {
@@ -307,6 +312,8 @@ struct Ctx<'a> {
 enum InitFailure {
     /// A protocol violation: the server broke a rule.
     Violation(String),
+    /// No reply arrived, which unseen evidence might explain.
+    Absent(String),
     /// A lawful outcome that still stops the scenario (an initialize error, a slow start).
     Blocked(String),
 }
@@ -325,6 +332,17 @@ impl Ctx<'_> {
         self.report(id, Verdict::Fail, detail);
     }
 
+    /// A failure because something expected never arrived.
+    fn fail_absent(&mut self, id: &str, detail: impl Into<String>) {
+        self.fail(id, detail);
+        self.results.last_mut().expect("just reported").absence = true;
+    }
+
+    /// A failure for a call error: absent when no response arrived.
+    fn fail_call(&mut self, id: &str, detail: impl Into<String>, e: &CallError) {
+        if matches!(e, CallError::Wait(_)) { self.fail_absent(id, detail) } else { self.fail(id, detail) }
+    }
+
     /// Initializes the server and sends `initialized`.
     async fn initialize(&mut self) -> Result<Message, InitFailure> {
         let t = self.cfg.startup_timeout;
@@ -337,7 +355,7 @@ impl Ctx<'_> {
                 )));
             }
             Err(CallError::Wait(WaitError::Closed)) => {
-                return Err(InitFailure::Violation("the server closed stdout without replying to initialize".into()));
+                return Err(InitFailure::Absent("the server closed stdout without replying to initialize".into()));
             }
             Err(e) => return Err(InitFailure::Blocked(format!("initialize: {e}"))),
         };
@@ -367,26 +385,34 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
     let reply = match ctx.initialize().await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why)) => return ctx.fail("L2", why),
+        Err(InitFailure::Absent(why)) => return ctx.fail_absent("L2", why),
         Err(InitFailure::Blocked(why)) => return ctx.report("L2", Verdict::Error, why),
     };
     judge_l2(ctx, &reply);
 
     let t = ctx.cfg.request_timeout;
     let mut problems = Vec::new();
+    let mut all_absent = true;
     for method in ["lspcheck/unknownRequest", "$/lspcheck/unknownRequest"] {
         match ctx.s.call(method, Some(json!({})), t).await {
             Ok(m) => match &m.kind {
                 Kind::Response { outcome: Outcome::Error { code: Some(codes::METHOD_NOT_FOUND), .. }, .. } => {}
                 Kind::Response { outcome, .. } => {
+                    all_absent = false;
                     problems.push(format!("{method}: {} instead of MethodNotFound", describe_outcome(outcome)))
                 }
                 _ => unreachable!(),
             },
-            Err(e) => problems.push(format!("{method}: {}", describe_call_error(&e, t))),
+            Err(e) => {
+                all_absent &= matches!(e, CallError::Wait(_));
+                problems.push(format!("{method}: {}", describe_call_error(&e, t)))
+            }
         }
     }
     if problems.is_empty() {
         ctx.pass("J4");
+    } else if all_absent {
+        ctx.fail_absent("J4", problems.join("; "));
     } else {
         ctx.fail("J4", problems.join("; "));
     }
@@ -412,7 +438,7 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
             }
             _ => unreachable!(),
         },
-        Err(e) => return ctx.fail("L4", format!("shutdown: {}", describe_call_error(&e, t))),
+        Err(e) => return ctx.fail_call("L4", format!("shutdown: {}", describe_call_error(&e, t)), &e),
     }
 
     if !ctx.s.is_alive() {
@@ -441,7 +467,7 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
             }
             _ => unreachable!(),
         },
-        Err(e) => ctx.fail("L1", describe_call_error(&e, t)),
+        Err(e) => ctx.fail_call("L1", describe_call_error(&e, t), &e),
     }
     // Leave politely so the server isn't killed mid-thought.
     if ctx.initialize().await.is_ok() {
@@ -455,7 +481,7 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
 async fn exit_without_shutdown(ctx: &mut Ctx<'_>) {
     match ctx.initialize().await {
         Ok(_) => {}
-        Err(InitFailure::Violation(why) | InitFailure::Blocked(why)) => {
+        Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
             return ctx.report("L7", Verdict::Error, format!("initialize didn't succeed: {why}"));
         }
     }
@@ -543,10 +569,6 @@ fn judge_l9(runs: &[ScenarioRun]) -> CheckResult {
     if all.iter().any(|(_, o)| o.coverage == Coverage::None) {
         return result("all", "L9", Verdict::NotExercised, "lspcheck can't track descendants on this platform yet");
     }
-    if let Some((name, o)) = all.iter().find(|(_, o)| o.scan_error.is_some()) {
-        let why = o.scan_error.as_deref().unwrap_or("");
-        return result("all", "L9", Verdict::Error, format!("in {name}, the process search failed: {why}"));
-    }
     let failures: Vec<String> = all
         .iter()
         .filter(|(_, o)| !o.killed && !o.leftovers.is_empty())
@@ -555,6 +577,13 @@ fn judge_l9(runs: &[ScenarioRun]) -> CheckResult {
             format!("in {name}, still running after the server exited: {}", list.join(", "))
         })
         .collect();
+    // A leak seen in one scenario stands even if another's search failed.
+    if failures.is_empty()
+        && let Some((name, o)) = all.iter().find(|(_, o)| o.scan_error.is_some())
+    {
+        let why = o.scan_error.as_deref().unwrap_or("");
+        return result("all", "L9", Verdict::Error, format!("in {name}, the process search failed: {why}"));
+    }
     if failures.is_empty() && !all.is_empty() && all.iter().all(|(_, o)| o.killed) {
         return result(
             "all",
@@ -662,6 +691,37 @@ mod tests {
     fn file_uris_encode_reserved_bytes() {
         assert_eq!(file_uri(Path::new("/tmp/a b/é")), "file:///tmp/a%20b/%C3%A9");
         assert_eq!(file_uri(Path::new("C:\\x y")), "file:///C:/x%20y");
+    }
+
+    fn observed_run(name: &'static str, leftovers: Vec<ProcInfo>, scan_error: Option<&str>) -> ScenarioRun {
+        ScenarioRun {
+            name,
+            results: Vec::new(),
+            observed: Some(Observations {
+                problems: Vec::new(),
+                content_types: Vec::new(),
+                killed: false,
+                leftovers,
+                coverage: Coverage::GroupAndEscaped,
+                scan_error: scan_error.map(str::to_string),
+                not_stopped: Vec::new(),
+                limit: None,
+            }),
+            transcript: None,
+        }
+    }
+
+    #[test]
+    fn a_leak_stands_when_another_scenarios_search_failed() {
+        let leak = ProcInfo { pid: 42, ppid: 1, pgid: 42, name: "helper".into() };
+        let runs =
+            [observed_run("lifecycle", vec![leak], None), observed_run("pre-initialize", vec![], Some("no /proc"))];
+        let r = judge_l9(&runs);
+        assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
+        assert!(r.detail.contains("helper"), "{}", r.detail);
+        // Without the leak, the failed search makes the result unknown.
+        let runs = [observed_run("lifecycle", vec![], None), observed_run("pre-initialize", vec![], Some("no /proc"))];
+        assert_eq!(judge_l9(&runs).verdict, Verdict::Error);
     }
 
     #[test]

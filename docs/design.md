@@ -68,12 +68,12 @@ are to LSP 3.17 and JSON-RPC 2.0.
 | L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification before it is dropped without a reply (the notification half isn't tested yet). |
 | L2 | MUST | `initialize` returns an object with `capabilities`; a chosen `positionEncoding` is one the client offered (offer `utf-8` first, `utf-16` last). |
 | L3 | POLICY | A second `initialize` gets an error and the server keeps serving. |
-| L4 | MUST | `shutdown` returns `null` and the process stays alive and readable until `exit`. |
+| L4 | MUST | `shutdown` returns `null` and the process keeps running until `exit`. |
 | L5 | SHOULD | Requests after `shutdown` get error `-32600` InvalidRequest. |
 | L6 | SHOULD | `exit` after `shutdown` ends the process with status 0 within the deadline. |
 | L7 | SHOULD | `exit` without `shutdown` ends it with status 1. |
 | L8 | POLICY | End of stdin without `exit` ends the process within the deadline (prevents orphaned servers). |
-| L9 | POLICY | After exit no descendant remains. Profiles can allow named long-lived daemons. Escapes through `setsid`/double fork are reported as a stated limit, not a pass. |
+| L9 | POLICY | After exit no descendant remains. Profiles can allow named long-lived daemons. Where lspcheck can't see an escape through `setsid`/double fork (macOS), a pass says so in its detail. |
 
 ### Cancellation
 | ID | Basis | Check |
@@ -133,7 +133,7 @@ Without a profile: an empty temp workspace and a `plaintext` document. Generic c
 - `--json`: versioned `report-v1` schema (checks, basis, verdict, evidence, timings, server argv, checker version,
   host OS/arch, profile hash). `--junit` for CI test tabs; `--markdown` for a GitHub step summary.
 - `--transcripts DIR`: one JSONL per session with direction, monotonic timestamp, raw bytes (base64 when not UTF-8),
-  parsed JSON when it parses, and stderr lines. `replay` re-sends the client side and waits for the recorded replies.
+  how the reader split them into frames, and stderr. `replay` re-sends the client side and waits for the recorded replies.
 
 ## Architecture
 Single crate, `src/` modules:
@@ -142,8 +142,10 @@ Single crate, `src/` modules:
 - `process`: spawn with a dedicated process group (Unix) or Job object (Windows). A small sentinel process joins the
   group first so the PGID can't be recycled while we scan for descendants (the reuse bug virgil-lsp hit). Kill escalation:
   SIGTERM, grace, SIGKILL. Descendant scan: Linux `/proc`, macOS `proc_listpids`, Windows job process list.
-- `session`: tokio tasks for stdout, stderr (always drained), stdin writes with their own deadline; central loop with
-  bidirectional id tables keyed on the **raw lexical id**; one monotonic deadline per step, case and run.
+- `session`: tokio tasks for stdout (parsed there, so framing evidence is complete even if replies aren't consumed)
+  and stderr (always drained); stdin writes bounded by a deadline. Request ids are random 31-bit integers, so a reply
+  can't be prepared before its request; ids match by **JSON value** (`1` and `1.0` are the same number). Each call has
+  one absolute deadline covering its write and its reply; each scenario has its own timeouts and a bounded cleanup.
 - `checks`: one module per area; each check declares id, basis, spec link, and a function over a `Session`.
 - `profile`, `report`, `cli` (clap).
 Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, toml, thiserror; `nix` on Unix,

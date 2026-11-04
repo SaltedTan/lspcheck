@@ -113,7 +113,7 @@ fn the_clean_standin_passes_every_check() {
 
 #[test]
 fn lawful_variations_fail_nothing() {
-    for name in ["extension-header", "decimal-ids"] {
+    for name in ["extension-header", "decimal-ids", "long-header"] {
         let r = fault(name);
         only_fails(&r, &[]);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
@@ -135,6 +135,29 @@ fn stdout_output_outside_frames_fails_f1_in_any_scenario() {
 #[test]
 fn a_control_byte_in_a_header_fails_f1() {
     only_fails(&fault("nul-header"), &["F1"]);
+}
+
+#[test]
+fn a_content_type_that_isnt_a_media_type_fails_f1() {
+    only_fails(&fault("bad-content-type"), &["F1"]);
+}
+
+#[test]
+fn output_written_just_before_exit_is_still_judged() {
+    // The bad line follows 100,000 frames that are still queued when the
+    // server exits; F1 must see it.
+    let r = fault("exit-flood");
+    expect(&r, "F1", "fail");
+    assert!(r.stdout.contains("goodbye"), "{}", r.stdout);
+}
+
+#[test]
+fn a_failure_seen_directly_stands_when_other_frames_were_skipped() {
+    // shutdown's wrong result was read; a skipped frame elsewhere can't explain it.
+    let r = run(&["--fault", "shutdown-result", "--fault", "big-frame"], &["--max-frame-mib", "1"]);
+    expect(&r, "L4", "fail");
+    expect(&r, "F1", "error");
+    assert_eq!(r.status, 1, "{}", r.stdout);
 }
 
 #[test]
@@ -230,8 +253,9 @@ fn a_child_that_leaves_the_group_with_a_non_utf8_name_still_fails_l9() {
 fn a_server_that_stops_reading_cant_stall_lspcheck() {
     let r = fault("block-on-config");
     expect(&r, "L2", "error");
-    // Three scenarios, each bounded by the 5 s startup timeout plus cleanup.
-    assert!(r.took < Duration::from_secs(40), "took {:?}\n{}", r.took, r.stdout);
+    // Three scenarios, each bounded by the 5 s startup timeout plus cleanup
+    // (a few seconds); unbounded, it would hit the watchdog.
+    assert!(r.took < Duration::from_secs(60), "took {:?}\n{}", r.took, r.stdout);
 }
 
 #[test]

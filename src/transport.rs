@@ -14,7 +14,7 @@
 //! [`Chunk::Oversized`], never as a framing error.
 
 /// The longest header section inspected, in bytes.
-pub const DEFAULT_MAX_HEADER_BYTES: usize = 8 * 1024;
+pub const DEFAULT_MAX_HEADER_BYTES: usize = 1024 * 1024;
 /// The largest body inspected, in bytes.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -39,6 +39,10 @@ pub enum Chunk {
     Oversized { headers: Vec<Header>, content_length: usize, limit: usize },
     /// The stream ended inside a frame: the header promised more body bytes.
     Truncated { headers: Vec<Header>, content_length: usize, received: usize },
+    /// A header section that looks valid so far but is longer than the
+    /// inspection limit. Its body can't be found, so the reader stops
+    /// inspecting the stream from here on.
+    HeaderLimit { limit: usize },
 }
 
 /// Field names that can anchor resynchronization.
@@ -55,6 +59,8 @@ pub struct FrameReader {
     pending: Option<(Vec<Header>, usize)>,
     /// An oversized body being skipped: its headers, length, and bytes left.
     skipping: Option<(Vec<Header>, usize, usize)>,
+    /// Set after [`Chunk::HeaderLimit`]: everything after is discarded.
+    stopped: bool,
 }
 
 impl Default for FrameReader {
@@ -65,11 +71,14 @@ impl Default for FrameReader {
 
 impl FrameReader {
     pub fn new(max_header: usize, max_body: usize) -> Self {
-        Self { buf: Vec::new(), max_header, max_body, synced: true, pending: None, skipping: None }
+        Self { buf: Vec::new(), max_header, max_body, synced: true, pending: None, skipping: None, stopped: false }
     }
 
     /// Adds bytes and returns every chunk they complete.
     pub fn feed(&mut self, data: &[u8]) -> Vec<Chunk> {
+        if self.stopped {
+            return Vec::new();
+        }
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
         loop {
@@ -104,6 +113,10 @@ impl FrameReader {
                     Here::Parsed(headers, len) => self.start_body(headers, len),
                     Here::Wait => break,
                     Here::NotAHeader => self.synced = false,
+                    Here::TooLong => {
+                        out.push(self.stop());
+                        break;
+                    }
                 }
                 continue;
             }
@@ -119,20 +132,26 @@ impl FrameReader {
             if start > 0 {
                 out.push(Chunk::Garbage(self.buf.drain(..start).collect()));
             }
-            let Some(end) = find(&self.buf, b"\r\n\r\n") else {
-                if self.buf.len() > self.max_header {
-                    out.push(Chunk::BadHeader {
-                        block: self.buf.drain(..self.max_header).collect(),
-                        reason: format!("no blank line within {} header bytes", self.max_header),
-                    });
-                    continue;
+            // A header section starts at the anchor; judge it as the in-step path does.
+            let window = &self.buf[..self.buf.len().min(self.max_header)];
+            match find(window, b"\r\n\r\n") {
+                Some(end) => {
+                    let block: Vec<u8> = self.buf.drain(..end + 4).collect();
+                    match parse_header_block(&block[..end]) {
+                        Ok((headers, len)) => self.start_body(headers, len),
+                        Err(reason) => out.push(Chunk::BadHeader { block, reason }),
+                    }
                 }
-                break;
-            };
-            let block: Vec<u8> = self.buf.drain(..end + 4).collect();
-            match parse_header_block(&block[..end]) {
-                Ok((headers, len)) => self.start_body(headers, len),
-                Err(reason) => out.push(Chunk::BadHeader { block, reason }),
+                None => match invalid_line_end(window) {
+                    Some((end, reason)) => {
+                        out.push(Chunk::BadHeader { block: self.buf.drain(..end).collect(), reason })
+                    }
+                    None if self.buf.len() >= self.max_header => {
+                        out.push(self.stop());
+                        break;
+                    }
+                    None => break,
+                },
             }
         }
         out
@@ -146,7 +165,14 @@ impl FrameReader {
         }
     }
 
-    /// Tries to read a header section at the start of the buffer.
+    fn stop(&mut self) -> Chunk {
+        self.stopped = true;
+        self.buf.clear();
+        Chunk::HeaderLimit { limit: self.max_header }
+    }
+
+    /// Tries to read a header section at the start of the buffer. The verdict
+    /// depends only on the first `max_header` bytes, never on how they arrived.
     fn try_header_here(&mut self) -> Here {
         let window = &self.buf[..self.buf.len().min(self.max_header)];
         match find(window, b"\r\n\r\n") {
@@ -157,7 +183,8 @@ impl FrameReader {
                 }
                 Err(_) => Here::NotAHeader,
             },
-            None if self.buf.len() >= self.max_header || has_invalid_line(&self.buf) => Here::NotAHeader,
+            None if invalid_line_end(window).is_some() => Here::NotAHeader,
+            None if self.buf.len() >= self.max_header => Here::TooLong,
             None => Here::Wait,
         }
     }
@@ -165,13 +192,16 @@ impl FrameReader {
     /// Ends the stream and returns whatever was left unfinished.
     pub fn finish(&mut self) -> Vec<Chunk> {
         let mut out = Vec::new();
+        if self.stopped {
+            return out;
+        }
         let rest = std::mem::take(&mut self.buf);
         if let Some((headers, content_length, left)) = self.skipping.take() {
             out.push(Chunk::Truncated { headers, content_length, received: content_length - left });
         } else if let Some((headers, content_length)) = self.pending.take() {
             out.push(Chunk::Truncated { headers, content_length, received: rest.len() });
         } else if !rest.is_empty() {
-            let header_like = (self.synced && !has_invalid_line(&rest)) || find_anchor(&rest) == Some(0);
+            let header_like = (self.synced && invalid_line_end(&rest).is_none()) || find_anchor(&rest) == Some(0);
             if header_like {
                 out.push(Chunk::BadHeader { block: rest, reason: "the stream ended inside a header section".into() });
             } else {
@@ -186,6 +216,7 @@ enum Here {
     Parsed(Vec<Header>, usize),
     Wait,
     NotAHeader,
+    TooLong,
 }
 
 /// Frames a body with a `Content-Length` header only.
@@ -202,12 +233,90 @@ pub fn encode_with_type(body: &[u8], content_type: &str) -> Vec<u8> {
     out
 }
 
-/// The charset a `Content-Type` value declares, lowercased, if any.
+/// The charset a `Content-Type` value declares, lowercased, if any. Invalid
+/// values (which the reader rejects) declare nothing.
 pub fn charset(content_type: &str) -> Option<String> {
-    content_type.split(';').skip(1).find_map(|param| {
-        let (name, value) = param.split_once('=')?;
-        name.trim().eq_ignore_ascii_case("charset").then(|| value.trim().trim_matches('"').to_ascii_lowercase())
-    })
+    let (_, params) = parse_media_type(content_type.as_bytes()).ok()?;
+    params.into_iter().find(|(name, _)| name.eq_ignore_ascii_case("charset")).map(|(_, v)| v.to_ascii_lowercase())
+}
+
+/// Parses an RFC 9110 media type: `type/subtype *( OWS ";" OWS [ name=value ] )`,
+/// where a value is a token or a quoted string. Returns the type and the
+/// parameters with quoted values unescaped.
+pub fn parse_media_type(v: &[u8]) -> Result<(String, Vec<(String, String)>), String> {
+    let shown = || String::from_utf8_lossy(v).into_owned();
+    let mut i = 0;
+    let token = |i: &mut usize| {
+        let start = *i;
+        while *i < v.len() && is_token_byte(v[*i]) {
+            *i += 1;
+        }
+        (*i > start).then(|| String::from_utf8_lossy(&v[start..*i]).into_owned())
+    };
+    let ows = |i: &mut usize| {
+        while *i < v.len() && (v[*i] == b' ' || v[*i] == b'\t') {
+            *i += 1;
+        }
+    };
+    let ty = token(&mut i).ok_or_else(|| format!("Content-Type {:?} doesn't start with a media type", shown()))?;
+    if v.get(i) != Some(&b'/') {
+        return Err(format!("Content-Type {:?} has no '/' in its media type", shown()));
+    }
+    i += 1;
+    let sub = token(&mut i).ok_or_else(|| format!("Content-Type {:?} has no media subtype", shown()))?;
+    let mut params: Vec<(String, String)> = Vec::new();
+    loop {
+        ows(&mut i);
+        if i == v.len() {
+            break;
+        }
+        if v[i] != b';' {
+            return Err(format!("Content-Type {:?} has unexpected text after the media type", shown()));
+        }
+        i += 1;
+        ows(&mut i);
+        if i == v.len() || v[i] == b';' {
+            continue;
+        }
+        let name = token(&mut i).ok_or_else(|| format!("Content-Type {:?} has a parameter without a name", shown()))?;
+        if v.get(i) != Some(&b'=') {
+            return Err(format!("Content-Type {:?} has a parameter without '='", shown()));
+        }
+        i += 1;
+        let value = if v.get(i) == Some(&b'"') {
+            i += 1;
+            let mut out = Vec::new();
+            loop {
+                match v.get(i) {
+                    None => return Err(format!("Content-Type {:?} has an unterminated quoted string", shown())),
+                    Some(b'"') => {
+                        i += 1;
+                        break;
+                    }
+                    Some(b'\\') => match v.get(i + 1) {
+                        Some(&c) if c == b'\t' || c == b' ' || (0x21..=0x7e).contains(&c) || c >= 0x80 => {
+                            out.push(c);
+                            i += 2;
+                        }
+                        _ => return Err(format!("Content-Type {:?} has a bad escape in a quoted string", shown())),
+                    },
+                    Some(&c) if c == b'\t' || c == b' ' || c == 0x21 || (0x23..=0x7e).contains(&c) || c >= 0x80 => {
+                        out.push(c);
+                        i += 1;
+                    }
+                    Some(_) => return Err(format!("Content-Type {:?} has a bad byte in a quoted string", shown())),
+                }
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        } else {
+            token(&mut i).ok_or_else(|| format!("Content-Type {:?} has a parameter without a value", shown()))?
+        };
+        if name.eq_ignore_ascii_case("charset") && params.iter().any(|(n, _)| n.eq_ignore_ascii_case("charset")) {
+            return Err(format!("Content-Type {:?} declares charset twice", shown()));
+        }
+        params.push((name, value));
+    }
+    Ok((format!("{ty}/{sub}"), params))
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -234,28 +343,32 @@ fn partial_anchor(buf: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// Whether some complete line in `buf` can't be a header field line.
-fn has_invalid_line(buf: &[u8]) -> bool {
-    let mut rest = buf;
-    while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
-        let line = &rest[..nl];
+/// If some line in `buf` can't be part of a header section, how many bytes
+/// to discard to get past it, and why. An incomplete last line counts only
+/// once its name has a byte that can't be in a token.
+fn invalid_line_end(buf: &[u8]) -> Option<(usize, String)> {
+    let mut start = 0;
+    while let Some(nl) = buf[start..].iter().position(|&b| b == b'\n') {
+        let line = &buf[start..start + nl];
+        let end = start + nl + 1;
         let Some(line) = line.strip_suffix(b"\r") else {
-            return true;
+            return Some((end, format!("header line {:?} ends with a bare LF", String::from_utf8_lossy(line))));
         };
         if line.is_empty() {
-            return false;
+            return None;
         }
-        if parse_field(line).is_err() {
-            return true;
+        if let Err(reason) = parse_field(line) {
+            return Some((end, reason));
         }
-        rest = &rest[nl + 1..];
+        start = end;
     }
-    // An incomplete last line is fine so far if its name could still be a token.
+    let rest = &buf[start..];
     if rest.is_empty() || rest == b"\r" {
-        return false;
+        return None;
     }
     let name_end = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
-    !rest[..name_end].iter().all(|&b| is_token_byte(b))
+    let bad = rest[..name_end].iter().position(|&b| !is_token_byte(b))?;
+    Some((start + bad + 1, format!("header name {:?} is not a token", String::from_utf8_lossy(&rest[..name_end]))))
 }
 
 fn parse_field(line: &[u8]) -> Result<Header, String> {
@@ -275,6 +388,9 @@ fn parse_field(line: &[u8]) -> Result<Header, String> {
         ));
     }
     let value = String::from_utf8_lossy(value).trim_matches([' ', '\t']).to_string();
+    if name.eq_ignore_ascii_case(b"content-type") {
+        parse_media_type(value.as_bytes())?;
+    }
     Ok(Header { name: String::from_utf8_lossy(name).into_owned(), value })
 }
 
@@ -406,12 +522,12 @@ mod tests {
     #[test]
     fn rejects_bad_header_sections() {
         for (block, reason) in [
-            ("Content-Type: x\r\n\r\n", "no Content-Length"),
+            ("Content-Type: a/b\r\n\r\n", "no Content-Length"),
             ("Content-Length: 1x\r\n\r\n", "not a decimal number"),
             ("Content-Length: -1\r\n\r\n", "not a decimal number"),
             ("Content-Length: 1\r\nContent-Length: 1\r\n\r\n", "appears twice"),
-            ("Content-Length: 1\r\nContent-Type: a\u{0}b\r\n\r\n", "control byte 0x00"),
-            ("Content-Length: 1\r\nContent-Type: a\u{7f}\r\n\r\n", "control byte 0x7f"),
+            ("Content-Length: 1\r\nContent-Type: a/\u{0}b\r\n\r\n", "control byte 0x00"),
+            ("Content-Length: 1\r\nContent-Type: a/b\u{7f}\r\n\r\n", "control byte 0x7f"),
         ] {
             match read_all(block.as_bytes()).as_slice() {
                 [Chunk::BadHeader { reason: r, .. }, ..] => {
@@ -460,18 +576,52 @@ mod tests {
     }
 
     #[test]
-    fn a_long_header_without_a_blank_line_is_rejected() {
-        let mut r = FrameReader::new(64, 1024);
-        let mut data = b"Content-Length: 2\r\nX-Pad: ".to_vec();
-        data.extend(std::iter::repeat_n(b'x', 100));
-        let out = r.feed(&data);
-        assert!(matches!(out.first(), Some(Chunk::BadHeader { .. })), "{out:?}");
+    fn a_header_past_the_inspection_limit_is_a_limit_wherever_the_bytes_split() {
+        for first in [&b"Content-Length: 2\r\nX-Pad: "[..], b"X-Pad: "] {
+            let mut stream = first.to_vec();
+            stream.extend(std::iter::repeat_n(b'x', 100));
+            if first.starts_with(b"X") {
+                stream.extend(b"\r\nContent-Length: 2");
+            }
+            stream.extend(b"\r\n\r\n{}");
+            for split in 0..=stream.len() {
+                let mut r = FrameReader::new(64, 1024);
+                let mut out = r.feed(&stream[..split]);
+                out.extend(r.feed(&stream[split..]));
+                out.extend(r.finish());
+                assert_eq!(out, vec![Chunk::HeaderLimit { limit: 64 }], "split at {split}");
+            }
+            // Within the limit, the same section is a frame.
+            let out = read_all(&stream);
+            assert_eq!(frames(&out), vec![b"{}".as_slice()]);
+        }
+    }
+
+    #[test]
+    fn content_type_values_must_be_media_types() {
+        for (value, ok) in [
+            ("application/vscode-jsonrpc; charset=utf-8", true),
+            ("application/vscode-jsonrpc;charset=\"utf-8\"", true),
+            ("application/vscode-jsonrpc ; charset=utf8 ; x=\"a\\\"b\"", true),
+            ("application/vscode-jsonrpc;", true),
+            ("not a media type; charset=\"utf-8", false),
+            ("application/vscode-jsonrpc; charset=\"utf-8", false),
+            ("application", false),
+            ("application/vscode-jsonrpc; charset", false),
+            ("application/vscode-jsonrpc; charset=utf-8; charset=utf-8", false),
+        ] {
+            assert_eq!(parse_media_type(value.as_bytes()).is_ok(), ok, "{value}");
+            let stream = format!("Content-Length: 2\r\nContent-Type: {value}\r\n\r\n{{}}");
+            let out = read_all(stream.as_bytes());
+            assert_eq!(frames(&out).len() == 1 && out.len() == 1, ok, "{value}: {out:?}");
+        }
     }
 
     #[test]
     fn charset_parameters() {
         assert_eq!(charset("application/vscode-jsonrpc; charset=utf-8").as_deref(), Some("utf-8"));
         assert_eq!(charset("application/vscode-jsonrpc;Charset=\"UTF8\"").as_deref(), Some("utf8"));
+        assert_eq!(charset("not a media type; charset=\"utf-8"), None);
         assert_eq!(charset("application/vscode-jsonrpc"), None);
     }
 }
