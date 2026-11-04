@@ -1,0 +1,39 @@
+[package]
+name = "lspcheck"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+description = "Checks that a language server speaks the Language Server Protocol correctly"
+repository = "https://github.com/SaltedTan/lspcheck"
+readme = "README.md"
+keywords = ["lsp", "language-server", "testing", "protocol", "json-rpc"]
+categories = ["development-tools::testing", "command-line-utilities"]
+exclude = ["/.github"]
+
+[features]
+# Builds `lspcheck-standin`, the test server with injectable faults. Tests need it.
+standin = []
+
+[[bin]]
+name = "lspcheck"
+path = "src/main.rs"
+
+[[bin]]
+name = "lspcheck-standin"
+path = "src/bin/standin.rs"
+required-features = ["standin"]
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["arbitrary_precision", "preserve_order"] }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt", "process", "io-util", "time", "macros", "sync"] }
+
+[target."cfg(unix)".dependencies]
+nix = { version = "0.31.3", features = ["signal", "process"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
