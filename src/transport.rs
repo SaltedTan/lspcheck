@@ -39,7 +39,8 @@ pub enum Chunk {
     /// was skipped without being read.
     Oversized { headers: Vec<Header>, content_length: usize, limit: usize },
     /// The stream ended inside a frame: the header promised more body bytes.
-    Truncated { headers: Vec<Header>, content_length: usize, received: usize },
+    /// `start` is where the body started, unless it was being skipped.
+    Truncated { headers: Vec<Header>, content_length: usize, received: usize, start: Option<usize> },
     /// A header section that looks valid so far but is longer than the
     /// inspection limit. Its body can't be found, so the reader stops
     /// inspecting the stream from here on.
@@ -218,9 +219,9 @@ impl FrameReader {
         }
         let rest = std::mem::take(&mut self.buf);
         if let Some((headers, content_length, left)) = self.skipping.take() {
-            out.push(Chunk::Truncated { headers, content_length, received: content_length - left });
-        } else if let Some((headers, content_length, _)) = self.pending.take() {
-            out.push(Chunk::Truncated { headers, content_length, received: rest.len() });
+            out.push(Chunk::Truncated { headers, content_length, received: content_length - left, start: None });
+        } else if let Some((headers, content_length, start)) = self.pending.take() {
+            out.push(Chunk::Truncated { headers, content_length, received: rest.len(), start: Some(start) });
         } else if !rest.is_empty() {
             let header_like = (self.synced && invalid_line_end(&rest).is_none()) || find_anchor(&rest) == Some(0);
             if header_like {
@@ -254,20 +255,25 @@ pub fn encode_with_type(body: &[u8], content_type: &str) -> Vec<u8> {
     out
 }
 
-/// What a frame body that isn't JSON says about how its `Content-Length` was
-/// counted. `rest` is the stream from where the body starts. If a complete
-/// JSON value with non-ASCII text starts there and its length in bytes isn't
-/// `content_length`, returns that length and what `content_length` counts
-/// instead, when it is recognisably the number of characters or UTF-16 code
-/// units. Only a bounded prefix of `rest` is examined.
+/// What a frame body that couldn't be read says about how its
+/// `Content-Length` was counted. `rest` is the stream from where the body
+/// starts. If a complete JSON value with non-ASCII text starts there, ends
+/// where the next header section or the stream does, and its length in bytes
+/// isn't `content_length`, returns that length and what `content_length`
+/// counts instead, when it is recognisably the number of characters or UTF-16
+/// code units. Anything else (such as a correctly counted body that isn't
+/// valid JSON) says nothing about the count. The work is bounded by
+/// `content_length`.
 pub fn miscounted_length(rest: &[u8], content_length: usize) -> Option<(usize, Option<&'static str>)> {
-    // N characters take at most 4N bytes.
-    let rest = &rest[..rest.len().min(content_length.saturating_mul(4).saturating_add(16))];
-    let mut values = serde_json::Deserializer::from_slice(rest).into_iter::<serde::de::IgnoredAny>();
+    // N characters or UTF-16 code units take at most 4N bytes.
+    let window = &rest[..rest.len().min(content_length.saturating_mul(4).saturating_add(16))];
+    let mut values = serde_json::Deserializer::from_slice(window).into_iter::<serde::de::IgnoredAny>();
     values.next()?.ok()?;
     let len = values.byte_offset();
     let text = std::str::from_utf8(&rest[..len]).ok()?;
-    if len == content_length || text.is_ascii() {
+    let after = &rest[len..];
+    let next_frame = after.is_empty() || ANCHORS.iter().any(|a| starts_with_ignore_case(after, a));
+    if len == content_length || text.is_ascii() || !next_frame {
         return None;
     }
     let (chars, units) = (text.chars().count(), text.encode_utf16().count());
@@ -693,8 +699,13 @@ mod tests {
         assert_eq!(miscounted_length(&stream, 10), Some((14, Some("characters"))));
         assert_eq!(miscounted_length(&stream, 11), Some((14, Some("UTF-16 code units"))));
         assert_eq!(miscounted_length(&stream, 12), Some((14, None)));
-        // A right count, ASCII text, or no JSON value there: nothing to say.
+        // At the end of the stream too.
+        assert_eq!(miscounted_length(body, 10), Some((14, Some("characters"))));
+        // A right count, ASCII text, no JSON value there, or a JSON value
+        // followed by something other than a frame: nothing to say.
         assert_eq!(miscounted_length(&stream, 14), None);
+        let junk = "{\"m\":\"é\"}junk".as_bytes();
+        assert_eq!(miscounted_length(&[junk, b"Content-Length: 2\r\n\r\n{}"].concat(), junk.len()), None);
         assert_eq!(miscounted_length(b"{\"m\":\"e\"}Content-Length", 5), None);
         assert_eq!(miscounted_length("{\"m\":\"é".as_bytes(), 5), None);
     }

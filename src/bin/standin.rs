@@ -21,6 +21,9 @@ const FAULTS: &[(&str, &str)] = &[
     ("bad-content-type", "send one notification whose Content-Type isn't a media type"),
     ("latin1", "declare charset=iso-8859-1 in a Content-Type header"),
     ("char-length", "count the Content-Length of outgoing frames in characters, not bytes"),
+    ("trailing-junk", "send one non-ASCII notification whose body is JSON followed by text, correctly counted"),
+    ("bad-bodies", "on initialize, send 70 frames whose body isn't JSON"),
+    ("overlong-last-frame", "on exit, send a non-ASCII log message declaring 10,000 more bytes than it has"),
     ("ascii-escape", "lawful: escape non-ASCII text in outgoing frames as \\u sequences"),
     ("extension-header", "lawful: send an X-Trace header before Content-Length"),
     ("long-header", "lawful: send a 200 KiB X-Pad header with every frame"),
@@ -128,6 +131,10 @@ fn main() {
                     let text = "x".repeat(2 * 1024 * 1024);
                     out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
                 }
+                if fault("overlong-last-frame") {
+                    let body = r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":4,"message":"é"}}"#;
+                    out.raw(format!("Content-Length: {}\r\n\r\n{body}", body.len() + 10_000).as_bytes());
+                }
                 if fault("exit-flood") {
                     let log =
                         json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
@@ -158,6 +165,15 @@ fn main() {
                 let text = "x".repeat(size);
                 for _ in 0..count {
                     out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
+                }
+            }
+            if fault("trailing-junk") {
+                let body = r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":4,"message":"é"}}junk"#;
+                out.raw(format!("Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+            }
+            if fault("bad-bodies") {
+                for _ in 0..70 {
+                    out.raw(b"Content-Length: 1\r\n\r\n!");
                 }
             }
             if fault("nul-header") {

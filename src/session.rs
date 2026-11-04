@@ -181,7 +181,8 @@ struct Evidence {
     limit: Option<(Duration, String)>,
     /// When the first readable frame with non-ASCII text in its body arrived.
     non_ascii: Option<Duration>,
-    /// Frames whose body isn't JSON: when, the Content-Length, and where the body starts.
+    /// Frames whose body couldn't be read (not JSON, or cut off by the end of
+    /// the stream): when, the Content-Length, and where the body starts.
     unparsed: Vec<(Duration, usize, usize)>,
     /// The stdout task has seen the end of the stream.
     done: bool,
@@ -900,8 +901,11 @@ async fn read_stdout(
             }
             Chunk::Garbage(b) => Problem::Garbage(b),
             Chunk::BadHeader { block, reason } => Problem::BadHeader { block, reason },
-            Chunk::Truncated { headers, content_length, received } => {
+            Chunk::Truncated { headers, content_length, received, start } => {
                 content_types(&mut ev, &headers);
+                if let Some(start) = start {
+                    ev.unparsed.push((at, content_length, start));
+                }
                 Problem::Truncated { content_length, received }
             }
         };
@@ -962,10 +966,10 @@ fn miscounted_frames(unparsed: &[(Duration, usize, usize)], transcript: &[Event]
         })
         .collect::<Vec<_>>()
         .concat();
-    // Enough to show the pattern without rescanning a long broken stream.
+    // Each analysis reads at most about 4 × Content-Length bytes, so the
+    // total is proportional to the output.
     unparsed
         .iter()
-        .take(64)
         .filter_map(|&(at, length, start)| {
             let (bytes, counts) = transport::miscounted_length(stdout.get(start..)?, length)?;
             let counts = counts.map(|c| format!(" (it counts {c})")).unwrap_or_default();

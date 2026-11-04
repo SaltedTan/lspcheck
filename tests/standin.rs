@@ -224,6 +224,27 @@ fn a_content_length_counted_in_characters_fails_f2() {
 }
 
 #[test]
+fn a_correctly_counted_body_that_isnt_json_fails_f1_not_f2() {
+    let r = fault("trailing-junk");
+    only_fails(&r, &["F1"]);
+}
+
+#[test]
+fn every_unreadable_body_is_examined_for_f2() {
+    // 70 unreadable bodies come before the miscounted ones in each scenario.
+    let r = run(&["--fault", "bad-bodies", "--fault", "char-length"], &[]);
+    expect(&r, "F2", "fail");
+}
+
+#[test]
+fn a_last_frame_cut_off_by_its_own_length_fails_f2() {
+    // Its body is complete; the Content-Length promised 10,000 bytes more.
+    let r = fault("overlong-last-frame");
+    expect(&r, "F2", "fail");
+    assert!(r.stdout.contains("Content-Length 10081, but the JSON body that follows is 81 bytes"), "{}", r.stdout);
+}
+
+#[test]
 fn escaped_non_ascii_output_leaves_f2_not_exercised() {
     let r = fault("ascii-escape");
     expect(&r, "F2", "not-exercised");
