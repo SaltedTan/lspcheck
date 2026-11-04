@@ -21,6 +21,8 @@ struct Run {
     status: i32,
     verdicts: BTreeMap<String, String>,
     stdout: String,
+    /// What the server wrote to stderr, from every transcript.
+    server_stderr: String,
     took: Duration,
 }
 
@@ -72,16 +74,20 @@ fn run_command(lspcheck_args: &[&str], server: &[&str], cwd: Option<&std::path::
         .iter()
         .map(|r| (r["id"].as_str().unwrap().to_string(), r["verdict"].as_str().unwrap().to_string()))
         .collect();
+    let mut server_stderr = String::new();
     if let Ok(entries) = std::fs::read_dir(dir.path().join("t")) {
         for entry in entries {
             let path = entry.unwrap().path();
             for line in std::fs::read_to_string(&path).unwrap().lines() {
-                serde_json::from_str::<Value>(line)
+                let event = serde_json::from_str::<Value>(line)
                     .unwrap_or_else(|e| panic!("{}: bad transcript line {line}: {e}", path.display()));
+                if event["dir"] == "err" {
+                    server_stderr.push_str(event["data"].as_str().unwrap_or(""));
+                }
             }
         }
     }
-    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, took }
+    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, server_stderr, took }
 }
 
 fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
@@ -91,6 +97,20 @@ fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
 
 fn fault(name: &str) -> Run {
     run(&["--fault", name], &[])
+}
+
+/// Runs a fault whose effect depends on where the server's reads happen to
+/// end, until the stand-in says on stderr that it took effect. A stand-in
+/// descheduled for the whole of a split write reads it in one piece, so the
+/// fault can't act; that run says nothing either way and is repeated.
+fn fault_taking_effect(name: &str, marker: &str) -> Run {
+    for _ in 0..5 {
+        let r = fault(name);
+        if r.server_stderr.contains(marker) {
+            return r;
+        }
+    }
+    panic!("the {name} fault never took effect in 5 runs");
 }
 
 fn expect(run: &Run, id: &str, verdict: &str) {
@@ -118,7 +138,7 @@ fn the_clean_standin_passes_every_check() {
 
 #[test]
 fn lawful_variations_fail_nothing() {
-    for name in ["extension-header", "decimal-ids", "long-header"] {
+    for name in ["extension-header", "decimal-ids", "long-header", "answers-reordered", "slow-reads", "no-open-close"] {
         let r = fault(name);
         only_fails(&r, &[]);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
@@ -185,9 +205,68 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
     for id in ["J4", "L4", "L6"] {
         expect(&r, id, "error");
     }
+    // So can the plain request the framing checks start with, which can't
+    // then tell whether the server answers requests.
+    for id in ["F3", "F4", "F5", "F6", "F7"] {
+        expect(&r, id, "error");
+    }
     // exit reached its pipe there, and the server never read it: that's real.
     expect(&r, "L7", "fail");
     assert_eq!(r.status, 2, "no MUST failure\n{}", r.stdout);
+}
+
+#[test]
+fn input_split_across_writes_must_be_read() {
+    // A reader that expects each header section in one read.
+    only_fails(&fault_taking_effect("split-header", "split-header dropped"), &["F3"]);
+    // A reader that decodes each read on its own, so a character cut in two is mangled.
+    let r = fault_taking_effect("split-utf8", "split-utf8 mangled");
+    only_fails(&r, &["F3"]);
+    assert!(r.stdout.contains("cut inside them"), "{}", r.stdout);
+}
+
+#[test]
+fn frames_coalesced_in_one_write_must_all_be_read() {
+    let r = fault("first-frame-per-read");
+    only_fails(&r, &["F4"]);
+    assert!(r.stdout.contains("1 of 2 requests went unanswered"), "{}", r.stdout);
+}
+
+#[test]
+fn counting_incoming_characters_instead_of_bytes_fails_f5() {
+    let r = fault("char-length-input");
+    only_fails(&r, &["F5"]);
+    // F3's multibyte part depends on F5, and says it wasn't run.
+    assert!(r.stdout.contains("wasn't run, because F5 didn't pass"), "{}", r.stdout);
+}
+
+#[test]
+fn rejecting_a_client_content_type_fails_f6_and_f7() {
+    only_fails(&fault("no-content-type"), &["F6", "F7"]);
+    let r = fault("strict-charset");
+    only_fails(&r, &["F7"]);
+    assert_eq!(r.status, 0, "F7 is a SHOULD check");
+}
+
+#[test]
+fn variants_after_the_server_stops_answering_are_inconclusive() {
+    // The server exits at F6; nothing after it can be judged.
+    let r = fault("exit-on-content-type");
+    expect(&r, "F4", "pass");
+    expect(&r, "F6", "fail");
+    for id in ["F7", "F3", "F5"] {
+        expect(&r, id, "error");
+    }
+    assert!(r.stdout.contains("the server exited after F6 didn't pass"), "{}", r.stdout);
+}
+
+#[test]
+fn framing_variants_are_not_exercised_when_plain_requests_go_unanswered() {
+    let r = run(&["--fault", "ignore-unknown-requests"], &["--timeout", "2"]);
+    expect(&r, "J4", "fail");
+    for id in ["F3", "F4", "F5", "F6", "F7"] {
+        expect(&r, id, "not-exercised");
+    }
 }
 
 #[test]

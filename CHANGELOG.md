@@ -4,6 +4,8 @@
 
 - First checks:
   - F1, stdout framing, and F8, the declared charset;
+  - F3 to F7, how the server reads its input: split writes, coalesced frames, multibyte text, and the client's
+    `Content-Type` header in both charset spellings;
   - J4, MethodNotFound for unknown requests;
   - L1, L2, L4, L6 and L7, the initialize, shutdown and exit lifecycle;
   - L9, leftover processes.

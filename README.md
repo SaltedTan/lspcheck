@@ -9,6 +9,11 @@ works with any server that talks over stdio, whatever language it is written in,
 $ lspcheck -- basedpyright-langserver --stdio
 lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  F1  MUST    Every byte on stdout belongs to a well-formed frame
+  PASS  F3  MUST    Input split across writes, down to single header bytes, is read
+  PASS  F4  MUST    Several frames in one write are all read
+  PASS  F5  MUST    Input with 2-, 3- and 4-byte UTF-8 characters keeps the stream in step
+  PASS  F6  MUST    A Content-Type header with charset=utf-8 from the client is accepted
+  PASS  F7  SHOULD  The legacy charset=utf8 spelling from the client is accepted
   PASS  F8  SHOULD  A Content-Type the server sends declares UTF-8
   PASS  J4  MUST    An unknown request gets MethodNotFound (-32601), including a $/ request
   FAIL  L1  SHOULD  A request before initialize gets ServerNotInitialized (-32002)
@@ -18,10 +23,10 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  L6  SHOULD  exit after shutdown ends the process with status 0
   PASS  L7  SHOULD  exit without shutdown ends the process with status 1
   PASS  L9  POLICY  No descendant process outlives the server
-9 checks: 8 pass, 1 fail (0 MUST, 1 SHOULD, 0 POLICY), 0 skipped, 0 not exercised, 0 errors
+14 checks: 13 pass, 1 fail (0 MUST, 1 SHOULD, 0 POLICY), 0 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 9 checks so far. [The design](docs/design.md) lists the rest, which cover framing edge
+lspcheck is early: it has 14 checks so far. [The design](docs/design.md) lists the rest, which cover framing edge
 cases, request ids, cancellation, document positions and robustness.
 
 ## What it doesn't do
@@ -49,7 +54,13 @@ lspcheck list                            # every check, with its specification s
 
 lspcheck runs the server several times, once per scenario, each time with an empty temporary workspace as its working
 directory. A server path with a directory part, such as `./my-server`, is resolved before that; a bare name is looked up
-on `PATH`. Framing and leftover-process checks are judged across every scenario.
+on `PATH`. The checks on the server's output (F1, F8) and on leftover processes (L9) are judged across every scenario.
+
+The checks on how the server reads its input (F3 to F7) send small requests the server doesn't know, which every server
+must answer, written in different ways: split across many writes, several frames in one write, with a `Content-Type`
+header, or carrying multibyte characters. Each way is judged only after a plain request has been answered, so lspcheck
+knows the server answers such requests and that its input is in step. If the server stops answering after one of
+them fails, the rest are reported as `ERROR`, not `FAIL`; if it never answers a plain request, they are `N/E`.
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of

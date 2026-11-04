@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestone M0 and part of M1 are done: the transport, process, and session layers, the stand-in server, and checks F1, F8, J4, L1, L2, L4, L6, L7 and L9. F1, F8 and L9 are judged across every scenario. Everything else below is planned.
+**Status:** milestone M0 and part of M1 are done: the transport, process, and session layers, the stand-in server, and checks F1, F3 to F8, J4, L1, L2, L4, L6, L7 and L9. F1, F8 and L9 are judged across every scenario. Everything else below is planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -44,12 +44,19 @@ are to LSP 3.17 and JSON-RPC 2.0.
 |---|---|---|
 | F1 | MUST | Every byte the server writes to stdout, from spawn to exit, belongs to a well-formed frame (startup banners, logs and stray newlines fail). |
 | F2 | MUST | Each frame's `Content-Length` equals the body's length in **bytes**. `not-exercised` if no frame carried non-ASCII text. |
-| F3 | MUST | Input split at every byte boundary of the header and inside the body is read correctly (initialize sent one byte at a time; later frames split at random seeded points). |
-| F4 | MUST | Several frames in one write are all read (`initialized` + a request + a notification coalesced). |
-| F5 | MUST | A `didOpen` whose text has 2-, 3- and 4-byte UTF-8 characters keeps the stream in sync: a following request is answered. |
+| F3 | MUST | Input split across writes is read: a request whose header is written one byte per write and whose body is cut at seeded points, then (when F5 passed) one cut inside 2-, 3- and 4-byte characters. The writes are 10 ms apart, so a server reading promptly sees them separately. |
+| F4 | MUST | Several frames in one write are all read (two requests with a `$/setTrace` notification between them). |
+| F5 | MUST | A `didOpen` whose text has 2-, 3- and 4-byte UTF-8 characters keeps the stream in sync: a following request, with such characters too, is answered. The `didOpen` is sent only when the server asks for open and close notifications (`textDocumentSync` a kind other than None, or `openClose: true`). |
 | F6 | MUST | A `Content-Type: application/vscode-jsonrpc; charset=utf-8` header is accepted (it's an optional header the client may send). |
 | F7 | SHOULD | The legacy `charset=utf8` spelling is treated as UTF-8. |
 | F8 | SHOULD | A `Content-Type` the server sends declares UTF-8 (or the legacy `utf8`), the only supported charset. |
+
+F3 to F7 share one scenario. After `initialize`, a plain request for an unknown method (which must be answered, see J4)
+shows that the server answers such probes. Each variant then sends probes written its own way, and fails if one goes
+unanswered. After a variant that didn't pass, a plain probe checks the server is still in step; if it isn't, the
+remaining variants are `error`, since their failure would say nothing new. If the first plain probe goes unanswered,
+all five are `not-exercised` (or `error`, when lspcheck's own evidence was incomplete). `initialize` itself is sent
+whole, because a missing reply to it can't be told apart from a slow start.
 
 ### JSON-RPC correlation
 | ID | Basis | Check |

@@ -10,7 +10,7 @@
 //! the same bug here.
 
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 
 const FAULTS: &[(&str, &str)] = &[
@@ -40,6 +40,17 @@ const FAULTS: &[(&str, &str)] = &[
     ("exit-flood", "on exit, write 100,000 small log messages and then a line outside any frame"),
     ("exit-status", "exit with status 3 on exit"),
     ("ignore-exit", "ignore exit and stay running"),
+    ("split-header", "drop input when a read ends inside a header section, as if each header came in one read"),
+    ("split-utf8", "decode each read as UTF-8 on its own, mangling characters split across reads"),
+    ("first-frame-per-read", "keep only the first frame of a read that holds three or more"),
+    ("char-length-input", "count the Content-Length of incoming frames in characters, not bytes"),
+    ("no-content-type", "ignore incoming frames that have a Content-Type header"),
+    ("strict-charset", "ignore incoming frames whose charset isn't spelled utf-8"),
+    ("exit-on-content-type", "exit when an incoming frame has a Content-Type header"),
+    ("ignore-unknown-requests", "never answer requests for unknown methods"),
+    ("answers-reordered", "lawful: answer requests that arrive together in reverse order"),
+    ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
+    ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
     ("escaped-child", "start a child in a new session, with a non-UTF-8 name, that outlives the server"),
 ];
@@ -71,17 +82,41 @@ fn main() {
         }
     }
     let fault = |name: &str| faults.iter().any(|f| f == name);
-    let mut out = Writer { out: std::io::stdout().lock(), faults: faults.clone() };
+    let mut out = Writer { out: std::io::stdout().lock(), faults: faults.clone(), holding: false, held: Vec::new() };
     if fault("stdout-banner") {
         out.raw(b"standin starting\n");
     }
-    let mut input = BufReader::new(std::io::stdin().lock());
+    let mut input = Input { inner: std::io::stdin().lock(), buf: Vec::new(), faults: faults.clone() };
     let (mut initialized, mut shut_down) = (false, false);
     let mut children: Vec<Child> = Vec::new();
-    while let Some(msg) = read_frame(&mut input) {
+    loop {
+        if !input.ready() {
+            // About to wait for input: send what was held back, newest first.
+            out.release();
+        }
+        let Some((headers, body)) = input.next() else { break };
+        if fault("answers-reordered") && input.ready() {
+            out.holding = true;
+        }
+        let charset = headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.split_once("charset=").map_or("", |(_, c)| c).trim().to_string());
+        if fault("exit-on-content-type") && charset.is_some() {
+            std::process::exit(2);
+        }
+        if (fault("no-content-type") && charset.is_some())
+            || (fault("strict-charset") && charset.as_deref().is_some_and(|c| c != "utf-8"))
+        {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
         let Some(id) = msg.get("id").cloned() else {
             // A notification.
+            if method == "textDocument/didOpen" && fault("no-open-close") {
+                std::process::exit(4);
+            }
             if method == "exit" && !fault("ignore-exit") {
                 if fault("big-frame-on-exit") {
                     let text = "x".repeat(2 * 1024 * 1024);
@@ -147,6 +182,9 @@ fn main() {
                 "capabilities": {"positionEncoding": encoding, "textDocumentSync": 1, "hoverProvider": true},
                 "serverInfo": {"name": "lspcheck-standin"}
             });
+            if fault("no-open-close") {
+                result["capabilities"]["textDocumentSync"] = json!({"openClose": false, "change": 0});
+            }
             if fault("no-capabilities") {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
             }
@@ -203,6 +241,7 @@ fn main() {
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
             m if m.starts_with("$/") && fault("ignore-dollar-request") => {}
+            _ if fault("ignore-unknown-requests") => {}
             _ if fault("wrong-unknown-error") => out.frame(&err(&id, -32600, "unknown")),
             _ => out.frame(&err(&id, -32601, "method not found")),
         }
@@ -263,6 +302,9 @@ fn spawn_child(arg: &str) -> Child {
 struct Writer<W: Write> {
     out: W,
     faults: Vec<String>,
+    /// Hold frames back until [`Writer::release`] (answers-reordered).
+    holding: bool,
+    held: Vec<Vec<u8>>,
 }
 
 impl<W: Write> Writer<W> {
@@ -273,8 +315,19 @@ impl<W: Write> Writer<W> {
 
     fn frame(&mut self, v: &Value) {
         let bytes = self.encode(v);
-        self.out.write_all(&bytes).unwrap();
-        self.out.flush().unwrap();
+        if self.holding {
+            self.held.push(bytes);
+        } else {
+            self.raw(&bytes);
+        }
+    }
+
+    /// Writes the frames held back, newest first.
+    fn release(&mut self) {
+        self.holding = false;
+        while let Some(bytes) = self.held.pop() {
+            self.raw(&bytes);
+        }
     }
 
     /// A frame with the header variants the faults ask for.
@@ -316,25 +369,127 @@ fn err(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-/// Reads one frame; `None` at end of input.
-fn read_frame(input: &mut impl BufRead) -> Option<Value> {
-    let mut length = None;
-    loop {
-        let mut line = String::new();
-        if input.read_line(&mut line).ok()? == 0 {
-            return None;
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            length = value.trim().parse::<usize>().ok();
+/// Frames read from stdin, with the reading faults applied. Reads go
+/// straight to the pipe (a read buffer larger than stdin's own bypasses it),
+/// so what one read returns is what one read of the pipe returned.
+struct Input<R: Read> {
+    inner: R,
+    buf: Vec<u8>,
+    faults: Vec<String>,
+}
+
+type Frame = (Vec<(String, String)>, Vec<u8>);
+
+enum Parsed {
+    /// A frame and how many bytes it took.
+    Frame(Frame, usize),
+    /// A header section without a usable Content-Length, and its length.
+    Bad(usize),
+    Incomplete,
+}
+
+impl<R: Read> Input<R> {
+    fn fault(&self, name: &str) -> bool {
+        self.faults.iter().any(|f| f == name)
+    }
+
+    /// The next frame, skipping header sections it can't use; `None` at end of input.
+    fn next(&mut self) -> Option<Frame> {
+        loop {
+            match self.parse(&self.buf) {
+                Parsed::Frame(frame, used) => {
+                    self.buf.drain(..used);
+                    return Some(frame);
+                }
+                Parsed::Bad(used) => {
+                    self.buf.drain(..used);
+                }
+                Parsed::Incomplete => {
+                    if !self.fill() {
+                        return None;
+                    }
+                }
+            }
         }
     }
-    let mut body = vec![0; length?];
-    input.read_exact(&mut body).ok()?;
-    serde_json::from_slice(&body).ok()
+
+    /// Whether a whole frame is already buffered.
+    fn ready(&self) -> bool {
+        matches!(self.parse(&self.buf), Parsed::Frame(..))
+    }
+
+    /// Reads once; false at end of input.
+    fn fill(&mut self) -> bool {
+        if self.fault("slow-reads") {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let mut chunk = vec![0u8; 64 * 1024];
+        let n = match self.inner.read(&mut chunk) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => n,
+        };
+        chunk.truncate(n);
+        // Each fault says on stderr when it took effect, since that depends
+        // on where the reads happened to end.
+        if self.fault("split-header") && !self.buf.is_empty() && find(&self.buf, b"\r\n\r\n").is_none() {
+            eprintln!("standin: split-header dropped {} bytes", self.buf.len());
+            self.buf.clear();
+        }
+        if self.fault("split-utf8") && std::str::from_utf8(&chunk).is_err() {
+            eprintln!("standin: split-utf8 mangled a read");
+            chunk = String::from_utf8_lossy(&chunk).into_owned().into_bytes();
+        }
+        self.buf.extend_from_slice(&chunk);
+        if self.fault("first-frame-per-read") {
+            let mut ends = Vec::new();
+            let mut at = 0;
+            while let Parsed::Frame(_, used) = self.parse(&self.buf[at..]) {
+                at += used;
+                ends.push(at);
+            }
+            if ends.len() >= 3 {
+                self.buf.truncate(ends[0]);
+            }
+        }
+        true
+    }
+
+    fn parse(&self, buf: &[u8]) -> Parsed {
+        let Some(end) = find(buf, b"\r\n\r\n") else { return Parsed::Incomplete };
+        let mut headers = Vec::new();
+        let mut length = None;
+        for line in String::from_utf8_lossy(&buf[..end]).split("\r\n") {
+            let Some((name, value)) = line.split_once(':') else { return Parsed::Bad(end + 4) };
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse::<usize>().ok();
+            }
+            headers.push((name.to_string(), value.trim().to_string()));
+        }
+        let Some(length) = length else { return Parsed::Bad(end + 4) };
+        let start = end + 4;
+        let size = if self.fault("char-length-input") {
+            // The bytes that `length` characters take.
+            let mut at = start;
+            for _ in 0..length {
+                at += match buf.get(at) {
+                    None => return Parsed::Incomplete,
+                    Some(b) if *b >= 0xf0 => 4,
+                    Some(b) if *b >= 0xe0 => 3,
+                    Some(b) if *b >= 0xc0 => 2,
+                    Some(_) => 1,
+                };
+            }
+            at - start
+        } else {
+            length
+        };
+        if buf.len() < start + size {
+            return Parsed::Incomplete;
+        }
+        Parsed::Frame((headers, buf[start..start + size].to_vec()), start + size)
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
