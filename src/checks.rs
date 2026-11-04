@@ -133,10 +133,11 @@ pub struct CheckResult {
     pub detail: String,
     /// The scenario the evidence came from, or "all" for cross-cutting checks.
     pub scenario: &'static str,
-    /// A failure because something expected never arrived, which evidence
-    /// lspcheck didn't see could explain. A failure seen directly isn't one.
+    /// For a failure because something expected never arrived: when lspcheck
+    /// stopped waiting. Evidence lspcheck didn't see before then could explain
+    /// it. A failure seen directly has none.
     #[serde(skip)]
-    pub absence: bool,
+    pub absent_at: Option<Duration>,
 }
 
 /// How a run is set up.
@@ -165,7 +166,7 @@ pub struct Observations {
     pub coverage: Coverage,
     pub scan_error: Option<String>,
     pub not_stopped: Vec<ProcInfo>,
-    pub limit: Option<String>,
+    pub limit: Option<(Duration, String)>,
 }
 
 /// One scenario's verdicts and observations.
@@ -256,17 +257,21 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         }
     }
     // A failure because something never arrived might be explained by
-    // evidence lspcheck didn't see: frames it skipped, or frames it couldn't
-    // read (a log line loses nothing, so it doesn't count). A failure seen
-    // directly, such as a wrong result, stands.
-    let unread = finish.problems.iter().any(|(_, p)| !matches!(p, Problem::Garbage(_)));
-    let why = match finish.limit.as_ref().or(finish.own_limit.as_ref()) {
-        Some(limit) => Some(limit.clone()),
-        None if unread => Some("some of the server's frames couldn't be read (see F1)".to_string()),
-        None => None,
-    };
-    if let Some(why) = why {
-        for r in results.iter_mut().filter(|r| r.verdict == Verdict::Fail && r.absence) {
+    // evidence lspcheck didn't see before it stopped waiting: frames it
+    // skipped, frames it couldn't read (a log line loses nothing, so it
+    // doesn't count), or its own side of the conversation failing. A failure
+    // seen directly, such as a wrong result, stands, and so does one whose
+    // wait ended before anything went unseen.
+    let unread = finish
+        .problems
+        .iter()
+        .find(|(_, p)| !matches!(p, Problem::Garbage(_)))
+        .map(|(at, _)| (*at, "some of the server's frames couldn't be read (see F1)".to_string()));
+    let explanations: Vec<&(Duration, String)> =
+        [&finish.limit, &finish.own_limit, &unread].into_iter().flatten().collect();
+    for r in results.iter_mut().filter(|r| r.verdict == Verdict::Fail) {
+        let Some(waited) = r.absent_at else { continue };
+        if let Some((_, why)) = explanations.iter().filter(|(at, _)| *at <= waited).min_by_key(|(at, _)| *at) {
             r.verdict = Verdict::Error;
             r.detail = format!("inconclusive, because {why}: {}", r.detail);
         }
@@ -297,7 +302,7 @@ fn observations(f: Finish) -> Observations {
 }
 
 fn result(scenario: &'static str, id: &str, verdict: Verdict, detail: impl Into<String>) -> CheckResult {
-    CheckResult { id: info(id).id, verdict, detail: detail.into(), scenario, absence: false }
+    CheckResult { id: info(id).id, verdict, detail: detail.into(), scenario, absent_at: None }
 }
 
 struct Ctx<'a> {
@@ -334,13 +339,18 @@ impl Ctx<'_> {
 
     /// A failure because something expected never arrived.
     fn fail_absent(&mut self, id: &str, detail: impl Into<String>) {
+        let waited = self.s.elapsed();
         self.fail(id, detail);
-        self.results.last_mut().expect("just reported").absence = true;
+        self.results.last_mut().expect("just reported").absent_at = Some(waited);
     }
 
-    /// A failure for a call error: absent when no response arrived.
+    /// The verdict for a call that got no response: a failure when the request
+    /// was delivered, and an error when lspcheck couldn't deliver it.
     fn fail_call(&mut self, id: &str, detail: impl Into<String>, e: &CallError) {
-        if matches!(e, CallError::Wait(_)) { self.fail_absent(id, detail) } else { self.fail(id, detail) }
+        match e {
+            CallError::Wait(_) => self.fail_absent(id, detail),
+            CallError::Write(_) => self.report(id, Verdict::Error, detail),
+        }
     }
 
     /// Initializes the server and sends `initialized`.
@@ -392,29 +402,31 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
 
     let t = ctx.cfg.request_timeout;
     let mut problems = Vec::new();
-    let mut all_absent = true;
+    let (mut seen_wrong, mut unsent) = (false, false);
     for method in ["lspcheck/unknownRequest", "$/lspcheck/unknownRequest"] {
         match ctx.s.call(method, Some(json!({})), t).await {
             Ok(m) => match &m.kind {
                 Kind::Response { outcome: Outcome::Error { code: Some(codes::METHOD_NOT_FOUND), .. }, .. } => {}
                 Kind::Response { outcome, .. } => {
-                    all_absent = false;
+                    seen_wrong = true;
                     problems.push(format!("{method}: {} instead of MethodNotFound", describe_outcome(outcome)))
                 }
                 _ => unreachable!(),
             },
             Err(e) => {
-                all_absent &= matches!(e, CallError::Wait(_));
+                unsent |= matches!(e, CallError::Write(_));
                 problems.push(format!("{method}: {}", describe_call_error(&e, t)))
             }
         }
     }
     if problems.is_empty() {
         ctx.pass("J4");
-    } else if all_absent {
-        ctx.fail_absent("J4", problems.join("; "));
-    } else {
+    } else if seen_wrong {
         ctx.fail("J4", problems.join("; "));
+    } else if unsent {
+        ctx.report("J4", Verdict::Error, problems.join("; "));
+    } else {
+        ctx.fail_absent("J4", problems.join("; "));
     }
 
     match ctx.s.call("shutdown", None, t).await {
@@ -528,13 +540,8 @@ fn cross(id: &str, runs: &[ScenarioRun], failures: Vec<String>, pass_detail: &st
     if observed(runs).next().is_none() {
         return result("all", id, Verdict::Error, "no scenario could start the server");
     }
-    if uses_frames && let Some((name, o)) = observed(runs).find(|(_, o)| o.limit.is_some()) {
-        return result(
-            "all",
-            id,
-            Verdict::Error,
-            format!("inconclusive: in {name}, {}", o.limit.as_deref().unwrap_or("")),
-        );
+    if uses_frames && let Some((name, (_, why))) = observed(runs).find_map(|(n, o)| o.limit.as_ref().map(|l| (n, l))) {
+        return result("all", id, Verdict::Error, format!("inconclusive: in {name}, {why}"));
     }
     result("all", id, Verdict::Pass, pass_detail)
 }

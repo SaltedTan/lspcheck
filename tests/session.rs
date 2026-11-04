@@ -69,3 +69,30 @@ async fn a_call_to_a_server_that_doesnt_read_ends_by_its_deadline() {
     assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
     s.finish(Duration::from_millis(200)).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_output_cant_stretch_a_call_past_its_deadline() {
+    // 150,000 log messages already queued when the call starts.
+    let script = r#"import sys, time
+body = b'{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":4,"message":"x"}}'
+sys.stdout.buffer.write((b'Content-Length: %d\r\n\r\n' % len(body) + body) * 150000)
+sys.stdout.buffer.flush()
+time.sleep(30)
+"#;
+    let cmd = ServerCommand::new(&[
+        OsString::from("python3"),
+        OsString::from("-I"),
+        OsString::from("-c"),
+        OsString::from(script),
+    ]);
+    let mut s = Session::start(&cmd, Options::default()).await.unwrap();
+    // Let the reader queue the backlog.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let started = std::time::Instant::now();
+    let got = s.call("lspcheck/test", None, Duration::from_millis(10)).await;
+    assert!(got.is_err());
+    // Taking in the backlog stops at the deadline instead of consuming all of it.
+    assert!(s.messages.len() < 150_000, "consumed {} messages", s.messages.len());
+    assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
+    s.finish(Duration::from_millis(200)).await;
+}

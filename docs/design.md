@@ -143,9 +143,11 @@ Single crate, `src/` modules:
   group first so the PGID can't be recycled while we scan for descendants (the reuse bug virgil-lsp hit). Kill escalation:
   SIGTERM, grace, SIGKILL. Descendant scan: Linux `/proc`, macOS `proc_listpids`, Windows job process list.
 - `session`: tokio tasks for stdout (parsed there, so framing evidence is complete even if replies aren't consumed)
-  and stderr (always drained); stdin writes bounded by a deadline. Request ids are random 31-bit integers, so a reply
-  can't be prepared before its request; ids match by **JSON value** (`1` and `1.0` are the same number). Each call has
-  one absolute deadline covering its write and its reply; each scenario has its own timeouts and a bounded cleanup.
+  and stderr (always drained); stdin writes bounded by a deadline. Request ids are random 31-bit integers, so a server
+  can't prepare a reply before it sees the request (output already read when a request is sent can't answer it, but
+  bytes still in the pipe can, so the randomness is what matters); ids match by **JSON value** (`1` and `1.0` are the
+  same number). Each call has one absolute deadline covering its write and its reply; each scenario has its own
+  timeouts and a bounded cleanup. After a write stops partway through a frame, lspcheck sends nothing more.
 - `checks`: one module per area; each check declares id, basis, spec link, and a function over a `Session`.
 - `profile`, `report`, `cli` (clap).
 Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, toml, thiserror; `nix` on Unix,

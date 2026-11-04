@@ -26,6 +26,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("flood", "write 2 MiB of log messages before replying to initialize"),
     ("big-frame", "lawful: send one 2 MiB log message before replying to initialize"),
     ("init-error", "lawful: refuse to initialize with an InitializeError"),
+    ("block-after-init", "after initialize, send a huge configuration request and stop reading"),
     ("block-on-config", "on initialize, send a huge configuration request and stop reading"),
     ("no-pre-init-error", "answer requests before initialize normally"),
     ("bad-encoding", "choose a position encoding the client didn't offer"),
@@ -35,6 +36,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("ignore-dollar-request", "never answer an unknown $/ request"),
     ("shutdown-result", "return {} from shutdown"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
+    ("big-frame-on-exit", "on exit, send one 2 MiB log message before exiting"),
     ("exit-flood", "on exit, write 100,000 small log messages and then a line outside any frame"),
     ("exit-status", "exit with status 3 on exit"),
     ("ignore-exit", "ignore exit and stay running"),
@@ -81,6 +83,10 @@ fn main() {
         let Some(id) = msg.get("id").cloned() else {
             // A notification.
             if method == "exit" && !fault("ignore-exit") {
+                if fault("big-frame-on-exit") {
+                    let text = "x".repeat(2 * 1024 * 1024);
+                    out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
+                }
                 if fault("exit-flood") {
                     let log =
                         json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
@@ -145,6 +151,11 @@ fn main() {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
             }
             out.frame(&ok(&id, result));
+            if fault("block-after-init") {
+                let items = vec![json!({"section": "x"}); 40_000];
+                out.frame(&json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": items}}));
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
             if fault("early-replies")
                 && let Some(n) = id.as_i64()
             {
@@ -180,7 +191,11 @@ fn main() {
                         .stderr(Stdio::null())
                         .spawn()
                         .unwrap();
-                    helper.stdin.take().unwrap().write_all(&out.encode(&ok(&id, result))).unwrap();
+                    // The helper's stdin stays open until this process is
+                    // gone, which is how the helper knows it may deliver.
+                    let mut pipe = helper.stdin.take().unwrap();
+                    pipe.write_all(&out.encode(&ok(&id, result))).unwrap();
+                    pipe.flush().unwrap();
                     std::process::exit(0);
                 }
                 out.frame(&ok(&id, result));
@@ -211,7 +226,8 @@ fn child(escape: bool) {
     std::thread::sleep(std::time::Duration::from_secs(60));
 }
 
-/// Writes its input to stdout once `parent` has exited.
+/// Writes its input to stdout once `parent` has exited: its stdin ends when
+/// the parent's handle closes, and on Unix it also waits to be reparented.
 fn relay(parent: u32) {
     let mut bytes = Vec::new();
     std::io::stdin().read_to_end(&mut bytes).unwrap();
@@ -223,10 +239,7 @@ fn relay(parent: u32) {
         }
     }
     #[cfg(not(unix))]
-    {
-        let _ = parent;
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
+    let _ = parent;
     let mut out = std::io::stdout().lock();
     out.write_all(&bytes).unwrap();
     out.flush().unwrap();

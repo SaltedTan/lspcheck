@@ -156,6 +156,9 @@ pub enum WriteError {
     Io(String),
     /// A request with this id is still waiting for its response.
     DuplicateId(String),
+    /// An earlier write stopped partway through a frame, so anything sent
+    /// now would land inside it; lspcheck sends nothing more.
+    Abandoned,
 }
 
 impl std::fmt::Display for WriteError {
@@ -165,6 +168,7 @@ impl std::fmt::Display for WriteError {
             WriteError::Timeout => f.write_str("the server stopped reading its stdin"),
             WriteError::Io(e) => write!(f, "writing to the server failed: {e}"),
             WriteError::DuplicateId(id) => write!(f, "a request with id {id} is still outstanding"),
+            WriteError::Abandoned => f.write_str("an earlier write to the server stopped partway through a frame"),
         }
     }
 }
@@ -174,7 +178,7 @@ impl std::fmt::Display for WriteError {
 struct Evidence {
     problems: Vec<(Duration, Problem)>,
     content_types: Vec<(Duration, String)>,
-    limit: Option<String>,
+    limit: Option<(Duration, String)>,
     /// The stdout task has seen the end of the stream.
     done: bool,
 }
@@ -194,12 +198,12 @@ pub struct Finish {
     pub scan_error: Option<String>,
     /// Processes lspcheck couldn't stop.
     pub not_stopped: Vec<ProcInfo>,
-    /// Why lspcheck's inspection of stdout is incomplete, if it is.
-    pub limit: Option<String>,
+    /// When and why lspcheck's inspection of stdout became incomplete, if it did.
+    pub limit: Option<(Duration, String)>,
     /// Why lspcheck's own side of the conversation was incomplete (it
     /// couldn't answer one of the server's requests), if it was. This can
     /// explain a reply that never came, but not what stdout contained.
-    pub own_limit: Option<String>,
+    pub own_limit: Option<(Duration, String)>,
     pub transcript: Vec<Event>,
     /// Every message the session consumed.
     pub messages: Vec<(Duration, Message)>,
@@ -246,8 +250,10 @@ pub struct Session {
     evidence: Arc<Mutex<Evidence>>,
     /// Every message consumed, in order.
     pub messages: Vec<(Duration, Message)>,
-    /// Why this session's own actions left evidence incomplete.
-    own_limit: Option<String>,
+    /// When and why this session's own actions left evidence incomplete.
+    own_limit: Option<(Duration, String)>,
+    /// Set when a write stopped partway through a frame.
+    abandoned: bool,
     /// Requests sent and not yet answered, with when they were sent.
     pending: HashMap<Id, Duration>,
     /// Requests answered: the index of the response in `messages`.
@@ -328,6 +334,7 @@ impl Session {
             evidence,
             messages: Vec::new(),
             own_limit: None,
+            abandoned: false,
             pending: HashMap::new(),
             answers: HashMap::new(),
             used_ids: HashSet::new(),
@@ -353,7 +360,8 @@ impl Session {
 
     /// Why evidence is incomplete so far, if it is: stdout's or lspcheck's own.
     pub fn limit(&self) -> Option<String> {
-        self.evidence.lock().expect("evidence lock").limit.clone().or_else(|| self.own_limit.clone())
+        let ev = self.evidence.lock().expect("evidence lock");
+        ev.limit.as_ref().or(self.own_limit.as_ref()).map(|(_, why)| why.clone())
     }
 
     /// Writes bytes exactly as given, within the write timeout.
@@ -365,6 +373,9 @@ impl Session {
     /// exactly how many reached the pipe.
     async fn write_until(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), WriteError> {
         let deadline = deadline.min(Instant::now() + self.opts.write_timeout);
+        if self.abandoned {
+            return Err(WriteError::Abandoned);
+        }
         let Some(stdin) = self.stdin.as_mut() else { return Err(WriteError::Closed) };
         let at = self.start.elapsed();
         let mut written = 0usize;
@@ -393,8 +404,22 @@ impl Session {
         };
         if let Err(e) = &outcome {
             self.note(format!("write stopped after {written} of {} bytes: {e}", bytes.len()));
+            if written > 0 && written < bytes.len() && self.stdin.is_some() {
+                self.abandoned = true;
+                self.limit_self(format!(
+                    "lspcheck's write stopped partway through a frame ({e}), so it sent nothing more"
+                ));
+            }
         }
         outcome
+    }
+
+    /// Records that lspcheck's own side of the conversation is incomplete.
+    fn limit_self(&mut self, why: String) {
+        self.note(why.clone());
+        if self.own_limit.is_none() {
+            self.own_limit = Some((self.start.elapsed(), why));
+        }
     }
 
     /// Frames and writes one message.
@@ -407,8 +432,8 @@ impl Session {
         self.write_until(&transport::encode(&body), deadline).await
     }
 
-    /// A fresh integer id in LSP's 32-bit range, unpredictable so that a
-    /// response can't be prepared before its request exists.
+    /// A fresh integer id in LSP's 32-bit range. Its unpredictability is what
+    /// keeps a server from preparing a response before the request exists.
     pub fn fresh_id(&mut self) -> Id {
         loop {
             let n = (random_u64() % (i32::MAX as u64)) as i64 + 1;
@@ -426,6 +451,9 @@ impl Session {
         Ok(id)
     }
 
+    /// Sends a request with a chosen id. Only output lspcheck has already read
+    /// is excluded from answering it, so with a predictable id a response the
+    /// server wrote just before may still count; [`Session::request`] avoids that.
     pub async fn request_with_id(&mut self, id: &Id, method: &str, params: Option<Value>) -> Result<(), WriteError> {
         self.request_until(id, method, params, Instant::now() + self.opts.write_timeout).await
     }
@@ -440,8 +468,11 @@ impl Session {
         if self.pending.contains_key(id) {
             return Err(WriteError::DuplicateId(id.to_string()));
         }
-        // Responses already on their way can't answer this request.
+        // Responses lspcheck has already read can't answer this request.
         self.absorb(deadline).await;
+        if Instant::now() >= deadline {
+            return Err(WriteError::Timeout);
+        }
         self.used_ids.insert(id.clone());
         self.answers.remove(id);
         self.pending.insert(id.clone(), self.start.elapsed());
@@ -461,15 +492,21 @@ impl Session {
         self.stdin = None;
     }
 
-    /// Takes in everything that has already arrived, without waiting.
+    /// Takes in what has already been read, without waiting for more and
+    /// without going past `deadline`. What it doesn't reach is handled later.
     async fn absorb(&mut self, deadline: Instant) {
         tokio::task::yield_now().await;
-        while !self.stdout_closed {
+        let mut n = 0u32;
+        while !self.stdout_closed && Instant::now() < deadline {
             match self.rx.try_recv() {
                 Ok((at, inbound)) => {
                     let _ = self.handle(at, inbound, deadline).await;
                 }
                 Err(_) => break,
+            }
+            n += 1;
+            if n.is_multiple_of(256) {
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -552,9 +589,7 @@ impl Session {
             // The server may be waiting for this answer, so what follows can't
             // be blamed on it. (A closed stdin means the server is exiting or
             // closed it itself; nothing more is expected of it.)
-            let why = format!("lspcheck couldn't answer the server's {method} request ({e})");
-            self.note(why.clone());
-            self.own_limit.get_or_insert(why);
+            self.limit_self(format!("lspcheck couldn't answer the server's {method} request ({e})"));
         }
     }
 
@@ -715,8 +750,10 @@ impl Session {
         self.group.close();
         let mut evidence = std::mem::take(&mut *self.evidence.lock().expect("evidence lock"));
         if !evidence.done && evidence.limit.is_none() {
-            evidence.limit =
-                Some("stdout stayed open after the server exited, so later output wasn't inspected".into());
+            evidence.limit = Some((
+                self.start.elapsed(),
+                "stdout stayed open after the server exited, so later output wasn't inspected".into(),
+            ));
         }
         let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
         Finish {
@@ -752,7 +789,7 @@ async fn read_stdout(
     let (mut total, mut stopped) = (0usize, false);
     let stop = |at: Duration, why: String| {
         record(&t, at, EventKind::Note(why.clone()));
-        evidence.lock().expect("evidence lock").limit.get_or_insert(why);
+        evidence.lock().expect("evidence lock").limit.get_or_insert((at, why));
         let _ = tx.send((at, Inbound::Stopped));
     };
     let deliver = |at: Duration, chunk: Chunk, stopped: &mut bool| {
@@ -776,9 +813,9 @@ async fn read_stdout(
             }
             Chunk::Oversized { headers, content_length, limit } => {
                 content_types(&mut ev, &headers);
-                ev.limit.get_or_insert(format!(
+                ev.limit.get_or_insert((at, format!(
                     "a {content_length}-byte frame is over lspcheck's {limit}-byte inspection limit (--max-frame-mib), so it wasn't checked"
-                ));
+                )));
                 return;
             }
             Chunk::HeaderLimit { limit } => {

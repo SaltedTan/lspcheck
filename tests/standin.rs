@@ -29,8 +29,13 @@ fn run_command(lspcheck_args: &[&str], server: &[&str], cwd: Option<&std::path::
     let dir = tempfile::tempdir().unwrap();
     let report = dir.path().join("report.json");
     let mut cmd = Command::new(LSPCHECK);
-    cmd.args(["--timeout", "5", "--startup-timeout", "5", "--exit-timeout", "2"])
-        .args(lspcheck_args)
+    // Defaults the caller can override.
+    for (flag, value) in [("--timeout", "5"), ("--startup-timeout", "5"), ("--exit-timeout", "2")] {
+        if !lspcheck_args.contains(&flag) {
+            cmd.args([flag, value]);
+        }
+    }
+    cmd.args(lspcheck_args)
         .arg("--json")
         .arg(&report)
         .arg("--transcripts")
@@ -146,7 +151,9 @@ fn a_content_type_that_isnt_a_media_type_fails_f1() {
 fn output_written_just_before_exit_is_still_judged() {
     // The bad line follows 100,000 frames that are still queued when the
     // server exits; F1 must see it.
-    let r = fault("exit-flood");
+    // The server writes it all after exit arrives, and a slow runner may take
+    // a while to read it, so the exit allowance is generous.
+    let r = run(&["--fault", "exit-flood"], &["--exit-timeout", "30"]);
     expect(&r, "F1", "fail");
     assert!(r.stdout.contains("goodbye"), "{}", r.stdout);
 }
@@ -158,6 +165,29 @@ fn a_failure_seen_directly_stands_when_other_frames_were_skipped() {
     expect(&r, "L4", "fail");
     expect(&r, "F1", "error");
     assert_eq!(r.status, 1, "{}", r.stdout);
+}
+
+#[test]
+fn a_frame_skipped_after_a_missed_reply_doesnt_excuse_it() {
+    // The $/ request goes unanswered; the oversized frame comes only on exit,
+    // long after lspcheck stopped waiting, so it can't have held the reply.
+    let r = run(&["--fault", "ignore-dollar-request", "--fault", "big-frame-on-exit"], &["--max-frame-mib", "1"]);
+    expect(&r, "J4", "fail");
+    expect(&r, "F1", "error");
+}
+
+#[test]
+fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
+    // The server stops reading while lspcheck answers its request, so
+    // lspcheck can't deliver the requests J4 and L4 depend on.
+    let r = run(&["--fault", "block-after-init"], &["--timeout", "1"]);
+    expect(&r, "L2", "pass");
+    for id in ["J4", "L4", "L6"] {
+        expect(&r, id, "error");
+    }
+    // exit reached its pipe there, and the server never read it: that's real.
+    expect(&r, "L7", "fail");
+    assert_eq!(r.status, 2, "no MUST failure\n{}", r.stdout);
 }
 
 #[test]

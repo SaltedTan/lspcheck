@@ -9,5 +9,5 @@
   - L9, leftover processes.
 - Terminal, JSON (`lspcheck-report-v1`) and JSON Lines transcript output.
 - Inspection limits (`--max-output-mib`, `--max-frame-mib`) that make results inconclusive rather than failed, when the
-  missing output could explain them.
+  missing output could explain them. Requests lspcheck couldn't deliver give errors, not failures.
 - `lspcheck-standin`, a test server with switchable faults.
