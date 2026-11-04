@@ -21,7 +21,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("bad-content-type", "send one notification whose Content-Type isn't a media type"),
     ("latin1", "declare charset=iso-8859-1 in a Content-Type header"),
     ("char-length", "count the Content-Length of outgoing frames in characters, not bytes"),
-    ("trailing-junk", "send one non-ASCII notification whose body is JSON then a fake header, correctly counted"),
+    ("trailing-junk", "send one non-ASCII notification whose body is JSON then a header and {}, correctly counted"),
     ("newline-after-body", "lawful: end every outgoing body with a newline, counted in its Content-Length"),
     ("bad-bodies", "on initialize, send 70 frames whose body isn't JSON"),
     ("overlong-last-frame", "on exit, send a non-ASCII log message and newline declaring 10,000 bytes too many"),
@@ -169,7 +169,7 @@ fn main() {
                 }
             }
             if fault("trailing-junk") {
-                let body = r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":4,"message":"é"}}Content-Length: junk"#;
+                let body = "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":4,\"message\":\"é\"}}Content-Length: 2\r\n\r\n{}";
                 out.raw(format!("Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
             }
             if fault("bad-bodies") {

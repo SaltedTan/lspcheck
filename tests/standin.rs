@@ -230,7 +230,7 @@ fn a_content_length_counted_in_characters_fails_f2() {
     only_fails(&r, &["F1", "F2"]);
     assert!(r.stdout.contains("(it counts characters)"), "{}", r.stdout);
     // Also with whitespace after the JSON, or an extension header before the next frame's Content-Length.
-    for other in ["newline-after-body", "extension-header"] {
+    for other in ["newline-after-body", "extension-header", "long-header"] {
         let r = run(&["--fault", "char-length", "--fault", other], &[]);
         expect(&r, "F2", "fail");
         assert!(r.stdout.contains("(it counts characters)"), "{other}\n{}", r.stdout);

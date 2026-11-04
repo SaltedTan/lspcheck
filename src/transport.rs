@@ -266,26 +266,38 @@ pub enum Count {
     Unchecked,
 }
 
-/// The longest header section [`miscounted_length`] reads after a body.
-const NEXT_HEADER_WINDOW: usize = 4096;
-
 /// What a frame body that couldn't be read says about how its
 /// `Content-Length` was counted.
 ///
-/// `rest` is the stream from where the body starts; `whole` says whether its
-/// end is the end of the server's output (and not where lspcheck stopped
-/// reading). The body is taken to be a complete JSON value with non-ASCII
-/// text that starts there, with any whitespace after it, when a complete
-/// valid header section or the end of the output follows. If its length in
-/// bytes isn't `content_length`, returns that length and what
-/// `content_length` counts instead, when it is recognisably the number of
-/// characters or UTF-16 code units. Anything else, such as a correctly
-/// counted body that isn't valid JSON, says nothing about the count.
+/// `rest` is the stream from where the body starts; `truncated` says whether
+/// the output ended before the declared length; `whole` says whether the end
+/// of `rest` is the end of the server's output (and not where lspcheck
+/// stopped reading). Two cases are clear evidence, when a complete JSON value
+/// with non-ASCII text (and any whitespace after it) starts the body:
+///
+/// - The declared length is shorter than the value, and a complete, valid
+///   header section or the end of the output follows it. A correctly counted
+///   body can't be like this: its value would have to run on into the next
+///   frame's header, and raw CR and LF can't be part of JSON.
+/// - The output ended inside the declared body, right after the value.
+///
+/// A declared length longer than the value of a complete frame proves
+/// nothing: it can't be told from a correctly counted body with text after
+/// its JSON, which is F1's business. For the evidence, returns the body's
+/// length and what `content_length` counts instead, when it is recognisably
+/// the number of characters or UTF-16 code units.
 ///
 /// Parsing reads at most about 4 × `content_length` bytes. Looking for the
-/// next header section reads up to 4 KiB, which is taken from `budget`; when
-/// the budget has run out, the count couldn't be checked.
-pub fn miscounted_length(rest: &[u8], content_length: usize, whole: bool, budget: &mut usize) -> Count {
+/// next header section reads up to lspcheck's header inspection limit, taken
+/// from `budget`; when that runs out, or the section is longer, the count
+/// couldn't be checked.
+pub fn miscounted_length(
+    rest: &[u8],
+    content_length: usize,
+    truncated: bool,
+    whole: bool,
+    budget: &mut usize,
+) -> Count {
     // N characters or UTF-16 code units take at most 4N bytes.
     let window = &rest[..rest.len().min(content_length.saturating_mul(4).saturating_add(16))];
     let mut values = serde_json::Deserializer::from_slice(window).into_iter::<serde::de::IgnoredAny>();
@@ -295,20 +307,35 @@ pub fn miscounted_length(rest: &[u8], content_length: usize, whole: bool, budget
     let value_end = values.byte_offset();
     let len = value_end + rest[value_end..].iter().take_while(|b| b" \t\r\n".contains(b)).count();
     let Ok(text) = std::str::from_utf8(&rest[..len]) else { return Count::Unknown };
-    if text.is_ascii() || content_length == len || content_length == value_end {
+    if text.is_ascii() {
         return Count::Unknown;
     }
-    let after = &rest[len..];
-    let next_frame = if after.is_empty() {
-        whole
+    if truncated {
+        if !(whole && len == rest.len() && content_length > len) {
+            return Count::Unknown;
+        }
     } else {
-        let scan = &after[..after.len().min(NEXT_HEADER_WINDOW)];
-        let Some(left) = budget.checked_sub(scan.len()) else { return Count::Unchecked };
-        *budget = left;
-        find(scan, b"\r\n\r\n").is_some_and(|end| parse_header_block(&scan[..end]).is_ok())
-    };
-    if !next_frame {
-        return Count::Unknown;
+        if content_length >= value_end {
+            return Count::Unknown;
+        }
+        let after = &rest[len..];
+        let next_frame = if after.is_empty() {
+            whole
+        } else {
+            let scan = &after[..after.len().min(DEFAULT_MAX_HEADER_BYTES)];
+            let end = find(scan, b"\r\n\r\n");
+            let examined = end.map_or(scan.len(), |e| e + 4);
+            let Some(left) = budget.checked_sub(examined) else { return Count::Unchecked };
+            *budget = left;
+            match end {
+                Some(end) => parse_header_block(&scan[..end]).is_ok(),
+                None if after.len() > scan.len() => return Count::Unchecked,
+                None => false,
+            }
+        };
+        if !next_frame {
+            return Count::Unknown;
+        }
     }
     let matches = |t: &str| (t.chars().count() == content_length, t.encode_utf16().count() == content_length);
     let counts = match [matches(text), matches(&text[..value_end])].into_iter().find(|(c, u)| *c || *u) {
@@ -727,9 +754,9 @@ mod tests {
 
     #[test]
     fn content_lengths_counted_in_characters_are_recognised() {
-        let check = |rest: &[u8], n: usize, whole: bool| {
+        let check = |rest: &[u8], n: usize, truncated: bool, whole: bool| {
             let mut budget = usize::MAX;
-            match miscounted_length(rest, n, whole, &mut budget) {
+            match miscounted_length(rest, n, truncated, whole, &mut budget) {
                 Count::Miscounted { bytes, counts } => Some((bytes, counts)),
                 Count::Unknown => None,
                 Count::Unchecked => unreachable!(),
@@ -739,29 +766,38 @@ mod tests {
         let next = b"Content-Length: 2\r\n\r\n{}";
         let stream = [body, next].concat();
         // 10 characters, 11 UTF-16 code units, 14 bytes.
-        assert_eq!(check(&stream, 10, true), Some((14, Some("characters"))));
-        assert_eq!(check(&stream, 11, true), Some((14, Some("UTF-16 code units"))));
-        assert_eq!(check(&stream, 12, true), Some((14, None)));
+        assert_eq!(check(&stream, 10, false, true), Some((14, Some("characters"))));
+        assert_eq!(check(&stream, 11, false, true), Some((14, Some("UTF-16 code units"))));
+        assert_eq!(check(&stream, 12, false, true), Some((14, None)));
         // At the end of the output, but not where lspcheck stopped reading.
-        assert_eq!(check(body, 10, true), Some((14, Some("characters"))));
-        assert_eq!(check(body, 10, false), None);
+        assert_eq!(check(body, 10, false, true), Some((14, Some("characters"))));
+        assert_eq!(check(body, 10, false, false), None);
         // Whitespace after the value belongs to the body, and the next
         // section may start with any header.
         let spaced = [body, b"\n", b"X-Trace: a\r\n", next].concat();
-        assert_eq!(check(&spaced, 11, true), Some((15, Some("characters"))));
-        assert_eq!(check(&[body, b"\n"].concat(), 10, true), Some((15, Some("characters"))));
-        // A right count, ASCII text, no JSON value there, or a JSON value
-        // followed by something other than a header section: nothing to say.
-        assert_eq!(check(&stream, 14, true), None);
-        assert_eq!(check(b"{\"m\":\"e\"}Content-Length: 2\r\n\r\n{}", 5, true), None);
-        assert_eq!(check("{\"m\":\"é".as_bytes(), 5, true), None);
-        for junk in [&b"junk"[..], b"Content-Length: not-a-header", b"Content-Length: 2\r\nX Y\r\n\r\n"] {
+        assert_eq!(check(&spaced, 11, false, true), Some((15, Some("characters"))));
+        // A last frame the output ended inside: too long a length shows.
+        let ended = [body, b"\n"].concat();
+        assert_eq!(check(&ended, 10_015, true, true), Some((15, None)));
+        assert_eq!(check(&ended, 10_015, true, false), None);
+        assert_eq!(check(&[&ended[..], b"x"].concat(), 10_016, true, true), None);
+        // A right count, a longer one on a complete frame, ASCII text, no
+        // JSON value there, or a JSON value followed by something other
+        // than a header section: nothing to say.
+        assert_eq!(check(&stream, 14, false, true), None);
+        assert_eq!(check(b"{\"m\":\"e\"}Content-Length: 2\r\n\r\n{}", 5, false, true), None);
+        assert_eq!(check("{\"m\":\"é".as_bytes(), 5, false, true), None);
+        for junk in [&b"junk"[..], b"Content-Length: not-a-header", next, b"Content-Length: 2\r\nX Y\r\n\r\n"] {
             let rest = [body, junk].concat();
-            assert_eq!(check(&rest, rest.len(), true), None, "{:?}", String::from_utf8_lossy(junk));
-            assert_eq!(check(&rest, 10, true), None, "{:?}", String::from_utf8_lossy(junk));
+            let shown = String::from_utf8_lossy(junk);
+            assert_eq!(check(&rest, rest.len(), false, true), None, "{shown:?}");
+            assert_eq!(check(&[&rest[..], next].concat(), rest.len(), false, true), None, "{shown:?}");
         }
+        assert_eq!(check(&[body, b"junk"].concat(), 10, false, true), None);
         // Looking for the next header section is bounded.
-        assert_eq!(miscounted_length(&stream, 10, true, &mut 4), Count::Unchecked);
+        assert_eq!(miscounted_length(&stream, 10, false, true, &mut 4), Count::Unchecked);
+        let long = [body, b"X-Pad: ", &vec![b'p'; DEFAULT_MAX_HEADER_BYTES][..], b"\r\n", next].concat();
+        assert_eq!(miscounted_length(&long, 10, false, true, &mut { usize::MAX }), Count::Unchecked);
     }
 
     #[test]
