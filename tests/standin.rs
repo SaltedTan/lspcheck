@@ -228,12 +228,12 @@ fn a_content_length_counted_in_characters_fails_f2() {
     let r = fault("char-length");
     // The frame can't be read either, so F1 fails too.
     only_fails(&r, &["F1", "F2"]);
-    assert!(r.stdout.contains("(it counts characters)"), "{}", r.stdout);
+    assert!(r.stdout.contains("counts characters, but"), "{}", r.stdout);
     // Also with whitespace after the JSON, or an extension header before the next frame's Content-Length.
     for other in ["newline-after-body", "extension-header", "long-header"] {
         let r = run(&["--fault", "char-length", "--fault", other], &[]);
         expect(&r, "F2", "fail");
-        assert!(r.stdout.contains("(it counts characters)"), "{other}\n{}", r.stdout);
+        assert!(r.stdout.contains("counts characters, but"), "{other}\n{}", r.stdout);
     }
 }
 
@@ -248,13 +248,18 @@ fn a_body_the_next_header_line_would_complete_fails_f1_not_f2() {
     // Joined to the next frame's first header line, the body would be JSON,
     // but the next header section starts where the body was declared to end.
     only_fails(&fault("json-into-next-header"), &["F1"]);
+    // Even when that header line isn't valid.
+    only_fails(&fault("json-into-bad-header"), &["F1"]);
 }
 
 #[test]
-fn a_miscount_too_long_to_examine_is_inconclusive_not_a_pass() {
-    let r = fault("long-miscount");
-    expect(&r, "F1", "fail");
-    expect(&r, "F2", "error");
+fn wrong_lengths_that_count_neither_characters_nor_code_units_fail_f1_not_f2() {
+    // Content-Length 1 for a long body, and one 10,000 bytes too long on the last frame.
+    for name in ["long-miscount", "overlong-last-frame"] {
+        let r = fault(name);
+        expect(&r, "F1", "fail");
+        expect(&r, "F2", "pass");
+    }
 }
 
 #[test]
@@ -262,14 +267,6 @@ fn every_unreadable_body_is_examined_for_f2() {
     // 70 unreadable bodies come before the miscounted ones in each scenario.
     let r = run(&["--fault", "bad-bodies", "--fault", "char-length"], &[]);
     expect(&r, "F2", "fail");
-}
-
-#[test]
-fn a_last_frame_cut_off_by_its_own_length_fails_f2() {
-    // Its body is complete; the Content-Length promised 10,000 bytes more.
-    let r = fault("overlong-last-frame");
-    expect(&r, "F2", "fail");
-    assert!(r.stdout.contains("Content-Length 10082, but the JSON body that follows is 82 bytes"), "{}", r.stdout);
 }
 
 #[test]

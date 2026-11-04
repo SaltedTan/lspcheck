@@ -181,10 +181,8 @@ struct Evidence {
     limit: Option<(Duration, String)>,
     /// When the first readable frame with non-ASCII text in its body arrived.
     non_ascii: Option<Duration>,
-    /// Frames whose body couldn't be read (not JSON, or cut off by the end of
-    /// the stream): when, the Content-Length, where the body starts, and
-    /// whether it was cut off.
-    unparsed: Vec<(Duration, usize, usize, bool)>,
+    /// Frames whose body isn't JSON: when, the Content-Length, and where the body starts.
+    unparsed: Vec<(Duration, usize, usize)>,
     /// lspcheck stopped reading stdout into the transcript before it ended.
     cut: bool,
     /// The stdout task has seen the end of the stream.
@@ -887,7 +885,7 @@ async fn read_stdout(
                         return;
                     }
                     Err(error) => {
-                        ev.unparsed.push((at, body.len(), start, false));
+                        ev.unparsed.push((at, body.len(), start));
                         Problem::NotJson { body, error }
                     }
                 }
@@ -912,11 +910,8 @@ async fn read_stdout(
             }
             Chunk::Garbage(b) => Problem::Garbage(b),
             Chunk::BadHeader { block, reason } => Problem::BadHeader { block, reason },
-            Chunk::Truncated { headers, content_length, received, start } => {
+            Chunk::Truncated { headers, content_length, received } => {
                 content_types(&mut ev, &headers);
-                if let Some(start) = start {
-                    ev.unparsed.push((at, content_length, start, true));
-                }
                 Problem::Truncated { content_length, received }
             }
         };
@@ -968,7 +963,7 @@ async fn read_stdout(
 /// every byte of stdout that was inspected; `whole` says whether that is all
 /// of it.
 fn miscounted_frames(
-    unparsed: &[(Duration, usize, usize, bool)],
+    unparsed: &[(Duration, usize, usize)],
     transcript: &[Event],
     whole: bool,
 ) -> (Vec<(Duration, String)>, usize) {
@@ -988,17 +983,16 @@ fn miscounted_frames(
     // a candidate body is bounded by this budget. A few examples are enough.
     let mut budget = 16 * 1024 * 1024;
     let (mut found, mut unchecked) = (Vec::new(), 0);
-    for &(at, length, start, truncated) in unparsed {
+    for &(at, length, start) in unparsed {
         if found.len() == 16 {
             break;
         }
         let Some(rest) = stdout.get(start..) else { continue };
-        match transport::miscounted_length(rest, length, truncated, whole, &mut budget) {
+        match transport::miscounted_length(rest, length, whole, &mut budget) {
             transport::Count::Miscounted { bytes, counts } => {
-                let counts = counts.map(|c| format!(" (it counts {c})")).unwrap_or_default();
                 found.push((
                     at,
-                    format!("Content-Length {length}{counts}, but the JSON body that follows is {bytes} bytes"),
+                    format!("Content-Length {length} counts {counts}, but the JSON body that follows is {bytes} bytes"),
                 ));
             }
             transport::Count::Unknown => {}
