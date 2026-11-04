@@ -12,4 +12,5 @@ pub mod message;
 pub mod process;
 pub mod report;
 pub mod session;
+pub mod transcript;
 pub mod transport;

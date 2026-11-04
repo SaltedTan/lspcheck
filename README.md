@@ -9,6 +9,7 @@ works with any server that talks over stdio, whatever language it is written in,
 $ lspcheck -- basedpyright-langserver --stdio
 lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  F1  MUST    Every byte on stdout belongs to a well-formed frame
+  PASS  F8  SHOULD  A Content-Type the server sends declares UTF-8
   PASS  J4  MUST    An unknown request gets MethodNotFound (-32601), including a $/ request
   FAIL  L1  SHOULD  A request before initialize gets ServerNotInitialized (-32002)
                      got result "[]" instead of ServerNotInitialized
@@ -17,10 +18,10 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  L6  SHOULD  exit after shutdown ends the process with status 0
   PASS  L7  SHOULD  exit without shutdown ends the process with status 1
   PASS  L9  POLICY  No descendant process outlives the server
-8 checks: 7 pass, 1 fail (0 MUST, 1 SHOULD, 0 POLICY), 0 skipped, 0 not exercised, 0 errors
+9 checks: 8 pass, 1 fail (0 MUST, 1 SHOULD, 0 POLICY), 0 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 8 checks so far. [The design](docs/design.md) lists the rest, which cover framing edge
+lspcheck is early: it has 9 checks so far. [The design](docs/design.md) lists the rest, which cover framing edge
 cases, request ids, cancellation, document positions and robustness.
 
 ## What it doesn't do
@@ -46,9 +47,18 @@ lspcheck --json report.json --transcripts out/ -- my-server
 lspcheck list                            # every check, with its specification section
 ```
 
-Each check runs in a fresh server process with an empty temporary workspace, and the server's working directory is
-that workspace. With `--transcripts`, lspcheck writes one JSON Lines file for each scenario. The file holds every byte
-sent and received and the server's stderr, with timestamps, so you can see exactly what happened in a failing scenario.
+lspcheck runs the server several times, once per scenario, each time with an empty temporary workspace as its working
+directory. A server path with a directory part, such as `./my-server`, is resolved before that; a bare name is looked up
+on `PATH`. Framing and leftover-process checks are judged across every scenario.
+
+With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
+stdin and the bytes read from its stdout, exactly as written and read, what lspcheck parsed them into, the first MiB of
+stderr, and timestamps, so you can see what happened in a failing scenario.
+
+lspcheck inspects at most `--max-output-mib` (256) of stdout per scenario and frames of at most `--max-frame-mib` (64).
+These are lspcheck's own limits, not protocol rules: past them it keeps reading so the server isn't blocked, but stops
+inspecting, and failures it might have explained are reported as `ERROR` (inconclusive), not `FAIL`. The same happens
+when some of the server's frames can't be read at all.
 
 ### Verdicts
 
@@ -58,7 +68,7 @@ sent and received and the server's stderr, with timestamps, so you can see exact
 | `FAIL` | The rule was broken; the detail line says how. |
 | `SKIP` | The rule doesn't apply to this server. |
 | `N/E` | Not exercised: the rule applies, but the run produced no evidence either way. |
-| `ERROR` | lspcheck or the environment failed, for example when the server couldn't start. It says nothing about the rule. |
+| `ERROR` | The result is unknown: the server couldn't start or refused to initialize, a timeout ran out, or the evidence is incomplete. It says nothing about the rule. |
 
 Each check has a basis: `MUST` for a normative rule of the LSP or JSON-RPC 2.0 specification, `SHOULD` for one of
 their recommendations, and `POLICY` for hygiene that the specification doesn't require but clients rely on, such as
@@ -70,11 +80,14 @@ not leaving child processes behind.
 - **1:** a `MUST` check failed, or with `--strict`, any check failed.
 - **2:** a usage error, or an `ERROR` verdict with no `MUST` failure.
 
+Some servers refuse to initialize without project files or settings. lspcheck reports that as `ERROR`, with the
+server's message, rather than as a failure.
+
 ## Platforms
 
-lspcheck runs on Linux, macOS and Windows. It finds the server's child processes on Linux and macOS. On Linux it also
-finds children that left the server's process group, because lspcheck makes itself a child subreaper. On Windows, check
-L9 reports `N/E` for now.
+lspcheck runs on Linux, macOS and Windows. L9 finds the server's leftover processes through its process group on Linux
+and macOS. On Linux lspcheck also makes itself a child subreaper, so it finds descendants that left the group with
+`setsid`. On macOS such a descendant can't be seen, and the L9 result says so. On Windows L9 reports `N/E` for now.
 
 ## Development
 

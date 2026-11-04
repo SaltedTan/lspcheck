@@ -3,9 +3,10 @@
 ## Unreleased
 
 - First checks:
-  - F1, stdout framing;
+  - F1, stdout framing, and F8, the declared charset;
   - J4, MethodNotFound for unknown requests;
   - L1, L2, L4, L6 and L7, the initialize, shutdown and exit lifecycle;
   - L9, leftover processes.
 - Terminal, JSON (`lspcheck-report-v1`) and JSON Lines transcript output.
+- Inspection limits (`--max-output-mib`, `--max-frame-mib`) that make results inconclusive rather than failed.
 - `lspcheck-standin`, a test server with switchable faults.

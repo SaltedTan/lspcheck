@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestone M0 and part of M1 are done: the transport, process, and session layers, the stand-in server, and checks F1, J4, L1, L2, L4, L6, L7 and L9. Everything else below is planned.
+**Status:** milestone M0 and part of M1 are done: the transport, process, and session layers, the stand-in server, and checks F1, F8, J4, L1, L2, L4, L6, L7 and L9. F1, F8 and L9 are judged across every scenario. Everything else below is planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -49,11 +49,12 @@ are to LSP 3.17 and JSON-RPC 2.0.
 | F5 | MUST | A `didOpen` whose text has 2-, 3- and 4-byte UTF-8 characters keeps the stream in sync: a following request is answered. |
 | F6 | MUST | A `Content-Type: application/vscode-jsonrpc; charset=utf-8` header is accepted (it's an optional header the client may send). |
 | F7 | SHOULD | The legacy `charset=utf8` spelling is treated as UTF-8. |
+| F8 | SHOULD | A `Content-Type` the server sends declares UTF-8 (or the legacy `utf8`), the only supported charset. |
 
 ### JSON-RPC correlation
 | ID | Basis | Check |
 |---|---|---|
-| J1 | MUST | A reply's `id` has the request's type and value: integer stays integer, `"7"` stays a string, compared lexically. |
+| J1 | MUST | A reply's `id` is the same value as the request's: a number stays a number with the same exact value (`7` and `7.0` are the same; no rounding through floating point), and `"7"` stays a string. |
 | J2 | MUST | Exactly one response per request within its deadline; no duplicates, no responses to ids never sent. |
 | J3 | MUST | No response to notifications, including unknown ones and unknown `$/` ones. |
 | J4 | MUST | An unknown request method gets error `-32601` MethodNotFound; an unknown `$/` request too. |
@@ -64,7 +65,7 @@ are to LSP 3.17 and JSON-RPC 2.0.
 ### Lifecycle
 | ID | Basis | Check |
 |---|---|---|
-| L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification before it is dropped without a reply. |
+| L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification before it is dropped without a reply (the notification half isn't tested yet). |
 | L2 | MUST | `initialize` returns an object with `capabilities`; a chosen `positionEncoding` is one the client offered (offer `utf-8` first, `utf-16` last). |
 | L3 | POLICY | A second `initialize` gets an error and the server keeps serving. |
 | L4 | MUST | `shutdown` returns `null` and the process stays alive and readable until `exit`. |

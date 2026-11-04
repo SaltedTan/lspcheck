@@ -2,51 +2,62 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Runs the lspcheck binary against the stand-in server: clean, every check
-//! passes; with each fault, the check that exists to catch it fails.
+//! passes; with each fault, the check that exists to catch it fails, and
+//! lawful-but-unusual behaviour fails nothing.
 
 #![cfg(feature = "standin")]
 
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const LSPCHECK: &str = env!("CARGO_BIN_EXE_lspcheck");
 const STANDIN: &str = env!("CARGO_BIN_EXE_lspcheck-standin");
+/// No run should take this long; a hang fails the test instead of the job.
+const WATCHDOG: Duration = Duration::from_secs(90);
 
 struct Run {
     status: i32,
     verdicts: BTreeMap<String, String>,
     stdout: String,
+    took: Duration,
 }
 
-fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
+/// Runs `lspcheck [lspcheck_args] -- <server>` with a watchdog.
+fn run_command(lspcheck_args: &[&str], server: &[&str], cwd: Option<&std::path::Path>) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let report = dir.path().join("report.json");
-    let out = Command::new(LSPCHECK)
-        .args([
-            "--timeout",
-            "5",
-            "--startup-timeout",
-            "5",
-            "--exit-timeout",
-            "2",
-        ])
+    let mut cmd = Command::new(LSPCHECK);
+    cmd.args(["--timeout", "5", "--startup-timeout", "5", "--exit-timeout", "2"])
         .args(lspcheck_args)
         .arg("--json")
         .arg(&report)
         .arg("--transcripts")
         .arg(dir.path().join("t"))
         .arg("--")
-        .arg(STANDIN)
-        .args(standin_args)
-        .output()
-        .unwrap();
+        .args(server)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let started = Instant::now();
+    let mut child = cmd.spawn().unwrap();
+    let out = loop {
+        if child.try_wait().unwrap().is_some() {
+            break child.wait_with_output().unwrap();
+        }
+        if started.elapsed() > WATCHDOG {
+            let _ = child.kill();
+            panic!("lspcheck ran longer than {WATCHDOG:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let took = started.elapsed();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let text = std::fs::read_to_string(&report).unwrap_or_else(|e| {
-        panic!(
-            "no report ({e}); stdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        )
+        panic!("no report ({e}); stdout:\n{stdout}\nstderr:\n{}", String::from_utf8_lossy(&out.stderr))
     });
     let json: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(json["schema"], "lspcheck-report-v1");
@@ -54,27 +65,23 @@ fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| {
-            (
-                r["id"].as_str().unwrap().to_string(),
-                r["verdict"].as_str().unwrap().to_string(),
-            )
-        })
+        .map(|r| (r["id"].as_str().unwrap().to_string(), r["verdict"].as_str().unwrap().to_string()))
         .collect();
-    for scenario in ["lifecycle", "pre-initialize", "exit-without-shutdown"] {
-        let path = dir.path().join("t").join(format!("{scenario}.jsonl"));
-        if path.exists() {
+    if let Ok(entries) = std::fs::read_dir(dir.path().join("t")) {
+        for entry in entries {
+            let path = entry.unwrap().path();
             for line in std::fs::read_to_string(&path).unwrap().lines() {
                 serde_json::from_str::<Value>(line)
-                    .unwrap_or_else(|e| panic!("{scenario}: bad transcript line {line}: {e}"));
+                    .unwrap_or_else(|e| panic!("{}: bad transcript line {line}: {e}", path.display()));
             }
         }
     }
-    Run {
-        status: out.status.code().unwrap_or(-1),
-        verdicts,
-        stdout,
-    }
+    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, took }
+}
+
+fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
+    let server: Vec<&str> = std::iter::once(STANDIN).chain(standin_args.iter().copied()).collect();
+    run_command(lspcheck_args, &server, None)
 }
 
 fn fault(name: &str) -> Run {
@@ -82,25 +89,16 @@ fn fault(name: &str) -> Run {
 }
 
 fn expect(run: &Run, id: &str, verdict: &str) {
-    assert_eq!(
-        run.verdicts.get(id).map(String::as_str),
-        Some(verdict),
-        "{id}\n{}",
-        run.stdout
-    );
+    assert_eq!(run.verdicts.get(id).map(String::as_str), Some(verdict), "{id}\n{}", run.stdout);
 }
 
 /// Every check except `failing` passes.
 fn only_fails(run: &Run, failing: &[&str]) {
     for (id, verdict) in &run.verdicts {
-        let want = if failing.contains(&id.as_str()) {
-            "fail"
-        } else {
-            "pass"
-        };
         if id == "L9" && !cfg!(unix) {
             continue;
         }
+        let want = if failing.contains(&id.as_str()) { "fail" } else { "pass" };
         assert_eq!(verdict, want, "{id}\n{}", run.stdout);
     }
 }
@@ -114,11 +112,36 @@ fn the_clean_standin_passes_every_check() {
 }
 
 #[test]
-fn stdout_banner_fails_f1() {
+fn lawful_variations_fail_nothing() {
+    for name in ["extension-header", "decimal-ids"] {
+        let r = fault(name);
+        only_fails(&r, &[]);
+        assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
+    }
+}
+
+#[test]
+fn stdout_output_outside_frames_fails_f1_in_any_scenario() {
     let r = fault("stdout-banner");
     only_fails(&r, &["F1"]);
     assert_eq!(r.status, 1, "F1 is a MUST check");
     assert!(r.stdout.contains("standin starting"), "{}", r.stdout);
+    // Only the pre-initialize scenario sees this one.
+    let r = fault("preinit-banner");
+    only_fails(&r, &["F1"]);
+    assert!(r.stdout.contains("in pre-initialize"), "{}", r.stdout);
+}
+
+#[test]
+fn a_control_byte_in_a_header_fails_f1() {
+    only_fails(&fault("nul-header"), &["F1"]);
+}
+
+#[test]
+fn a_non_utf8_charset_fails_f8() {
+    let r = fault("latin1");
+    only_fails(&r, &["F8"]);
+    assert_eq!(r.status, 0, "F8 is a SHOULD check");
 }
 
 #[test]
@@ -130,14 +153,27 @@ fn answering_before_initialize_fails_l1() {
 
 #[test]
 fn strict_turns_should_failures_into_status_1() {
-    let r = run(&["--fault", "no-pre-init-error"], &["--strict"]);
-    assert_eq!(r.status, 1);
+    assert_eq!(run(&["--fault", "no-pre-init-error"], &["--strict"]).status, 1);
 }
 
 #[test]
 fn bad_initialize_results_fail_l2() {
     only_fails(&fault("bad-encoding"), &["L2"]);
     only_fails(&fault("no-capabilities"), &["L2"]);
+}
+
+#[test]
+fn a_refused_initialize_is_an_error_not_a_failure() {
+    let r = fault("init-error");
+    expect(&r, "L2", "error");
+    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+    assert_eq!(r.status, 2);
+    assert!(r.stdout.contains("Required SDK is unavailable"), "{}", r.stdout);
+}
+
+#[test]
+fn replies_sent_before_their_requests_dont_count() {
+    only_fails(&fault("early-replies"), &["J4"]);
 }
 
 #[test]
@@ -168,7 +204,7 @@ fn ignoring_exit_fails_l6_and_l7() {
     let r = fault("ignore-exit");
     expect(&r, "L6", "fail");
     expect(&r, "L7", "fail");
-    // lspcheck had to stop it, so cleanup is untested rather than passed.
+    // lspcheck had to stop it in every scenario, so cleanup is untested rather than passed.
     if cfg!(unix) {
         expect(&r, "L9", "not-exercised");
     }
@@ -179,17 +215,50 @@ fn ignoring_exit_fails_l6_and_l7() {
 fn an_orphaned_child_fails_l9() {
     let r = fault("orphan-child");
     only_fails(&r, &["L9"]);
-    assert!(
-        r.stdout.contains("lspcheck-stand"),
-        "names the process:\n{}",
-        r.stdout
-    );
+    assert!(r.stdout.contains("lspcheck-stand"), "names the process:\n{}", r.stdout);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn a_child_that_leaves_the_process_group_still_fails_l9() {
-    only_fails(&fault("escaped-child"), &["L9"]);
+fn a_child_that_leaves_the_group_with_a_non_utf8_name_still_fails_l9() {
+    let r = fault("escaped-child");
+    only_fails(&r, &["L9"]);
+    assert!(r.stdout.contains("\u{fffd}standin"), "{}", r.stdout);
+}
+
+#[test]
+fn a_server_that_stops_reading_cant_stall_lspcheck() {
+    let r = fault("block-on-config");
+    expect(&r, "L2", "error");
+    // Three scenarios, each bounded by the 5 s startup timeout plus cleanup.
+    assert!(r.took < Duration::from_secs(40), "took {:?}\n{}", r.took, r.stdout);
+}
+
+#[test]
+fn output_past_the_budget_is_inconclusive_not_a_failure() {
+    let r = run(&["--fault", "flood"], &["--max-output-mib", "1"]);
+    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+    expect(&r, "F1", "error");
+    assert_eq!(r.status, 2);
+    // Within budget, the same server passes.
+    only_fails(&fault("flood"), &[]);
+}
+
+#[test]
+fn a_frame_past_the_inspection_limit_is_skipped_not_failed() {
+    let r = run(&["--fault", "big-frame"], &["--max-frame-mib", "1"]);
+    expect(&r, "F1", "error");
+    expect(&r, "L2", "pass");
+    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+}
+
+#[test]
+fn a_relative_server_path_is_resolved_before_entering_the_workspace() {
+    let path = std::path::Path::new(STANDIN);
+    let dir = path.parent().unwrap();
+    let rel = format!("./{}", path.file_name().unwrap().to_str().unwrap());
+    let r = run_command(&["--only", "L2"], &[&rel], Some(dir));
+    expect(&r, "L2", "pass");
 }
 
 #[test]
@@ -199,22 +268,27 @@ fn only_runs_the_named_checks() {
 }
 
 #[test]
+fn only_a_cross_cutting_check_still_runs_every_scenario() {
+    let r = run(&["--fault", "preinit-banner"], &["--only", "F1"]);
+    expect(&r, "F1", "fail");
+}
+
+#[test]
 fn a_missing_server_is_an_error_not_a_failure() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(LSPCHECK)
-        .arg("--json")
-        .arg(dir.path().join("r.json"))
-        .args(["--", "/nonexistent/lspcheck-no-such-server"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    let json: Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.path().join("r.json")).unwrap()).unwrap();
-    assert!(
-        json["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|r| r["verdict"] == "error")
-    );
+    let r = run_command(&[], &["/nonexistent/lspcheck-no-such-server"], None);
+    assert_eq!(r.status, 2);
+    assert!(r.verdicts.values().all(|v| v == "error"), "{}", r.stdout);
+}
+
+#[test]
+fn unreadable_frames_make_other_failures_inconclusive() {
+    // Every frame has a NUL in a header, so no reply can be read: F1 fails,
+    // and what that hides is an error, not a failure.
+    let r = fault("all-nul-headers");
+    expect(&r, "F1", "fail");
+    for (id, v) in &r.verdicts {
+        if id != "F1" {
+            assert_ne!(v, "fail", "{id}\n{}", r.stdout);
+        }
+    }
 }
