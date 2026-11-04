@@ -1,0 +1,69 @@
+# Repository instructions for coding agents
+
+lspcheck starts a language server over stdio and checks that it follows LSP 3.17 and JSON-RPC 2.0: framing, replies,
+lifecycle, and whether it leaves processes behind. Read the [README](README.md) for what users see and the
+[design](docs/design.md) for the check catalogue, architecture and milestones.
+
+| Path | What it holds |
+| --- | --- |
+| `src/main.rs` | The command line (clap) and the hidden process-group sentinel mode. |
+| `src/checks.rs` | The check catalogue, the scenarios that exercise it, and the verdict rules. |
+| `src/session.rs` | One run of a server: pipes, deadlines, request matching, transcripts, cleanup. |
+| `src/transport.rs` | The incremental frame reader and the header and media-type grammar. |
+| `src/message.rs` | JSON-RPC classification, ids compared by exact value, message builders. |
+| `src/process.rs` | Process groups, the Linux child subreaper, and the leftover-process search. |
+| `src/report.rs`, `src/transcript.rs` | Terminal and JSON reports; JSON Lines transcripts. |
+| `src/bin/standin.rs` | `lspcheck-standin`, a correct test server with faults switched on one at a time. |
+| `tests/` | The CLI against the stand-in (`standin.rs`) and session-level guarantees (`session.rs`). |
+
+## Build, test and lint
+
+The toolchain is pinned in `rust-toolchain.toml`.
+
+```sh
+cargo build --all-features
+cargo test --all-features                        # unit tests and runs against the stand-in
+cargo test --all-features --test standin NAME    # one focused test
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+CI runs clippy on Linux and the tests on Linux, macOS and Windows. Code under `cfg(unix)`, `cfg(target_os = "linux")`
+or `cfg(not(unix))` is easy to break for the other targets, so lint them locally as well:
+
+```sh
+rustup target add x86_64-apple-darwin x86_64-pc-windows-gnu
+cargo clippy --all-targets --all-features --target x86_64-apple-darwin -- -D warnings
+cargo clippy --all-targets --all-features --target x86_64-pc-windows-gnu -- -D warnings
+```
+
+Before a pull request, run fmt, clippy on all three targets and the full test suite. If you skip one, say which and
+why.
+
+## Rules that keep verdicts trustworthy
+
+Server authors will act on what lspcheck reports, so a wrong verdict is the worst bug it can have.
+
+- **Every check can fail.** Each check has a stand-in fault that makes it fail and a test showing that, and the clean
+  stand-in passes it. Lawful but unusual behaviour gets a fault too, with a test that nothing fails.
+- **A regression test must catch the bug.** Run a new test against the commit before the fix (a `git worktree` with
+  the new stand-in and tests copied in, with `cargo test --no-fail-fast`) and confirm it fails there.
+- **FAIL means lspcheck saw the rule broken.** A reply that never arrived is a failure only if nothing lspcheck failed
+  to inspect could have held it. A request lspcheck couldn't deliver is an `ERROR`. lspcheck's own inspection limits
+  are not protocol rules.
+- **Bound every wait.** Every write, wait and cleanup step has an absolute deadline; nothing joins a thread or waits
+  on a process without one.
+- **No timing races in tests.** GitHub-hosted runners are slow and uneven. Don't rely on a narrow window; order events
+  with a handshake (the stand-in's children print `ready`) and give deadlines generous margins.
+- Each check states its basis (`MUST`, `SHOULD` or `POLICY`) and links its section of the specification.
+
+## Changes
+
+- Keep changes small and focused, with tests. Work on a branch and open a pull request; CI must pass.
+- Changes to `.github/workflows/`, dependencies (`Cargo.toml`, `Cargo.lock`) or the pinned toolchain need the
+  maintainer's merge.
+- Update the README, `docs/design.md` (including its status line) and `CHANGELOG.md` under *Unreleased* for
+  user-visible changes.
+- New source files start with the copyright and SPDX header the existing files use. The project is Apache-2.0.
+- Reporting findings to other projects' servers, such as those in a CI matrix, is outward-facing: ask the maintainer
+  first.
