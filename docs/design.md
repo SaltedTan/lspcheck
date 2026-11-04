@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestone M0 and part of M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, L1, L2, L4, L6, L7 and L9. F1, F2, F8 and L9 are judged across every scenario. Everything else below is planned.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. F1, F2, F8 and L9 are judged across every scenario. Everything else below is planned; M2 is next.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -72,14 +72,14 @@ whole, because a missing reply to it can't be told apart from a slow start.
 ### Lifecycle
 | ID | Basis | Check |
 |---|---|---|
-| L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification before it is dropped without a reply (the notification half isn't tested yet). |
+| L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification sent before it (`workspace/didChangeConfiguration`) is dropped without a reply: no response other than those two answers may arrive before the answer to `initialize`. |
 | L2 | MUST | `initialize` returns an object with `capabilities`; a chosen `positionEncoding` is one the client offered (offer `utf-8` first, `utf-16` last). |
-| L3 | POLICY | A second `initialize` gets an error and the server keeps serving. |
+| L3 | POLICY | A second `initialize` gets an error and the server keeps serving: a plain request answered before it is answered after it too. |
 | L4 | MUST | `shutdown` returns `null` and the process keeps running until `exit`. |
-| L5 | SHOULD | Requests after `shutdown` get error `-32600` InvalidRequest. |
+| L5 | SHOULD | Requests after `shutdown` get error `-32600` InvalidRequest (tested with `workspace/symbol`, after L3 in the same scenario; if the server stopped answering at L3, L5 is `error`). |
 | L6 | SHOULD | `exit` after `shutdown` ends the process with status 0 within the deadline. |
 | L7 | SHOULD | `exit` without `shutdown` ends it with status 1. |
-| L8 | POLICY | End of stdin without `exit` ends the process within the deadline (prevents orphaned servers). |
+| L8 | POLICY | End of stdin without `exit`, after `initialize`, ends the process within the exit deadline, with any status (prevents orphaned servers). |
 | L9 | POLICY | After exit no descendant remains. Profiles can allow named long-lived daemons. Where lspcheck can't see an escape through `setsid`/double fork (macOS), a pass says so in its detail. |
 
 ### Cancellation

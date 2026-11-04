@@ -38,6 +38,13 @@ const FAULTS: &[(&str, &str)] = &[
     ("block-after-init", "after initialize, send a huge configuration request and stop reading"),
     ("block-on-config", "on initialize, send a huge configuration request and stop reading"),
     ("no-pre-init-error", "answer requests before initialize normally"),
+    ("ignore-pre-init-requests", "never answer requests before initialize"),
+    ("reply-to-pre-init-notification", "answer a notification before initialize with an error whose id is null"),
+    ("late-reply-to-pre-init-notification", "like reply-to-pre-init-notification, after the next request's answer"),
+    ("reinitialize", "answer a second initialize as if it were the first"),
+    ("exit-on-reinitialize", "exit on a second initialize"),
+    ("post-shutdown-results", "answer requests after shutdown normally"),
+    ("ignore-eof", "keep running when stdin ends"),
     ("bad-encoding", "choose a position encoding the client didn't offer"),
     ("no-capabilities", "leave capabilities out of the initialize result"),
     ("early-replies", "answer guessed request ids before they are sent, then answer unknown requests wrongly"),
@@ -98,6 +105,8 @@ fn main() {
     }
     let mut input = Input { inner: std::io::stdin().lock(), buf: Vec::new(), faults: faults.clone() };
     let (mut initialized, mut shut_down) = (false, false);
+    // A reply to a notification, held until the next request has been answered.
+    let mut late_reply: Option<Value> = None;
     let mut children: Vec<Child> = Vec::new();
     loop {
         if !input.ready() {
@@ -130,6 +139,16 @@ fn main() {
             if method == "textDocument/didOpen" && fault("no-open-close") {
                 std::process::exit(4);
             }
+            if !initialized && fault("late-reply-to-pre-init-notification") {
+                late_reply = Some(
+                    json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32002, "message": "not initialized"}}),
+                );
+            }
+            if !initialized && fault("reply-to-pre-init-notification") {
+                out.frame(
+                    &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32002, "message": "not initialized"}}),
+                );
+            }
             if method == "exit" && !fault("ignore-exit") {
                 if fault("big-frame-on-exit") {
                     let text = "x".repeat(2 * 1024 * 1024);
@@ -157,6 +176,13 @@ fn main() {
             }
             continue;
         };
+        if method == "initialize" && initialized && !fault("reinitialize") {
+            if fault("exit-on-reinitialize") {
+                std::process::exit(3);
+            }
+            out.frame(&err(&id, -32600, "already initialized"));
+            continue;
+        }
         if method == "initialize" {
             if fault("orphan-child") {
                 children.push(spawn_child("--child"));
@@ -244,14 +270,22 @@ fn main() {
             }
             continue;
         }
+        if !initialized && fault("ignore-pre-init-requests") {
+            continue;
+        }
         if !initialized && !fault("no-pre-init-error") {
             if fault("preinit-banner") {
                 out.raw(b"pre-init server log\n");
             }
-            out.frame(&err(&id, -32002, "not initialized"));
+            // Both in one write, so the reply is read in the same go as the answer.
+            let mut bytes = out.encode(&err(&id, -32002, "not initialized"));
+            if let Some(reply) = late_reply.take() {
+                bytes.extend(out.encode(&reply));
+            }
+            out.raw(&bytes);
             continue;
         }
-        if shut_down {
+        if shut_down && !fault("post-shutdown-results") {
             out.frame(&err(&id, -32600, "shutting down"));
             continue;
         }
@@ -288,6 +322,9 @@ fn main() {
         }
     }
     // End of input without exit.
+    if fault("ignore-eof") {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
     drop(children);
     std::process::exit(1);
 }

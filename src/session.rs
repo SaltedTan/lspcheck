@@ -496,6 +496,11 @@ impl Session {
         }
     }
 
+    /// Whether lspcheck has sent a request with this id in this session.
+    pub fn sent(&self, id: &Id) -> bool {
+        self.used_ids.contains(id)
+    }
+
     /// Sends a request, registering it so only a later response can answer it.
     pub async fn request(&mut self, method: &str, params: Option<Value>) -> Result<Id, WriteError> {
         let id = self.fresh_id();

@@ -368,6 +368,18 @@ fn answering_before_initialize_fails_l1() {
 }
 
 #[test]
+fn output_skipped_after_a_missed_answer_doesnt_excuse_it() {
+    // The request before initialize goes unanswered; the frame too big to
+    // inspect comes only with the answer to initialize, after lspcheck
+    // stopped waiting, so it can't have held the answer.
+    let r = run(
+        &["--fault", "ignore-pre-init-requests", "--fault", "big-frame"],
+        &["--timeout", "2", "--max-frame-mib", "1"],
+    );
+    expect(&r, "L1", "fail");
+}
+
+#[test]
 fn strict_turns_should_failures_into_status_1() {
     assert_eq!(run(&["--fault", "no-pre-init-error"], &["--strict"]).status, 1);
 }
@@ -399,6 +411,39 @@ fn wrong_unknown_method_errors_fail_j4() {
 }
 
 #[test]
+fn replying_to_a_notification_before_initialize_fails_l1() {
+    for name in ["reply-to-pre-init-notification", "late-reply-to-pre-init-notification"] {
+        let r = fault(name);
+        only_fails(&r, &["L1"]);
+        assert!(r.stdout.contains("a notification sent before initialize got a reply"), "{name}\n{}", r.stdout);
+    }
+}
+
+#[test]
+fn a_second_initialize_must_get_an_error_and_leave_the_server_serving() {
+    only_fails(&fault("reinitialize"), &["L3"]);
+    // Exiting fails L3, and leaves L5 unjudged rather than failed.
+    let r = fault("exit-on-reinitialize");
+    expect(&r, "L3", "fail");
+    expect(&r, "L5", "error");
+    assert!(r.verdicts.iter().all(|(id, v)| id == "L3" || v != "fail"), "{}", r.stdout);
+}
+
+#[test]
+fn answering_requests_after_shutdown_fails_l5() {
+    let r = fault("post-shutdown-results");
+    only_fails(&r, &["L5"]);
+    assert_eq!(r.status, 0, "L5 is a SHOULD check");
+}
+
+#[test]
+fn staying_alive_after_the_end_of_input_fails_l8() {
+    let r = fault("ignore-eof");
+    only_fails(&r, &["L8"]);
+    assert_eq!(r.status, 0, "L8 is a POLICY check");
+}
+
+#[test]
 fn a_non_null_shutdown_result_fails_l4() {
     only_fails(&fault("shutdown-result"), &["L4"]);
 }
@@ -420,7 +465,15 @@ fn ignoring_exit_fails_l6_and_l7() {
     let r = fault("ignore-exit");
     expect(&r, "L6", "fail");
     expect(&r, "L7", "fail");
-    // lspcheck had to stop it in every scenario, so cleanup is untested rather than passed.
+    // It still exits when its input ends, so its cleanup was tested there.
+    expect(&r, "L8", "pass");
+    if cfg!(unix) {
+        expect(&r, "L9", "pass");
+    }
+    // Ignoring the end of input too, lspcheck had to stop it in every
+    // scenario, so cleanup is untested rather than passed.
+    let r = run(&["--fault", "ignore-exit", "--fault", "ignore-eof"], &[]);
+    expect(&r, "L8", "fail");
     if cfg!(unix) {
         expect(&r, "L9", "not-exercised");
     }
