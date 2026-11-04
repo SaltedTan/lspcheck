@@ -169,6 +169,7 @@ pub struct Observations {
     pub content_types: Vec<(Duration, String)>,
     pub non_ascii: Option<Duration>,
     pub miscounted: Vec<(Duration, String)>,
+    pub unchecked: usize,
     pub killed: bool,
     pub leftovers: Vec<ProcInfo>,
     pub coverage: Coverage,
@@ -305,6 +306,7 @@ fn observations(f: Finish) -> Observations {
         content_types: f.content_types,
         non_ascii: f.non_ascii,
         miscounted: f.miscounted,
+        unchecked: f.unchecked,
         killed: f.killed,
         leftovers: f.leftovers,
         coverage: f.coverage,
@@ -868,6 +870,16 @@ fn judge_f2(runs: &[ScenarioRun]) -> CheckResult {
         })
         .collect();
     let r = cross("F2", runs, failures, "", true);
+    if r.verdict == Verdict::Pass
+        && let Some((name, o)) = observed(runs).find(|(_, o)| o.unchecked > 0)
+    {
+        return result(
+            "all",
+            "F2",
+            Verdict::Error,
+            format!("inconclusive: in {name}, {} unreadable frames weren't checked (too many to examine)", o.unchecked),
+        );
+    }
     if r.verdict == Verdict::Pass && observed(runs).all(|(_, o)| o.non_ascii.is_none()) {
         return result(
             "all",
@@ -1030,6 +1042,7 @@ mod tests {
                 content_types: Vec::new(),
                 non_ascii: None,
                 miscounted: Vec::new(),
+                unchecked: 0,
                 killed: false,
                 leftovers,
                 coverage: Coverage::GroupAndEscaped,

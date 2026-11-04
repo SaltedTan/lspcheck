@@ -184,6 +184,8 @@ struct Evidence {
     /// Frames whose body couldn't be read (not JSON, or cut off by the end of
     /// the stream): when, the Content-Length, and where the body starts.
     unparsed: Vec<(Duration, usize, usize)>,
+    /// lspcheck stopped reading stdout into the transcript before it ended.
+    cut: bool,
     /// The stdout task has seen the end of the stream.
     done: bool,
 }
@@ -223,6 +225,9 @@ pub struct Finish {
     /// Frames whose Content-Length wasn't the length in bytes of the JSON
     /// body that followed, which had non-ASCII text: when, and how.
     pub miscounted: Vec<(Duration, String)>,
+    /// How many unreadable frames weren't checked for that, because the
+    /// work allowed for it ran out.
+    pub unchecked: usize,
 }
 
 type Transcript = Arc<Mutex<Vec<Event>>>;
@@ -817,7 +822,8 @@ impl Session {
             ));
         }
         let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
-        let miscounted = miscounted_frames(&evidence.unparsed, &transcript);
+        let whole = evidence.done && !evidence.cut;
+        let (miscounted, unchecked) = miscounted_frames(&evidence.unparsed, &transcript, whole);
         Finish {
             exit: if killed { None } else { self.exit },
             killed,
@@ -834,6 +840,7 @@ impl Session {
             content_types: evidence.content_types,
             non_ascii: evidence.non_ascii,
             miscounted,
+            unchecked,
         }
     }
 }
@@ -853,7 +860,10 @@ async fn read_stdout(
     let (mut total, mut stopped) = (0usize, false);
     let stop = |at: Duration, why: String| {
         record(&t, at, EventKind::Note(why.clone()));
-        evidence.lock().expect("evidence lock").limit.get_or_insert((at, why));
+        let mut ev = evidence.lock().expect("evidence lock");
+        ev.cut = true;
+        ev.limit.get_or_insert((at, why));
+        drop(ev);
         let _ = tx.send((at, Inbound::Stopped));
     };
     let deliver = |at: Duration, chunk: Chunk, stopped: &mut bool| {
@@ -952,11 +962,17 @@ async fn read_stdout(
     let _ = tx.send((at, Inbound::Closed));
 }
 
-/// Frames whose body wasn't JSON because their Content-Length wasn't counted
-/// in bytes. The transcript holds every byte of stdout that was inspected.
-fn miscounted_frames(unparsed: &[(Duration, usize, usize)], transcript: &[Event]) -> Vec<(Duration, String)> {
+/// Frames whose body couldn't be read because their Content-Length wasn't
+/// counted in bytes, and how many couldn't be checked. The transcript holds
+/// every byte of stdout that was inspected; `whole` says whether that is all
+/// of it.
+fn miscounted_frames(
+    unparsed: &[(Duration, usize, usize)],
+    transcript: &[Event],
+    whole: bool,
+) -> (Vec<(Duration, String)>, usize) {
     if unparsed.is_empty() {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let stdout: Vec<u8> = transcript
         .iter()
@@ -966,16 +982,26 @@ fn miscounted_frames(unparsed: &[(Duration, usize, usize)], transcript: &[Event]
         })
         .collect::<Vec<_>>()
         .concat();
-    // Each analysis reads at most about 4 × Content-Length bytes, so the
-    // total is proportional to the output.
-    unparsed
-        .iter()
-        .filter_map(|&(at, length, start)| {
-            let (bytes, counts) = transport::miscounted_length(stdout.get(start..)?, length)?;
-            let counts = counts.map(|c| format!(" (it counts {c})")).unwrap_or_default();
-            Some((at, format!("Content-Length {length}{counts}, but the JSON body that follows is {bytes} bytes")))
-        })
-        .collect()
+    // Parsing reads at most about 4 × Content-Length bytes per frame, which
+    // is proportional to the output; looking for the header section after
+    // a candidate body is bounded by this budget.
+    let mut budget = 1024 * 1024;
+    let (mut found, mut unchecked) = (Vec::new(), 0);
+    for &(at, length, start) in unparsed {
+        let Some(rest) = stdout.get(start..) else { continue };
+        match transport::miscounted_length(rest, length, whole, &mut budget) {
+            transport::Count::Miscounted { bytes, counts } => {
+                let counts = counts.map(|c| format!(" (it counts {c})")).unwrap_or_default();
+                found.push((
+                    at,
+                    format!("Content-Length {length}{counts}, but the JSON body that follows is {bytes} bytes"),
+                ));
+            }
+            transport::Count::Unknown => {}
+            transport::Count::Unchecked => unchecked += 1,
+        }
+    }
+    (found, unchecked)
 }
 
 fn parsed_event(chunk: &Chunk) -> EventKind {

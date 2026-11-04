@@ -138,7 +138,15 @@ fn the_clean_standin_passes_every_check() {
 
 #[test]
 fn lawful_variations_fail_nothing() {
-    for name in ["extension-header", "decimal-ids", "long-header", "answers-reordered", "slow-reads", "no-open-close"] {
+    for name in [
+        "extension-header",
+        "decimal-ids",
+        "long-header",
+        "answers-reordered",
+        "slow-reads",
+        "no-open-close",
+        "newline-after-body",
+    ] {
         let r = fault(name);
         only_fails(&r, &[]);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
@@ -221,6 +229,12 @@ fn a_content_length_counted_in_characters_fails_f2() {
     // The frame can't be read either, so F1 fails too.
     only_fails(&r, &["F1", "F2"]);
     assert!(r.stdout.contains("(it counts characters)"), "{}", r.stdout);
+    // Also with whitespace after the JSON, or an extension header before the next frame's Content-Length.
+    for other in ["newline-after-body", "extension-header"] {
+        let r = run(&["--fault", "char-length", "--fault", other], &[]);
+        expect(&r, "F2", "fail");
+        assert!(r.stdout.contains("(it counts characters)"), "{other}\n{}", r.stdout);
+    }
 }
 
 #[test]
@@ -241,7 +255,7 @@ fn a_last_frame_cut_off_by_its_own_length_fails_f2() {
     // Its body is complete; the Content-Length promised 10,000 bytes more.
     let r = fault("overlong-last-frame");
     expect(&r, "F2", "fail");
-    assert!(r.stdout.contains("Content-Length 10081, but the JSON body that follows is 81 bytes"), "{}", r.stdout);
+    assert!(r.stdout.contains("Content-Length 10082, but the JSON body that follows is 82 bytes"), "{}", r.stdout);
 }
 
 #[test]
