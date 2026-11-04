@@ -244,6 +244,20 @@ fn a_correctly_counted_body_that_isnt_json_fails_f1_not_f2() {
 }
 
 #[test]
+fn a_body_the_next_header_line_would_complete_fails_f1_not_f2() {
+    // Joined to the next frame's first header line, the body would be JSON,
+    // but the next header section starts where the body was declared to end.
+    only_fails(&fault("json-into-next-header"), &["F1"]);
+}
+
+#[test]
+fn a_miscount_too_long_to_examine_is_inconclusive_not_a_pass() {
+    let r = fault("long-miscount");
+    expect(&r, "F1", "fail");
+    expect(&r, "F2", "error");
+}
+
+#[test]
 fn every_unreadable_body_is_examined_for_f2() {
     // 70 unreadable bodies come before the miscounted ones in each scenario.
     let r = run(&["--fault", "bad-bodies", "--fault", "char-length"], &[]);

@@ -877,7 +877,10 @@ fn judge_f2(runs: &[ScenarioRun]) -> CheckResult {
             "all",
             "F2",
             Verdict::Error,
-            format!("inconclusive: in {name}, {} unreadable frames weren't checked (too many to examine)", o.unchecked),
+            format!(
+                "inconclusive: in {name}, lspcheck couldn't finish checking {} unreadable frame(s) within its limits",
+                o.unchecked
+            ),
         );
     }
     if r.verdict == Verdict::Pass && observed(runs).all(|(_, o)| o.non_ascii.is_none()) {

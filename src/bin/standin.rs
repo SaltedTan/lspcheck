@@ -24,6 +24,8 @@ const FAULTS: &[(&str, &str)] = &[
     ("trailing-junk", "send one non-ASCII notification whose body is JSON then a header and {}, correctly counted"),
     ("newline-after-body", "lawful: end every outgoing body with a newline, counted in its Content-Length"),
     ("bad-bodies", "on initialize, send 70 frames whose body isn't JSON"),
+    ("json-into-next-header", "send a correctly counted body that the next frame's first header line would complete"),
+    ("long-miscount", "send one long non-ASCII log message declaring a Content-Length of 1"),
     ("overlong-last-frame", "on exit, send a non-ASCII log message and newline declaring 10,000 bytes too many"),
     ("ascii-escape", "lawful: escape non-ASCII text in outgoing frames as \\u sequences"),
     ("extension-header", "lawful: send an X-Trace header before Content-Length"),
@@ -171,6 +173,21 @@ fn main() {
             if fault("trailing-junk") {
                 let body = "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":4,\"message\":\"é\"}}Content-Length: 2\r\n\r\n{}";
                 out.raw(format!("Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+            }
+            if fault("json-into-next-header") {
+                let body =
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":4,\"message\":\"é";
+                out.raw(
+                    format!("Content-Length: {}\r\n\r\n{body}X: \"}}}}\r\nContent-Length: 2\r\n\r\n{{}}", body.len())
+                        .as_bytes(),
+                );
+            }
+            if fault("long-miscount") {
+                let text = "é".repeat(100);
+                let body = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{{\"type\":4,\"message\":\"{text}\"}}}}"
+                );
+                out.raw(format!("Content-Length: 1\r\n\r\n{body}").as_bytes());
             }
             if fault("bad-bodies") {
                 for _ in 0..70 {
