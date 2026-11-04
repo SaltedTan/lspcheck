@@ -179,6 +179,10 @@ struct Evidence {
     problems: Vec<(Duration, Problem)>,
     content_types: Vec<(Duration, String)>,
     limit: Option<(Duration, String)>,
+    /// When the first readable frame with non-ASCII text in its body arrived.
+    non_ascii: Option<Duration>,
+    /// Frames whose body isn't JSON: when, the Content-Length, and where the body starts.
+    unparsed: Vec<(Duration, usize, usize)>,
     /// The stdout task has seen the end of the stream.
     done: bool,
 }
@@ -213,6 +217,11 @@ pub struct Finish {
     pub unmatched: Vec<(Duration, Id)>,
     /// `Content-Type` values the server sent.
     pub content_types: Vec<(Duration, String)>,
+    /// When the first readable frame with non-ASCII text in its body arrived.
+    pub non_ascii: Option<Duration>,
+    /// Frames whose Content-Length wasn't the length in bytes of the JSON
+    /// body that followed, which had non-ASCII text: when, and how.
+    pub miscounted: Vec<(Duration, String)>,
 }
 
 type Transcript = Arc<Mutex<Vec<Event>>>;
@@ -807,6 +816,7 @@ impl Session {
             ));
         }
         let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
+        let miscounted = miscounted_frames(&evidence.unparsed, &transcript);
         Finish {
             exit: if killed { None } else { self.exit },
             killed,
@@ -821,6 +831,8 @@ impl Session {
             problems: evidence.problems,
             unmatched: std::mem::take(&mut self.unmatched),
             content_types: evidence.content_types,
+            non_ascii: evidence.non_ascii,
+            miscounted,
         }
     }
 }
@@ -852,14 +864,20 @@ async fn read_stdout(
             }
         };
         let problem = match chunk {
-            Chunk::Frame { headers, body } => {
+            Chunk::Frame { headers, body, start } => {
                 content_types(&mut ev, &headers);
                 match Message::parse(&body) {
                     Ok(m) => {
+                        if ev.non_ascii.is_none() && !body.is_ascii() {
+                            ev.non_ascii = Some(at);
+                        }
                         let _ = tx.send((at, Inbound::Message(m)));
                         return;
                     }
-                    Err(error) => Problem::NotJson { body, error },
+                    Err(error) => {
+                        ev.unparsed.push((at, body.len(), start));
+                        Problem::NotJson { body, error }
+                    }
                 }
             }
             Chunk::Oversized { headers, content_length, limit } => {
@@ -928,6 +946,32 @@ async fn read_stdout(
     record(&t, at, EventKind::StdoutClosed);
     evidence.lock().expect("evidence lock").done = true;
     let _ = tx.send((at, Inbound::Closed));
+}
+
+/// Frames whose body wasn't JSON because their Content-Length wasn't counted
+/// in bytes. The transcript holds every byte of stdout that was inspected.
+fn miscounted_frames(unparsed: &[(Duration, usize, usize)], transcript: &[Event]) -> Vec<(Duration, String)> {
+    if unparsed.is_empty() {
+        return Vec::new();
+    }
+    let stdout: Vec<u8> = transcript
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Read(b) => Some(b.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    // Enough to show the pattern without rescanning a long broken stream.
+    unparsed
+        .iter()
+        .take(64)
+        .filter_map(|&(at, length, start)| {
+            let (bytes, counts) = transport::miscounted_length(stdout.get(start..)?, length)?;
+            let counts = counts.map(|c| format!(" (it counts {c})")).unwrap_or_default();
+            Some((at, format!("Content-Length {length}{counts}, but the JSON body that follows is {bytes} bytes")))
+        })
+        .collect()
 }
 
 fn parsed_event(chunk: &Chunk) -> EventKind {

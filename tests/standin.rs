@@ -216,6 +216,37 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
 }
 
 #[test]
+fn a_content_length_counted_in_characters_fails_f2() {
+    let r = fault("char-length");
+    // The frame can't be read either, so F1 fails too.
+    only_fails(&r, &["F1", "F2"]);
+    assert!(r.stdout.contains("(it counts characters)"), "{}", r.stdout);
+}
+
+#[test]
+fn escaped_non_ascii_output_leaves_f2_not_exercised() {
+    let r = fault("ascii-escape");
+    expect(&r, "F2", "not-exercised");
+    for (id, v) in &r.verdicts {
+        if id != "F2" && !(id == "L9" && !cfg!(unix)) {
+            assert_eq!(v, "pass", "{id}\n{}", r.stdout);
+        }
+    }
+    assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn a_server_lost_on_the_f2_probe_doesnt_fail_what_follows() {
+    // The probe for F2's evidence has a string id, and this server exits on
+    // it. F3's last part comes after it, and isn't run.
+    let r = fault("exit-on-string-id");
+    expect(&r, "F2", "not-exercised");
+    expect(&r, "F3", "pass");
+    assert!(r.stdout.contains("the part that splits multibyte characters wasn't run"), "{}", r.stdout);
+    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+}
+
+#[test]
 fn input_split_across_writes_must_be_read() {
     // A reader that expects each header section in one read.
     only_fails(&fault_taking_effect("split-header", "split-header dropped"), &["F3"]);
@@ -235,7 +266,14 @@ fn frames_coalesced_in_one_write_must_all_be_read() {
 #[test]
 fn counting_incoming_characters_instead_of_bytes_fails_f5() {
     let r = fault("char-length-input");
-    only_fails(&r, &["F5"]);
+    expect(&r, "F5", "fail");
+    // The probe with non-ASCII output for F2 isn't sent to a server that can't read it.
+    expect(&r, "F2", "not-exercised");
+    for (id, v) in &r.verdicts {
+        if !["F2", "F5"].contains(&id.as_str()) && !(id == "L9" && !cfg!(unix)) {
+            assert_eq!(v, "pass", "{id}\n{}", r.stdout);
+        }
+    }
     // F3's multibyte part depends on F5, and says it wasn't run.
     assert!(r.stdout.contains("wasn't run, because F5 didn't pass"), "{}", r.stdout);
 }

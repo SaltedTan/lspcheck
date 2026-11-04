@@ -3,7 +3,7 @@
 ## Unreleased
 
 - First checks:
-  - F1, stdout framing, and F8, the declared charset;
+  - F1, stdout framing, F2, Content-Length counted in bytes, and F8, the declared charset;
   - F3 to F7, how the server reads its input: split writes, coalesced frames, multibyte text, and the client's
     `Content-Type` header in both charset spellings;
   - J4, MethodNotFound for unknown requests;

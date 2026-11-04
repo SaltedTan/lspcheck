@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestone M0 and part of M1 are done: the transport, process, and session layers, the stand-in server, and checks F1, F3 to F8, J4, L1, L2, L4, L6, L7 and L9. F1, F8 and L9 are judged across every scenario. Everything else below is planned.
+**Status:** milestone M0 and part of M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, L1, L2, L4, L6, L7 and L9. F1, F2, F8 and L9 are judged across every scenario. Everything else below is planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -43,7 +43,7 @@ are to LSP 3.17 and JSON-RPC 2.0.
 | ID | Basis | Check |
 |---|---|---|
 | F1 | MUST | Every byte the server writes to stdout, from spawn to exit, belongs to a well-formed frame (startup banners, logs and stray newlines fail). |
-| F2 | MUST | Each frame's `Content-Length` equals the body's length in **bytes**. `not-exercised` if no frame carried non-ASCII text. |
+| F2 | MUST | Each frame's `Content-Length` equals the body's length in **bytes**. A frame whose body isn't JSON fails F2 when a complete JSON value with non-ASCII text starts where the body does and is longer or shorter than `Content-Length`; the detail says whether the count was of characters or UTF-16 code units. To get non-ASCII output, the framing scenario sends a request whose string id has some (once F5 has shown the server reads such input). `not-exercised` if no readable frame carried non-ASCII text. |
 | F3 | MUST | Input split across writes is read: a request whose header is written one byte per write and whose body is cut at seeded points, then (when F5 passed) one cut inside 2-, 3- and 4-byte characters. The writes are 10 ms apart, so a server reading promptly sees them separately. |
 | F4 | MUST | Several frames in one write are all read (two requests with a `$/setTrace` notification between them). |
 | F5 | MUST | A `didOpen` whose text has 2-, 3- and 4-byte UTF-8 characters keeps the stream in sync: a following request, with such characters too, is answered. The `didOpen` is sent only when the server asks for open and close notifications (`textDocumentSync` a kind other than None, or `openClose: true`). |
