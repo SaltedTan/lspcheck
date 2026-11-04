@@ -17,17 +17,22 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  F7  SHOULD  The legacy charset=utf8 spelling from the client is accepted
   PASS  F8  SHOULD  A Content-Type the server sends declares UTF-8
   PASS  J4  MUST    An unknown request gets MethodNotFound (-32601), including a $/ request
-  FAIL  L1  SHOULD  A request before initialize gets ServerNotInitialized (-32002)
+  FAIL  L1  SHOULD  Before initialize, a request gets ServerNotInitialized (-32002) and a notification no reply
                      got result "[]" instead of ServerNotInitialized
   PASS  L2  MUST    initialize returns capabilities and an offered position encoding
+  FAIL  L3  POLICY  A second initialize gets an error and the server keeps serving
+                     a second initialize got result "{\"capabilities\":{\"textDocumentSync\":{\"willSave\":true,\"change\":2,\"openClose\":true"… instead of an error
   PASS  L4  MUST    shutdown returns null and the server keeps running until exit
+  FAIL  L5  SHOULD  A request after shutdown gets InvalidRequest (-32600)
+                     a request after shutdown got result "[]" instead of InvalidRequest
   PASS  L6  SHOULD  exit after shutdown ends the process with status 0
   PASS  L7  SHOULD  exit without shutdown ends the process with status 1
+  PASS  L8  POLICY  End of input without exit ends the process
   PASS  L9  POLICY  No descendant process outlives the server
-15 checks: 14 pass, 1 fail (0 MUST, 1 SHOULD, 0 POLICY), 0 skipped, 0 not exercised, 0 errors
+18 checks: 15 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 15 checks so far. [The design](docs/design.md) lists the rest, which cover framing edge
+lspcheck is early: it has 18 checks so far, covering framing and the lifecycle. [The design](docs/design.md) lists the rest, which cover framing edge
 cases, request ids, cancellation, document positions and robustness.
 
 ## What it doesn't do

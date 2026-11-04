@@ -87,11 +87,20 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "An unknown request gets MethodNotFound (-32601), including a $/ request",
         "dollarRequests"
     ),
-    check!("L1", Lifecycle, Should, "A request before initialize gets ServerNotInitialized (-32002)", "initialize"),
+    check!(
+        "L1",
+        Lifecycle,
+        Should,
+        "Before initialize, a request gets ServerNotInitialized (-32002) and a notification no reply",
+        "initialize"
+    ),
     check!("L2", Lifecycle, Must, "initialize returns capabilities and an offered position encoding", "initialize"),
+    check!("L3", Lifecycle, Policy, "A second initialize gets an error and the server keeps serving", "initialize"),
     check!("L4", Lifecycle, Must, "shutdown returns null and the server keeps running until exit", "shutdown"),
+    check!("L5", Lifecycle, Should, "A request after shutdown gets InvalidRequest (-32600)", "shutdown"),
     check!("L6", Lifecycle, Should, "exit after shutdown ends the process with status 0", "exit"),
     check!("L7", Lifecycle, Should, "exit without shutdown ends the process with status 1", "exit"),
+    check!("L8", Lifecycle, Policy, "End of input without exit ends the process", "exit"),
     check!("L9", Lifecycle, Policy, "No descendant process outlives the server", "exit"),
 ];
 
@@ -200,6 +209,8 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "pre-initialize", checks: &["L1"] },
     Scenario { name: "exit-without-shutdown", checks: &["L7"] },
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
+    Scenario { name: "after-initialize", checks: &["L3", "L5"] },
+    Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
 /// Runs the scenarios needed for `selected` (every check when empty) and
@@ -259,6 +270,8 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         "pre-initialize" => pre_initialize(&mut ctx).await,
         "exit-without-shutdown" => exit_without_shutdown(&mut ctx).await,
         "framing" => framing(&mut ctx).await,
+        "after-initialize" => after_initialize(&mut ctx).await,
+        "end-of-input" => end_of_input(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
     let Ctx { s, mut results, .. } = ctx;
@@ -485,19 +498,47 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
     }
 }
 
-/// A request before initialize.
+/// A notification and a request before initialize.
 async fn pre_initialize(ctx: &mut Ctx<'_>) {
     let t = ctx.cfg.request_timeout;
+    let before = ctx.s.messages.len();
+    if let Err(e) = ctx.s.notify("workspace/didChangeConfiguration", Some(json!({"settings": {}}))).await {
+        ctx.report("L1", Verdict::Error, format!("could not send a notification: {e}"));
+        return;
+    }
     match ctx.s.call("workspace/symbol", Some(json!({"query": ""})), t).await {
-        Ok(m) => match &m.kind {
-            Kind::Response { outcome: Outcome::Error { code: Some(codes::SERVER_NOT_INITIALIZED), .. }, .. } => {
-                ctx.pass("L1")
+        Ok(m) => {
+            let mut problems = Vec::new();
+            match &m.kind {
+                Kind::Response {
+                    outcome: Outcome::Error { code: Some(codes::SERVER_NOT_INITIALIZED), .. }, ..
+                } => {}
+                Kind::Response { outcome, .. } => {
+                    problems.push(format!("got {} instead of ServerNotInitialized", describe_outcome(outcome)))
+                }
+                _ => unreachable!(),
             }
-            Kind::Response { outcome, .. } => {
-                ctx.fail("L1", format!("got {} instead of ServerNotInitialized", describe_outcome(outcome)))
+            // A server reads in order, so a reply to the notification comes
+            // before the request's answer.
+            let answer = m.response_id();
+            let reply = ctx.s.messages[before..].iter().find_map(|(_, x)| match &x.kind {
+                Kind::Response { id, outcome } if Some(id) != answer => {
+                    Some(format!("{} with id {id}", describe_outcome(outcome)))
+                }
+                Kind::Invalid(_) if x.value.get("result").is_some() || x.value.get("error").is_some() => {
+                    Some(format!("a response without an id: {}", session::preview(x.value.to_string().as_bytes())))
+                }
+                _ => None,
+            });
+            if let Some(reply) = reply {
+                problems.push(format!("a notification sent before initialize got a reply: {reply}"));
             }
-            _ => unreachable!(),
-        },
+            if problems.is_empty() {
+                ctx.pass("L1");
+            } else {
+                ctx.fail("L1", problems.join("; "));
+            }
+        }
         Err(e) => ctx.fail_call("L1", describe_call_error(&e, t), &e),
     }
     // Leave politely so the server isn't killed mid-thought.
@@ -505,6 +546,104 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
         let _ = ctx.s.call("shutdown", None, t).await;
         let _ = ctx.s.notify("exit", None).await;
         let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    }
+}
+
+/// A second initialize, then a request after shutdown.
+async fn after_initialize(ctx: &mut Ctx<'_>) {
+    if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
+        ctx.initialize().await
+    {
+        for id in ["L3", "L5"] {
+            ctx.report(id, Verdict::Error, format!("initialize didn't succeed: {why}"));
+        }
+        return;
+    }
+    let t = ctx.cfg.request_timeout;
+    // Whether the server answers a plain request, so that whether it still
+    // does after the second initialize means something.
+    let answers = ctx.s.call(PROBE, Some(json!({})), t).await.is_ok();
+
+    // L3. Why the server can no longer be relied on, if it can't.
+    let mut stopped: Option<&str> = None;
+    match ctx.s.call("initialize", Some(initialize_params(&ctx.root)), t).await {
+        Ok(m) => match &m.kind {
+            Kind::Response { outcome: Outcome::Error { code: Some(_), .. }, .. } => {
+                if !answers {
+                    ctx.pass_with(
+                        "L3",
+                        "whether it keeps serving wasn't checked: it didn't answer a plain request before either",
+                    );
+                } else {
+                    match ctx.s.call(PROBE, Some(json!({})), t).await {
+                        Ok(_) => ctx.pass("L3"),
+                        Err(e) => {
+                            stopped = Some("the server stopped answering after the second initialize (see L3)");
+                            let why = format!(
+                                "after the error for the second initialize, a plain request went unanswered ({})",
+                                describe_call_error(&e, t)
+                            );
+                            ctx.fail_call("L3", why, &e);
+                        }
+                    }
+                }
+            }
+            Kind::Response { outcome, .. } => {
+                ctx.fail("L3", format!("a second initialize got {} instead of an error", describe_outcome(outcome)))
+            }
+            _ => unreachable!(),
+        },
+        Err(e) => {
+            stopped = Some("the second initialize went unanswered (see L3)");
+            ctx.fail_call("L3", format!("a second initialize went unanswered ({})", describe_call_error(&e, t)), &e);
+        }
+    }
+
+    // L5.
+    if let Some(why) = stopped {
+        return ctx.report("L5", Verdict::Error, format!("not judged: {why}"));
+    }
+    if let Err(e) = ctx.s.call("shutdown", None, t).await {
+        return ctx.report("L5", Verdict::Error, format!("shutdown: {}", describe_call_error(&e, t)));
+    }
+    if !ctx.s.is_alive() {
+        return ctx.report("L5", Verdict::NotExercised, "the server exited after shutdown, before exit (see L4)");
+    }
+    match ctx.s.call("workspace/symbol", Some(json!({"query": ""})), t).await {
+        Ok(m) => match &m.kind {
+            Kind::Response { outcome: Outcome::Error { code: Some(codes::INVALID_REQUEST), .. }, .. } => ctx.pass("L5"),
+            Kind::Response { outcome, .. } => ctx.fail(
+                "L5",
+                format!("a request after shutdown got {} instead of InvalidRequest", describe_outcome(outcome)),
+            ),
+            _ => unreachable!(),
+        },
+        Err(e) => ctx.fail_call(
+            "L5",
+            format!("a request after shutdown went unanswered ({})", describe_call_error(&e, t)),
+            &e,
+        ),
+    }
+    if ctx.s.notify("exit", None).await.is_ok() {
+        let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    }
+}
+
+/// End of input without exit, as when the editor goes away.
+async fn end_of_input(ctx: &mut Ctx<'_>) {
+    if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
+        ctx.initialize().await
+    {
+        return ctx.report("L8", Verdict::Error, format!("initialize didn't succeed: {why}"));
+    }
+    if !ctx.s.is_alive() {
+        return ctx.report("L8", Verdict::NotExercised, "the server exited before its input ended");
+    }
+    ctx.s.close_stdin();
+    let wait = ctx.cfg.exit_timeout;
+    match ctx.s.wait_exit(Instant::now() + wait).await {
+        Some(_) => ctx.pass("L8"),
+        None => ctx.fail("L8", format!("still running {} s after its stdin closed", wait.as_secs())),
     }
 }
 
