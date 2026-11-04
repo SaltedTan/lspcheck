@@ -38,6 +38,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("block-after-init", "after initialize, send a huge configuration request and stop reading"),
     ("block-on-config", "on initialize, send a huge configuration request and stop reading"),
     ("no-pre-init-error", "answer requests before initialize normally"),
+    ("ignore-pre-init-requests", "never answer requests before initialize"),
     ("reply-to-pre-init-notification", "answer a notification before initialize with an error whose id is null"),
     ("late-reply-to-pre-init-notification", "like reply-to-pre-init-notification, after the next request's answer"),
     ("reinitialize", "answer a second initialize as if it were the first"),
@@ -267,6 +268,9 @@ fn main() {
                     out.frame(&err(&json!(next), -32601, "method not found"));
                 }
             }
+            continue;
+        }
+        if !initialized && fault("ignore-pre-init-requests") {
             continue;
         }
         if !initialized && !fault("no-pre-init-error") {

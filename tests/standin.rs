@@ -368,6 +368,18 @@ fn answering_before_initialize_fails_l1() {
 }
 
 #[test]
+fn output_skipped_after_a_missed_answer_doesnt_excuse_it() {
+    // The request before initialize goes unanswered; the frame too big to
+    // inspect comes only with the answer to initialize, after lspcheck
+    // stopped waiting, so it can't have held the answer.
+    let r = run(
+        &["--fault", "ignore-pre-init-requests", "--fault", "big-frame"],
+        &["--timeout", "2", "--max-frame-mib", "1"],
+    );
+    expect(&r, "L1", "fail");
+}
+
+#[test]
 fn strict_turns_should_failures_into_status_1() {
     assert_eq!(run(&["--fault", "no-pre-init-error"], &["--strict"]).status, 1);
 }

@@ -507,6 +507,9 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
         return;
     }
     let request = ctx.s.call("workspace/symbol", Some(json!({"query": ""})), t).await;
+    // When lspcheck stopped waiting for the answer: only what it missed
+    // before then could explain a missing answer.
+    let waited = ctx.s.elapsed();
     // A reply to the notification can come after the request's answer, so
     // look at everything read until the answer to initialize.
     let init = ctx.initialize().await;
@@ -542,7 +545,12 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
         // The reply was seen, whatever happened to the request.
         Err(e) => match replied {
             Some(replied) => ctx.fail("L1", format!("{replied}; the request got {}", describe_call_error(e, t))),
-            None => ctx.fail_call("L1", describe_call_error(e, t), e),
+            None => {
+                ctx.fail_call("L1", describe_call_error(e, t), e);
+                if let Some(r) = ctx.results.last_mut().filter(|r| r.absent_at.is_some()) {
+                    r.absent_at = Some(waited);
+                }
+            }
         },
     }
     // Leave politely so the server isn't killed mid-thought.
