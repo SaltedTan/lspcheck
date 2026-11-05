@@ -164,19 +164,24 @@ pub enum ContentChange {
 pub enum ChangeError {
     /// A line of the range the document doesn't have.
     NoLine(usize),
-    /// A character of the range past the end of its line in the encoding.
-    PastEndOfLine,
+    /// A character of the range inside a character in the encoding.
+    InsideCharacter,
     /// The range's end precedes its start.
     Inverted,
 }
 
 /// The byte offset of a position in the whole text: the line's start plus
-/// the character's offset in the line.
-fn position_byte(text: &str, encoding: Encoding, p: Position) -> Result<usize, ChangeError> {
+/// the character's offset in the line, clamping a character past the end of
+/// its line to the line's length: LSP 3.17 says a character greater than
+/// the line length defaults back to the line length. Only applying a change
+/// clamps; an inspected position past the end of its line is reported as
+/// such.
+fn position_byte_clamped(text: &str, encoding: Encoding, p: Position) -> Result<usize, ChangeError> {
     let mut start = 0;
     for (line, l) in split_lines(text).into_iter().enumerate() {
         if line == p.line {
-            let off = offset_to_bytes(l, encoding, p.character).map_err(|_| ChangeError::PastEndOfLine)?;
+            let character = p.character.min(line_length(l, encoding));
+            let off = offset_to_bytes(l, encoding, character).map_err(|_| ChangeError::InsideCharacter)?;
             return Ok(start + off);
         }
         start += l.len();
@@ -188,9 +193,10 @@ fn position_byte(text: &str, encoding: Encoding, p: Position) -> Result<usize, C
 }
 
 /// Applies one content change to a text, with the range counted in
-/// `encoding`. A change whose range doesn't fit the text is an error, never
-/// a panic: a line the document doesn't have, a character past the end of
-/// its line, or an end before the start.
+/// `encoding`. A character past the end of its line is clamped to the
+/// line's length, as the spec lets clients do. A change that still doesn't
+/// fit is an error, never a panic: a line the document doesn't have, a
+/// character inside a character, or an end before the start.
 pub fn apply_change(text: &str, encoding: Encoding, change: &ContentChange) -> Result<String, ChangeError> {
     match change {
         ContentChange::Full(new) => Ok(new.clone()),
@@ -198,8 +204,8 @@ pub fn apply_change(text: &str, encoding: Encoding, change: &ContentChange) -> R
             if (range.end.line, range.end.character) < (range.start.line, range.start.character) {
                 return Err(ChangeError::Inverted);
             }
-            let start_byte = position_byte(text, encoding, range.start)?;
-            let end_byte = position_byte(text, encoding, range.end)?;
+            let start_byte = position_byte_clamped(text, encoding, range.start)?;
+            let end_byte = position_byte_clamped(text, encoding, range.end)?;
             let mut out = String::with_capacity(text.len() + insert.len());
             out.push_str(&text[..start_byte]);
             out.push_str(insert);
@@ -330,24 +336,16 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
                             push_range(&mut out, uri, &format!("{p}.textEdits[{j}].range"));
                         }
                     }
-                    // `label` is a string, one label part, or an array of
-                    // parts; only parts with a `location` are walked.
-                    if let Some(label) = h.get("label") {
-                        if let Some(parts) = label.as_array() {
-                            for (k, part) in parts.iter().enumerate() {
-                                let loc = part.get("location");
-                                if let Some(luri) = loc.and_then(|l| l.get("uri")).and_then(|v| v.as_str())
-                                    && as_range(loc.and_then(|l| l.get("range"))).is_some()
-                                {
-                                    push_range(&mut out, luri, &format!("{p}.label[{k}].location"));
-                                }
-                            }
-                        } else {
-                            let loc = label.get("location");
+                    // `label` is a string or an array of label parts; only
+                    // parts with a `location` are walked. A single object is
+                    // not a shape the spec defines, so it is not walked.
+                    if let Some(parts) = h.get("label").and_then(|v| v.as_array()) {
+                        for (k, part) in parts.iter().enumerate() {
+                            let loc = part.get("location");
                             if let Some(luri) = loc.and_then(|l| l.get("uri")).and_then(|v| v.as_str())
                                 && as_range(loc.and_then(|l| l.get("range"))).is_some()
                             {
-                                push_range(&mut out, luri, &format!("{p}.label.location"));
+                                push_range(&mut out, luri, &format!("{p}.label[{k}].location"));
                             }
                         }
                     }
@@ -388,15 +386,25 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
                 }
             }
         }
-        "textDocument/linkedEditingRange" | "textDocument/prepareRename" => {
-            if let (Some(uri), Some(r)) = (request_doc, result) {
-                if let Some(arr) = r.as_array() {
-                    for (i, v) in arr.iter().enumerate() {
-                        if as_range(Some(v)).is_some() {
-                            push_range(&mut out, uri, &format!("[{i}]"));
-                        }
+        "textDocument/linkedEditingRange" => {
+            // `LinkedEditingRanges | null`: `{"ranges": [Range, ...],
+            // "wordPattern"?: string}`; each range is about the request's
+            // document.
+            if let (Some(uri), Some(ranges)) =
+                (request_doc, result.and_then(|r| r.get("ranges")).and_then(|v| v.as_array()))
+            {
+                for (i, v) in ranges.iter().enumerate() {
+                    if as_range(Some(v)).is_some() {
+                        push_range(&mut out, uri, &format!("ranges[{i}]"));
                     }
-                } else if as_range(Some(r)).is_some() {
+                }
+            }
+        }
+        "textDocument/prepareRename" => {
+            // `Range`, `{range, placeholder}`, `{defaultBehavior}` or
+            // `null`; never an array.
+            if let (Some(uri), Some(r)) = (request_doc, result) {
+                if as_range(Some(r)).is_some() {
                     push_range(&mut out, uri, "");
                 } else if as_range(r.get("range")).is_some() {
                     push_range(&mut out, uri, "range");
@@ -785,22 +793,63 @@ mod tests {
     fn a_range_that_does_not_fit_is_an_error_not_a_panic() {
         let text = "ab\ncd";
         let p = |line, character| Position { line, character };
-        let cases: [(Range, ChangeError); 4] = [
+        let cases: [(Range, ChangeError); 3] = [
             (Range { start: p(0, 0), end: p(9, 0) }, ChangeError::NoLine(9)),
             (Range { start: p(9, 0), end: p(9, 0) }, ChangeError::NoLine(9)),
-            (Range { start: p(0, 3), end: p(0, 4) }, ChangeError::PastEndOfLine),
             (Range { start: p(1, 0), end: p(0, 1) }, ChangeError::Inverted),
         ];
         for (range, want) in cases {
             let change = ContentChange::Text { range, text: "x".into() };
             assert_eq!(apply_change(text, Encoding::Utf16, &change), Err(want), "{range:?}");
         }
+        // A character inside a character (between the halves of a UTF-16
+        // surrogate pair) is an error, not a clamp.
+        let text = "a\u{10400}b";
+        let range = Range { start: Position { line: 0, character: 2 }, end: Position { line: 0, character: 3 } };
+        assert_eq!(
+            apply_change(text, Encoding::Utf16, &ContentChange::Text { range, text: "x".into() }),
+            Err(ChangeError::InsideCharacter)
+        );
         // A range past the end in one encoding can fit in another: the
-        // same range is judged in the given encoding only.
+        // same range is judged in the given encoding only, and a character
+        // past the end clamps to the line's length.
         let text = "x\u{00E9}";
         let range = Range { start: Position { line: 0, character: 1 }, end: Position { line: 0, character: 3 } };
-        assert!(apply_change(text, Encoding::Utf16, &ContentChange::Text { range, text: "".into() }).is_err());
-        assert!(apply_change(text, Encoding::Utf8, &ContentChange::Text { range, text: "".into() }).is_ok());
+        // In UTF-16 the line is two units long, so the end clamps to it;
+        // in UTF-8 it is exactly three bytes long. Both delete the `é`.
+        assert_eq!(
+            apply_change(text, Encoding::Utf16, &ContentChange::Text { range, text: "".into() }),
+            Ok("x".into())
+        );
+        assert_eq!(apply_change(text, Encoding::Utf8, &ContentChange::Text { range, text: "".into() }), Ok("x".into()));
+    }
+
+    #[test]
+    fn a_change_clamps_a_character_past_the_line_end() {
+        // LSP 3.17: a character greater than the line length defaults back
+        // to the line length, when applying a change.
+        let insert = ContentChange::Text {
+            range: Range { start: Position { line: 0, character: 100 }, end: Position { line: 0, character: 100 } },
+            text: "X".into(),
+        };
+        assert_eq!(apply_change("ab", Encoding::Utf16, &insert), Ok("abX".into()));
+        let replace = ContentChange::Text {
+            range: Range { start: Position { line: 0, character: 1 }, end: Position { line: 0, character: 100 } },
+            text: "X".into(),
+        };
+        assert_eq!(apply_change("ab", Encoding::Utf16, &replace), Ok("aX".into()));
+        // A line past the end of the document is still an error, and so is
+        // a start after the end.
+        let past_line = ContentChange::Text {
+            range: Range { start: Position { line: 5, character: 0 }, end: Position { line: 5, character: 0 } },
+            text: "X".into(),
+        };
+        assert_eq!(apply_change("ab", Encoding::Utf16, &past_line), Err(ChangeError::NoLine(5)));
+        let inverted = ContentChange::Text {
+            range: Range { start: Position { line: 0, character: 100 }, end: Position { line: 0, character: 1 } },
+            text: "X".into(),
+        };
+        assert_eq!(apply_change("ab", Encoding::Utf16, &inverted), Err(ChangeError::Inverted));
     }
 
     #[test]
@@ -815,6 +864,9 @@ mod tests {
                     let bytes = offset_to_bytes(line, enc, offset).expect("a boundary offset converts");
                     // The byte offset is a UTF-8 boundary of the line.
                     assert!(line.is_char_boundary(bytes), "{line:?} {enc:?} {offset} -> {bytes}");
+                    // The prefix up to it has exactly `offset` units in the
+                    // encoding: the conversion landed where it should.
+                    assert_eq!(line_length(&line[..bytes], enc), offset, "{line:?} {enc:?} {offset} -> {bytes}");
                     // And converting it back, in UTF-8, gives the same place.
                     assert_eq!(offset_to_bytes(line, Encoding::Utf8, bytes), Ok(bytes));
                 }
@@ -836,11 +888,11 @@ mod tests {
                 for a in 0..n {
                     for b in a..n.min(a + 2) {
                         let sa = |c: usize| {
-                            position_byte(text, enc, Position { line: a, character: c })
+                            position_byte_clamped(text, enc, Position { line: a, character: c })
                                 .unwrap_or_else(|e| panic!("{text:?} {enc:?} a={a} c={c} {e:?}"))
                         };
                         let sb = |c: usize| {
-                            position_byte(text, enc, Position { line: b, character: c })
+                            position_byte_clamped(text, enc, Position { line: b, character: c })
                                 .unwrap_or_else(|e| panic!("{text:?} {enc:?} b={b} c={c} {e:?}"))
                         };
                         for ca in &bounds[a] {
@@ -971,13 +1023,6 @@ mod tests {
                 ("file:///b.txt", "relatedDocuments.items[0].range", FoundKind::Range),
             ]
         );
-        // A bare `Diagnostic` array is the other lawful shape.
-        let result: Value = serde_json::from_str(
-            r#"[{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } } }]"#,
-        )
-        .expect("valid JSON");
-        let out = positions("textDocument/diagnostic", &params, Some(&result));
-        assert_eq!(uris(&out), [("file:///a.txt", "[0].range", FoundKind::Range)]);
     }
 
     #[test]
@@ -1090,11 +1135,11 @@ mod tests {
                 { "position": { "line": 0, "character": 2 },
                   "textEdits": [ { "range": { "start": { "line": 0, "character": 2 }, "end": { "line": 0, "character": 2 } } } ],
                   "label": [
-                    { "value": "a", "location": { "uri": "file:///b.txt", "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 1 } } } },
-                    "plain"
+                    { "value": "a", "location": { "uri": "file:///b.txt", "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 1 } } } }
                   ]
                 },
-                { "position": { "line": 1, "character": 0 }, "label": { "value": "b", "location": { "uri": "file:///c.txt", "range": { "start": { "line": 2, "character": 0 }, "end": { "line": 2, "character": 1 } } } } }
+                { "position": { "line": 1, "character": 0 },
+                  "label": [ { "value": "b", "location": { "uri": "file:///c.txt", "range": { "start": { "line": 2, "character": 0 }, "end": { "line": 2, "character": 1 } } } } ] }
             ]"#,
         )
         .expect("valid JSON");
@@ -1106,7 +1151,7 @@ mod tests {
                 ("file:///a.txt", "[0].textEdits[0].range", FoundKind::Range),
                 ("file:///b.txt", "[0].label[0].location", FoundKind::Range),
                 ("file:///a.txt", "[1].position", FoundKind::Position),
-                ("file:///c.txt", "[1].label.location", FoundKind::Range),
+                ("file:///c.txt", "[1].label[0].location", FoundKind::Range),
             ]
         );
     }
@@ -1152,27 +1197,42 @@ mod tests {
     }
 
     #[test]
-    fn linked_editing_and_prepare_rename_walk_ranges() {
+    fn linked_editing_walks_its_ranges() {
         let params = doc_params("file:///a.txt");
-        let array: Value = serde_json::from_str(
-            r#"[{ "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }]"#,
+        // `LinkedEditingRanges`: `{"ranges": [Range, ...]}`.
+        let result: Value = serde_json::from_str(
+            r#"{ "ranges": [ { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                            { "start": { "line": 2, "character": 3 }, "end": { "line": 2, "character": 4 } } ] }"#,
         )
         .expect("valid JSON");
+        let out = positions("textDocument/linkedEditingRange", &params, Some(&result));
+        assert_eq!(
+            uris(&out),
+            [("file:///a.txt", "ranges[0]", FoundKind::Range), ("file:///a.txt", "ranges[1]", FoundKind::Range),]
+        );
+        // `null` has no positions.
+        assert!(positions("textDocument/linkedEditingRange", &params, Some(&Value::Null)).is_empty());
+    }
+
+    #[test]
+    fn prepare_rename_walks_a_range_or_a_wrapped_range() {
+        let params = doc_params("file:///a.txt");
         let single: Value =
             serde_json::from_str(r#"{ "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }"#)
                 .expect("valid JSON");
+        let out = positions("textDocument/prepareRename", &params, Some(&single));
+        assert_eq!(uris(&out), [("file:///a.txt", "", FoundKind::Range)]);
+        // `{range, placeholder}`.
         let wrapped: Value = serde_json::from_str(
-            r#"{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } } }"#,
+            r#"{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }, "placeholder": "x" }"#,
         )
         .expect("valid JSON");
-        for method in ["textDocument/linkedEditingRange", "textDocument/prepareRename"] {
-            let out = positions(method, &params, Some(&array));
-            assert_eq!(uris(&out), [("file:///a.txt", "[0]", FoundKind::Range)], "{method} array");
-            let out = positions(method, &params, Some(&single));
-            assert_eq!(uris(&out), [("file:///a.txt", "", FoundKind::Range)], "{method} single");
-            let out = positions(method, &params, Some(&wrapped));
-            assert_eq!(uris(&out), [("file:///a.txt", "range", FoundKind::Range)], "{method} wrapped");
-        }
+        let out = positions("textDocument/prepareRename", &params, Some(&wrapped));
+        assert_eq!(uris(&out), [("file:///a.txt", "range", FoundKind::Range)]);
+        // `{defaultBehavior}` and `null` have no positions.
+        let behavior: Value = serde_json::from_str(r#"{ "defaultBehavior": 2 }"#).expect("valid JSON");
+        assert!(positions("textDocument/prepareRename", &params, Some(&behavior)).is_empty());
+        assert!(positions("textDocument/prepareRename", &params, Some(&Value::Null)).is_empty());
     }
 
     #[test]
@@ -1202,6 +1262,29 @@ mod tests {
                 .expect("valid JSON");
         let out = positions("textDocument/documentHighlight", &params, Some(&result));
         assert_eq!(uris(&out), [("file:///a.txt", "[0].range", FoundKind::Range)]);
+        // A bare `Diagnostic` array is not a `DocumentDiagnosticReport`. It
+        // is still walked: its items are about the request's document, so
+        // the attribution is certain.
+        let result: Value = serde_json::from_str(
+            r#"[{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } } }]"#,
+        )
+        .expect("valid JSON");
+        let out = positions("textDocument/diagnostic", &params, Some(&result));
+        assert_eq!(uris(&out), [("file:///a.txt", "[0].range", FoundKind::Range)]);
+        // A single-object inlay-hint `label` is not a shape the spec
+        // defines, so it is not walked.
+        let result: Value = serde_json::from_str(
+            r#"[{ "position": { "line": 0, "character": 0 }, "label": { "value": "b", "location": { "uri": "file:///c.txt", "range": { "start": { "line": 2, "character": 0 }, "end": { "line": 2, "character": 1 } } } } }]"#,
+        )
+        .expect("valid JSON");
+        let out = positions("textDocument/inlayHint", &params, Some(&result));
+        assert_eq!(uris(&out), [("file:///a.txt", "[0].position", FoundKind::Position)]);
+        // A `prepareRename` result is never an array, so one is not walked.
+        let result: Value = serde_json::from_str(
+            r#"[{ "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }]"#,
+        )
+        .expect("valid JSON");
+        assert!(positions("textDocument/prepareRename", &params, Some(&result)).is_empty());
     }
 
     #[test]
