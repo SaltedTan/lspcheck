@@ -690,8 +690,14 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             return;
         }
     };
-    let Some(init_id) = reply.response_id().cloned() else { unreachable!("initialize is a request") };
     let t = ctx.cfg.request_timeout;
+    // C3 judges replies that could only answer a cancel. A plain request
+    // first orders any reply to `initialized` before the cancels.
+    let barrier_from = ctx.s.messages.len();
+    let c3_from = match ctx.s.call(PROBE, Some(json!({})), t).await {
+        Ok(m) => m.response_id().and_then(|id| response_index(&ctx.s.messages, id, barrier_from)).map(|i| i + 1),
+        Err(_) => None,
+    };
 
     // C1. The request and its cancellation go out before anything is read, so
     // the server has both when it decides the request's fate. `workspace/symbol`
@@ -790,6 +796,13 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     // Each cancel is followed by its own plain request, so no read can hold
     // three of lspcheck's frames: a server that mishandles coalesced frames
     // (F4) can't make this check fail for the wrong reason.
+    if probe.is_err() {
+        let why = "not judged: the server had already stopped answering (see C1)";
+        for id in ["C2", "C3"] {
+            ctx.report(id, Verdict::Error, why);
+        }
+        return;
+    }
     let unknown = ctx.s.fresh_id();
     let finished = answered_index.is_some();
     let from = ctx.s.messages.len();
@@ -850,9 +863,15 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         }
     }
 
-    // C3. The only notifications sent after initialize are `initialized` and
-    // the cancels, so a response with no usable id answers one of them.
-    let from = ctx.s.messages.iter().rposition(|(_, m)| m.response_id() == Some(&init_id)).map_or(0, |i| i + 1);
+    // C3. After the barrier the only notifications lspcheck sent are the
+    // cancels, so a response with no usable id answers one of them.
+    let Some(from) = c3_from else {
+        return ctx.report(
+            "C3",
+            Verdict::Error,
+            "not judged: the plain request sent after `initialized` went unanswered",
+        );
+    };
     let violation = (from..ctx.s.messages.len()).find_map(|i| {
         let (at, m) = &ctx.s.messages[i];
         match &m.kind {
@@ -869,11 +888,11 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     match violation {
         Some((_, what)) => ctx.fail(
             "C3",
-            format!("{what}; lspcheck only sent notifications (`initialized` and `$/cancelRequest`) there, so it answers one"),
+            format!("{what}; lspcheck sent only `$/cancelRequest` notifications and answered requests since then, so it answers a cancel"),
         ),
         None => ctx.pass_with(
             "C3",
-            "no response answered `initialized` or either $/cancelRequest notification",
+            "no response answered a $/cancelRequest notification",
         ),
     }
 
