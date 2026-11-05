@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! What the documents scenario judges: the documents lspcheck opened with
-//! every version it sent, the texts a position may refer to, and D1's verdict
-//! over every position the server sent about them.
+//! every version it sent, the texts a position may refer to, D1's verdict
+//! over every position the server sent about them, and D2's verdict over
+//! every version the server labelled diagnostics with.
 //!
 //! Pure functions only; the scenario that gathers the evidence is in
 //! `checks`. A position is judged only where lspcheck knows exactly which
@@ -11,6 +12,7 @@
 
 use crate::checks::Verdict;
 use crate::text::{self, Encoding, Found, FoundKind, Position, PositionStatus};
+use serde_json::Value;
 use std::time::Duration;
 
 /// The lines of document A, LF only, with a final newline after the last.
@@ -72,6 +74,22 @@ pub struct Source {
     pub read_at: Duration,
     /// The `version` a `publishDiagnostics` is labelled with, if any.
     pub label: Option<i64>,
+}
+
+/// A `textDocument/publishDiagnostics` notification the server sent.
+#[derive(Debug, Clone)]
+pub struct Published {
+    pub uri: String,
+    /// The `version` member of the params: `None` when it isn't there.
+    pub version: Option<Value>,
+    /// When the notification was read.
+    pub read_at: Duration,
+}
+
+/// A document version's value, when it is a JSON integer that fits, however
+/// it is spelled: `42`, `42.0` and `4.2e1` are all 42.
+pub fn version_number(v: &Value) -> Option<i64> {
+    v.as_number().and_then(crate::message::integer_value)
 }
 
 /// Whether two URIs name the same document: equal as written, or equal
@@ -315,6 +333,87 @@ fn counts(j: &Judged) -> String {
     out
 }
 
+/// The lawful publishes a D2 detail counts, after its main clause.
+fn unjudged_counts(unversioned: usize, unjudged: usize) -> String {
+    let mut out = String::new();
+    if unversioned > 0 {
+        out.push_str(&format!("; {unversioned} without a version, which is lawful"));
+    }
+    if unjudged > 0 {
+        out.push_str(&format!("; {unjudged} with a version that isn't an integer, which D2 doesn't judge"));
+    }
+    out
+}
+
+/// D2's verdict: an integer `version` in `textDocument/publishDiagnostics`
+/// for a document lspcheck opened is one lspcheck sent for that URI (in
+/// `didOpen`, later `didChange`) before the notification was read. An older
+/// version is lawful, and so is none at all; `null` or a non-integer one
+/// isn't judged here (a type error for K2), nor is any URI lspcheck didn't
+/// open. `incomplete` says why lspcheck may have missed a notification the
+/// server sent from the `didOpen` on.
+pub fn judge_d2(docs: &[OpenDoc], published: &[Published], incomplete: Option<&str>) -> (Verdict, String) {
+    let mut fails: Vec<String> = Vec::new();
+    let (mut checked, mut unversioned, mut unjudged) = (0usize, 0usize, 0usize);
+    for p in published {
+        let Some(doc) = docs.iter().find(|d| same_uri(&d.uri, &p.uri)) else { continue };
+        let Some(n) = p.version.as_ref().and_then(version_number) else {
+            match p.version {
+                None => unversioned += 1,
+                Some(_) => unjudged += 1,
+            }
+            continue;
+        };
+        // The same "sent" test as `candidates`: what lspcheck had written
+        // for this URI by the time the notification was read.
+        let sent: Vec<i64> = doc.versions.iter().filter(|v| v.at <= p.read_at).map(|v| v.number).collect();
+        if sent.contains(&n) {
+            checked += 1;
+            continue;
+        }
+        let had = sent.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" and ");
+        let had = if had.is_empty() { "none".to_string() } else { had };
+        fails.push(format!(
+            "{} carries version {}, and lspcheck had sent {had} for it before the notification was read",
+            p.uri, n
+        ));
+    }
+    if !fails.is_empty() {
+        // A failure that was seen stands, whatever else was missed.
+        let more = fails.len().saturating_sub(NAMED);
+        let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
+        let first: Vec<&str> = fails.iter().take(NAMED).map(String::as_str).collect();
+        return (
+            Verdict::Fail,
+            format!(
+                "{} diagnostics notification(s) carry a version lspcheck hadn't sent for the document: {}{tail}",
+                fails.len(),
+                first.join("; ")
+            ),
+        );
+    }
+    let extras = unjudged_counts(unversioned, unjudged);
+    if let Some(why) = incomplete {
+        return (
+            Verdict::Error,
+            format!(
+                "inconclusive, because {why}: a versioned diagnostics notification may have been missed; \
+                 {checked} versioned diagnostics notification(s) arrived{extras}"
+            ),
+        );
+    }
+    if checked == 0 {
+        return (
+            Verdict::NotExercised,
+            format!("no versioned diagnostics notification for an opened document arrived{extras}"),
+        );
+    }
+    (
+        Verdict::Pass,
+        format!("{checked} versioned diagnostics notification(s) named a version lspcheck had sent{extras}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +607,152 @@ mod tests {
         let (_, detail) = judge_d1(Encoding::Utf8, &many, None);
         assert!(detail.starts_with("5 position(s) fall inside a character, counted in UTF-8 bytes"), "{detail}");
         assert!(detail.contains("p0; p1; p2; and 2 more"), "{detail}");
+    }
+
+    fn publish(uri: &str, version: Value, read: u64) -> Published {
+        Published { uri: uri.into(), version: Some(version), read_at: Duration::from_millis(read) }
+    }
+
+    fn unversioned(uri: &str, read: u64) -> Published {
+        Published { uri: uri.into(), version: None, read_at: Duration::from_millis(read) }
+    }
+
+    #[test]
+    fn d2_accepts_every_version_sent_before_the_publish_was_read() {
+        let d = [doc(&[(10, 41, "a"), (100, 42, "b")])];
+        // The version it was opened with, still lawful when read after a
+        // later version was sent: an older version is lawful.
+        let (v, detail) =
+            judge_d2(&d, &[publish(URI, serde_json::json!(41), 50), publish(URI, serde_json::json!(41), 150)], None);
+        assert_eq!(v, Verdict::Pass);
+        assert!(
+            detail.starts_with("2 versioned diagnostics notification(s) named a version lspcheck had sent"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn d2_fails_on_a_version_sent_only_after_the_publish_was_read() {
+        // Version 42 exists, but only from 100 ms on; at 50 the document had 41.
+        let d = [doc(&[(10, 41, "a"), (100, 42, "b")])];
+        let (v, detail) = judge_d2(&d, &[publish(URI, serde_json::json!(42), 50)], None);
+        assert_eq!(v, Verdict::Fail);
+        assert!(
+            detail.contains("carries version 42, and lspcheck had sent 41 for it before the notification was read"),
+            "{detail}"
+        );
+        // Read before any version was sent, it names that too.
+        let (v, detail) = judge_d2(&d, &[publish(URI, serde_json::json!(41), 5)], None);
+        assert_eq!(v, Verdict::Fail);
+        assert!(detail.contains("and lspcheck had sent none for it"), "{detail}");
+    }
+
+    #[test]
+    fn d2_fails_on_a_version_the_document_never_had() {
+        let d = [doc(&[(10, 41, "a"), (100, 42, "b")])];
+        let (v, detail) = judge_d2(&d, &[publish(URI, serde_json::json!(1), 150)], None);
+        assert_eq!(v, Verdict::Fail);
+        assert!(
+            detail.starts_with("1 diagnostics notification(s) carry a version lspcheck hadn't sent for the document:"),
+            "{detail}"
+        );
+        assert!(detail.contains("carries version 1, and lspcheck had sent 41 and 42"), "{detail}");
+        // A failure seen stands even when evidence is incomplete.
+        assert_eq!(
+            judge_d2(&d, &[publish(URI, serde_json::json!(1), 150)], Some("a frame was skipped")).0,
+            Verdict::Fail
+        );
+        // Several failures are named a few at a time.
+        let many: Vec<Published> = (0..5).map(|i| publish(URI, serde_json::json!(i), 150)).collect();
+        let (v, detail) = judge_d2(&d, &many, None);
+        assert_eq!(v, Verdict::Fail);
+        assert!(
+            detail.starts_with("5 diagnostics notification(s) carry a version lspcheck hadn't sent for the document:"),
+            "{detail}"
+        );
+        assert!(detail.contains("carries version 0, and lspcheck had sent 41 and 42"), "{detail}");
+        assert!(
+            detail.ends_with(
+                "version 2, and lspcheck had sent 41 and 42 for it before the notification was read; and 2 more"
+            ),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn d2_verdicts_without_a_version_it_can_judge() {
+        let d = [doc(&[(10, 41, "a"), (100, 42, "b")])];
+        let missed = Some("a frame was skipped");
+        // A pass over missed evidence is inconclusive, as for D1.
+        let (v, detail) = judge_d2(&d, &[publish(URI, serde_json::json!(41), 50)], missed);
+        assert_eq!(v, Verdict::Error);
+        assert!(
+            detail.starts_with(
+                "inconclusive, because a frame was skipped: a versioned diagnostics notification may have been missed"
+            ),
+            "{detail}"
+        );
+        assert!(detail.contains("1 versioned diagnostics notification(s) arrived"), "{detail}");
+        // No versioned publish for an opened URI: not exercised, with the
+        // unversioned ones counted.
+        let (v, detail) = judge_d2(&d, &[unversioned(URI, 50)], None);
+        assert_eq!(v, Verdict::NotExercised);
+        assert!(
+            detail.contains("no versioned diagnostics notification for an opened document arrived; 1 without a version, which is lawful"),
+            "{detail}"
+        );
+        // `null`, a string and a float aren't judged: a type error for K2.
+        for bad in [Value::Null, serde_json::json!("41"), serde_json::json!(41.5)] {
+            let (v, detail) = judge_d2(&d, &[publish(URI, bad, 50)], None);
+            assert_eq!(v, Verdict::NotExercised, "{detail}");
+            assert!(detail.contains("1 with a version that isn't an integer, which D2 doesn't judge"), "{detail}");
+        }
+        // Beside a lawful publish they don't keep it from passing.
+        let (v, detail) = judge_d2(
+            &d,
+            &[publish(URI, Value::Null, 50), unversioned(URI, 60), publish(URI, serde_json::json!(41), 70)],
+            None,
+        );
+        assert_eq!(v, Verdict::Pass);
+        assert!(detail.contains("named a version lspcheck had sent; 1 without a version, which is lawful; 1 with a version that isn't an integer"), "{detail}");
+        // A URI lspcheck never opened isn't judged, whatever its version.
+        let (v, detail) = judge_d2(&d, &[publish("file:///w/other.txt", serde_json::json!(999), 50)], None);
+        assert_eq!(v, Verdict::NotExercised);
+        assert_eq!(detail, "no versioned diagnostics notification for an opened document arrived");
+    }
+
+    #[test]
+    fn d2_judges_integer_versions_however_they_are_spelled() {
+        let d = [doc(&[(10, 41, "a")])];
+        let parsed = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        // 41.0 and 4.1e1 are version 41, which was sent.
+        for text in ["41.0", "4.1e1", "410e-1"] {
+            let (v, detail) = judge_d2(&d, &[publish(URI, parsed(text), 50)], None);
+            assert_eq!(v, Verdict::Pass, "{text}: {detail}");
+        }
+        // 42.0 and 4.2e1 are version 42, which wasn't.
+        for text in ["42.0", "4.2e1"] {
+            let (v, detail) = judge_d2(&d, &[publish(URI, parsed(text), 50)], None);
+            assert_eq!(v, Verdict::Fail, "{text}: {detail}");
+            assert!(detail.contains("carries version 42"), "{text}: {detail}");
+        }
+        assert_eq!(version_number(&parsed("41.5")), None);
+    }
+
+    #[test]
+    fn d2_matches_uris_after_normalizing_them() {
+        // `file:///C:/` and `file:///c:/` (and a %-escaped colon) name the
+        // same document.
+        let d = [doc(&[(10, 41, "a")])]
+            .into_iter()
+            .map(|mut d| {
+                d.uri = "file:///C:/w/doc.txt".into();
+                d
+            })
+            .collect::<Vec<_>>();
+        let (v, _) = judge_d2(&d, &[publish("file:///c%3A/w/doc.txt", serde_json::json!(41), 50)], None);
+        assert_eq!(v, Verdict::Pass);
+        let (v, _) = judge_d2(&d, &[publish("file:///c:/w/doc.txt", serde_json::json!(999), 50)], None);
+        assert_eq!(v, Verdict::Fail);
     }
 }

@@ -10,7 +10,7 @@
 //! lspcheck hit one of its own inspection limits is reported as an error,
 //! because the missing evidence might explain it.
 
-use crate::documents::{self, DOC_A_LINES, OpenDoc, Source, Version};
+use crate::documents::{self, DOC_A_LINES, OpenDoc, Published, Source, Version};
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
 use crate::session::{self, CallError, Finish, Options, Problem, Recv, Session, Unmatched, WaitError, WriteError};
@@ -126,6 +126,13 @@ pub const CATALOGUE: &[CheckInfo] = &[
         Must,
         "Positions fall on character boundaries of the text, in the negotiated encoding",
         "position"
+    ),
+    check!(
+        "D2",
+        Documents,
+        Must,
+        "A diagnostics version is one the document had when the notification was read",
+        "publishDiagnosticsParams"
     ),
 ];
 
@@ -251,7 +258,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
-    Scenario { name: "documents", checks: &["D1"] },
+    Scenario { name: "documents", checks: &["D1", "D2"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
@@ -1303,7 +1310,7 @@ async fn ask(
 fn labelled_diagnostics(m: &Message, uri: &str, version: i64) -> bool {
     m.method() == Some(PUBLISH_DIAGNOSTICS)
         && m.value.pointer("/params/uri").and_then(Value::as_str).is_some_and(|u| documents::same_uri(u, uri))
-        && m.value.pointer("/params/version").and_then(Value::as_i64) == Some(version)
+        && m.value.pointer("/params/version").and_then(documents::version_number) == Some(version)
 }
 
 /// Reads until diagnostics for `uri` labelled `version` have been read (from
@@ -1326,21 +1333,31 @@ async fn await_diagnostics(ctx: &mut Ctx<'_>, uri: &str, version: i64, from: usi
 /// Documents: lspcheck opens document A, asks the server's advertised
 /// requests about it one at a time, and waits a while for diagnostics. Every
 /// position the server sends about it must fall on a character boundary of
-/// the text it refers to, in the negotiated encoding (D1).
+/// the text it refers to, in the negotiated encoding (D1), and every
+/// `version` its diagnostics carry for the document must be one lspcheck
+/// sent for it before the notification was read (D2).
 ///
-/// A position can come at any time (diagnostics especially), so the verdict
-/// is given at the end, over everything read before lspcheck sent `exit`.
+/// A position or a version can arrive at any time (diagnostics especially),
+/// so both verdicts are given at the end, over everything read before
+/// lspcheck sent `exit`.
 async fn documents(ctx: &mut Ctx<'_>) {
     let params = documents_initialize_params(&ctx.root);
     let reply = match ctx.initialize_with(params).await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
-            return ctx.report("D1", Verdict::Error, format!("initialize didn't succeed: {why}"));
+            ctx.report("D1", Verdict::Error, format!("initialize didn't succeed: {why}"));
+            ctx.report("D2", Verdict::Error, format!("initialize didn't succeed: {why}"));
+            return;
         }
     };
     if !opens_documents(&reply) {
         ctx.report(
             "D1",
+            Verdict::Skip,
+            "the server doesn't ask for didOpen (textDocumentSync), so lspcheck opens no document",
+        );
+        ctx.report(
+            "D2",
             Verdict::Skip,
             "the server doesn't ask for didOpen (textDocumentSync), so lspcheck opens no document",
         );
@@ -1350,7 +1367,8 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let encoding = match negotiated_encoding(&reply) {
         Ok(e) => e,
         Err(why) => {
-            ctx.report("D1", Verdict::Error, why);
+            ctx.report("D1", Verdict::Error, why.clone());
+            ctx.report("D2", Verdict::Error, why);
             leave(ctx).await;
             return;
         }
@@ -1370,6 +1388,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let doc = json!({"uri": uri, "languageId": "plaintext", "version": DOC_A_VERSION, "text": text});
     if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await {
         ctx.report("D1", Verdict::Error, format!("lspcheck couldn't send didOpen: {e}"));
+        ctx.report("D2", Verdict::Error, format!("lspcheck couldn't send didOpen: {e}"));
         leave(ctx).await;
         return;
     }
@@ -1403,15 +1422,21 @@ async fn documents(ctx: &mut Ctx<'_>) {
     // to lspcheck's requests, however late.
     let msgs = &ctx.s.messages;
     let mut sources = Vec::new();
+    let mut published = Vec::new();
     for (at, m) in msgs.iter().filter(|(at, _)| *at < end) {
         if m.method() == Some(PUBLISH_DIAGNOSTICS) && matches!(m.kind, Kind::Notification { .. }) {
             let params = m.value.get("params").cloned().unwrap_or(Value::Null);
+            if let Some(uri) = params.get("uri").and_then(Value::as_str) {
+                // The raw value: `null` or a non-integer version isn't D2's
+                // to judge, but it isn't an integer version either.
+                published.push(Published { uri: uri.into(), version: params.get("version").cloned(), read_at: *at });
+            }
             sources.push(Source {
                 method: PUBLISH_DIAGNOSTICS.into(),
                 found: text::positions(PUBLISH_DIAGNOSTICS, &params, None),
                 asked_at: None,
                 read_at: *at,
-                label: params.get("version").and_then(Value::as_i64),
+                label: params.get("version").and_then(documents::version_number),
             });
         }
     }
@@ -1437,6 +1462,11 @@ async fn documents(ctx: &mut Ctx<'_>) {
         detail = format!("{detail}; {}", notes.join("; "));
     }
     ctx.report("D1", verdict, detail);
+    let (verdict, mut detail) = documents::judge_d2(&docs, &published, incomplete.as_deref());
+    if !notes.is_empty() {
+        detail = format!("{detail}; {}", notes.join("; "));
+    }
+    ctx.report("D2", verdict, detail);
 }
 
 /// End of input without exit, as when the editor goes away.

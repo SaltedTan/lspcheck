@@ -120,10 +120,18 @@ const FAULTS: &[(&str, &str)] = &[
     ("utf32-encoding", "lawful: choose utf-32 when offered, and count positions in code points"),
     ("past-line-end", "lawful: add diagnostics ending past the end of a line and past the end of the document"),
     ("grapheme-split", "lawful: add a diagnostic starting between a letter and its combining mark"),
-    ("foreign-locations", "lawful: add diagnostics and related information inside characters of a URI never opened"),
+    (
+        "foreign-locations",
+        "lawful: add diagnostics and related information inside characters of a URI never opened, labelled with a version lspcheck never sent",
+    ),
     ("positions-in-data", "lawful: put positions inside characters into each diagnostic's data"),
     ("no-diagnostics", "lawful: never publish diagnostics"),
     ("unversioned-diagnostics", "lawful: publish diagnostics without a version"),
+    (
+        "diagnostics-own-version",
+        "label publishDiagnostics with the stand-in's own counter instead of the document's version",
+    ),
+    ("future-diagnostics-version", "label publishDiagnostics with the document's version plus one"),
     ("big-frame-on-open", "after publishing diagnostics for an opened document, send a 2 MiB log message"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
@@ -186,6 +194,8 @@ fn main() {
     // The text of each open document, and how positions are counted.
     let mut docs: HashMap<String, String> = HashMap::new();
     let mut units = Units::Utf16;
+    // For diagnostics-own-version: the stand-in's own diagnostics counter.
+    let mut own_version = 0i64;
     loop {
         if !input.ready() {
             // About to wait for input: send what was held back, newest first.
@@ -300,7 +310,16 @@ fn main() {
             {
                 docs.insert(uri.to_string(), text.to_string());
                 if !fault("no-diagnostics") {
-                    let version = msg.pointer("/params/textDocument/version").cloned().unwrap_or(Value::Null);
+                    let mut version = msg.pointer("/params/textDocument/version").cloned().unwrap_or(Value::Null);
+                    if fault("diagnostics-own-version") {
+                        // Its own counter instead: versions the document never had.
+                        own_version += 1;
+                        version = json!(own_version);
+                    } else if fault("future-diagnostics-version")
+                        && let Some(n) = version.as_i64()
+                    {
+                        version = json!(n + 1);
+                    }
                     publish_diagnostics(&mut out, &faults, units, uri, text, version);
                 }
                 if fault("big-frame-on-open") {
@@ -786,7 +805,9 @@ fn publish_diagnostics<W: Write>(
             first["relatedInformation"] =
                 json!([{"location": {"uri": ELSEWHERE, "range": range(0, 1, 0, 3)}, "message": "elsewhere"}]);
         }
-        let params = json!({"uri": ELSEWHERE, "diagnostics": [{"range": range(0, 1, 0, 1), "message": "elsewhere"}]});
+        // With a version lspcheck never sent for it: no position or version
+        // in a URI lspcheck didn't open is judged.
+        let params = json!({"uri": ELSEWHERE, "version": 999, "diagnostics": [{"range": range(0, 1, 0, 1), "message": "elsewhere"}]});
         out.frame(&json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}));
     }
     let mut params = json!({"uri": uri, "diagnostics": diagnostics});

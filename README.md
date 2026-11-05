@@ -44,10 +44,12 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
                      no response answered a $/cancelRequest notification
   PASS  D1  MUST    Positions fall on character boundaries of the text, in the negotiated encoding
                      4 informative position(s) on character boundaries, counted in UTF-16 code units; 12 position(s) seen in the opened document, 0 past the end of a line, 0 on a line it doesn't have, 0 in other documents
-27 checks: 24 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
+  PASS  D2  MUST    A diagnostics version is one the document had when the notification was read
+                     1 versioned diagnostics notification(s) named a version lspcheck had sent
+28 checks: 25 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 27 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
+lspcheck is early: it has 28 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
 document positions. [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids,
 documents and robustness.
 
@@ -101,6 +103,11 @@ the two sides agreed (UTF-16 unless the server chose another): never between the
 inside a UTF-8 multibyte sequence. The document is built so that counting in the wrong units lands inside a
 character, and a failure says which counting would have fit. A position past the end of a line isn't judged, because
 the client clamps it. Most language servers ignore a plain-text document without a profile, and then D1 is `N/E`.
+
+The same scenario also checks diagnostics versions (D2): when the server labels a `publishDiagnostics` for the opened
+document with a `version`, it must be one lspcheck sent for it before the notification was read — so a server that
+labels with its own counter, or with one the document never had, fails. An older version is lawful, a notification
+without a version leaves D2 `N/E`, and a `version` that is `null` or not an integer isn't judged here.
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of
