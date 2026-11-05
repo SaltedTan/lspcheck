@@ -8,6 +8,7 @@
 //! binary and its tests can share it, and its API may change in any release.
 
 pub mod checks;
+pub mod documents;
 pub mod message;
 pub mod process;
 pub mod report;

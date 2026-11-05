@@ -10,6 +10,7 @@
 //! the same bug here.
 
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 
@@ -108,6 +109,18 @@ const FAULTS: &[(&str, &str)] = &[
     ),
     ("big-frame-after-drop", "after cancelled-no-reply drops a request, send a 2 MiB log message with the next answer"),
     ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
+    ("utf8-positions-as-utf16", "count positions in UTF-8 bytes while UTF-16 is negotiated"),
+    ("codepoint-positions", "count positions in code points while UTF-16 is negotiated"),
+    ("utf16-positions-as-utf8", "choose utf-8 when offered, but count positions in UTF-16 code units"),
+    ("utf8-encoding", "lawful: choose utf-8 when offered, and count positions in bytes"),
+    ("utf32-encoding", "lawful: choose utf-32 when offered, and count positions in code points"),
+    ("past-line-end", "lawful: add diagnostics ending past the end of a line and past the end of the document"),
+    ("grapheme-split", "lawful: add a diagnostic starting between a letter and its combining mark"),
+    ("foreign-locations", "lawful: add diagnostics and related information inside characters of a URI never opened"),
+    ("positions-in-data", "lawful: put positions inside characters into each diagnostic's data"),
+    ("no-diagnostics", "lawful: never publish diagnostics"),
+    ("unversioned-diagnostics", "lawful: publish diagnostics without a version"),
+    ("big-frame-on-open", "after publishing diagnostics for an opened document, send a 2 MiB log message"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
     ("escaped-child", "start a child in a new session, with a non-UTF-8 name, that outlives the server"),
@@ -166,6 +179,9 @@ fn main() {
     // For null-reply-after-first-probe: whether a request was answered since initialize.
     let mut answered_one = false;
     let mut children: Vec<Child> = Vec::new();
+    // The text of each open document, and how positions are counted.
+    let mut docs: HashMap<String, String> = HashMap::new();
+    let mut units = Units::Utf16;
     loop {
         if !input.ready() {
             // About to wait for input: send what was held back, newest first.
@@ -271,6 +287,22 @@ fn main() {
             }
             if initialized && method.starts_with("$/lspcheck/") && fault("exit-on-unknown-notification") {
                 std::process::exit(0);
+            }
+            if method == "textDocument/didOpen"
+                && let (Some(uri), Some(text)) = (
+                    msg.pointer("/params/textDocument/uri").and_then(Value::as_str),
+                    msg.pointer("/params/textDocument/text").and_then(Value::as_str),
+                )
+            {
+                docs.insert(uri.to_string(), text.to_string());
+                if !fault("no-diagnostics") {
+                    let version = msg.pointer("/params/textDocument/version").cloned().unwrap_or(Value::Null);
+                    publish_diagnostics(&mut out, &faults, units, uri, text, version);
+                }
+                if fault("big-frame-on-open") {
+                    let text = "x".repeat(2 * 1024 * 1024);
+                    out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
+                }
             }
             if !initialized && fault("late-reply-to-pre-init-notification") {
                 late_reply = Some(
@@ -405,13 +437,37 @@ fn main() {
                 continue;
             }
             initialized = true;
-            let encoding = if fault("bad-encoding") { "utf-7" } else { "utf-16" };
+            let offered = |name: &str| {
+                msg.pointer("/params/capabilities/general/positionEncodings")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| a.iter().any(|e| e == name))
+            };
+            let encoding;
+            (encoding, units) = if fault("bad-encoding") {
+                ("utf-7", Units::Utf16)
+            } else if fault("utf32-encoding") && offered("utf-32") {
+                ("utf-32", Units::CodePoints)
+            } else if fault("utf8-encoding") && offered("utf-8") {
+                ("utf-8", Units::Bytes)
+            } else if fault("utf16-positions-as-utf8") && offered("utf-8") {
+                ("utf-8", Units::Utf16)
+            } else if fault("utf8-positions-as-utf16") {
+                ("utf-16", Units::Bytes)
+            } else if fault("codepoint-positions") {
+                ("utf-16", Units::CodePoints)
+            } else {
+                ("utf-16", Units::Utf16)
+            };
             let mut result = json!({
                 "capabilities": {
                     "positionEncoding": encoding,
-                    "textDocumentSync": 1,
+                    "textDocumentSync": {"openClose": true, "change": 2},
                     "hoverProvider": true,
-                    "workspaceSymbolProvider": true
+                    "workspaceSymbolProvider": true,
+                    "documentSymbolProvider": true,
+                    "foldingRangeProvider": true,
+                    "documentHighlightProvider": true,
+                    "selectionRangeProvider": true
                 },
                 "serverInfo": {"name": "lspcheck-standin"}
             });
@@ -534,6 +590,15 @@ fn main() {
                 out.frame(&reply);
             }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
+            "textDocument/documentSymbol"
+            | "textDocument/foldingRange"
+            | "textDocument/documentHighlight"
+            | "textDocument/selectionRange" => {
+                let text = msg.pointer("/params/textDocument/uri").and_then(Value::as_str).and_then(|u| docs.get(u));
+                let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                let result = text.map_or(Value::Null, |text| document_answer(&method, &params, text, units));
+                out.frame(&ok(&id, result));
+            }
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
             "$/lspcheck/unknownRequest" if fault("result-and-error") => out.frame(&json!({
                 "jsonrpc": "2.0",
@@ -563,6 +628,162 @@ fn main() {
     }
     drop(children);
     std::process::exit(1);
+}
+
+/// How the stand-in counts character offsets: the negotiated encoding's
+/// units, or another's when a fault says so.
+#[derive(Clone, Copy)]
+enum Units {
+    Bytes,
+    Utf16,
+    CodePoints,
+}
+
+impl Units {
+    /// The length of `s` in these units.
+    fn of(self, s: &str) -> usize {
+        match self {
+            Units::Bytes => s.len(),
+            Units::Utf16 => s.encode_utf16().count(),
+            Units::CodePoints => s.chars().count(),
+        }
+    }
+}
+
+/// A document's lines, split at `\n`, `\r\n` and `\r`, without their ends.
+fn lines(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(['\n', '\r']) {
+        out.push(&rest[..i]);
+        let skip = if rest[i..].starts_with("\r\n") { 2 } else { 1 };
+        rest = &rest[i + skip..];
+    }
+    out.push(rest);
+    out
+}
+
+/// Each ASCII word (`[A-Za-z]+`): its line, its start and end in `units`,
+/// and its text.
+fn words(text: &str, units: Units) -> Vec<(usize, usize, usize, &str)> {
+    let mut out = Vec::new();
+    for (n, line) in lines(text).into_iter().enumerate() {
+        let mut start = None;
+        for (i, c) in line.char_indices().chain([(line.len(), ' ')]) {
+            match (c.is_ascii_alphabetic(), start) {
+                (true, None) => start = Some(i),
+                (false, Some(s)) => {
+                    out.push((n, units.of(&line[..s]), units.of(&line[..i]), &line[s..i]));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn range(sl: usize, sc: usize, el: usize, ec: usize) -> Value {
+    json!({"start": {"line": sl, "character": sc}, "end": {"line": el, "character": ec}})
+}
+
+/// The answer to a request about an open document.
+fn document_answer(method: &str, params: &Value, text: &str, units: Units) -> Value {
+    let words = words(text, units);
+    let lines = lines(text);
+    let at = |p: &Value| (p["line"].as_u64().unwrap_or(0) as usize, p["character"].as_u64().unwrap_or(0) as usize);
+    // The word a position touches.
+    let word_at = |(line, ch): (usize, usize)| words.iter().find(|(l, s, e, _)| *l == line && *s <= ch && ch <= *e);
+    match method {
+        "textDocument/documentSymbol" => words
+            .iter()
+            .map(|(l, s, e, w)| json!({"name": w, "kind": 13, "range": range(*l, *s, *l, *e), "selectionRange": range(*l, *s, *l, *e)}))
+            .collect(),
+        "textDocument/foldingRange" => {
+            // From the end of the first line to the end of the last with text.
+            let last = lines.iter().rposition(|l| !l.is_empty()).unwrap_or(0);
+            if last == 0 {
+                return json!([]);
+            }
+            json!([{"startLine": 0, "startCharacter": units.of(lines[0]), "endLine": last, "endCharacter": units.of(lines[last])}])
+        }
+        "textDocument/documentHighlight" => match word_at(at(&params["position"])) {
+            Some((_, _, _, word)) => words
+                .iter()
+                .filter(|(.., w)| w == word)
+                .map(|(l, s, e, _)| json!({"range": range(*l, *s, *l, *e), "kind": 1}))
+                .collect(),
+            None => json!([]),
+        },
+        "textDocument/selectionRange" => params["positions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|p| {
+                let (line, ch) = at(p);
+                let Some(text) = lines.get(line) else { return json!({"range": range(line, ch, line, ch)}) };
+                let parent = json!({"range": range(line, 0, line, units.of(text))});
+                match word_at((line, ch)) {
+                    Some((l, s, e, _)) => json!({"range": range(*l, *s, *l, *e), "parent": parent}),
+                    None => json!({"range": range(line, ch, line, ch), "parent": parent}),
+                }
+            })
+            .collect(),
+        _ => Value::Null,
+    }
+}
+
+/// A URI the stand-in publishes about without it ever being opened.
+const ELSEWHERE: &str = "file:///lspcheck-standin/elsewhere.txt";
+
+/// Publishes a warning for each ASCII word of a document, labelled with its
+/// version, plus what the lawful position faults add.
+fn publish_diagnostics<W: Write>(
+    out: &mut Writer<W>,
+    faults: &[String],
+    units: Units,
+    uri: &str,
+    text: &str,
+    version: Value,
+) {
+    let fault = |name: &str| faults.iter().any(|f| f == name);
+    let mut diagnostics: Vec<Value> = words(text, units)
+        .iter()
+        .map(|(l, s, e, w)| {
+            json!({"range": range(*l, *s, *l, *e), "severity": 2, "source": "standin", "message": format!("word: {w}")})
+        })
+        .collect();
+    let lines = lines(text);
+    if fault("past-line-end") {
+        let end = units.of(lines[0]) + 3;
+        diagnostics.push(json!({"range": range(0, 0, 0, end), "severity": 3, "message": "past the line"}));
+        diagnostics.push(json!({"range": range(0, 0, lines.len() + 5, 0), "severity": 3, "message": "past the end"}));
+    }
+    if fault("grapheme-split")
+        && let Some((n, at)) = lines.iter().enumerate().find_map(|(n, l)| l.find('\u{301}').map(|at| (n, at)))
+    {
+        let start = units.of(&lines[n][..at]);
+        let end = units.of(&lines[n][..at + '\u{301}'.len_utf8()]);
+        diagnostics.push(json!({"range": range(n, start, n, end), "severity": 3, "message": "a lone combining mark"}));
+    }
+    if fault("positions-in-data") {
+        for d in &mut diagnostics {
+            d["data"] = json!({"line": 0, "character": 1, "range": range(0, 1, 0, 3)});
+        }
+    }
+    if fault("foreign-locations") {
+        if let Some(first) = diagnostics.first_mut() {
+            first["relatedInformation"] =
+                json!([{"location": {"uri": ELSEWHERE, "range": range(0, 1, 0, 3)}, "message": "elsewhere"}]);
+        }
+        let params = json!({"uri": ELSEWHERE, "diagnostics": [{"range": range(0, 1, 0, 1), "message": "elsewhere"}]});
+        out.frame(&json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}));
+    }
+    let mut params = json!({"uri": uri, "diagnostics": diagnostics});
+    if !fault("unversioned-diagnostics") {
+        params["version"] = version;
+    }
+    out.frame(&json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}));
 }
 
 /// A leftover child: it signals that it's ready, then sleeps for a minute.

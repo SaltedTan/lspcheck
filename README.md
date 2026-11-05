@@ -2,7 +2,8 @@
 
 lspcheck starts a language server and checks that it speaks the
 [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) correctly. It checks message
-framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, and whether the server leaves processes behind. It
+framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, document positions, and whether the server leaves
+processes behind. It
 works with any server that talks over stdio, whatever language it is written in, and needs no configuration.
 
 ```console
@@ -19,6 +20,7 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  J1  MUST    A reply keeps its request's id: a number stays a number, exactly
   PASS  J2  MUST    Exactly one response per request: none duplicated or unasked
   PASS  J3  MUST    Notifications get no response, including unknown and $/ ones
+                     no response answered a notification
   PASS  J4  MUST    An unknown request gets MethodNotFound (-32601), including a $/ request
   PASS  J5  MUST    Envelopes are well formed: jsonrpc 2.0, one of result/error, an integer code
   PASS  J6  MUST    Concurrent requests are each answered with the right id
@@ -35,14 +37,19 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  L8  POLICY  End of input without exit ends the process
   PASS  L9  POLICY  No descendant process outlives the server
   PASS  C1  MUST    A cancelled request still gets exactly one response
+                     workspace/symbol (the server advertises workspaceSymbolProvider): answered with a result, and only once
   PASS  C2  MUST    Cancelling an unknown or finished request produces nothing
+                     cancelling an id never sent and a finished request drew no reply, and the server kept serving
   PASS  C3  MUST    No response to $/cancelRequest itself
-26 checks: 23 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
+                     no response answered a $/cancelRequest notification
+  PASS  D1  MUST    Positions fall on character boundaries of the text, in the negotiated encoding
+                     4 informative position(s) on character boundaries, counted in UTF-16 code units; 12 position(s) seen in the opened document, 0 past the end of a line, 0 on a line it doesn't have, 0 in other documents
+27 checks: 24 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 26 checks so far, covering framing, JSON-RPC correlation, the lifecycle and cancellation.
-[The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, document positions and
-robustness.
+lspcheck is early: it has 27 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
+document positions. [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids,
+documents and robustness.
 
 ## What it doesn't do
 
@@ -86,6 +93,14 @@ them fails, the rest are reported as `ERROR`, not `FAIL`; if it never answers a 
 F2 needs output with non-ASCII text, so lspcheck sends a request whose string id has some, which the response must
 echo. A server that escapes all non-ASCII text as `\u` sequences (which is lawful) gives no evidence, and F2 reports
 `N/E`.
+
+D1 opens a plain-text document whose lines mix emoji, a combining mark and CJK characters, asks each document request
+the server advertises (symbols, folding ranges, highlights, selection ranges and others), and reads the diagnostics it
+publishes. Every position the server sends about the document must fall between characters in the position encoding
+the two sides agreed (UTF-16 unless the server chose another): never between the halves of a UTF-16 surrogate pair or
+inside a UTF-8 multibyte sequence. The document is built so that counting in the wrong units lands inside a
+character, and a failure says which counting would have fit. A position past the end of a line isn't judged, because
+the client clamps it. Most language servers ignore a plain-text document without a profile, and then D1 is `N/E`.
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of

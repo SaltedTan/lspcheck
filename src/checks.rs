@@ -10,9 +10,11 @@
 //! lspcheck hit one of its own inspection limits is reported as an error,
 //! because the missing evidence might explain it.
 
+use crate::documents::{self, DOC_A_LINES, OpenDoc, Source, Version};
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
-use crate::session::{self, CallError, Finish, Options, Problem, Session, Unmatched, WaitError, WriteError};
+use crate::session::{self, CallError, Finish, Options, Problem, Recv, Session, Unmatched, WaitError, WriteError};
+use crate::text::{self, Encoding, Position};
 use crate::transcript;
 use crate::transport;
 use serde::Serialize;
@@ -50,6 +52,7 @@ pub enum Area {
     JsonRpc,
     Lifecycle,
     Cancellation,
+    Documents,
 }
 
 /// A check's identity and documentation.
@@ -117,6 +120,13 @@ pub const CATALOGUE: &[CheckInfo] = &[
     check!("C1", Cancellation, Must, "A cancelled request still gets exactly one response", "cancelRequest"),
     check!("C2", Cancellation, Must, "Cancelling an unknown or finished request produces nothing", "cancelRequest"),
     check!("C3", Cancellation, Must, "No response to $/cancelRequest itself", "cancelRequest"),
+    check!(
+        "D1",
+        Documents,
+        Must,
+        "Positions fall on character boundaries of the text, in the negotiated encoding",
+        "position"
+    ),
 ];
 
 /// Checks judged from every scenario's observations.
@@ -241,6 +251,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
+    Scenario { name: "documents", checks: &["D1"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
@@ -288,6 +299,11 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         Err(e) => return Ok(unstarted(format!("could not create a workspace: {e}"))),
     };
     let root = workspace.path().to_path_buf();
+    // The URIs lspcheck builds should match the ones a server derives from
+    // the real path (on macOS, /var is /private/var). Windows' canonical
+    // form is a verbatim path that doesn't make a usable URI, so it is left.
+    #[cfg(unix)]
+    let root = root.canonicalize().unwrap_or(root);
     let opts = Options {
         sentinel: cfg.sentinel.clone(),
         max_body: cfg.max_body,
@@ -314,6 +330,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         "framing" => framing(&mut ctx).await,
         "after-initialize" => after_initialize(&mut ctx).await,
         "cancellation" => cancellation(&mut ctx).await,
+        "documents" => documents(&mut ctx).await,
         "end-of-input" => end_of_input(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
@@ -439,8 +456,14 @@ impl Ctx<'_> {
 
     /// Initializes the server and sends `initialized`.
     async fn initialize(&mut self) -> Result<Message, InitFailure> {
+        let params = initialize_params(&self.root);
+        self.initialize_with(params).await
+    }
+
+    /// Initializes the server with these params and sends `initialized`.
+    async fn initialize_with(&mut self, params: Value) -> Result<Message, InitFailure> {
         let t = self.cfg.startup_timeout;
-        let reply = match self.s.call("initialize", Some(initialize_params(&self.root)), t).await {
+        let reply = match self.s.call("initialize", Some(params), t).await {
             Ok(reply) => reply,
             Err(CallError::Wait(WaitError::Timeout)) => {
                 return Err(InitFailure::Blocked(format!(
@@ -1155,6 +1178,264 @@ async fn leave(ctx: &mut Ctx<'_>) -> Duration {
     end
 }
 
+/// The method whose notifications carry diagnostics.
+const PUBLISH_DIAGNOSTICS: &str = "textDocument/publishDiagnostics";
+/// How long lspcheck waits for diagnostics labelled with the version it sent.
+/// Absence fails nothing, so the wait only buys evidence.
+const DIAGNOSTICS_WAIT: Duration = Duration::from_secs(3);
+/// The version document A is opened with. A distinctive base catches a server
+/// that labels diagnostics with a counter of its own.
+const DOC_A_VERSION: i64 = 41;
+
+/// A request lspcheck sent about a document.
+struct Asked {
+    id: Id,
+    method: &'static str,
+    params: Value,
+    /// When lspcheck began writing it.
+    at: Duration,
+}
+
+/// Initialize params for the documents scenario: the usual ones, plus the
+/// client capabilities for the requests it may send.
+fn documents_initialize_params(root: &Path) -> Value {
+    let mut params = initialize_params(root);
+    let doc = &mut params["capabilities"]["textDocument"];
+    for (name, caps) in [
+        ("foldingRange", json!({"lineFoldingOnly": false})),
+        ("selectionRange", json!({})),
+        ("documentHighlight", json!({})),
+        ("documentLink", json!({})),
+        ("codeLens", json!({})),
+        ("diagnostic", json!({"relatedDocumentSupport": false})),
+        ("inlayHint", json!({})),
+        ("formatting", json!({})),
+    ] {
+        doc[name] = caps;
+    }
+    params
+}
+
+/// The encoding positions are counted in: the server's `positionEncoding`, or
+/// UTF-16 when it chose none. One lspcheck didn't offer is L2's failure, and
+/// leaves nothing D1 could count in.
+fn negotiated_encoding(reply: &Message) -> Result<Encoding, String> {
+    let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { unreachable!() };
+    match result.pointer("/capabilities/positionEncoding") {
+        None => Ok(Encoding::Utf16),
+        Some(Value::String(name)) if OFFERED_ENCODINGS.contains(&name.as_str()) => {
+            Ok(Encoding::from_name(name).expect("every offered encoding has a name lspcheck knows"))
+        }
+        Some(other) => {
+            Err(format!("not judged: the server chose positionEncoding {other}, which lspcheck didn't offer (see L2)"))
+        }
+    }
+}
+
+/// Whether a server capability is advertised: `true`, or an options object.
+fn advertises(caps: &Value, name: &str) -> bool {
+    matches!(caps.get(name), Some(Value::Bool(true) | Value::Object(_)))
+}
+
+/// The advertised requests about document A at `uri`, with their params.
+/// Every position sent is counted in the negotiated encoding.
+fn document_requests(caps: &Value, uri: &str, encoding: Encoding) -> Vec<(&'static str, Value)> {
+    let pos = |p: Position| json!({"line": p.line, "character": p.character});
+    let doc = json!({"uri": uri});
+    let (word, _) = documents::doc_a_span(0, "word", encoding);
+    // `word` is ASCII, so two units in is inside it in every encoding.
+    let inside = Position { line: 0, character: word.character + 2 };
+    let l0_end = Position { line: 0, character: text::line_length(DOC_A_LINES[0], encoding) };
+    let (_, name_end) = documents::doc_a_span(2, "name", encoding);
+    // The empty line after the final newline ends the document.
+    let whole = json!({"start": {"line": 0, "character": 0}, "end": {"line": DOC_A_LINES.len(), "character": 0}});
+    [
+        ("documentSymbolProvider", "textDocument/documentSymbol", json!({"textDocument": doc})),
+        ("foldingRangeProvider", "textDocument/foldingRange", json!({"textDocument": doc})),
+        ("documentLinkProvider", "textDocument/documentLink", json!({"textDocument": doc})),
+        ("codeLensProvider", "textDocument/codeLens", json!({"textDocument": doc})),
+        ("inlayHintProvider", "textDocument/inlayHint", json!({"textDocument": doc, "range": whole})),
+        (
+            "documentFormattingProvider",
+            "textDocument/formatting",
+            json!({"textDocument": doc, "options": {"tabSize": 4, "insertSpaces": true}}),
+        ),
+        ("diagnosticProvider", "textDocument/diagnostic", json!({"textDocument": doc})),
+        ("hoverProvider", "textDocument/hover", json!({"textDocument": doc, "position": pos(word)})),
+        (
+            "documentHighlightProvider",
+            "textDocument/documentHighlight",
+            json!({"textDocument": doc, "position": pos(word)}),
+        ),
+        (
+            "selectionRangeProvider",
+            "textDocument/selectionRange",
+            json!({"textDocument": doc, "positions": [pos(word), pos(inside), pos(l0_end), pos(name_end)]}),
+        ),
+    ]
+    .into_iter()
+    .filter(|(cap, ..)| advertises(caps, cap))
+    .map(|(_, method, params)| (method, params))
+    .collect()
+}
+
+/// Sends one request and waits for its response, all by one `--timeout`
+/// deadline. Errs when lspcheck couldn't send it.
+async fn ask(
+    ctx: &mut Ctx<'_>,
+    method: &'static str,
+    params: Value,
+) -> Result<(Asked, Result<(), WaitError>), WriteError> {
+    let deadline = Instant::now() + ctx.cfg.request_timeout;
+    let id = ctx.s.fresh_id();
+    let bytes = frame(&message::request(&id, method, Some(params.clone())));
+    ctx.s.begin_request(&id, deadline).await?;
+    let at = ctx.s.elapsed();
+    if let Err(e) = ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await {
+        ctx.s.abort_request(&id);
+        return Err(e);
+    }
+    let answer = ctx.s.wait_response(&id, deadline).await.map(|_| ());
+    Ok((Asked { id, method, params, at }, answer))
+}
+
+/// Whether a message is a `publishDiagnostics` for `uri` labelled `version`.
+fn labelled_diagnostics(m: &Message, uri: &str, version: i64) -> bool {
+    m.method() == Some(PUBLISH_DIAGNOSTICS)
+        && m.value.pointer("/params/uri").and_then(Value::as_str).is_some_and(|u| documents::same_uri(u, uri))
+        && m.value.pointer("/params/version").and_then(Value::as_i64) == Some(version)
+}
+
+/// Reads until diagnostics for `uri` labelled `version` have been read (from
+/// message `from` on), or for [`DIAGNOSTICS_WAIT`], answering the server's
+/// requests meanwhile.
+async fn await_diagnostics(ctx: &mut Ctx<'_>, uri: &str, version: i64, from: usize) {
+    let deadline = Instant::now() + DIAGNOSTICS_WAIT;
+    let mut checked = from;
+    loop {
+        if ctx.s.messages[checked..].iter().any(|(_, m)| labelled_diagnostics(m, uri, version)) {
+            return;
+        }
+        checked = ctx.s.messages.len();
+        if matches!(ctx.s.recv(deadline).await, Recv::Closed | Recv::Timeout) {
+            return;
+        }
+    }
+}
+
+/// Documents: lspcheck opens document A, asks the server's advertised
+/// requests about it one at a time, and waits a while for diagnostics. Every
+/// position the server sends about it must fall on a character boundary of
+/// the text it refers to, in the negotiated encoding (D1).
+///
+/// A position can come at any time (diagnostics especially), so the verdict
+/// is given at the end, over everything read before lspcheck sent `exit`.
+async fn documents(ctx: &mut Ctx<'_>) {
+    let params = documents_initialize_params(&ctx.root);
+    let reply = match ctx.initialize_with(params).await {
+        Ok(reply) => reply,
+        Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
+            return ctx.report("D1", Verdict::Error, format!("initialize didn't succeed: {why}"));
+        }
+    };
+    if !opens_documents(&reply) {
+        ctx.report(
+            "D1",
+            Verdict::Skip,
+            "the server doesn't ask for didOpen (textDocumentSync), so lspcheck opens no document",
+        );
+        leave(ctx).await;
+        return;
+    }
+    let encoding = match negotiated_encoding(&reply) {
+        Ok(e) => e,
+        Err(why) => {
+            ctx.report("D1", Verdict::Error, why);
+            leave(ctx).await;
+            return;
+        }
+    };
+    let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { unreachable!() };
+    let caps = result.get("capabilities").cloned().unwrap_or(Value::Null);
+
+    // Document A, saved in the workspace as an editor would open it.
+    let path = ctx.root.join("doc.txt");
+    let text = documents::doc_a();
+    if let Err(e) = std::fs::write(&path, &text) {
+        ctx.s.note(format!("couldn't write {}: {e}", path.display()));
+    }
+    let uri = file_uri(&path);
+    let from = ctx.s.messages.len();
+    let opened_at = ctx.s.elapsed();
+    let doc = json!({"uri": uri, "languageId": "plaintext", "version": DOC_A_VERSION, "text": text});
+    if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await {
+        ctx.report("D1", Verdict::Error, format!("lspcheck couldn't send didOpen: {e}"));
+        leave(ctx).await;
+        return;
+    }
+    let docs = [OpenDoc { uri: uri.clone(), versions: vec![Version { at: opened_at, number: DOC_A_VERSION, text }] }];
+
+    // One request at a time, so a reply always refers to the version current
+    // when it was asked. No reply, or an error, is simply no evidence.
+    let t = ctx.cfg.request_timeout;
+    let mut asked = Vec::new();
+    let mut notes = Vec::new();
+    for (method, params) in document_requests(&caps, &uri, encoding) {
+        match ask(ctx, method, params).await {
+            Ok((a, answer)) => {
+                asked.push(a);
+                if let Err(e) = answer {
+                    let why = describe_call_error(&CallError::Wait(e), t);
+                    notes.push(format!("{method} went unanswered ({why}), so no more requests were sent"));
+                    break;
+                }
+            }
+            Err(e) => {
+                notes.push(format!("lspcheck couldn't send {method} ({e}), so no more requests were sent"));
+                break;
+            }
+        }
+    }
+    await_diagnostics(ctx, &uri, DOC_A_VERSION, from).await;
+    let end = leave(ctx).await;
+
+    // Everything read before `exit` was sent: diagnostics, and the replies
+    // to lspcheck's requests, however late.
+    let msgs = &ctx.s.messages;
+    let mut sources = Vec::new();
+    for (at, m) in msgs.iter().filter(|(at, _)| *at < end) {
+        if m.method() == Some(PUBLISH_DIAGNOSTICS) && matches!(m.kind, Kind::Notification { .. }) {
+            let params = m.value.get("params").cloned().unwrap_or(Value::Null);
+            sources.push(Source {
+                method: PUBLISH_DIAGNOSTICS.into(),
+                found: text::positions(PUBLISH_DIAGNOSTICS, &params, None),
+                asked_at: None,
+                read_at: *at,
+                label: params.get("version").and_then(Value::as_i64),
+            });
+        }
+    }
+    for a in &asked {
+        let answer = msgs.iter().find(|(at, m)| *at >= a.at && *at < end && m.response_id() == Some(&a.id));
+        if let Some((at, Message { kind: Kind::Response { outcome: Outcome::Result(result), .. }, .. })) = answer {
+            sources.push(Source {
+                method: a.method.into(),
+                found: text::positions(a.method, &a.params, Some(result)),
+                asked_at: Some(a.at),
+                read_at: *at,
+                label: None,
+            });
+        }
+    }
+    let judged = documents::judge_positions(encoding, &docs, &sources);
+    let incomplete = ctx.s.incomplete_within(opened_at, end);
+    let (verdict, mut detail) = documents::judge_d1(encoding, &judged, incomplete.as_deref());
+    if !notes.is_empty() {
+        detail = format!("{detail}; {}", notes.join("; "));
+    }
+    ctx.report("D1", verdict, detail);
+}
+
 /// End of input without exit, as when the editor goes away.
 async fn end_of_input(ctx: &mut Ctx<'_>) {
     if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
@@ -1663,8 +1944,15 @@ fn judge_j2(runs: &[ScenarioRun]) -> CheckResult {
 /// answers some notification. `framing` is left out because its variants can
 /// make a server misread the input (a null-id ParseError is then lawful), and
 /// `pre-initialize` because L1 judges what happens there.
-const J3_SCENARIOS: &[&str] =
-    &["lifecycle", "json-rpc", "after-initialize", "cancellation", "end-of-input", "exit-without-shutdown"];
+const J3_SCENARIOS: &[&str] = &[
+    "lifecycle",
+    "json-rpc",
+    "after-initialize",
+    "cancellation",
+    "documents",
+    "end-of-input",
+    "exit-without-shutdown",
+];
 
 /// J3 across the scenarios in [`J3_SCENARIOS`]: no response without an id
 /// (`id` missing or null) is read after `initialized`, to the end of the

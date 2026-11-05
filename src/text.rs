@@ -540,7 +540,7 @@ mod tests {
 
     /// The first line of the `documents` scenario's document A: six emoji, a
     /// word, six emoji, ending in a 4-byte character.
-    const L0: &str = "\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600} word \u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}";
+    const L0: &str = crate::documents::DOC_A_LINES[0];
     /// Document B of the same scenario: a lone CR, a CR LF, then LF lines.
     const DOC_B: &str = "x\r\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\r\n word\n\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\n name\n";
 
