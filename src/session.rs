@@ -86,6 +86,12 @@ pub enum EventKind {
     StdoutClosed,
     Exited(String),
     Note(String),
+    /// The workspace the server runs in and the files in it, so a transcript
+    /// can be replayed in a recreated workspace.
+    Workspace {
+        path: PathBuf,
+        files: Vec<(String, String)>,
+    },
 }
 
 /// Something wrong with the server's output stream.
@@ -417,6 +423,11 @@ impl Session {
 
     pub fn note(&self, text: impl Into<String>) {
         record(&self.transcript, self.start.elapsed(), EventKind::Note(text.into()));
+    }
+
+    /// Records the workspace and the files in it, for [`crate::replay`].
+    pub fn record_workspace(&self, path: PathBuf, files: Vec<(String, String)>) {
+        record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files });
     }
 
     /// Why evidence is incomplete so far, if it is: an inspection limit,

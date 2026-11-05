@@ -4,6 +4,7 @@
 use clap::{Parser, Subcommand};
 use lspcheck::checks::{self, Config};
 use lspcheck::process::{self, SENTINEL_ARG, ServerCommand};
+use lspcheck::replay;
 use lspcheck::report;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -64,6 +65,23 @@ struct Cli {
 enum Cmd {
     /// List every check with its basis and specification section.
     List,
+    /// Re-run a recorded session against a server, without judging checks.
+    Replay {
+        /// The transcript to replay (a .jsonl file from --transcripts).
+        transcript: PathBuf,
+        /// The server command and its arguments, after `--`.
+        #[arg(last = true, value_name = "SERVER")]
+        server: Vec<OsString>,
+        /// Seconds to wait for each response.
+        #[arg(long, default_value_t = 10, value_name = "SECS")]
+        timeout: u64,
+        /// Seconds to wait for the server to exit.
+        #[arg(long, default_value_t = 5, value_name = "SECS")]
+        exit_timeout: u64,
+        /// Write the replay's own transcript here.
+        #[arg(long = "transcript", value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -78,6 +96,48 @@ fn main() {
             println!("{:<3} {:<6} {}\n    {}", c.id, c.basis.label(), c.title, checks::spec_url(c));
         }
         return;
+    }
+    if let Some(Cmd::Replay { transcript, server, timeout, exit_timeout, output }) = cli.command {
+        if server.is_empty() {
+            eprintln!(
+                "lspcheck replay: give the server command after `--`, for example: lspcheck replay t.jsonl -- gopls"
+            );
+            std::process::exit(2);
+        }
+        let output = output.unwrap_or_else(|| {
+            let mut p = transcript.clone();
+            let stem =
+                transcript.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "transcript".into());
+            p.set_file_name(format!("{stem}.replay.jsonl"));
+            p
+        });
+        let overwrites = match (output.canonicalize(), transcript.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => output == transcript,
+        };
+        if overwrites {
+            eprintln!("lspcheck replay: the replay transcript would overwrite the input {}", transcript.display());
+            std::process::exit(2);
+        }
+        process::enable_subreaper();
+        let server_cmd = ServerCommand::new(&server);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+        match rt.block_on(replay::replay(
+            &transcript,
+            &server_cmd,
+            Duration::from_secs(timeout),
+            Duration::from_secs(exit_timeout),
+            &output,
+        )) {
+            Ok(summary) => {
+                print!("{}", summary.render());
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("lspcheck replay: {e}");
+                std::process::exit(2);
+            }
+        }
     }
     if cli.server.is_empty() {
         eprintln!("lspcheck: give the server command after `--`, for example: lspcheck -- gopls");

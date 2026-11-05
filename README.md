@@ -111,7 +111,24 @@ without a version leaves D2 `N/E`, and a `version` that is `null` or not an inte
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of
-stderr, and timestamps, so you can see what happened in a failing scenario.
+stderr, and timestamps, so you can see what happened in a failing scenario. Each file begins with a meta line naming the
+workspace the scenario ran in and the files it held, so a replay can recreate it.
+
+### Reproducing a failure
+
+`lspcheck replay` re-runs one recorded session against a server, without judging any check:
+
+```sh
+lspcheck replay out/lifecycle.jsonl -- my-server --stdio
+```
+
+It recreates the recorded workspace (refusing to touch an existing non-empty one), re-sends every client write in the
+transcript in order, and reports what the server did this time: each request's outcome against the recorded one, the
+exit status, and how many server-to-client requests were answered. Gaps of at least 200 ms between writes are kept as
+pauses; smaller ones are sent back-to-back. Server-to-client requests are answered with the same auto-answers a live
+run uses, so they don't stall the replay. The replay's own transcript goes to `--transcript FILE` (never overwriting an
+existing file), and the workspace is removed afterwards. The exit status is 0 when the replay ran, 2 for usage errors
+and transcripts that can't be read. Replay shows *what changed*; to judge checks on the server, run `lspcheck` on it.
 
 lspcheck inspects at most `--max-output-mib` (256) of stdout per scenario and frames of at most `--max-frame-mib` (64).
 These are lspcheck's own limits, not protocol rules: past them it keeps reading so the server isn't blocked, but stops
