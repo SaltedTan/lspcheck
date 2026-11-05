@@ -219,6 +219,10 @@ pub struct Unmatched {
     pub loose: Option<Id>,
 }
 
+/// The note recorded when lspcheck starts stopping a server that is still
+/// running; what the server sends after it is a reaction to being stopped.
+pub const STOPPING_NOTE: &str = "lspcheck is stopping the server";
+
 /// What remains when a session ends.
 #[derive(Debug)]
 pub struct Finish {
@@ -869,7 +873,7 @@ impl Session {
         let mut killed = false;
         if self.is_alive() {
             killed = true;
-            self.note("lspcheck is stopping the server");
+            self.note(STOPPING_NOTE);
             #[cfg(unix)]
             {
                 self.group.signal(nix::sys::signal::Signal::SIGTERM);

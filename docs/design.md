@@ -224,7 +224,9 @@ Without a profile: an empty temp workspace and a `plaintext` document. Generic c
   workspace (refusing a non-empty or symlink path; preserving an existing empty directory), re-sends every client write
   in order (gaps under 200 ms kept as pauses), and answers server-to-client requests with the same auto-answers a live run
   uses. It reports each request's outcome against the recorded one (result / error code / no reply), the exit status
-  recorded versus now, and how many server-to-client requests were answered. It judges no check: the summary says to
+  recorded versus now, and how many server-to-client requests were answered. An outcome is the first response with
+  the request's id read after the write holding the request's last byte began, before the id was next sent and before
+  lspcheck began stopping the server; both runs are matched the same way. It judges no check: the summary says to
   run `lspcheck --only ID` to judge. `--transcript FILE` writes the replay's own transcript without overwriting an
   existing path. Transcripts without a workspace line replay in the current directory with a note. The transcript
   includes `{"dir":"meta","event":"stdin closed"}` when lspcheck closes stdin. Exit 0 when the replay ran, 2 for usage

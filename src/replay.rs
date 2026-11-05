@@ -164,6 +164,48 @@ fn first_response_in_window(
         })
 }
 
+/// When the replay wrote each request occurrence.
+struct SendTimes<'a> {
+    /// When its first byte was written.
+    first: &'a [Option<Duration>],
+    /// When the write holding its last byte began.
+    complete: &'a [Option<Duration>],
+    /// Why its reply can't be attributed, when it can't.
+    failed: &'a [Option<&'static str>],
+}
+
+/// What the replay saw for each request occurrence, matched the way the
+/// recording's outcomes are: the first response with its id read from when
+/// the write holding its last byte began, until the same id was next written
+/// or lspcheck began stopping the server.
+fn replayed_outcomes(
+    requests: &[RequestOccurrence],
+    times: &SendTimes,
+    stop_at: Option<Duration>,
+    messages: &[(Duration, Message)],
+) -> Vec<String> {
+    requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            let next_send = requests[index + 1..]
+                .iter()
+                .position(|next| next.id == request.id)
+                .and_then(|relative| times.first[index + 1 + relative]);
+            let end = match (next_send, stop_at) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            times.failed[index]
+                .map(str::to_string)
+                .or_else(|| {
+                    times.complete[index].and_then(|at| first_response_in_window(&request.id, at, end, messages))
+                })
+                .unwrap_or_else(|| "no reply".into())
+        })
+        .collect()
+}
+
 async fn wait_gates(session: &mut Session, gates: &[Id], timeout: Duration) {
     for id in gates {
         if session.wait_response(id, Instant::now() + timeout).await.is_err() {
@@ -192,6 +234,7 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
     let mut last_out_at: Option<f64> = None;
     let mut out_offset = 0usize;
     let mut out_events = Vec::new();
+    let mut stop_line: Option<usize> = None;
     for (n, raw) in text.lines().enumerate() {
         if raw.trim().is_empty() {
             continue;
@@ -229,9 +272,12 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
                     && after_idle
                     && frames_only
                     && messages.iter().all(|message| message.as_ref().is_some_and(is_skippable_response));
-                if skip {
-                    plan.server_requests += messages.len();
-                }
+                // Every response frame lspcheck wrote, whether or not the
+                // event is skipped, counted the way the replay's are.
+                plan.server_requests += messages
+                    .iter()
+                    .filter(|m| m.as_ref().is_some_and(|m| matches!(m.kind, Kind::Response { .. })))
+                    .count();
                 let step_index = plan.steps.len();
                 let event_start = out_offset;
                 let event_end = event_start + bytes.len();
@@ -272,6 +318,9 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
                 }
             }
             Some("meta") => {
+                if stop_line.is_none() && v.get("note").and_then(Value::as_str) == Some(session::STOPPING_NOTE) {
+                    stop_line = Some(n);
+                }
                 if v.get("event").and_then(Value::as_str) == Some("exited") {
                     plan.exit = v.get("how").and_then(Value::as_str).map(str::to_string);
                 }
@@ -312,7 +361,10 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
         plan.requests[index].recorded = responses
             .iter()
             .find(|(line, response_id, _)| {
-                response_id == &id && *line > complete_line && next_start.is_none_or(|next| *line < next)
+                response_id == &id
+                    && *line > complete_line
+                    && next_start.is_none_or(|next| *line < next)
+                    && stop_line.is_none_or(|stop| *line < stop)
             })
             .map(|(_, _, outcome)| outcome.clone());
     }
@@ -331,14 +383,16 @@ fn validate_workspace_files(files: &[(String, String)]) -> Result<Vec<PathBuf>, 
     let mut paths: Vec<PathBuf> = Vec::with_capacity(files.len());
     for (name, _) in files {
         let invalid = || format!("invalid workspace file key {name:?}");
+        // Keys are written with '/' between directories. A backslash is
+        // part of a file name on Unix, and can't be one on Windows.
         if name.is_empty()
             || name.starts_with('/')
-            || name.starts_with('\\')
+            || (cfg!(windows) && name.contains('\\'))
             || (name.as_bytes().get(1) == Some(&b':') && name.as_bytes()[0].is_ascii_alphabetic())
         {
             return Err(invalid());
         }
-        let parts: Vec<&str> = name.split(['/', '\\']).collect();
+        let parts: Vec<&str> = name.split('/').collect();
         if parts.iter().any(|part| part.is_empty() || *part == "." || *part == "..") {
             return Err(invalid());
         }
@@ -357,6 +411,17 @@ fn validate_workspace_files(files: &[(String, String)]) -> Result<Vec<PathBuf>, 
     Ok(paths)
 }
 
+/// The recorded workspace path as replay uses it: absolute, without `.` or
+/// `..` segments, and without a trailing separator. On Linux `link/` names
+/// the directory a symlink points to, so a trailing separator would let a
+/// symlinked workspace pass for a real directory.
+fn workspace_path(recorded: &Path) -> Result<PathBuf, String> {
+    if !recorded.is_absolute() || recorded.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!("the workspace {} is not an absolute path without '..'", recorded.display()));
+    }
+    Ok(recorded.components().collect())
+}
+
 /// A workspace guard removes only files and directories it created.
 struct WorkspaceGuard {
     path: Option<PathBuf>,
@@ -368,8 +433,12 @@ struct WorkspaceGuard {
 
 impl WorkspaceGuard {
     fn new(w: Option<&Workspace>) -> Result<WorkspaceGuard, String> {
+        let path = match w {
+            Some(w) => Some(workspace_path(&w.path)?),
+            None => None,
+        };
         let mut guard = WorkspaceGuard {
-            path: w.map(|w| w.path.clone()),
+            path: path.clone(),
             created_root: false,
             created_files: Vec::new(),
             created_dirs: Vec::new(),
@@ -377,27 +446,27 @@ impl WorkspaceGuard {
         };
         if let Some(w) = w {
             let paths = validate_workspace_files(&w.files)?;
-            match std::fs::symlink_metadata(&w.path) {
+            let root = path.as_ref().expect("a workspace has a path");
+            match std::fs::symlink_metadata(root) {
                 Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-                    return Err(format!("the workspace {} is not a real directory", w.path.display()));
+                    return Err(format!("the workspace {} is not a real directory", root.display()));
                 }
                 Ok(_) => {
-                    let mut entries = std::fs::read_dir(&w.path)
-                        .map_err(|e| format!("can't read workspace {}: {e}", w.path.display()))?;
+                    let mut entries =
+                        std::fs::read_dir(root).map_err(|e| format!("can't read workspace {}: {e}", root.display()))?;
                     if entries.next().is_some() {
-                        return Err(format!("the workspace {} already exists and is not empty", w.path.display()));
+                        return Err(format!("the workspace {} already exists and is not empty", root.display()));
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let parent = w.path.parent().unwrap_or_else(|| Path::new("."));
+                    let parent = root.parent().unwrap_or_else(|| Path::new("."));
                     if !parent.is_dir() {
                         return Err(format!("the parent directory {} does not exist", parent.display()));
                     }
-                    std::fs::create_dir(&w.path)
-                        .map_err(|e| format!("can't create workspace {}: {e}", w.path.display()))?;
+                    std::fs::create_dir(root).map_err(|e| format!("can't create workspace {}: {e}", root.display()))?;
                     guard.created_root = true;
                 }
-                Err(e) => return Err(format!("can't inspect workspace {}: {e}", w.path.display())),
+                Err(e) => return Err(format!("can't inspect workspace {}: {e}", root.display())),
             }
             guard.write_files(w, &paths)?;
         }
@@ -513,7 +582,10 @@ pub async fn replay(
     // had already read, including events replaced by the session's auto-answer.
     let mut sending = true;
     let mut close = plan.stdin_close;
-    let mut send_times: Vec<Option<Duration>> = vec![None; plan.requests.len()];
+    // When each request's first byte was written, and when the write holding
+    // its last byte began.
+    let mut first_times: Vec<Option<Duration>> = vec![None; plan.requests.len()];
+    let mut complete_times: Vec<Option<Duration>> = vec![None; plan.requests.len()];
     let mut registered = vec![false; plan.requests.len()];
     let mut registration_failed = vec![None; plan.requests.len()];
     for (step_index, step) in plan.steps.iter().enumerate() {
@@ -545,7 +617,15 @@ pub async fn replay(
                         .note(format!("could not register request id {id} before replay write: {e}; sending anyway"));
                 }
             }
-            send_times[request_index] = Some(session.elapsed());
+            first_times[request_index] = Some(session.elapsed());
+        }
+        // A request's reply window opens when the write holding its last
+        // byte begins, as the recorded one does (responses after that event).
+        let write_at = session.elapsed();
+        for (request_index, request) in plan.requests.iter().enumerate() {
+            if request.complete_step == step_index {
+                complete_times[request_index] = Some(write_at);
+            }
         }
         if let Err(e) = session.write_split(&step.bytes, &[], Duration::ZERO, Instant::now() + timeout).await {
             session.note(format!("replay stopped sending: {e}"));
@@ -582,28 +662,21 @@ pub async fn replay(
     transcript::write_new(output, &finish.transcript).map_err(|e| format!("can't write {}: {e}", output.display()))?;
     let workspace_removed = guard.remove();
 
+    // What the server sent once lspcheck began stopping it is a reaction to
+    // that, not a reply the recording can be compared with.
+    let stop_at = finish.transcript.iter().find_map(|event| match &event.kind {
+        session::EventKind::Note(text) if text == session::STOPPING_NOTE => Some(event.at),
+        _ => None,
+    });
+    let times = SendTimes { first: &first_times, complete: &complete_times, failed: &registration_failed };
     let requests = plan
         .requests
         .iter()
-        .enumerate()
-        .map(|(index, request)| {
-            let next_send = plan.requests[index + 1..]
-                .iter()
-                .enumerate()
-                .find(|(_, next)| next.id == request.id)
-                .and_then(|(relative, _)| send_times[index + 1 + relative]);
-            let replayed = registration_failed[index]
-                .map(str::to_string)
-                .or_else(|| {
-                    send_times[index]
-                        .and_then(|at| first_response_in_window(&request.id, at, next_send, &finish.messages))
-                })
-                .unwrap_or_else(|| "no reply".into());
-            RequestOutcome {
-                id: request.id.to_string(),
-                recorded: request.recorded.clone().unwrap_or_else(|| "no reply".into()),
-                replayed,
-            }
+        .zip(replayed_outcomes(&plan.requests, &times, stop_at, &finish.messages))
+        .map(|(request, replayed)| RequestOutcome {
+            id: request.id.to_string(),
+            recorded: request.recorded.clone().unwrap_or_else(|| "no reply".into()),
+            replayed,
         })
         .collect();
     let exit = match finish.exit {
@@ -872,6 +945,102 @@ mod tests {
         assert_eq!(p.requests.len(), 2);
         assert_eq!(p.requests[0].recorded.as_deref(), Some("result"));
         assert_eq!(p.requests[1].recorded.as_deref(), Some("error -32601"));
+    }
+
+    fn read(at_ms: u64, body: Value) -> (Duration, Message) {
+        (Duration::from_millis(at_ms), Message::parse(&serde_json::to_vec(&body).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn replies_after_lspcheck_began_stopping_the_server_dont_count() {
+        let req = frame(&request(&Id::int(1), "m", None));
+        let reply = frame(&json!({"jsonrpc": "2.0", "id": 1, "result": null}));
+        let stopping = json!({"t_ms": 10.0, "dir": "meta", "note": session::STOPPING_NOTE}).to_string();
+        // In the recording: the reply came only once lspcheck was stopping the server.
+        let p = plan(&[line("out", 0.0, &req), stopping, line("in", 20.0, &reply)].join("\n"));
+        assert_eq!(p.requests[0].recorded, None);
+        // In the replay: the same.
+        let times = SendTimes { first: &[Some(Duration::ZERO)], complete: &[Some(Duration::ZERO)], failed: &[None] };
+        let late = [read(20, json!({"jsonrpc": "2.0", "id": 1, "result": null}))];
+        let stop = Some(Duration::from_millis(10));
+        assert_eq!(replayed_outcomes(&p.requests, &times, stop, &late), vec!["no reply".to_string()]);
+        let early = [read(5, json!({"jsonrpc": "2.0", "id": 1, "result": null}))];
+        assert_eq!(replayed_outcomes(&p.requests, &times, stop, &early), vec!["result".to_string()]);
+    }
+
+    #[test]
+    fn a_reply_window_opens_when_the_requests_last_byte_is_written() {
+        let req = frame(&request(&Id::int(1), "m", None));
+        let split = req.iter().position(|&b| b == b'{').unwrap();
+        let premature = frame(&json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "early"}}));
+        let reply = frame(&json!({"jsonrpc": "2.0", "id": 1, "result": null}));
+        // A response with the request's id arrives between its header and body.
+        let jsonl = [
+            line("out", 0.0, &req[..split]),
+            line("in", 5.0, &premature),
+            line("out", 10.0, &req[split..]),
+            line("in", 15.0, &reply),
+        ]
+        .join("\n");
+        let p = plan(&jsonl);
+        assert_eq!(p.requests[0].recorded.as_deref(), Some("result"));
+        let times =
+            SendTimes { first: &[Some(Duration::ZERO)], complete: &[Some(Duration::from_millis(10))], failed: &[None] };
+        let messages = [
+            read(5, json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "early"}})),
+            read(15, json!({"jsonrpc": "2.0", "id": 1, "result": null})),
+        ];
+        assert_eq!(replayed_outcomes(&p.requests, &times, None, &messages), vec!["result".to_string()]);
+    }
+
+    #[test]
+    fn answers_split_across_writes_are_counted() {
+        // The replay counts every response frame it wrote; the recording's
+        // count must include one split across two writes.
+        let answer = frame(&json!({"jsonrpc": "2.0", "id": "cfg", "result": []}));
+        let half = answer.len() / 2;
+        let p = plan(&[line("out", 0.0, &answer[..half]), line("out", 10.0, &answer[half..])].join("\n"));
+        assert!(!p.steps[0].skip && !p.steps[1].skip);
+        assert_eq!(p.server_requests, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_is_part_of_a_unix_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let mut guard = WorkspaceGuard::new(Some(&workspace(root.clone(), &[("nested\\doc.txt", "text")]))).unwrap();
+        let names: Vec<String> =
+            std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["nested\\doc.txt".to_string()]);
+        assert!(guard.remove());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_symlink_is_refused_however_it_is_spelled() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &root).unwrap();
+        for spelling in [format!("{}/", root.display()), format!("{}/.", root.display())] {
+            let w = workspace(PathBuf::from(&spelling), &[("doc.txt", "text")]);
+            assert!(WorkspaceGuard::new(Some(&w)).is_err(), "{spelling}");
+            assert!(std::fs::symlink_metadata(&root).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_relative_workspace_or_one_with_dot_dot_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [PathBuf::from("workspace"), dir.path().join("a/../workspace")] {
+            assert!(WorkspaceGuard::new(Some(&workspace(path.clone(), &[("doc.txt", "text")]))).is_err(), "{path:?}");
+        }
+        assert!(!dir.path().join("workspace").exists());
     }
 
     fn workspace(path: PathBuf, files: &[(&str, &str)]) -> Workspace {

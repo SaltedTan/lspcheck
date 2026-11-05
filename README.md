@@ -125,7 +125,8 @@ lspcheck replay out/lifecycle.jsonl -- my-server --stdio
 
 It recreates the recorded workspace (refusing to touch an existing non-empty one), re-sends every client write in the
 transcript in order, and reports what the server did this time: each request's outcome against the recorded one, the
-exit status, and how many server-to-client requests were answered. Gaps under 200 ms between writes are kept as pauses;
+exit status, and how many server-to-client requests were answered. Responses the server sends once lspcheck has begun
+stopping it don't count as replies, in the recording or the replay. Gaps under 200 ms between writes are kept as pauses;
 longer ones are sent back-to-back. Server-to-client requests are answered with the same auto-answers a live run uses,
 so they don't stall the replay. The replay's own transcript goes to `--transcript FILE`; it never overwrites an existing
 file, so pass `--transcript` to choose another path or remove the existing output. The workspace is removed afterwards
