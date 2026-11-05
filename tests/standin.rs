@@ -119,11 +119,17 @@ fn expect(run: &Run, id: &str, verdict: &str) {
 
 /// Every check except `failing` passes.
 fn only_fails(run: &Run, failing: &[&str]) {
+    let expected: Vec<(&str, &str)> = failing.iter().map(|id| (*id, "fail")).collect();
+    passes_except(run, &expected);
+}
+
+/// Every check passes except those listed, which get the verdict given.
+fn passes_except(run: &Run, expected: &[(&str, &str)]) {
     for (id, verdict) in &run.verdicts {
         if id == "L9" && !cfg!(unix) {
             continue;
         }
-        let want = if failing.contains(&id.as_str()) { "fail" } else { "pass" };
+        let want = expected.iter().find(|(e, _)| e == id).map_or("pass", |(_, v)| v);
         assert_eq!(verdict, want, "{id}\n{}", run.stdout);
     }
 }
@@ -153,6 +159,8 @@ fn the_clean_standin_passes_every_check() {
     only_fails(&r, &[]);
     assert_eq!(r.status, 0, "{}", r.stdout);
     assert_eq!(r.verdicts.len(), lspcheck::checks::CATALOGUE.len());
+    // D1 passed on evidence, not for lack of it.
+    assert!(r.stdout.contains("informative position(s) on character boundaries"), "{}", r.stdout);
 }
 
 #[test]
@@ -163,10 +171,16 @@ fn lawful_variations_fail_nothing() {
         "long-header",
         "answers-reordered",
         "slow-reads",
-        "no-open-close",
         "newline-after-body",
         "defer-until-next",
         "cancelled-other-error",
+        "utf8-encoding",
+        "past-line-end",
+        "grapheme-split",
+        "foreign-locations",
+        "positions-in-data",
+        "no-diagnostics",
+        "unversioned-diagnostics",
     ] {
         let r = fault(name);
         only_fails(&r, &[]);
@@ -353,12 +367,9 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
     let r = fault("char-length-input");
     expect(&r, "F5", "fail");
     // The probe with non-ASCII output for F2 isn't sent to a server that can't read it.
-    expect(&r, "F2", "not-exercised");
-    for (id, v) in &r.verdicts {
-        if !["F2", "F5"].contains(&id.as_str()) && !(id == "L9" && !cfg!(unix)) {
-            assert_eq!(v, "pass", "{id}\n{}", r.stdout);
-        }
-    }
+    // Nor can it read D1's document, whose emoji put its input out of step:
+    // no position comes back, which says nothing about how it counts them.
+    passes_except(&r, &[("F5", "fail"), ("F2", "not-exercised"), ("D1", "not-exercised")]);
     // F3's multibyte part depends on F5, and says it wasn't run.
     assert!(r.stdout.contains("wasn't run, because F5 didn't pass"), "{}", r.stdout);
 }
@@ -425,8 +436,10 @@ fn strict_turns_should_failures_into_status_1() {
 
 #[test]
 fn bad_initialize_results_fail_l2() {
-    only_fails(&fault("bad-encoding"), &["L2"]);
-    only_fails(&fault("no-capabilities"), &["L2"]);
+    // D1 can't count positions in an encoding lspcheck didn't offer, and
+    // without capabilities the server doesn't ask for didOpen.
+    passes_except(&fault("bad-encoding"), &[("L2", "fail"), ("D1", "error")]);
+    passes_except(&fault("no-capabilities"), &[("L2", "fail"), ("D1", "skip")]);
 }
 
 #[test]
@@ -744,11 +757,12 @@ fn a_frame_skipped_after_a_cancelled_request_went_unanswered_doesnt_excuse_it() 
 
 #[test]
 fn a_server_that_stops_reading_cant_stall_lspcheck() {
-    let r = fault("block-on-config");
+    let r = run(&["--fault", "block-on-config"], &["--startup-timeout", "2"]);
     expect(&r, "L2", "error");
-    // Three scenarios, each bounded by the 5 s startup timeout plus cleanup
-    // (a few seconds); unbounded, it would hit the watchdog.
-    assert!(r.took < Duration::from_secs(60), "took {:?}\n{}", r.took, r.stdout);
+    // Every scenario is bounded by the 2 s startup timeout plus cleanup (a
+    // second or two); unbounded, it would hit the watchdog.
+    let bound = Duration::from_secs(5) * lspcheck::checks::SCENARIOS.len() as u32;
+    assert!(r.took < bound, "took {:?}, more than {bound:?}\n{}", r.took, r.stdout);
 }
 
 #[test]
@@ -808,4 +822,54 @@ fn unreadable_frames_make_other_failures_inconclusive() {
             assert_ne!(v, "fail", "{id}\n{}", r.stdout);
         }
     }
+}
+
+#[test]
+fn a_server_that_doesnt_open_documents_skips_d1() {
+    let r = fault("no-open-close");
+    passes_except(&r, &[("D1", "skip")]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn positions_counted_in_the_wrong_units_fail_d1() {
+    for (name, diagnosis) in [
+        ("utf8-positions-as-utf16", "on a boundary if counted in UTF-8 bytes"),
+        ("codepoint-positions", "on a boundary if counted in code points"),
+        ("utf16-positions-as-utf8", "on a boundary if counted in UTF-16 code units"),
+    ] {
+        let r = fault(name);
+        only_fails(&r, &["D1"]);
+        assert_eq!(r.status, 1, "D1 is a MUST check");
+        assert!(r.stdout.contains("inside a character of version 41"), "{name}\n{}", r.stdout);
+        assert!(r.stdout.contains(diagnosis), "{name}\n{}", r.stdout);
+    }
+}
+
+#[test]
+fn positions_in_a_duplicate_response_are_judged_too() {
+    // The first answer is valid; the second, a duplicate (J2's finding),
+    // has a position inside a character.
+    only_fails(&fault("invalid-duplicate-symbols"), &["D1", "J2"]);
+}
+
+#[test]
+fn utf32_positions_leave_d1_not_exercised() {
+    // No offset can fall inside a character in UTF-32.
+    let r = fault("utf32-encoding");
+    passes_except(&r, &[("D1", "not-exercised")]);
+    assert!(r.stdout.contains("the server chose utf-32"), "{}", r.stdout);
+}
+
+#[test]
+fn a_frame_skipped_after_didopen_makes_a_d1_pass_inconclusive() {
+    // The oversized log follows the diagnostics, so it might have held
+    // positions; D1 can't pass.
+    let r = run(&["--fault", "big-frame-on-open"], &["--max-frame-mib", "1"]);
+    expect(&r, "D1", "error");
+    // A position seen inside a character still fails.
+    let r = run(&["--fault", "big-frame-on-open", "--fault", "codepoint-positions"], &["--max-frame-mib", "1"]);
+    expect(&r, "D1", "fail");
+    // Within the limit, the same server passes.
+    only_fails(&fault("big-frame-on-open"), &[]);
 }

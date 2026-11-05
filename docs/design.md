@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6 and C1 to C3 are done; J7, documents and `replay` are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3 and D1 are done; J7, D2 to D6 and `replay` are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -120,12 +120,51 @@ cancelled request until it is cancelled again, for C2 from its first cancel, and
 each until `exit`. A missing response is excused only by something missed while lspcheck was waiting for it.
 
 ### Documents and positions (richer with a profile document)
+D1 is done; D2 to D6 are planned.
+
 | ID | Basis | Check |
 |---|---|---|
-| D1 | MUST | Every `Range`/`Position` in any reply or notification that refers to an open document lies within that document's current text in the negotiated encoding (line exists; character ≤ line length in UTF-16/UTF-8/UTF-32 units). Text with emoji and combining marks makes UTF-8/UTF-16 confusion visible. |
-| D2 | MUST | `publishDiagnostics` for an open document carries, if any, its latest version, and in-bounds ranges. |
-| D3 | MUST | Edits follow the advertised sync kind (full or incremental); after an incremental edit across a 4-byte character, D1 still holds. |
-| D4 | POLICY | Requests on a closed or never-opened document get an error or empty result, and the server keeps serving. |
+| D1 | MUST | Every judged position in a reply or notification about an open document is at a character boundary of the text it refers to, in the negotiated encoding: never inside a UTF-16 surrogate pair or a UTF-8 multi-byte sequence. Positions past the end of a line or of the document aren't judged, since the spec lets clients clamp them. Splitting a grapheme cluster is lawful. |
+| D2 | MUST | A `version` in `textDocument/publishDiagnostics` for an open document is one the document had: one lspcheck sent in `didOpen` or `didChange` for that URI before the notification was read. An older version is lawful. |
+| D3 | MUST | After a `didChange`, positions refer to the changed text. lspcheck sends the change the advertised way: an incremental edit replaces a 4-byte character and adds a line, or the full text when the server asked for Full. |
+| D4 | POLICY | A request about a closed document, and one about a URI that was never opened and doesn't exist, each get a response (any result or error), and the server keeps serving. |
+| D5 | MUST | Lines are split at `\n`, `\r\n` and `\r`: positions in a document with CR LF and lone CR line endings fall on character boundaries of the lines the spec defines. |
+| D6 | MUST | A `selectionRange` result has one entry per position, `result[i].range` contains `positions[i]`, and each `parent.range` contains its child's range. |
+
+The checks share one scenario, `documents`. lspcheck initializes with client capabilities for folding ranges,
+selection ranges, highlights, links, code lenses, pull diagnostics, inlay hints and formatting, and offers the usual
+encodings (`utf-8`, `utf-32`, `utf-16`). The negotiated encoding is the server's `positionEncoding`, or UTF-16 when it
+chose none. If the server doesn't ask for `didOpen`, D1 is `SKIP`. Otherwise lspcheck saves document A as `doc.txt` in
+the workspace and opens it as `plaintext` at version 41. A's first line is six emoji, ` word `, six emoji: the start
+and end of `word` land inside a character whichever way a server confuses UTF-8 bytes, UTF-16 units and code points.
+Its other lines hold a combining mark, CJK characters, a ZWJ sequence, a flag and an ASCII line. lspcheck then sends
+each request the server advertises (document symbols, folding ranges, links, code lenses, inlay hints, formatting,
+pull diagnostics, and hover, highlights and selection ranges at positions in and around `word`), one at a time, each
+bounded by `--timeout`, with every position counted in the negotiated encoding. It stops sending them after one goes
+unanswered. Then it waits up to 3 s for diagnostics labelled with version 41, and leaves.
+
+Positions are found by a fixed table of where each reply and `publishDiagnostics` carries them, never by searching
+for `line` and `character` (so a diagnostic's `data`, for instance, is never read). A position counts only when its URI
+names the opened document, compared as written and then after percent-decoding and folding a drive letter's case. It
+is judged when its line exists and its character is at most the line's length. It is *informative* when its line has
+non-ASCII text before it, since only those can show encodings confused. A reply refers to the version current when its
+request was sent, and diagnostics to the version they are labelled with, or else to any version sent before they were
+read; a position is invalid only if it falls inside a character in every text it may refer to. The verdict is given
+at the end, over everything read before `exit` was sent:
+
+- **fail:** an invalid position. The detail names the first three, with where each was found and the counting that
+  would have put it on a boundary (such as "on a boundary if counted in UTF-8 bytes"). That diagnosis is detail only.
+  A failure seen stands even if evidence elsewhere is incomplete.
+- **not-exercised:** the server chose UTF-32, where no offset can fall inside a character, or no informative position
+  was judged and lspcheck missed nothing. The detail counts the positions seen, past the end of a line, on lines the document doesn't have, and in
+  other documents. Positions past the end of a line that would fit counted another way are reported as a hint of that
+  counting, which D1 can't prove.
+- **error:** `initialize` failed, `didOpen` couldn't be sent, the server chose an encoding lspcheck didn't offer (L2's
+  failure), or nothing failed but lspcheck missed something the server sent from the `didOpen` on (a frame it skipped
+  or couldn't read, a server request it couldn't answer, or reading that stopped), which might have held positions.
+- **pass:** otherwise, with the number of informative positions judged.
+
+Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them.
 
 ### Capabilities and robustness
 | ID | Basis | Check |

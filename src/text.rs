@@ -234,6 +234,9 @@ pub struct Found {
     /// A short path describing where it was found, for failure details.
     pub pointer: String,
     pub kind: FoundKind,
+    /// The positions to judge: a range's start and end, a position, and
+    /// none for a line alone, which isn't judged.
+    pub at: Vec<Position>,
 }
 
 /// The positions a reply (or `textDocument/publishDiagnostics`'s params)
@@ -275,19 +278,19 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
                                 uri: uri.to_string(),
                                 pointer: format!("{p}.{name}"),
                                 kind: FoundKind::Line,
+                                at: Vec::new(),
                             });
                         }
                     }
                     // A `FoldingRange` with characters is a position on its
                     // line; without them it is a line alone.
                     for (line_name, char_name) in [("startLine", "startCharacter"), ("endLine", "endCharacter")] {
-                        if fr.get(line_name).and_then(|v| as_u64(Some(v))).is_some()
-                            && fr.get(char_name).and_then(|v| as_u64(Some(v))).is_some()
-                        {
+                        if let (Some(line), Some(character)) = (as_u64(fr.get(line_name)), as_u64(fr.get(char_name))) {
                             out.push(Found {
                                 uri: uri.to_string(),
                                 pointer: format!("{p}.{char_name}"),
                                 kind: FoundKind::Position,
+                                at: vec![Position { line, character }],
                             });
                         }
                     }
@@ -307,33 +310,34 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
         | "textDocument/rangeFormatting" => {
             if let (Some(uri), Some(arr)) = (request_doc, result.and_then(|r| r.as_array())) {
                 for (i, v) in arr.iter().enumerate() {
-                    if as_range(v.get("range")).is_some() {
-                        push_range(&mut out, uri, &format!("[{i}].range"));
+                    if let Some(r) = as_range(v.get("range")) {
+                        push_range(&mut out, uri, &format!("[{i}].range"), r);
                     }
                 }
             }
         }
         "textDocument/hover" => {
             if let (Some(uri), Some(r)) = (request_doc, result)
-                && as_range(r.get("range")).is_some()
+                && let Some(r) = as_range(r.get("range"))
             {
-                push_range(&mut out, uri, "range");
+                push_range(&mut out, uri, "range", r);
             }
         }
         "textDocument/inlayHint" => {
             if let (Some(uri), Some(arr)) = (request_doc, result.and_then(|r| r.as_array())) {
                 for (i, h) in arr.iter().enumerate() {
                     let p = format!("[{i}]");
-                    if as_pos(h.get("position")).is_some() {
+                    if let Some((line, character)) = as_pos(h.get("position")) {
                         out.push(Found {
                             uri: uri.to_string(),
                             pointer: format!("{p}.position"),
                             kind: FoundKind::Position,
+                            at: vec![Position { line, character }],
                         });
                     }
                     for (j, te) in h.get("textEdits").and_then(|v| v.as_array()).into_iter().flatten().enumerate() {
-                        if as_range(te.get("range")).is_some() {
-                            push_range(&mut out, uri, &format!("{p}.textEdits[{j}].range"));
+                        if let Some(r) = as_range(te.get("range")) {
+                            push_range(&mut out, uri, &format!("{p}.textEdits[{j}].range"), r);
                         }
                     }
                     // `label` is a string or an array of label parts; only
@@ -343,9 +347,9 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
                         for (k, part) in parts.iter().enumerate() {
                             let loc = part.get("location");
                             if let Some(luri) = loc.and_then(|l| l.get("uri")).and_then(|v| v.as_str())
-                                && as_range(loc.and_then(|l| l.get("range"))).is_some()
+                                && let Some(r) = as_range(loc.and_then(|l| l.get("range")))
                             {
-                                push_range(&mut out, luri, &format!("{p}.label[{k}].location"));
+                                push_range(&mut out, luri, &format!("{p}.label[{k}].location"), r);
                             }
                         }
                     }
@@ -370,18 +374,18 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
                         // A `LocationLink`: the target ranges name the
                         // target document, the origin range the request's.
                         if let Some(turi) = as_str(l.get("targetUri")) {
-                            if as_range(l.get("targetRange")).is_some() {
-                                push_range(&mut out, turi, &format!("{p}.targetRange"));
+                            if let Some(r) = as_range(l.get("targetRange")) {
+                                push_range(&mut out, turi, &format!("{p}.targetRange"), r);
                             }
-                            if as_range(l.get("targetSelectionRange")).is_some() {
-                                push_range(&mut out, turi, &format!("{p}.targetSelectionRange"));
+                            if let Some(r) = as_range(l.get("targetSelectionRange")) {
+                                push_range(&mut out, turi, &format!("{p}.targetSelectionRange"), r);
                             }
                         }
-                        if as_range(l.get("originSelectionRange")).is_some() {
-                            push_range(&mut out, uri, &format!("{p}.originSelectionRange"));
+                        if let Some(r) = as_range(l.get("originSelectionRange")) {
+                            push_range(&mut out, uri, &format!("{p}.originSelectionRange"), r);
                         }
-                    } else if let (Some(uri), Some(_)) = (as_str(l.get("uri")), as_range(l.get("range"))) {
-                        push_range(&mut out, uri, &format!("{p}.range"));
+                    } else if let (Some(uri), Some(r)) = (as_str(l.get("uri")), as_range(l.get("range"))) {
+                        push_range(&mut out, uri, &format!("{p}.range"), r);
                     }
                 }
             }
@@ -394,8 +398,8 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
                 (request_doc, result.and_then(|r| r.get("ranges")).and_then(|v| v.as_array()))
             {
                 for (i, v) in ranges.iter().enumerate() {
-                    if as_range(Some(v)).is_some() {
-                        push_range(&mut out, uri, &format!("ranges[{i}]"));
+                    if let Some(r) = as_range(Some(v)) {
+                        push_range(&mut out, uri, &format!("ranges[{i}]"), r);
                     }
                 }
             }
@@ -404,10 +408,10 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
             // `Range`, `{range, placeholder}`, `{defaultBehavior}` or
             // `null`; never an array.
             if let (Some(uri), Some(r)) = (request_doc, result) {
-                if as_range(Some(r)).is_some() {
-                    push_range(&mut out, uri, "");
-                } else if as_range(r.get("range")).is_some() {
-                    push_range(&mut out, uri, "range");
+                if let Some(r) = as_range(Some(r)) {
+                    push_range(&mut out, uri, "", r);
+                } else if let Some(r) = as_range(r.get("range")) {
+                    push_range(&mut out, uri, "range", r);
                 }
             }
         }
@@ -423,16 +427,16 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
 fn diagnostics(out: &mut Vec<Found>, uri: &str, prefix: &str, arr: &Value) {
     for (i, d) in arr.as_array().into_iter().flatten().enumerate() {
         let p = format!("{prefix}[{i}]");
-        if as_range(d.get("range")).is_some() {
-            push_range(out, uri, &format!("{p}.range"));
+        if let Some(r) = as_range(d.get("range")) {
+            push_range(out, uri, &format!("{p}.range"), r);
         }
         for (j, rel) in d.get("relatedInformation").and_then(|v| v.as_array()).into_iter().flatten().enumerate() {
             // Each entry is `{ location: Location }`.
             let loc = rel.get("location");
             if let Some(luri) = loc.and_then(|l| l.get("uri")).and_then(|v| v.as_str())
-                && as_range(loc.and_then(|l| l.get("range"))).is_some()
+                && let Some(r) = as_range(loc.and_then(|l| l.get("range")))
             {
-                push_range(out, luri, &format!("{p}.relatedInformation[{j}].location"));
+                push_range(out, luri, &format!("{p}.relatedInformation[{j}].location"), r);
             }
         }
     }
@@ -464,17 +468,17 @@ fn symbols(out: &mut Vec<Found>, uri: &str, prefix: &str, arr: &Value) {
         if let Some(loc) = s.get("location") {
             // A `SymbolInformation`: its `location` names the document.
             if let Some(luri) = as_str(loc.get("uri"))
-                && as_range(loc.get("range")).is_some()
+                && let Some(r) = as_range(loc.get("range"))
             {
-                push_range(out, luri, &format!("{p}.location"));
+                push_range(out, luri, &format!("{p}.location"), r);
             }
         } else {
             // A `DocumentSymbol`: it belongs to the requested document.
-            if as_range(s.get("range")).is_some() {
-                push_range(out, uri, &format!("{p}.range"));
+            if let Some(r) = as_range(s.get("range")) {
+                push_range(out, uri, &format!("{p}.range"), r);
             }
-            if as_range(s.get("selectionRange")).is_some() {
-                push_range(out, uri, &format!("{p}.selectionRange"));
+            if let Some(r) = as_range(s.get("selectionRange")) {
+                push_range(out, uri, &format!("{p}.selectionRange"), r);
             }
             if let Some(children) = s.get("children") {
                 symbols(out, uri, &format!("{p}.children"), children);
@@ -492,8 +496,8 @@ fn selection_ranges(out: &mut Vec<Found>, uri: &str, prefix: &str, value: &Value
     };
     for (s, idx) in items {
         let p = format!("{prefix}{idx}");
-        if as_range(s.get("range")).is_some() {
-            push_range(out, uri, &format!("{p}.range"));
+        if let Some(r) = as_range(s.get("range")) {
+            push_range(out, uri, &format!("{p}.range"), r);
         }
         if let Some(parent) = s.get("parent") {
             selection_ranges(out, uri, &format!("{p}.parent"), parent);
@@ -501,8 +505,13 @@ fn selection_ranges(out: &mut Vec<Found>, uri: &str, prefix: &str, value: &Value
     }
 }
 
-fn push_range(out: &mut Vec<Found>, uri: &str, pointer: &str) {
-    out.push(Found { uri: uri.to_string(), pointer: pointer.to_string(), kind: FoundKind::Range });
+fn push_range(out: &mut Vec<Found>, uri: &str, pointer: &str, ((sl, sc), (el, ec)): ((usize, usize), (usize, usize))) {
+    out.push(Found {
+        uri: uri.to_string(),
+        pointer: pointer.to_string(),
+        kind: FoundKind::Range,
+        at: vec![Position { line: sl, character: sc }, Position { line: el, character: ec }],
+    });
 }
 
 fn as_u64(v: Option<&Value>) -> Option<usize> {
@@ -531,7 +540,7 @@ mod tests {
 
     /// The first line of the `documents` scenario's document A: six emoji, a
     /// word, six emoji, ending in a 4-byte character.
-    const L0: &str = "\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600} word \u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}";
+    const L0: &str = crate::documents::DOC_A_LINES[0];
     /// Document B of the same scenario: a lone CR, a CR LF, then LF lines.
     const DOC_B: &str = "x\r\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\r\n word\n\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\n name\n";
 
@@ -1233,6 +1242,45 @@ mod tests {
         let behavior: Value = serde_json::from_str(r#"{ "defaultBehavior": 2 }"#).expect("valid JSON");
         assert!(positions("textDocument/prepareRename", &params, Some(&behavior)).is_empty());
         assert!(positions("textDocument/prepareRename", &params, Some(&Value::Null)).is_empty());
+    }
+
+    #[test]
+    fn found_positions_carry_their_values() {
+        let p = |line, character| Position { line, character };
+        let params = doc_params("file:///a.txt");
+        // A range gives its start and end, in that order.
+        let result: Value = serde_json::from_str(r#"{ "contents": "x", "range": { "start": { "line": 1, "character": 2 }, "end": { "line": 3, "character": 4 } } }"#)
+            .expect("valid JSON");
+        let out = positions("textDocument/hover", &params, Some(&result));
+        assert_eq!(out[0].at, [p(1, 2), p(3, 4)]);
+        // A folding range's character is a position on its own line; a line
+        // alone gives nothing to judge.
+        let result: Value =
+            serde_json::from_str(r#"[{ "startLine": 4, "endLine": 6, "startCharacter": 1, "endCharacter": 9 }]"#)
+                .expect("valid JSON");
+        let out = positions("textDocument/foldingRange", &params, Some(&result));
+        let at: Vec<(&str, &[Position])> = out.iter().map(|f| (f.pointer.as_str(), f.at.as_slice())).collect();
+        assert_eq!(
+            at,
+            [
+                ("[0].startLine", &[][..]),
+                ("[0].endLine", &[][..]),
+                ("[0].startCharacter", &[p(4, 1)][..]),
+                ("[0].endCharacter", &[p(6, 9)][..]),
+            ]
+        );
+        // An inlay hint's position, and a related location's range.
+        let result: Value = serde_json::from_str(r#"[{ "position": { "line": 7, "character": 8 }, "label": "x" }]"#)
+            .expect("valid JSON");
+        assert_eq!(positions("textDocument/inlayHint", &params, Some(&result))[0].at, [p(7, 8)]);
+        let params: Value = serde_json::from_str(
+            r#"{ "uri": "file:///a.txt", "diagnostics": [ { "range": { "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 2 } },
+                 "relatedInformation": [ { "location": { "uri": "file:///b.txt", "range": { "start": { "line": 5, "character": 6 }, "end": { "line": 5, "character": 7 } } } } ] } ] }"#,
+        )
+        .expect("valid JSON");
+        let out = positions("textDocument/publishDiagnostics", &params, None);
+        assert_eq!(out[0].at, [p(0, 1), p(0, 2)]);
+        assert_eq!(out[1].at, [p(5, 6), p(5, 7)]);
     }
 
     #[test]

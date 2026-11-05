@@ -12,6 +12,8 @@ lifecycle, and whether it leaves processes behind. Read the [README](README.md) 
 | `src/transport.rs` | The incremental frame reader and the header and media-type grammar. |
 | `src/message.rs` | JSON-RPC classification, ids compared by exact value, message builders. |
 | `src/process.rs` | Process groups, the Linux child subreaper, and the leftover-process search. |
+| `src/text.rs` | The text model: line splits, position encodings, content changes, where replies carry positions. |
+| `src/documents.rs` | The documents lspcheck opens, the texts a position may refer to, and D1's judging. |
 | `src/report.rs`, `src/transcript.rs` | Terminal and JSON reports; JSON Lines transcripts. |
 | `src/bin/standin.rs` | `lspcheck-standin`, a correct test server with faults switched on one at a time. |
 | `tests/` | The CLI against the stand-in (`standin.rs`) and session-level guarantees (`session.rs`). |
