@@ -236,6 +236,13 @@ pub struct Finish {
     pub transcript: Vec<Event>,
     /// Every message the session consumed.
     pub messages: Vec<(Duration, Message)>,
+    /// When lspcheck sent `initialized`, if it did.
+    pub initialized_at: Option<Duration>,
+    /// When lspcheck sent `exit`, if it did.
+    pub exit_at: Option<Duration>,
+    /// Why evidence between `initialized` and `exit` is incomplete, if it is.
+    /// A response without an id read in that window could have been skipped.
+    pub j3_incomplete: Option<String>,
     /// Every stream problem in the whole of stdout.
     pub problems: Vec<(Duration, Problem)>,
     /// Responses that matched no outstanding request, with what explains them.
@@ -289,6 +296,10 @@ pub struct Session {
     evidence: Arc<Mutex<Evidence>>,
     /// Every message consumed, in order.
     pub messages: Vec<(Duration, Message)>,
+    /// When lspcheck sent `initialized`, if it did.
+    initialized_at: Option<Duration>,
+    /// When lspcheck sent `exit`, if it did.
+    exit_at: Option<Duration>,
     /// When and why this session's own actions left evidence incomplete.
     own_limit: Option<(Duration, String)>,
     /// Set when a write stopped partway through a frame.
@@ -379,6 +390,8 @@ impl Session {
             transcript,
             evidence,
             messages: Vec::new(),
+            initialized_at: None,
+            exit_at: None,
             own_limit: None,
             abandoned: false,
             pending: HashMap::new(),
@@ -447,12 +460,20 @@ impl Session {
     /// the rest from being recorded). An unanswered request makes the
     /// evidence incomplete from when it was read.
     pub fn take_in(&mut self) {
+        self.take_queued(true);
+    }
+
+    /// Records everything already in the channel without waiting. With
+    /// `mark_requests`, a server request lspcheck never answered also makes the
+    /// evidence incomplete from when it was read (as `take_in` does).
+    fn take_queued(&mut self, mark_requests: bool) {
         while let Ok((at, inbound)) = self.rx.try_recv() {
             match inbound {
                 Inbound::Message(m) => {
                     // A server waiting for this answer may be holding back
                     // what it would have sent next.
-                    if let Kind::Request { method, .. } = &m.kind
+                    if mark_requests
+                        && let Kind::Request { method, .. } = &m.kind
                         && self.own_limit.is_none()
                     {
                         self.own_limit = Some((at, format!("lspcheck didn't answer the server's {method} request")));
@@ -560,6 +581,17 @@ impl Session {
     }
 
     async fn send_until(&mut self, value: &Value, deadline: Instant) -> Result<(), WriteError> {
+        // The times bound the window in which a response without an id could
+        // answer a notification. Recorded before the write so that a response
+        // read while it is in progress is still inside the window.
+        if value.get("id").is_none() {
+            let at = self.start.elapsed();
+            match value.get("method").and_then(Value::as_str) {
+                Some("initialized") if self.initialized_at.is_none() => self.initialized_at = Some(at),
+                Some("exit") if self.exit_at.is_none() => self.exit_at = Some(at),
+                _ => {}
+            }
+        }
         let body = serde_json::to_vec(value).expect("JSON values serialize");
         self.write_until(&transport::encode(&body), deadline).await
     }
@@ -904,9 +936,18 @@ impl Session {
         while !self.evidence.lock().expect("evidence lock").done && Instant::now() < deadline {
             sleep(Duration::from_millis(10)).await;
         }
-        // Classify responses that arrived and weren't waited for, briefly.
-        self.drain(Instant::now() + Duration::from_millis(200)).await;
+        // The stdout task has stopped (or the bound above expired), so
+        // everything it read is already queued. Record it all without waiting:
+        // every process has been stopped, so no server request can be answered,
+        // and the work is bounded by --max-output-mib.
+        self.take_queued(false);
         self.group.close();
+        // A response without an id read between `initialized` and `exit` could
+        // be a reply to a notification; anything lspcheck missed in that window
+        // makes judging J3 inconclusive.
+        let j3_incomplete = self
+            .initialized_at
+            .and_then(|from| self.incomplete_within(from, self.exit_at.unwrap_or_else(|| self.start.elapsed())));
         let mut evidence = std::mem::take(&mut *self.evidence.lock().expect("evidence lock"));
         if !evidence.done && evidence.limit.is_none() {
             evidence.limit = Some((
@@ -947,6 +988,9 @@ impl Session {
             own_limit: self.own_limit.take(),
             transcript,
             messages: std::mem::take(&mut self.messages),
+            initialized_at: self.initialized_at,
+            exit_at: self.exit_at,
+            j3_incomplete,
             problems: evidence.problems,
             unmatched,
             answered: std::mem::take(&mut self.answered),

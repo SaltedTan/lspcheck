@@ -53,20 +53,26 @@ const FAULTS: &[(&str, &str)] = &[
     ("reply-twice", "answer every lspcheck/probe twice"),
     ("reply-unsent-id", "after initialize, send a response with an id lspcheck never used"),
     ("reply-to-notification", "answer an unknown notification with an error whose id is null"),
+    ("exit-on-unknown-notification", "exit after the second unknown notification (after any reply to it)"),
+    ("big-reply-to-notification", "answer an unknown notification with a 2 MiB error whose id is null"),
     ("no-jsonrpc-field", "after initialize, send a window/logMessage notification without \"jsonrpc\""),
     ("result-and-error", "answer an unknown $/ request with both a result and an error"),
     ("string-error-code", "answer an unknown $/ request with an error whose code is the string \"-32601\""),
-    ("drop-concurrent", "when more requests are already buffered, answer only the last of them"),
+    (
+        "drop-concurrent",
+        "on a request with an all-digit string id, wait for the next frame and drop the earlier request",
+    ),
     ("ignore-dollar-request", "never answer an unknown $/ request"),
     ("shutdown-result", "return {} from shutdown"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
     ("big-frame-on-exit", "on exit, send one 2 MiB log message before exiting"),
     ("exit-flood", "on exit, write 100,000 small log messages and then a line outside any frame"),
+    ("exit-flood-bad-envelope", "on exit, write 200,000 log messages and then one without \"jsonrpc\""),
     ("exit-status", "exit with status 3 on exit"),
     ("ignore-exit", "ignore exit and stay running"),
     ("split-header", "drop input when a read ends inside a header section, as if each header came in one read"),
     ("split-utf8", "decode each read as UTF-8 on its own, mangling characters split across reads"),
-    ("first-frame-per-read", "keep only the first frame of a read that holds a notification and two more"),
+    ("first-frame-per-read", "keep only the first frame of a read that holds $/setTrace and two more"),
     ("char-length-input", "count the Content-Length of incoming frames in characters, not bytes"),
     ("no-content-type", "ignore incoming frames that have a Content-Type header"),
     ("strict-charset", "ignore incoming frames whose charset isn't spelled utf-8"),
@@ -159,7 +165,17 @@ fn main() {
             // About to wait for input: send what was held back, newest first.
             out.release();
         }
-        let Some((headers, body)) = input.next() else { break };
+        let Some((mut headers, mut body)) = input.next() else { break };
+        // A server that answers only the latest of several concurrent requests:
+        // J6's batch is the only one with an all-digit string id, and lspcheck
+        // writes all four requests before reading, so waiting for the next
+        // frame is guaranteed to succeed. This depends on protocol order, not
+        // on where the OS happened to end its reads.
+        if fault("drop-concurrent") && is_digit_string_request(&body) {
+            let Some(next) = input.next() else { break };
+            eprintln!("standin: drop-concurrent dropped a request");
+            (headers, body) = next;
+        }
         if fault("answers-reordered") && input.ready() {
             out.holding = true;
         }
@@ -234,10 +250,17 @@ fn main() {
                 std::process::exit(4);
             }
             if initialized
-                && fault("reply-to-notification")
+                && (fault("reply-to-notification") || fault("big-reply-to-notification"))
                 && (method.starts_with("lspcheck/") || method.starts_with("$/lspcheck/"))
             {
-                out.frame(&err(&Value::Null, -32601, "unknown notification"));
+                let mut reply = err(&Value::Null, -32601, "unknown notification");
+                if fault("big-reply-to-notification") {
+                    reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
+                }
+                out.frame(&reply);
+            }
+            if initialized && method.starts_with("$/lspcheck/") && fault("exit-on-unknown-notification") {
+                std::process::exit(0);
             }
             if !initialized && fault("late-reply-to-pre-init-notification") {
                 late_reply = Some(
@@ -265,6 +288,16 @@ fn main() {
                     bytes.extend_from_slice(b"goodbye\n");
                     out.raw(&bytes);
                 }
+                if fault("exit-flood-bad-envelope") {
+                    let log =
+                        json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
+                    let mut bytes = out.encode(&log).repeat(200_000);
+                    let mut bad =
+                        json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
+                    bad.as_object_mut().unwrap().remove("jsonrpc");
+                    bytes.extend(out.encode(&bad));
+                    out.raw(&bytes);
+                }
                 let status = if fault("exit-status") {
                     3
                 } else if shut_down {
@@ -277,12 +310,6 @@ fn main() {
             continue;
         };
         if no_more_answers {
-            continue;
-        }
-        // A server that assumes one request per read, keeping only the last
-        // when several are buffered: the earlier ones are never answered.
-        if fault("drop-concurrent") && input.ready_request() {
-            eprintln!("standin: drop-concurrent dropped a request");
             continue;
         }
         // A numeric string id turned into a number: the wrong JSON type.
@@ -728,15 +755,6 @@ impl<R: Read> Input<R> {
         matches!(self.parse(&self.buf), Parsed::Frame(..))
     }
 
-    /// Whether a whole request (rather than a notification) is already buffered.
-    fn ready_request(&self) -> bool {
-        match self.parse(&self.buf) {
-            Parsed::Frame((_, body), _) => serde_json::from_slice::<Value>(&body)
-                .is_ok_and(|v| v.get("id").is_some() && v.get("method").is_some_and(Value::is_string)),
-            _ => false,
-        }
-    }
-
     /// Reads once; false at end of input.
     fn fill(&mut self) -> bool {
         if self.fault("slow-reads") {
@@ -762,16 +780,18 @@ impl<R: Read> Input<R> {
         if self.fault("first-frame-per-read") {
             let mut ends = Vec::new();
             let mut at = 0;
-            let mut notification = false;
+            let mut set_trace = false;
             while let Parsed::Frame((_, body), used) = self.parse(&self.buf[at..]) {
                 at += used;
                 ends.push(at);
-                notification |= serde_json::from_slice::<Value>(&body)
-                    .is_ok_and(|v| v.get("method").is_some() && v.get("id").is_none());
+                // Only F4's shape: two requests with $/setTrace between them.
+                // Any notification would also match `initialized` coalescing
+                // with J6's requests, which this fault must not touch.
+                set_trace |= serde_json::from_slice::<Value>(&body).is_ok_and(|v| {
+                    v.get("id").is_none() && v.get("method").and_then(Value::as_str) == Some("$/setTrace")
+                });
             }
-            // Only a read with a notification in it, F4's shape: a read of
-            // only requests is what the drop-concurrent fault covers.
-            if ends.len() >= 3 && notification {
+            if ends.len() >= 3 && set_trace {
                 self.buf.truncate(ends[0]);
             }
         }
@@ -816,4 +836,15 @@ impl<R: Read> Input<R> {
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Whether `body` is a request whose id is a non-empty all-digit string. Only
+/// J6 sends one, which is what makes drop-concurrent act in protocol order.
+fn is_digit_string_request(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body).is_ok_and(|v| {
+        v.get("method").is_some_and(Value::is_string)
+            && v.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    })
 }

@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J1 to J6, and L1 to L9. M2 is under way: C1 to C3 are done. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario. J7, documents, transcripts and `replay` are still planned.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6 and C1 to C3 are done; J7, documents and `replay` are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -63,17 +63,19 @@ whole, because a missing reply to it can't be told apart from a slow start.
 |---|---|---|
 | J1 | MUST | A reply's `id` is the same value as the request's: a number stays a number with the same exact value (`7` and `7.0` are the same; no rounding through floating point), and `"7"` stays a string. A reply that is only loosely equal (the number spelled as a string, or equal only after rounding) fails with both spellings; a request with a string id and one with a number id must each be answered exactly somewhere in the run. |
 | J2 | MUST | No response is unmatched: no duplicate for a request already answered, none to an id lspcheck never sent, and none read before its request was sent. Responses with a null id and those to a request lspcheck couldn't deliver are lawful; loosely equal ids belong to J1. A request that never got its reply is judged by the check that sent it. |
-| J3 | MUST | No response to notifications, including unknown ones and unknown `$/` ones. |
+| J3 | MUST | No response to notifications, including unknown ones and unknown `$/` ones. A response without an id (`id` missing or `null`) read after `initialized` and before `exit`, in a scenario whose input is all well formed (every one but `framing` and `pre-initialize`), answers one of lspcheck's notifications. |
 | J4 | MUST | An unknown request method gets error `-32601` MethodNotFound; an unknown `$/` request too. |
-| J5 | MUST | Envelopes: `"jsonrpc": "2.0"`, exactly one of `result`/`error`, error `code` an integer and `message` a string. |
+| J5 | MUST | Envelopes: `"jsonrpc": "2.0"`, exactly one of `result`/`error`, error `code` an integer and `message` a string; request ids integers or strings, response ids integers, strings or `null`; `params`, when present, an object or an array. |
 | J6 | MUST | Concurrent requests (sent before any reply) are each answered with the right id; order may differ. |
 | J7 | MUST | Server-to-client requests have well-formed unique ids; the checker answers them (configurable) and checks the server tolerates the answers. |
 
 J1, J2 and J5 are judged across every scenario from the responses and messages seen. The `json-rpc` scenario exercises J6
 and J3: after `initialize`, four requests are written before any reply is read (two numeric ids, one numeric string and
 one non-numeric string), and each must be answered with its exact id in any order; then two unknown notifications are
-followed by two probes that must be answered without any response to the notifications. A notification may be answered
-with an error whose id is `null`, or an object with `result` or `error` but no id; either fails J3.
+followed by two probes; this guarantees J3 is exercised. Across the other scenarios with well-formed input, any response
+without an id read between `initialized` and `exit` fails J3 too, since it can only answer a notification (C3 leaves to
+J3 the ones it can't attribute to a cancel). A frame lspcheck skipped or couldn't read in those windows makes a pass an
+error.
 
 ### Lifecycle
 | ID | Basis | Check |

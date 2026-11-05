@@ -120,7 +120,7 @@ pub const CATALOGUE: &[CheckInfo] = &[
 ];
 
 /// Checks judged from every scenario's observations.
-pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "J1", "J2", "J5", "L9"];
+pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "J1", "J2", "J3", "J5", "L9"];
 
 pub fn info(id: &str) -> &'static CheckInfo {
     CATALOGUE.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("unknown check {id}"))
@@ -202,6 +202,14 @@ pub struct Observations {
     pub limit: Option<(Duration, String)>,
     /// Every message the server sent, in order.
     pub messages: Vec<(Duration, Message)>,
+    /// When lspcheck sent `initialized`, if it did.
+    pub initialized_at: Option<Duration>,
+    /// When lspcheck sent `exit`, if it did.
+    pub exit_at: Option<Duration>,
+    /// Why evidence between `initialized` and `exit` is incomplete, if it is.
+    pub j3_incomplete: Option<String>,
+    /// How the json-rpc scenario's dedicated J3 exercise went, if it ran.
+    pub j3_exercise: Option<(Verdict, String)>,
     /// Responses that matched no outstanding request, classified.
     pub unmatched: Vec<Unmatched>,
     /// Requests that were answered, with when their response was read.
@@ -227,7 +235,7 @@ pub struct Scenario {
 
 pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "lifecycle", checks: &["L2", "J4", "L4", "L6"] },
-    Scenario { name: "json-rpc", checks: &["J6", "J3"] },
+    Scenario { name: "json-rpc", checks: &["J6"] },
     Scenario { name: "pre-initialize", checks: &["L1"] },
     Scenario { name: "exit-without-shutdown", checks: &["L7"] },
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
@@ -253,6 +261,7 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
         judge_f8(&runs),
         judge_j1(&runs),
         judge_j2(&runs),
+        judge_j3(&runs),
         judge_j5(&runs),
         judge_l9(&runs),
     ]
@@ -296,7 +305,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
             return Ok(unstarted(format!("could not start {}: {e}", cfg.server.display())));
         }
     };
-    let mut ctx = Ctx { s: session, cfg, root, results: Vec::new(), scenario: name };
+    let mut ctx = Ctx { s: session, cfg, root, results: Vec::new(), scenario: name, j3_exercise: None };
     match name {
         "lifecycle" => lifecycle(&mut ctx).await,
         "json-rpc" => json_rpc(&mut ctx).await,
@@ -308,7 +317,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         "end-of-input" => end_of_input(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
-    let Ctx { s, mut results, .. } = ctx;
+    let Ctx { s, mut results, j3_exercise, .. } = ctx;
     let finish = s.finish(cfg.leftover_grace).await;
     for id in scenario.checks {
         if !results.iter().any(|r| r.id == *id) {
@@ -344,10 +353,10 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         None => None,
     };
     drop(workspace);
-    Ok(ScenarioRun { name, results, observed: Some(observations(finish)), transcript })
+    Ok(ScenarioRun { name, results, observed: Some(observations(finish, j3_exercise)), transcript })
 }
 
-fn observations(f: Finish) -> Observations {
+fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observations {
     Observations {
         problems: f.problems,
         content_types: f.content_types,
@@ -361,6 +370,10 @@ fn observations(f: Finish) -> Observations {
         not_stopped: f.not_stopped,
         limit: f.limit,
         messages: f.messages,
+        initialized_at: f.initialized_at,
+        exit_at: f.exit_at,
+        j3_incomplete: f.j3_incomplete,
+        j3_exercise,
         unmatched: f.unmatched,
         answered: f.answered,
     }
@@ -376,6 +389,8 @@ struct Ctx<'a> {
     root: PathBuf,
     results: Vec<CheckResult>,
     scenario: &'static str,
+    /// How the json-rpc scenario's dedicated J3 exercise went.
+    j3_exercise: Option<(Verdict, String)>,
 }
 
 /// Why initialization didn't succeed.
@@ -540,14 +555,15 @@ async fn json_rpc(ctx: &mut Ctx<'_>) {
     if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
         ctx.initialize().await
     {
-        for id in ["J6", "J3"] {
-            ctx.report(id, Verdict::Error, format!("initialize didn't succeed: {why}"));
-        }
+        ctx.report("J6", Verdict::Error, format!("initialize didn't succeed: {why}"));
+        ctx.j3_exercise = Some((Verdict::Error, format!("initialize didn't succeed: {why}")));
         return;
     }
     let t = ctx.cfg.request_timeout;
     check_j6(ctx, t).await;
-    check_j3(ctx, t).await;
+    // J3 is judged across every scenario with well-formed input; this dedicated
+    // exercise is what guarantees unknown and $/ notifications were sent.
+    ctx.j3_exercise = Some(check_j3(ctx, t).await);
 
     // Leave politely so the server isn't killed mid-thought.
     if ctx.s.call("shutdown", None, t).await.is_ok() {
@@ -587,7 +603,10 @@ async fn check_j6(ctx: &mut Ctx<'_>, t: Duration) {
     }
     if failure.is_none() {
         for (i, body) in bodies.iter().enumerate() {
-            if let Err(e) = ctx.s.write_raw(body).await {
+            // The shared deadline, not a fresh write timeout: a write that
+            // can't finish by then is an error like any other, and the time
+            // left to wait for the replies mustn't shrink with every write.
+            if let Err(e) = ctx.s.write_split(body, &[], Duration::ZERO, deadline).await {
                 // The server may have seen part of the failed write, so those
                 // ids are aborted; the earlier, whole ones stay outstanding.
                 ids[i..].iter().for_each(|id| ctx.s.abort_request(id));
@@ -638,28 +657,45 @@ async fn check_j6(ctx: &mut Ctx<'_>, t: Duration) {
 
 /// Two unknown notifications, then two probes: nothing must answer the
 /// notifications. The second probe's reply ends the window, so a late reply
-/// still counts.
-async fn check_j3(ctx: &mut Ctx<'_>, t: Duration) {
+/// still counts. This is the guaranteed exercise behind J3's cross-scenario
+/// verdict, so it returns rather than reports.
+async fn check_j3(ctx: &mut Ctx<'_>, t: Duration) -> (Verdict, String) {
     const UNKNOWN: [&str; 2] = ["lspcheck/unknownNotification", "$/lspcheck/unknownNotification"];
     let before = ctx.s.messages.len();
+    let from = ctx.s.elapsed();
     for method in UNKNOWN {
         if let Err(e) = ctx.s.notify(method, Some(json!({}))).await {
-            return ctx.report("J3", Verdict::Error, format!("lspcheck couldn't send {method}: {e}"));
+            return (Verdict::Error, format!("lspcheck couldn't send {method}: {e}"));
         }
     }
+    // A reply could still be coming after a probe fails, so keep what was
+    // already read: a reply seen there is a failure either way.
+    let mut probe_error = None;
     for _ in 0..2 {
         if let Err(e) = ctx.s.call(PROBE, Some(json!({})), t).await {
-            // A reply could still be coming, so this says nothing either way.
-            return ctx.report("J3", Verdict::Error, format!("couldn't tell: the server stopped answering ({e})"));
+            probe_error = Some(e);
+            break;
         }
     }
+    // The second probe's answer, or where lspcheck gave up waiting for it,
+    // ends the window.
+    let to = ctx.s.elapsed();
     let replies: Vec<String> = ctx.s.messages[before..].iter().filter_map(|(_, m)| reply_to_notification(m)).collect();
-    if replies.is_empty() {
-        return ctx.pass("J3");
+    if !replies.is_empty() {
+        let more = replies.len() - 1;
+        let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+        return (Verdict::Fail, format!("a notification was answered with {}{tail}", replies[0]));
     }
-    let more = replies.len() - 1;
-    let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
-    ctx.fail("J3", format!("a notification was answered with {}{tail}", replies[0]));
+    if let Some(e) = probe_error {
+        return (Verdict::Error, format!("couldn't tell: the server stopped answering ({e})"));
+    }
+    // A frame skipped or unreadable in the window could have been the reply.
+    match ctx.s.incomplete_within(from, to) {
+        Some(why) => {
+            (Verdict::Error, format!("inconclusive, because {why}: it may have held a reply to a notification"))
+        }
+        None => (Verdict::Pass, String::new()),
+    }
 }
 
 /// Whether a message is a response where a notification's reply would be, and
@@ -669,7 +705,10 @@ fn reply_to_notification(m: &Message) -> Option<String> {
         Kind::Response { id: Id::Null, outcome } => {
             Some(format!("a response with id null ({})", describe_outcome(outcome)))
         }
-        Kind::Invalid(_) if m.value.get("result").is_some() || m.value.get("error").is_some() => {
+        Kind::Invalid(_)
+            if (m.value.get("result").is_some() || m.value.get("error").is_some())
+                && m.value.get("id").is_none_or(Value::is_null) =>
+        {
             Some(format!("a response without an id: {}", session::preview(m.value.to_string().as_bytes())))
         }
         _ => None,
@@ -1601,6 +1640,77 @@ fn judge_j2(runs: &[ScenarioRun]) -> CheckResult {
     r
 }
 
+/// The scenarios whose input is all well-formed, so a response without an id
+/// answers some notification. `framing` is left out because its variants can
+/// make a server misread the input (a null-id ParseError is then lawful), and
+/// `pre-initialize` because L1 judges what happens there.
+const J3_SCENARIOS: &[&str] =
+    &["lifecycle", "json-rpc", "after-initialize", "cancellation", "end-of-input", "exit-without-shutdown"];
+
+/// J3 across the scenarios in [`J3_SCENARIOS`]: no response without an id
+/// (`id` missing or null) is read between `initialized` and `exit`. Messages
+/// read before `exit` are judged; a reply to `exit` itself is outside the
+/// window, so it is left to the json-rpc scenario's dedicated exercise.
+fn judge_j3(runs: &[ScenarioRun]) -> CheckResult {
+    let mut failures = Vec::new();
+    let mut incomplete: Option<(&'static str, String)> = None;
+    let mut exercise: Option<(Verdict, String)> = None;
+    for (name, o) in observed(runs).filter(|(name, _)| J3_SCENARIOS.contains(name)) {
+        if name == "json-rpc" {
+            exercise = o.j3_exercise.clone();
+        }
+        let Some(from) = o.initialized_at else { continue };
+        let to = o.exit_at.unwrap_or(Duration::MAX);
+        if let Some((at, what)) = o.messages.iter().find_map(|(at, m)| {
+            if *at < from || *at >= to {
+                return None;
+            }
+            reply_to_notification(m).map(|what| (*at, what))
+        }) {
+            failures.push(format!("in {name} at {} ms, a notification was answered: {what}", at.as_millis()));
+        }
+        if incomplete.is_none()
+            && let Some(why) = &o.j3_incomplete
+        {
+            incomplete = Some((name, why.clone()));
+        }
+    }
+    if !failures.is_empty() {
+        return result("all", "J3", Verdict::Fail, failures.join("; "));
+    }
+    match exercise {
+        Some((Verdict::Error, why)) => return result("all", "J3", Verdict::Error, why),
+        Some((Verdict::Fail, why)) => return result("all", "J3", Verdict::Fail, why),
+        Some((Verdict::Pass, _)) => {}
+        Some(_) => unreachable!("check_j3 returns a pass, failure or error"),
+        None => {
+            return result(
+                "all",
+                "J3",
+                Verdict::Error,
+                "the json-rpc scenario didn't send its unknown notifications, so J3 wasn't exercised",
+            );
+        }
+    }
+    if let Some((name, why)) = incomplete {
+        return result("all", "J3", Verdict::Error, format!("inconclusive: in {name}, {why}"));
+    }
+    result("all", "J3", Verdict::Pass, "no response answered a notification")
+}
+
+/// Why a message's `params`, if it has one, isn't a structured value.
+fn params_problem(m: &Message) -> Option<String> {
+    let params = m.value.get("params")?;
+    if params.is_object() || params.is_array() {
+        return None;
+    }
+    Some(format!(
+        "params is {}, not an object or an array: {}",
+        params,
+        session::preview(m.value.to_string().as_bytes())
+    ))
+}
+
 /// Why a message isn't a well-formed JSON-RPC 2.0 envelope, if it isn't.
 fn envelope_problem(m: &Message) -> Option<String> {
     match &m.kind {
@@ -1612,12 +1722,21 @@ fn envelope_problem(m: &Message) -> Option<String> {
         Kind::Response { outcome: Outcome::Error { message: None, error, .. }, .. } => {
             Some(format!("an error whose message isn't a string: {}", session::preview(error.to_string().as_bytes())))
         }
+        // A response's id is a string, a number or null. Numbers must be whole:
+        // `2.0` is an integer id, but `2.5` isn't one JSON-RPC allows.
+        Kind::Response { id: Id::Other(raw), .. } => {
+            Some(format!("a response with id {raw}, which is neither a string, a number nor null"))
+        }
+        Kind::Response { id: id @ Id::Num { raw, .. }, .. } if !id.is_integer() => {
+            Some(format!("a response with the non-integer id {raw}"))
+        }
         Kind::Request { id, .. } => match id {
             Id::Null => Some("a request with id null".into()),
             Id::Other(raw) => Some(format!("a request with id {raw}, which is neither a string nor a number")),
             Id::Num { raw, .. } if !id.is_integer() => Some(format!("a request with the non-integer id {raw}")),
-            _ => None,
+            _ => params_problem(m),
         },
+        Kind::Notification { .. } => params_problem(m),
         _ => None,
     }
 }
@@ -1786,6 +1905,10 @@ mod tests {
                 not_stopped: Vec::new(),
                 limit: None,
                 messages: Vec::new(),
+                initialized_at: None,
+                exit_at: None,
+                j3_incomplete: None,
+                j3_exercise: None,
                 unmatched: Vec::new(),
                 answered: Vec::new(),
             }),
@@ -1822,8 +1945,20 @@ mod tests {
         assert!(bad(r#"{"jsonrpc":"2.0","id":null,"method":"m"}"#).is_some());
         assert!(bad(r#"{"jsonrpc":"2.0","id":1.5,"method":"m"}"#).is_some());
         assert!(bad(r#"{"jsonrpc":"2.0","id":true,"method":"m"}"#).is_some());
+        // Response ids: a string, a whole number or null. `2.0` is a whole
+        // number spelled with a fraction, so it stays lawful.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":true,"result":null}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":[1],"result":null}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":2.5,"result":null}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":2.0,"result":null}"#).is_none());
+        // params, when present, is an object or an array.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"method":"m","params":3}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","method":"m","params":"x"}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","method":"m","params":null}"#).is_some());
         // Well-formed envelopes.
         assert!(bad(r#"{"jsonrpc":"2.0","id":1,"method":"m"}"#).is_none());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"method":"m","params":{}}"#).is_none());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"method":"m","params":[]}"#).is_none());
         assert!(bad(r#"{"jsonrpc":"2.0","method":"m"}"#).is_none());
         assert!(bad(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).is_none());
         assert!(bad(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"x"}}"#).is_none());
