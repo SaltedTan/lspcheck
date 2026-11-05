@@ -57,7 +57,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("out-of-range-id", "after initialize, send a request whose id 2147483648 is outside LSP's integer range"),
     (
         "fill-stdin-on-initialized",
-        "on initialized, ask for a configuration whose answer fills a 64 KiB pipe, then stop reading for 3 s",
+        "with the initialize result, ask for a configuration whose answer fills a 64 KiB pipe; stop reading for 3 s",
     ),
     ("exit-on-unknown-notification", "exit after the second unknown notification (after any reply to it)"),
     ("big-reply-to-notification", "answer an unknown notification with a 2 MiB error whose id is null"),
@@ -165,8 +165,6 @@ fn main() {
     let mut initialized_reply = fault("initialized-reply-after-cancel");
     // For null-reply-after-first-probe: whether a request was answered since initialize.
     let mut answered_one = false;
-    // For fill-stdin-on-initialized: pause once `initialized` arrives.
-    let mut pause_on_initialized = false;
     let mut children: Vec<Child> = Vec::new();
     loop {
         if !input.ready() {
@@ -239,9 +237,6 @@ fn main() {
         }
         let Some(id) = msg.get("id").cloned() else {
             // A notification.
-            if method == "initialized" && std::mem::take(&mut pause_on_initialized) {
-                std::thread::sleep(std::time::Duration::from_secs(3));
-            }
             if method == "$/cancelRequest" {
                 if std::mem::take(&mut initialized_reply) {
                     for _ in 0..2 {
@@ -428,14 +423,15 @@ fn main() {
             }
             if fault("fill-stdin-on-initialized") {
                 // In the same write as the result, so the client reads both at
-                // once and answers before its next request. The answer, with
-                // `initialized` still unread, leaves 30 bytes of a 64 KiB pipe:
-                // too few for the client's next requests while this server
-                // isn't reading.
+                // once and answers before its next request. `initialized` and
+                // the answer then leave 30 bytes of a 64 KiB pipe: too few for
+                // the client's next request while this server isn't reading.
                 let mut bytes = out.encode(&ok(&id, result));
                 bytes.extend(out.encode(&config_filling(65_536 - 74 - 30)));
                 out.raw(&bytes);
-                pause_on_initialized = true;
+                // Stop reading before `initialized` can even arrive, so what
+                // the client writes next stays in the pipe.
+                std::thread::sleep(std::time::Duration::from_secs(3));
                 continue;
             }
             out.frame(&ok(&id, result));

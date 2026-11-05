@@ -504,8 +504,15 @@ fn replies_to_exit_and_out_of_range_ids_are_judged() {
 #[cfg(target_os = "linux")]
 #[test]
 fn concurrent_requests_that_cant_be_written_in_time_are_an_error() {
-    let r = run(&["--fault", "fill-stdin-on-initialized"], &["--timeout", "1"]);
-    expect(&r, "J6", "error");
+    // The server stops reading before `initialized` arrives, so `initialized`
+    // and lspcheck's answer fill the pipe whatever the read grouping.
+    for extra in [&[][..], &["--fault", "slow-reads"][..]] {
+        let mut args = vec!["--fault", "fill-stdin-on-initialized"];
+        args.extend_from_slice(extra);
+        let r = run(&args, &["--timeout", "1"]);
+        expect(&r, "J6", "error");
+        assert!(r.stdout.contains("couldn't send a request"), "{}", r.stdout);
+    }
 }
 
 #[test]

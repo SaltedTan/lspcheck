@@ -74,7 +74,9 @@ and J3: after `initialize`, four requests are written before any reply is read (
 one non-numeric string), and each must be answered with its exact id in any order; then two unknown notifications are
 followed by two probes; this guarantees J3 is exercised. Across the other scenarios with well-formed input, any response
 without an id read after `initialized` fails J3 too, since it can only answer a notification (C3 leaves to J3 the ones
-it can't attribute to a cancel). A frame lspcheck skipped or couldn't read since then makes a pass an error. A frame
+it can't attribute to a cancel), until a write of lspcheck's stops partway through a frame: the server may answer
+that malformed input with a null-id ParseError. A frame lspcheck skipped or couldn't read since `initialized`, or such a
+write, makes a pass an error. A frame
 lspcheck couldn't read anywhere (F1) also makes a J1, J2 or J5 pass an error: it might have held what they judge.
 
 ### Lifecycle

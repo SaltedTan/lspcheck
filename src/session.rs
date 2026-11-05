@@ -241,6 +241,8 @@ pub struct Finish {
     /// Why evidence since `initialized` is incomplete, if it is.
     /// A response without an id read in that window could have been skipped.
     pub j3_incomplete: Option<String>,
+    /// When a write of lspcheck's that stopped partway through a frame began.
+    pub abandoned_at: Option<Duration>,
     /// Every stream problem in the whole of stdout.
     pub problems: Vec<(Duration, Problem)>,
     /// Responses that matched no outstanding request, with what explains them.
@@ -298,8 +300,10 @@ pub struct Session {
     initialized_at: Option<Duration>,
     /// When and why this session's own actions left evidence incomplete.
     own_limit: Option<(Duration, String)>,
-    /// Set when a write stopped partway through a frame.
-    abandoned: bool,
+    /// When a write that stopped partway through a frame began: from then on
+    /// the server may lawfully answer malformed input with errors whose id
+    /// is null.
+    abandoned: Option<Duration>,
     /// Requests sent and not yet answered, with when they were sent.
     pending: HashMap<Id, Duration>,
     /// Requests answered: the index of the response in `messages`.
@@ -388,7 +392,7 @@ impl Session {
             messages: Vec::new(),
             initialized_at: None,
             own_limit: None,
-            abandoned: false,
+            abandoned: None,
             pending: HashMap::new(),
             answers: HashMap::new(),
             used_ids: HashMap::new(),
@@ -506,7 +510,8 @@ impl Session {
         deadline: Instant,
     ) -> Result<(), WriteError> {
         let deadline = deadline.min(Instant::now() + self.opts.write_timeout);
-        if self.abandoned {
+        let began = self.start.elapsed();
+        if self.abandoned.is_some() {
             return Err(WriteError::Abandoned);
         }
         let Some(stdin) = self.stdin.as_mut() else { return Err(WriteError::Closed) };
@@ -553,7 +558,7 @@ impl Session {
         if let Err(e) = &outcome {
             self.note(format!("write stopped after {written} of {} bytes: {e}", bytes.len()));
             if written > 0 && written < bytes.len() && self.stdin.is_some() {
-                self.abandoned = true;
+                self.abandoned = Some(began);
                 self.limit_self(format!(
                     "lspcheck's write stopped partway through a frame ({e}), so it sent nothing more"
                 ));
@@ -981,6 +986,7 @@ impl Session {
             messages: std::mem::take(&mut self.messages),
             initialized_at: self.initialized_at,
             j3_incomplete,
+            abandoned_at: self.abandoned,
             problems: evidence.problems,
             unmatched,
             answered: std::mem::take(&mut self.answered),

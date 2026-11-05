@@ -206,6 +206,8 @@ pub struct Observations {
     pub initialized_at: Option<Duration>,
     /// Why evidence since `initialized` is incomplete, if it is.
     pub j3_incomplete: Option<String>,
+    /// When a write of lspcheck's that stopped partway through a frame began.
+    pub abandoned_at: Option<Duration>,
     /// How the json-rpc scenario's dedicated J3 exercise went, if it ran.
     pub j3_exercise: Option<(Verdict, String)>,
     /// Responses that matched no outstanding request, classified.
@@ -370,6 +372,7 @@ fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observatio
         messages: f.messages,
         initialized_at: f.initialized_at,
         j3_incomplete: f.j3_incomplete,
+        abandoned_at: f.abandoned_at,
         j3_exercise,
         unmatched: f.unmatched,
         answered: f.answered,
@@ -1665,7 +1668,10 @@ const J3_SCENARIOS: &[&str] =
 
 /// J3 across the scenarios in [`J3_SCENARIOS`]: no response without an id
 /// (`id` missing or null) is read after `initialized`, to the end of the
-/// session (a reply to `exit` answers a notification too).
+/// session (a reply to `exit` answers a notification too), or until a write
+/// of lspcheck's stopped partway through a frame: the server may answer that
+/// malformed input with a null-id error. (Such a write also makes the
+/// session's evidence incomplete, so a pass becomes an error.)
 fn judge_j3(runs: &[ScenarioRun]) -> CheckResult {
     let mut failures = Vec::new();
     let mut incomplete: Option<(&'static str, String)> = None;
@@ -1675,10 +1681,9 @@ fn judge_j3(runs: &[ScenarioRun]) -> CheckResult {
             exercise = o.j3_exercise.clone();
         }
         let Some(from) = o.initialized_at else { continue };
-        // Through the end of the session: a reply to `exit` answers a
-        // notification too.
+        let to = o.abandoned_at.unwrap_or(Duration::MAX);
         if let Some((at, what)) = o.messages.iter().find_map(|(at, m)| {
-            if *at < from {
+            if *at < from || *at >= to {
                 return None;
             }
             reply_to_notification(m).map(|what| (*at, what))
@@ -1929,6 +1934,7 @@ mod tests {
                 messages: Vec::new(),
                 initialized_at: None,
                 j3_incomplete: None,
+                abandoned_at: None,
                 j3_exercise: None,
                 unmatched: Vec::new(),
                 answered: Vec::new(),
@@ -1948,6 +1954,28 @@ mod tests {
         // Without the leak, the failed search makes the result unknown.
         let runs = [observed_run("lifecycle", vec![], None), observed_run("pre-initialize", vec![], Some("no /proc"))];
         assert_eq!(judge_l9(&runs).verdict, Verdict::Error);
+    }
+
+    #[test]
+    fn j3_doesnt_blame_a_parse_error_for_lspchecks_own_truncated_output() {
+        // After a write of lspcheck's stopped partway through a frame, a
+        // null-id ParseError lawfully answers that malformed input.
+        let parse_error =
+            Message::parse(br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#).unwrap();
+        let run = |abandoned_at: Option<Duration>| {
+            let mut r = observed_run("lifecycle", vec![], None);
+            let o = r.observed.as_mut().unwrap();
+            o.initialized_at = Some(Duration::from_millis(10));
+            o.abandoned_at = abandoned_at;
+            o.messages = vec![(Duration::from_millis(500), parse_error.clone())];
+            let mut exercise = observed_run("json-rpc", vec![], None);
+            exercise.observed.as_mut().unwrap().j3_exercise = Some((Verdict::Pass, String::new()));
+            [r, exercise]
+        };
+        assert_eq!(judge_j3(&run(None)).verdict, Verdict::Fail);
+        assert_ne!(judge_j3(&run(Some(Duration::from_millis(100)))).verdict, Verdict::Fail);
+        // A reply read before the truncated write began still counts.
+        assert_eq!(judge_j3(&run(Some(Duration::from_millis(600)))).verdict, Verdict::Fail);
     }
 
     #[test]
