@@ -10,7 +10,7 @@
 //! the same bug here.
 
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 
@@ -154,6 +154,15 @@ const FAULTS: &[(&str, &str)] = &[
         "on didOpen, publish a bad-boundary diagnostic, then exit so didChange can't be sent",
     ),
     ("big-frame-on-open", "after publishing diagnostics for an opened document, send a 2 MiB log message"),
+    ("ignore-unopened", "never answer a request about a document that isn't open"),
+    ("stop-after-unopened", "stop answering anything after a request about a document that isn't open"),
+    ("unopened-error", "lawful: answer a request about a document that isn't open with InvalidParams"),
+    ("closed-from-disk", "lawful: answer requests about closed documents from the file on disk"),
+    (
+        "disk-diagnostics-after-close",
+        "lawful: on didClose, publish unversioned diagnostics for the file on disk, which another tool changed to ASCII",
+    ),
+    ("drop-first-request", "never answer the first request about a document, then answer normally"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
     ("escaped-child", "start a child in a new session, with a non-UTF-8 name, that outlives the server"),
@@ -203,6 +212,8 @@ fn main() {
     let mut deferred: Option<Value> = None;
     // Set by stop-after-unknown-cancel: requests are no longer answered.
     let mut no_more_answers = false;
+    // For drop-first-request: whether the first document request was dropped.
+    let mut dropped_first = false;
     // What the cancel faults send, and where: now, or after the next answer.
     let mut cancel_out =
         CancelOut { late: fault("late-cancel-replies"), big: fault("big-cancel-replies"), held: Vec::new() };
@@ -216,6 +227,8 @@ fn main() {
     // The text of each open document, with the version it was last sent at,
     // and how positions are counted.
     let mut docs: HashMap<String, (String, i64)> = HashMap::new();
+    // The URIs closed with didClose, for closed-from-disk.
+    let mut closed: HashSet<String> = HashSet::new();
     let mut units = Units::Utf16;
     // The unit of the encoding the stand-in declared, used to apply changes;
     // a position-counting fault changes `units`, not this.
@@ -380,6 +393,25 @@ fn main() {
                     out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
                 }
             }
+            if method == "textDocument/didClose"
+                && let Some(uri) = msg.pointer("/params/textDocument/uri").and_then(Value::as_str)
+            {
+                // The document is no longer open: requests about it are
+                // answered from disk (closed-from-disk) or not at all.
+                if docs.remove(uri).is_some() && fault("closed-from-disk") {
+                    closed.insert(uri.to_string());
+                }
+                // The file on disk now reads "abc": offset 1 is a boundary
+                // there, though it is inside an emoji of every version sent.
+                if fault("disk-diagnostics-after-close") {
+                    let d = json!({"range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
+                                   "severity": 3, "message": "on disk"});
+                    let params = json!({"uri": uri, "diagnostics": [d]});
+                    out.frame(
+                        &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
+                    );
+                }
+            }
             if method == "textDocument/didChange"
                 && let (Some(uri), Some(changes)) = (
                     msg.pointer("/params/textDocument/uri").and_then(Value::as_str),
@@ -521,6 +553,32 @@ fn main() {
             continue;
         };
         if no_more_answers {
+            continue;
+        }
+        if fault("drop-first-request") && !dropped_first && method.starts_with("textDocument/") {
+            dropped_first = true;
+            continue;
+        }
+        // A request about a document that isn't open: the D4 faults decide
+        // its fate. `hover` answers null for every URI, so it is included.
+        let unopened =
+            matches!(
+                method.as_str(),
+                "textDocument/hover"
+                    | "textDocument/documentSymbol"
+                    | "textDocument/foldingRange"
+                    | "textDocument/documentHighlight"
+                    | "textDocument/selectionRange"
+            ) && msg.pointer("/params/textDocument/uri").and_then(Value::as_str).is_some_and(|u| !docs.contains_key(u));
+        if unopened && fault("ignore-unopened") {
+            continue;
+        }
+        if unopened && fault("stop-after-unopened") {
+            no_more_answers = true;
+            continue;
+        }
+        if unopened && fault("unopened-error") {
+            out.frame(&err(&id, -32602, "document not open"));
             continue;
         }
         // A numeric string id turned into a number: the wrong JSON type.
@@ -782,8 +840,20 @@ fn main() {
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .and_then(|u| docs.get(u).map(|(t, _)| t));
+                // A closed document, answered from the file on disk.
+                let disk = if text.is_none() && fault("closed-from-disk") {
+                    msg.pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|u| closed.get(u).and_then(|u| disk_text(u.as_str())))
+                } else {
+                    None
+                };
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                let result = text.map_or(Value::Null, |text| document_answer(&method, &params, text, units));
+                let result = match (text, disk) {
+                    (Some(t), _) => document_answer(&method, &params, t, units),
+                    (None, Some(t)) => document_answer(&method, &params, &t, units),
+                    _ => Value::Null,
+                };
                 out.frame(&ok(&id, result));
                 if method == "textDocument/documentSymbol" && fault("invalid-duplicate-symbols") {
                     // Offset 1 of line 0 is inside its first emoji in UTF-8, UTF-16 alike.
@@ -1027,6 +1097,27 @@ fn publish_diagnostics<W: Write>(
         params["version"] = v;
     }
     out.frame(&json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}));
+}
+
+/// The file a `file:` URI names, read from disk (closed-from-disk); `None`
+/// when the URI isn't a `file:` URI, the path isn't UTF-8, or the read fails.
+fn disk_text(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h = (bytes[i + 1] as char).to_digit(16)?;
+            let l = (bytes[i + 2] as char).to_digit(16)?;
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    std::fs::read_to_string(String::from_utf8_lossy(&out).into_owned()).ok()
 }
 
 /// A leftover child: it signals that it's ready, then sleeps for a minute.

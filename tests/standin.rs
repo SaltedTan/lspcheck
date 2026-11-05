@@ -245,6 +245,9 @@ fn the_clean_standin_passes_every_check() {
         r.stdout
     );
     assert!(r.stdout.contains("informative position(s) on character boundaries after the change"), "{}", r.stdout);
+    // D4 passed on evidence: the closed, the never-opened and the plain
+    // request were all answered.
+    assert!(r.stdout.contains("all three answered"), "{}", r.stdout);
 }
 
 #[test]
@@ -270,6 +273,10 @@ fn lawful_variations_fail_nothing() {
         "stale-unversioned-diagnostics",
         "no-change-sync",
         "register-other",
+        "unopened-error",
+        "closed-from-disk",
+        "disk-diagnostics-after-close",
+        "drop-first-request",
     ] {
         let r = fault(name);
         // With no versioned publish for the opened document, D2 has nothing
@@ -468,7 +475,9 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
     // The probe with non-ASCII output for F2 isn't sent to a server that can't read it.
     // Nor can it read D1's document, whose emoji put its input out of step:
     // no position or versioned diagnostics come back, which says nothing
-    // about how it counts them.
+    // about how it counts them. It had stopped answering before D4's
+    // requests, so their going unanswered says nothing about documents that
+    // aren't open: D4 is an error.
     passes_except(
         &r,
         &[
@@ -477,8 +486,10 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
             ("D1", "not-exercised"),
             ("D2", "not-exercised"),
             ("D3", "not-exercised"),
+            ("D4", "error"),
         ],
     );
+    assert!(r.stdout.contains("but the server had already stopped answering"), "{}", r.stdout);
     // F3's multibyte part depends on F5, and says it wasn't run.
     assert!(r.stdout.contains("wasn't run, because F5 didn't pass"), "{}", r.stdout);
 }
@@ -547,9 +558,13 @@ fn strict_turns_should_failures_into_status_1() {
 fn bad_initialize_results_fail_l2() {
     // D1 can't count positions in an encoding lspcheck didn't offer, and D2
     // and D3 can't judge without it either; without capabilities the server
-    // doesn't ask for didOpen, so all three are skipped.
+    // doesn't ask for didOpen, so all three are skipped, and it advertises no
+    // document request, so D4 skips too.
     passes_except(&fault("bad-encoding"), &[("L2", "fail"), ("D1", "error"), ("D2", "error"), ("D3", "error")]);
-    passes_except(&fault("no-capabilities"), &[("L2", "fail"), ("D1", "skip"), ("D2", "skip"), ("D3", "skip")]);
+    passes_except(
+        &fault("no-capabilities"),
+        &[("L2", "fail"), ("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D4", "skip")],
+    );
 }
 
 #[test]
@@ -938,7 +953,44 @@ fn unreadable_frames_make_other_failures_inconclusive() {
 fn a_server_that_doesnt_open_documents_skips_d1() {
     let r = fault("no-open-close");
     passes_except(&r, &[("D1", "skip"), ("D2", "skip"), ("D3", "skip")]);
+    // D4 still runs: doc.txt on disk, never opened.
+    assert!(r.stdout.contains("the document on disk (never opened)"), "{}", r.stdout);
     assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn requests_about_documents_that_arent_open_must_be_answered() {
+    // The stand-in never answers a request about a document that isn't
+    // open: D4 fails on the closed document's request. J2 judges responses
+    // that arrived unasked, not requests that went unanswered, so it passes.
+    let r = fault("ignore-unopened");
+    expect(&r, "D4", "fail");
+    only_fails(&r, &["D4"]);
+    assert_eq!(r.status, 0, "D4 is a POLICY check\n{}", r.stdout);
+    assert!(r.stdout.contains("went unanswered"), "{}", r.stdout);
+}
+
+#[test]
+fn a_server_that_recovered_from_an_earlier_timeout_still_fails_d4() {
+    // The first document request goes unanswered, then the server answers
+    // the rest at both versions, then stops at the closed document. It had
+    // recovered, so D4 fails rather than calling it a server that had
+    // already stopped answering.
+    let r = run(&["--fault", "drop-first-request", "--fault", "stop-after-unopened"], &[]);
+    only_fails(&r, &["D4"]);
+    assert!(r.stdout.contains("the closed document went unanswered"), "{}", r.stdout);
+}
+
+#[test]
+fn stopping_after_an_unopened_request_fails_d4() {
+    // After a request about a document that isn't open, the stand-in stops
+    // answering anything: D4's first such request goes unanswered, and so do
+    // the requests after it. No other scenario sends such a request, so
+    // nothing else fails.
+    let r = fault("stop-after-unopened");
+    expect(&r, "D4", "fail");
+    only_fails(&r, &["D4"]);
+    assert_eq!(r.status, 0, "D4 is a POLICY check\n{}", r.stdout);
 }
 
 #[test]
@@ -1034,9 +1086,10 @@ fn an_undeliverable_change_errors_d3_but_keeps_d1s_failure() {
     // The stand-in publishes version 41's diagnostics with a position inside
     // the first character, then exits: lspcheck's `didChange` can't be
     // delivered, so D3 is an error, but D1's failure stands and D2 is still
-    // judged (the diagnostic's version 41 was sent).
+    // judged (the diagnostic's version 41 was sent). The server is gone, so
+    // D4 can't be judged either.
     let r = fault("close-stdin-before-change");
-    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D4", "error")]);
     assert_eq!(r.status, 1, "D1 is a MUST check");
     assert!(r.stdout.contains("couldn't send didChange"), "{}", r.stdout);
 }

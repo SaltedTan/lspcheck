@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3, D1 to D3 and `replay` are done; J7 and D4 to D6 are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3, D1 to D4 and `replay` are done; J7 and D5 to D6 are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -120,7 +120,7 @@ cancelled request until it is cancelled again, for C2 from its first cancel, and
 each until `exit`. A missing response is excused only by something missed while lspcheck was waiting for it.
 
 ### Documents and positions (richer with a profile document)
-D1 to D3 are done; D4 to D6 are planned.
+D1 to D4 are done; D5 to D6 are planned.
 
 | ID | Basis | Check |
 |---|---|---|
@@ -149,7 +149,12 @@ changes, the first replacing the first emoji of the first line with four emoji (
 text model in the negotiated encoding), the second inserting a line of ten emoji after it, so every later line moves
 down one; a Full sync sends the whole changed text. lspcheck applies its own changes with its own text model to get
 version 42, then sends the same requests again, with positions counted against version 42's text, one at a time, and
-waits up to 3 s for diagnostics labelled with version 42. Then it leaves.
+waits up to 3 s for diagnostics labelled with version 42. Then it closes document A with a `didClose` and sends
+D4's requests: one advertised document request (preferably `documentSymbol`, otherwise `hover` at (0,0), otherwise
+the first advertised of `foldingRange`, `documentHighlight` at (0,0) and `selectionRange` at (0,0)) about the closed
+document, the same request about `missing.txt` in the workspace, which was never opened and doesn't exist, and a
+plain `lspcheck/probe`, each sent alone and awaited by `--timeout`. If the server doesn't ask for `didOpen`, D1 to
+D3 skip and D4 still runs, with the document never opened. Then it leaves.
 
 Positions are found by a fixed table of where each reply and `publishDiagnostics` carries them, never by searching
 for `line` and `character` (so a diagnostic's `data`, for instance, is never read). A position counts only when its URI
@@ -212,8 +217,25 @@ fault.
 Positions in every alternative text are counted in the negotiated encoding: a server that ignored the
 change, or counted its range wrongly, still counts its positions as agreed.
 
+D4 judges that a response comes, not what it says: any result or error is lawful, including real results read from
+disk, and the content of a reply is never judged. D1 to D3 judge only what was read before lspcheck began sending
+`didClose`: after it, the server may read the file from disk, whose text lspcheck doesn't track (another tool may
+have changed it), so neither D4's replies nor later diagnostics are judged by them.
+
+- **skip:** the server advertises none of `hoverProvider`, `documentSymbolProvider`, `foldingRangeProvider`,
+  `documentHighlightProvider` or `selectionRangeProvider`.
+- **fail:** any of the three requests goes unanswered within `--timeout`. It goes through `fail_call`, so it is
+  `error` when lspcheck couldn't deliver the request, or when missed evidence could have held the answer.
+- **error:** the `didClose` couldn't be sent, or an earlier step left the session unable to send; or a D4 request
+  went unanswered when the server's latest requests before it had gone unanswered too (it had stopped answering
+  before any document was closed, which says nothing about documents that aren't open). A server that answers again
+  in between has recovered, and is judged as usual.
+- **pass:** all three are answered. The detail records each outcome: result (null, empty, or non-empty) or the
+  error code, for the closed document, the never-opened one, and the probe.
+
 Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs
-only one versioned publish for the document, so it is exercised wherever diagnostics are labelled.
+only one versioned publish for the document, so it is exercised wherever diagnostics are labelled. D4 runs wherever
+a document request is advertised.
 
 ### Capabilities and robustness
 | ID | Basis | Check |

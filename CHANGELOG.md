@@ -26,6 +26,11 @@
     character of the changed text fails D3 when no other counting of the changed text explains it and a text the
     change should have produced does; otherwise D3 is an error and D1 carries the failure. A server that
     takes no changes leaves D3 skipped.
+  - D4, documents that aren't open: the `documents` scenario now closes document A with a `didClose`, then sends one
+    advertised document request about the closed document, the same request about a file that was never opened and
+    doesn't exist, and a plain request, each awaited alone. Each must get a response — any result or error is
+    lawful, including one read from disk — and the server must keep serving. A server that advertises none of the
+    document requests leaves D4 skipped; D4 still runs when the server doesn't ask for `didOpen`.
 - The text model behind the upcoming document checks (`src/text.rs`): the spec's line split, the UTF-8/UTF-16/UTF-32
   position encodings, the character-boundary test, applying content changes, and the table of the positions a reply
   refers to.

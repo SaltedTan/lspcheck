@@ -135,6 +135,13 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "publishDiagnosticsParams"
     ),
     check!("D3", Documents, Must, "After a didChange, positions refer to the changed text", "textDocumentSync"),
+    check!(
+        "D4",
+        Documents,
+        Policy,
+        "A request about a document that isn't open gets a response, and the server keeps serving",
+        "textDocumentSync"
+    ),
 ];
 
 /// Checks judged from every scenario's observations.
@@ -259,7 +266,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
-    Scenario { name: "documents", checks: &["D1", "D2", "D3"] },
+    Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
@@ -1299,7 +1306,7 @@ async fn ask(
     ctx: &mut Ctx<'_>,
     method: &'static str,
     params: Value,
-) -> Result<(Asked, Result<(), WaitError>), WriteError> {
+) -> Result<(Asked, Result<Message, WaitError>), WriteError> {
     let deadline = Instant::now() + ctx.cfg.request_timeout;
     let id = ctx.s.fresh_id();
     let bytes = frame(&message::request(&id, method, Some(params.clone())));
@@ -1309,7 +1316,7 @@ async fn ask(
         ctx.s.abort_request(&id);
         return Err(e);
     }
-    let answer = ctx.s.wait_response(&id, deadline).await.map(|_| ());
+    let answer = ctx.s.wait_response(&id, deadline).await;
     Ok((Asked { id, method, params, at }, answer))
 }
 
@@ -1339,13 +1346,14 @@ async fn await_diagnostics(ctx: &mut Ctx<'_>, uri: &str, version: i64, from: usi
 
 /// Sends the advertised requests one at a time, so a reply always refers to
 /// the version current when it was asked. No reply, or an error, is simply
-/// no evidence: the rest are not sent, and the note says so.
+/// no evidence: the rest are not sent, and the note says so. Returns why
+/// the server stopped answering, when a request went unanswered.
 async fn ask_all(
     ctx: &mut Ctx<'_>,
     requests: Vec<(&'static str, Value)>,
     asked: &mut Vec<Asked>,
     notes: &mut Vec<String>,
-) {
+) -> Option<String> {
     for (method, params) in requests {
         match ask(ctx, method, params).await {
             Ok((a, answer)) => {
@@ -1353,7 +1361,7 @@ async fn ask_all(
                 if let Err(e) = answer {
                     let why = describe_call_error(&CallError::Wait(e), ctx.cfg.request_timeout);
                     notes.push(format!("{method} went unanswered ({why}), so no more requests were sent"));
-                    break;
+                    return Some(format!("{method} went unanswered ({why})"));
                 }
             }
             Err(e) => {
@@ -1362,6 +1370,7 @@ async fn ask_all(
             }
         }
     }
+    None
 }
 
 /// Whether a message is a `client/registerCapability` registering the sync
@@ -1388,10 +1397,11 @@ const DOC_A2_VERSION: i64 = 42;
 /// the text it refers to, in the negotiated encoding (D1), every `version`
 /// its diagnostics carry for the document must be one lspcheck sent for it
 /// before the notification was read (D2), and after the `didChange` lspcheck
-/// sends, positions must refer to the changed text (D3).
+/// sends, positions must refer to the changed text (D3). Finally it closes
+/// the document and asks about documents that aren't open (D4).
 ///
 /// A position or a version can arrive at any time (diagnostics especially),
-/// so all three verdicts are given at the end, over everything read before
+/// so the D1 to D3 verdicts are given at the end, over everything read before
 /// lspcheck sent `exit`.
 async fn documents(ctx: &mut Ctx<'_>) {
     let params = documents_initialize_params(&ctx.root);
@@ -1399,17 +1409,25 @@ async fn documents(ctx: &mut Ctx<'_>) {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
             let detail = format!("initialize didn't succeed: {why}");
-            for id in ["D1", "D2", "D3"] {
+            for id in ["D1", "D2", "D3", "D4"] {
                 ctx.report(id, Verdict::Error, detail.clone());
             }
             return;
         }
     };
+    let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { unreachable!() };
+    let caps = result.get("capabilities").cloned().unwrap_or(Value::Null);
     if !opens_documents(&reply) {
         let detail = "the server doesn't ask for didOpen (textDocumentSync), so lspcheck opens no document";
         for id in ["D1", "D2", "D3"] {
             ctx.report(id, Verdict::Skip, detail);
         }
+        // D4 still runs: doc.txt on disk, never opened.
+        let path = ctx.root.join("doc.txt");
+        let _ = std::fs::write(&path, documents::doc_a());
+        ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+        let uri = file_uri(&path);
+        d4(ctx, &caps, false, &uri, None).await;
         leave(ctx).await;
         return;
     }
@@ -1419,12 +1437,17 @@ async fn documents(ctx: &mut Ctx<'_>) {
             for id in ["D1", "D2", "D3"] {
                 ctx.report(id, Verdict::Error, why.clone());
             }
+            // D4 doesn't need the encoding, and runs with the document
+            // never opened, as when the server doesn't ask for didOpen.
+            let path = ctx.root.join("doc.txt");
+            let _ = std::fs::write(&path, documents::doc_a());
+            ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+            let uri = file_uri(&path);
+            d4(ctx, &caps, false, &uri, None).await;
             leave(ctx).await;
             return;
         }
     };
-    let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { unreachable!() };
-    let caps = result.get("capabilities").cloned().unwrap_or(Value::Null);
     let sync = documents::sync_kind(result);
 
     // Document A, saved in the workspace as an editor would open it.
@@ -1453,7 +1476,8 @@ async fn documents(ctx: &mut Ctx<'_>) {
 
     let mut asked = Vec::new();
     let mut notes = Vec::new();
-    ask_all(ctx, document_requests(&caps, &uri, &text, encoding), &mut asked, &mut notes).await;
+    // Why the server stopped answering before D4, if it did.
+    let mut stalled = ask_all(ctx, document_requests(&caps, &uri, &text, encoding), &mut asked, &mut notes).await;
     await_diagnostics(ctx, &uri, DOC_A_VERSION, from).await;
 
     // The change to version 42, the advertised way. A sync kind of None
@@ -1501,13 +1525,16 @@ async fn documents(ctx: &mut Ctx<'_>) {
                 docs[0].versions.push(Version { at: change_at, number: DOC_A2_VERSION, text: after });
                 // The same requests at version 42, with positions of the
                 // changed text, one at a time as before.
-                ask_all(
+                let stopped = ask_all(
                     ctx,
                     document_requests(&caps, &uri, &docs[0].versions[1].text, encoding),
                     &mut asked,
                     &mut notes,
                 )
                 .await;
+                // The latest requests say whether the server is answering
+                // now: an earlier timeout it recovered from doesn't count.
+                stalled = stopped;
                 await_diagnostics(ctx, &uri, DOC_A2_VERSION, from).await;
             }
             Err(e) => {
@@ -1518,7 +1545,15 @@ async fn documents(ctx: &mut Ctx<'_>) {
             }
         }
     }
+    // D4: the document is closed, so a request about it, one about a URI
+    // that was never opened and doesn't exist, and a plain request, each
+    // get a response, and the server keeps serving.
+    let closed_at = d4(ctx, &caps, true, &uri, stalled.as_deref()).await;
     let end = leave(ctx).await;
+    // D1 to D3 judge what was read while the document was open. Once
+    // `didClose` is sent the server may lawfully read the file from disk,
+    // whose text lspcheck doesn't track, so later positions aren't judged.
+    let end = closed_at.map_or(end, |at| at.min(end));
 
     // Everything read before `exit` was sent: diagnostics, and the replies
     // to lspcheck's requests, however late.
@@ -1612,6 +1647,130 @@ async fn documents(ctx: &mut Ctx<'_>) {
             }
         }
     }
+}
+
+/// D4's request: its method, and how to build its params for a URI.
+type D4Request = (&'static str, fn(&str) -> Value);
+
+/// D4's request about a document: the first advertised of `documentSymbol`,
+/// `hover` at (0,0), `foldingRange`, `documentHighlight` at (0,0) and
+/// `selectionRange` at (0,0). (0,0) is a boundary in every encoding, so no
+/// text model is needed.
+fn d4_request(caps: &Value) -> Option<D4Request> {
+    if advertises(caps, "documentSymbolProvider") {
+        return Some(("textDocument/documentSymbol", |uri| json!({"textDocument": {"uri": uri}})));
+    }
+    if advertises(caps, "hoverProvider") {
+        return Some((
+            "textDocument/hover",
+            |uri| json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}}),
+        ));
+    }
+    if advertises(caps, "foldingRangeProvider") {
+        return Some(("textDocument/foldingRange", |uri| json!({"textDocument": {"uri": uri}})));
+    }
+    if advertises(caps, "documentHighlightProvider") {
+        return Some((
+            "textDocument/documentHighlight",
+            |uri| json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}}),
+        ));
+    }
+    if advertises(caps, "selectionRangeProvider") {
+        return Some((
+            "textDocument/selectionRange",
+            |uri| json!({"textDocument": {"uri": uri}, "positions": [{"line": 0, "character": 0}]}),
+        ));
+    }
+    None
+}
+
+/// How a D4 response looks: the result (null, empty, or non-empty) or the
+/// error code. The content is never judged.
+fn describe_d4_outcome(m: &Message) -> String {
+    let Kind::Response { outcome, .. } = &m.kind else { unreachable!("wait_response returns a response") };
+    match outcome {
+        Outcome::Result(Value::Null) => "result null".into(),
+        Outcome::Result(Value::Array(a)) if a.is_empty() => "result (empty)".into(),
+        Outcome::Result(Value::Object(o)) if o.is_empty() => "result (empty)".into(),
+        Outcome::Result(_) => "result (non-empty)".into(),
+        Outcome::Error { code: Some(c), .. } => format!("error {c}"),
+        Outcome::Error { .. } => "an error without an integer code".into(),
+        Outcome::Malformed(why) => format!("a malformed response that {why}"),
+    }
+}
+
+/// D4: one advertised request about a document that isn't open (closed, or
+/// never opened when `closed` is false), one about a URI that was never
+/// opened and doesn't exist, and a plain request, each sent alone and
+/// awaited by `--timeout`. Any result or error is lawful, including one read
+/// from disk; what is judged is that a response comes, and that the server
+/// keeps serving. The requests are not judged by D1 to D3: the document is
+/// not open, so a reply may refer to the file on disk, which has no version
+/// in lspcheck's model. `stalled` says why the server had already stopped
+/// answering earlier in the scenario: then an unanswered D4 request says
+/// nothing about documents that aren't open, so it is an error, not a
+/// failure (a server that answers them anyway still passes).
+async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: Option<&str>) -> Option<Duration> {
+    let mut stalled = stalled;
+    if !ctx.s.is_alive() {
+        ctx.report("D4", Verdict::Error, "not judged: the server exited before the document was closed");
+        return None;
+    }
+    let Some((method, params_for)) = d4_request(caps) else {
+        ctx.report(
+            "D4",
+            Verdict::Skip,
+            "the server advertises no request about a document (none of documentSymbolProvider, hoverProvider, \
+             foldingRangeProvider, documentHighlightProvider, selectionRangeProvider)",
+        );
+        return None;
+    };
+    // When lspcheck began closing the document: from then on, the server may
+    // answer from disk. Set even if the write fails partway.
+    let closed_at = closed.then(|| ctx.s.elapsed());
+    if closed && let Err(e) = ctx.s.notify("textDocument/didClose", Some(json!({"textDocument": {"uri": uri}}))).await {
+        ctx.report("D4", Verdict::Error, format!("lspcheck couldn't send didClose: {e}"));
+        return closed_at;
+    }
+    let t = ctx.cfg.request_timeout;
+    let missing = file_uri(&ctx.root.join("missing.txt"));
+    let closed_label = if closed { "the closed document" } else { "the document on disk (never opened)" };
+    let mut outcomes = Vec::new();
+    for (label, doc_uri) in
+        [(closed_label, Some(uri)), ("the never-opened document", Some(missing.as_str())), ("the plain request", None)]
+    {
+        let (m, params) = match doc_uri {
+            Some(u) => (method, params_for(u)),
+            None => (PROBE, json!({})),
+        };
+        match ask(ctx, m, params).await {
+            Ok((_, Ok(reply))) => {
+                outcomes.push(format!("{label} got {}", describe_d4_outcome(&reply)));
+                // It is answering again, whatever happened before.
+                stalled = None;
+            }
+            Ok((_, Err(e))) => {
+                let e = CallError::Wait(e);
+                let what = format!("{label} went unanswered ({})", describe_call_error(&e, t));
+                if let Some(why) = stalled {
+                    ctx.report(
+                        "D4",
+                        Verdict::Error,
+                        format!("not judged: {what}, but the server had already stopped answering ({why})"),
+                    );
+                    return closed_at;
+                }
+                ctx.fail_call("D4", what, &e);
+                return closed_at;
+            }
+            Err(e) => {
+                ctx.report("D4", Verdict::Error, format!("{label}: lspcheck couldn't send it ({e})"));
+                return closed_at;
+            }
+        }
+    }
+    ctx.pass_with("D4", format!("all three answered: {}", outcomes.join("; ")));
+    closed_at
 }
 
 /// End of input without exit, as when the editor goes away.
