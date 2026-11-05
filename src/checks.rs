@@ -1532,7 +1532,9 @@ async fn documents(ctx: &mut Ctx<'_>) {
                     &mut notes,
                 )
                 .await;
-                stalled = stalled.or(stopped);
+                // The latest requests say whether the server is answering
+                // now: an earlier timeout it recovered from doesn't count.
+                stalled = stopped;
                 await_diagnostics(ctx, &uri, DOC_A2_VERSION, from).await;
             }
             Err(e) => {
@@ -1546,8 +1548,12 @@ async fn documents(ctx: &mut Ctx<'_>) {
     // D4: the document is closed, so a request about it, one about a URI
     // that was never opened and doesn't exist, and a plain request, each
     // get a response, and the server keeps serving.
-    d4(ctx, &caps, true, &uri, stalled.as_deref()).await;
+    let closed_at = d4(ctx, &caps, true, &uri, stalled.as_deref()).await;
     let end = leave(ctx).await;
+    // D1 to D3 judge what was read while the document was open. Once
+    // `didClose` is sent the server may lawfully read the file from disk,
+    // whose text lspcheck doesn't track, so later positions aren't judged.
+    let end = closed_at.map_or(end, |at| at.min(end));
 
     // Everything read before `exit` was sent: diagnostics, and the replies
     // to lspcheck's requests, however late.
@@ -1704,20 +1710,27 @@ fn describe_d4_outcome(m: &Message) -> String {
 /// answering earlier in the scenario: then an unanswered D4 request says
 /// nothing about documents that aren't open, so it is an error, not a
 /// failure (a server that answers them anyway still passes).
-async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: Option<&str>) {
+async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: Option<&str>) -> Option<Duration> {
+    let mut stalled = stalled;
     if !ctx.s.is_alive() {
-        return ctx.report("D4", Verdict::Error, "not judged: the server exited before the document was closed");
+        ctx.report("D4", Verdict::Error, "not judged: the server exited before the document was closed");
+        return None;
     }
     let Some((method, params_for)) = d4_request(caps) else {
-        return ctx.report(
+        ctx.report(
             "D4",
             Verdict::Skip,
             "the server advertises no request about a document (none of documentSymbolProvider, hoverProvider, \
              foldingRangeProvider, documentHighlightProvider, selectionRangeProvider)",
         );
+        return None;
     };
+    // When lspcheck began closing the document: from then on, the server may
+    // answer from disk. Set even if the write fails partway.
+    let closed_at = closed.then(|| ctx.s.elapsed());
     if closed && let Err(e) = ctx.s.notify("textDocument/didClose", Some(json!({"textDocument": {"uri": uri}}))).await {
-        return ctx.report("D4", Verdict::Error, format!("lspcheck couldn't send didClose: {e}"));
+        ctx.report("D4", Verdict::Error, format!("lspcheck couldn't send didClose: {e}"));
+        return closed_at;
     }
     let t = ctx.cfg.request_timeout;
     let missing = file_uri(&ctx.root.join("missing.txt"));
@@ -1733,27 +1746,31 @@ async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: O
         match ask(ctx, m, params).await {
             Ok((_, Ok(reply))) => {
                 outcomes.push(format!("{label} got {}", describe_d4_outcome(&reply)));
+                // It is answering again, whatever happened before.
+                stalled = None;
             }
             Ok((_, Err(e))) => {
                 let e = CallError::Wait(e);
                 let what = format!("{label} went unanswered ({})", describe_call_error(&e, t));
                 if let Some(why) = stalled {
-                    return ctx.report(
+                    ctx.report(
                         "D4",
                         Verdict::Error,
                         format!("not judged: {what}, but the server had already stopped answering ({why})"),
                     );
+                    return closed_at;
                 }
                 ctx.fail_call("D4", what, &e);
-                return;
+                return closed_at;
             }
             Err(e) => {
                 ctx.report("D4", Verdict::Error, format!("{label}: lspcheck couldn't send it ({e})"));
-                return;
+                return closed_at;
             }
         }
     }
     ctx.pass_with("D4", format!("all three answered: {}", outcomes.join("; ")));
+    closed_at
 }
 
 /// End of input without exit, as when the editor goes away.

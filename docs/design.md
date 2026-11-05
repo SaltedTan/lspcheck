@@ -218,16 +218,18 @@ Positions in every alternative text are counted in the negotiated encoding: a se
 change, or counted its range wrongly, still counts its positions as agreed.
 
 D4 judges that a response comes, not what it says: any result or error is lawful, including real results read from
-disk, and the content of a reply is never judged (so D4's requests are not judged by D1 to D3; a reply to one may
-refer to the file on disk, which has no version in lspcheck's model).
+disk, and the content of a reply is never judged. D1 to D3 judge only what was read before lspcheck began sending
+`didClose`: after it, the server may read the file from disk, whose text lspcheck doesn't track (another tool may
+have changed it), so neither D4's replies nor later diagnostics are judged by them.
 
 - **skip:** the server advertises none of `hoverProvider`, `documentSymbolProvider`, `foldingRangeProvider`,
   `documentHighlightProvider` or `selectionRangeProvider`.
 - **fail:** any of the three requests goes unanswered within `--timeout`. It goes through `fail_call`, so it is
   `error` when lspcheck couldn't deliver the request, or when missed evidence could have held the answer.
 - **error:** the `didClose` couldn't be sent, or an earlier step left the session unable to send; or a D4 request
-  went unanswered after an earlier request in the scenario had already gone unanswered, since a server that had
-  stopped answering before any document was closed says nothing about documents that aren't open.
+  went unanswered when the server's latest requests before it had gone unanswered too (it had stopped answering
+  before any document was closed, which says nothing about documents that aren't open). A server that answers again
+  in between has recovered, and is judged as usual.
 - **pass:** all three are answered. The detail records each outcome: result (null, empty, or non-empty) or the
   error code, for the closed document, the never-opened one, and the probe.
 

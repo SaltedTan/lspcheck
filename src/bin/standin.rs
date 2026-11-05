@@ -158,6 +158,11 @@ const FAULTS: &[(&str, &str)] = &[
     ("stop-after-unopened", "stop answering anything after a request about a document that isn't open"),
     ("unopened-error", "lawful: answer a request about a document that isn't open with InvalidParams"),
     ("closed-from-disk", "lawful: answer requests about closed documents from the file on disk"),
+    (
+        "disk-diagnostics-after-close",
+        "lawful: on didClose, publish unversioned diagnostics for the file on disk, which another tool changed to ASCII",
+    ),
+    ("drop-first-request", "never answer the first request about a document, then answer normally"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
     ("escaped-child", "start a child in a new session, with a non-UTF-8 name, that outlives the server"),
@@ -207,6 +212,8 @@ fn main() {
     let mut deferred: Option<Value> = None;
     // Set by stop-after-unknown-cancel: requests are no longer answered.
     let mut no_more_answers = false;
+    // For drop-first-request: whether the first document request was dropped.
+    let mut dropped_first = false;
     // What the cancel faults send, and where: now, or after the next answer.
     let mut cancel_out =
         CancelOut { late: fault("late-cancel-replies"), big: fault("big-cancel-replies"), held: Vec::new() };
@@ -394,6 +401,16 @@ fn main() {
                 if docs.remove(uri).is_some() && fault("closed-from-disk") {
                     closed.insert(uri.to_string());
                 }
+                // The file on disk now reads "abc": offset 1 is a boundary
+                // there, though it is inside an emoji of every version sent.
+                if fault("disk-diagnostics-after-close") {
+                    let d = json!({"range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
+                                   "severity": 3, "message": "on disk"});
+                    let params = json!({"uri": uri, "diagnostics": [d]});
+                    out.frame(
+                        &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
+                    );
+                }
             }
             if method == "textDocument/didChange"
                 && let (Some(uri), Some(changes)) = (
@@ -536,6 +553,10 @@ fn main() {
             continue;
         };
         if no_more_answers {
+            continue;
+        }
+        if fault("drop-first-request") && !dropped_first && method.starts_with("textDocument/") {
+            dropped_first = true;
             continue;
         }
         // A request about a document that isn't open: the D4 faults decide

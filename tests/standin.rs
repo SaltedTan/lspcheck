@@ -275,6 +275,8 @@ fn lawful_variations_fail_nothing() {
         "register-other",
         "unopened-error",
         "closed-from-disk",
+        "disk-diagnostics-after-close",
+        "drop-first-request",
     ] {
         let r = fault(name);
         // With no versioned publish for the opened document, D2 has nothing
@@ -966,6 +968,17 @@ fn requests_about_documents_that_arent_open_must_be_answered() {
     only_fails(&r, &["D4"]);
     assert_eq!(r.status, 0, "D4 is a POLICY check\n{}", r.stdout);
     assert!(r.stdout.contains("went unanswered"), "{}", r.stdout);
+}
+
+#[test]
+fn a_server_that_recovered_from_an_earlier_timeout_still_fails_d4() {
+    // The first document request goes unanswered, then the server answers
+    // the rest at both versions, then stops at the closed document. It had
+    // recovered, so D4 fails rather than calling it a server that had
+    // already stopped answering.
+    let r = run(&["--fault", "drop-first-request", "--fault", "stop-after-unopened"], &[]);
+    only_fails(&r, &["D4"]);
+    assert!(r.stdout.contains("the closed document went unanswered"), "{}", r.stdout);
 }
 
 #[test]
