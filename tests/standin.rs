@@ -1038,9 +1038,9 @@ fn replay_of_the_documents_scenario_recreates_its_document() {
     let last = std::fs::read_to_string(&transcript)
         .unwrap()
         .lines()
+        .rev()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v["workspace"].is_string())
-        .last()
+        .find(|v| v["workspace"].is_string())
         .expect("a workspace line");
     assert!(last["files"]["doc.txt"].as_str().is_some_and(|t| !t.is_empty()), "{last}");
     let ws = recorded_workspace(&transcript);
