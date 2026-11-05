@@ -166,6 +166,7 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: on didClose, publish unversioned diagnostics for the file on disk, which another tool changed to ASCII",
     ),
     ("drop-first-request", "never answer the first request about a document, then answer normally"),
+    ("stop-at-crlf", "stop answering anything from the first request about crlf.txt"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
     ("escaped-child", "start a child in a new session, with a non-UTF-8 name, that outlives the server"),
@@ -558,6 +559,13 @@ fn main() {
             continue;
         };
         if no_more_answers {
+            continue;
+        }
+        if fault("stop-at-crlf")
+            && method.starts_with("textDocument/")
+            && msg.pointer("/params/textDocument/uri").and_then(Value::as_str).is_some_and(|u| u.ends_with("crlf.txt"))
+        {
+            no_more_answers = true;
             continue;
         }
         if fault("drop-first-request") && !dropped_first && method.starts_with("textDocument/") {

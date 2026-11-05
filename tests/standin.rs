@@ -978,6 +978,16 @@ fn requests_about_documents_that_arent_open_must_be_answered() {
 }
 
 #[test]
+fn a_server_that_stopped_answering_at_the_second_document_leaves_d4_an_error() {
+    // A is answered at both versions; the server stops at B's first request,
+    // the latest before D4's, so D4's unanswered requests say nothing about
+    // documents that aren't open.
+    let r = fault("stop-at-crlf");
+    passes_except(&r, &[("D4", "error")]);
+    assert!(r.stdout.contains("the server had already stopped answering"), "{}", r.stdout);
+}
+
+#[test]
 fn a_server_that_recovered_from_an_earlier_timeout_still_fails_d4() {
     // The first document request goes unanswered, then the server answers
     // the rest at both versions, then stops at the closed document. It had

@@ -261,6 +261,18 @@ pub fn only_after(doc: &OpenDoc, source: &Source, change_at: Duration) -> bool {
     !candidates.is_empty() && candidates.iter().all(|v| v.at >= change_at)
 }
 
+/// Forgets what lspcheck read about `uri` from `closed_at` on, when it began
+/// closing that document: from then the server may answer about it from
+/// disk. Only the positions and publishes about `uri` go; a source keeps
+/// its positions about other documents (a diagnostic for an open document
+/// may point at a closed one in its related information).
+pub fn forget_after_close(sources: &mut [Source], published: &mut Vec<Published>, uri: &str, closed_at: Duration) {
+    for s in sources.iter_mut().filter(|s| s.read_at >= closed_at) {
+        s.found.retain(|f| !same_uri(&f.uri, uri));
+    }
+    published.retain(|p| !(p.read_at >= closed_at && same_uri(&p.uri, uri)));
+}
+
 /// The alternative texts for D3's rule (b): the text before the change (an
 /// ignored change, a stale snapshot, or the file read from disk, counted in
 /// the negotiated encoding), and, for an incremental sync, the change
@@ -1409,6 +1421,29 @@ mod tests {
         );
         assert!(detail.contains("p0 (fits the text before the change); p1"), "{detail}");
         assert!(detail.ends_with("; and 2 more"), "{detail}");
+    }
+
+    #[test]
+    fn what_is_about_a_closed_document_is_forgotten_position_by_position() {
+        let b = "file:///w/crlf.txt";
+        let at = Duration::from_millis(100);
+        // A diagnostic for open A, read after B's close, with related
+        // information in B: A's position stays, B's goes.
+        let mut sources = vec![
+            diagnostics(vec![range(URI, (1, 11), (1, 12)), range(b, (0, 0), (0, 1))], 150, None),
+            diagnostics(vec![range(b, (1, 1), (1, 2))], 50, None),
+        ];
+        let mut published = vec![
+            Published { uri: b.into(), version: Some(serde_json::json!(7)), read_at: Duration::from_millis(150) },
+            Published { uri: b.into(), version: Some(serde_json::json!(7)), read_at: Duration::from_millis(50) },
+            Published { uri: URI.into(), version: None, read_at: Duration::from_millis(150) },
+        ];
+        forget_after_close(&mut sources, &mut published, b, at);
+        assert_eq!(sources[0].found.len(), 1);
+        assert_eq!(sources[0].found[0].uri, URI);
+        assert_eq!(sources[1].found.len(), 1, "read before the close: kept");
+        assert_eq!(published.len(), 2);
+        assert!(published.iter().all(|p| p.uri == URI || p.read_at < at));
     }
 
     #[test]

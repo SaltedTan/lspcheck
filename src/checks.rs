@@ -1582,7 +1582,13 @@ async fn documents(ctx: &mut Ctx<'_>) {
         });
         // The advertised requests about B, with positions on B2 and B4. A
         // stall here doesn't affect D4, which concerns only A.
-        let _ = ask_all(ctx, document_requests(&caps, &b_uri, &b_text, encoding), &mut asked, &mut notes).await;
+        // B's requests are the latest before D4's, so they say whether the
+        // server is answering when D4 starts (when any were asked).
+        let asked_before = asked.len();
+        let b_stalled = ask_all(ctx, document_requests(&caps, &b_uri, &b_text, encoding), &mut asked, &mut notes).await;
+        if asked.len() > asked_before {
+            stalled = b_stalled;
+        }
         await_diagnostics(ctx, &b_uri, DOC_B_VERSION, b_from).await;
     }
     // Close B before D4 runs, so D4's requests concern only A and missing.txt.
@@ -1644,8 +1650,10 @@ async fn documents(ctx: &mut Ctx<'_>) {
         }
     }
     // What is about B and was read after B's close isn't judged, as for A.
+    if let Some(at) = b_closed_at {
+        documents::forget_after_close(&mut sources, &mut published, &b_uri, at);
+    }
     let about_b = |s: &Source| s.found.iter().any(|f| documents::same_uri(&f.uri, &b_uri));
-    sources.retain(|s| !(about_b(s) && b_closed_at.is_some_and(|at| s.read_at >= at)));
     let judged = documents::judge_positions(encoding, &docs, &sources);
     let incomplete = ctx.s.incomplete_within(opened_at, end);
     let (verdict, mut detail) = documents::judge_d1(encoding, &judged, incomplete.as_deref());
