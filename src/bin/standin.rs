@@ -133,6 +133,20 @@ const FAULTS: &[(&str, &str)] = &[
         "label publishDiagnostics with the stand-in's own counter instead of the document's version",
     ),
     ("future-diagnostics-version", "label publishDiagnostics with the document's version plus one"),
+    ("ignore-changes", "don't apply didChange, and label the old text's diagnostics with the new version"),
+    ("codepoint-changes", "apply incremental change ranges counting code points, and answer correctly otherwise"),
+    (
+        "mislabelled-diagnostics",
+        "after a didChange, publish the previous text's diagnostics labelled with the new version",
+    ),
+    (
+        "stale-diagnostics",
+        "lawful: on a didChange, first publish the previous text's diagnostics labelled with the previous version, then the new",
+    ),
+    ("stale-unversioned-diagnostics", "lawful: as stale-diagnostics, without versions"),
+    ("full-sync", "lawful: advertise Full sync, and take the whole text each change"),
+    ("no-change-sync", "lawful: advertise openClose without a change kind"),
+    ("register-sync", "after initialized, register textDocument/didChange dynamically"),
     ("big-frame-on-open", "after publishing diagnostics for an opened document, send a 2 MiB log message"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
@@ -193,9 +207,13 @@ fn main() {
     // For null-reply-after-first-probe: whether a request was answered since initialize.
     let mut answered_one = false;
     let mut children: Vec<Child> = Vec::new();
-    // The text of each open document, and how positions are counted.
-    let mut docs: HashMap<String, String> = HashMap::new();
+    // The text of each open document, with the version it was last sent at,
+    // and how positions are counted.
+    let mut docs: HashMap<String, (String, i64)> = HashMap::new();
     let mut units = Units::Utf16;
+    // The unit of the encoding the stand-in declared, used to apply changes;
+    // a position-counting fault changes `units`, not this.
+    let mut negotiated_units = Units::Utf16;
     // For diagnostics-own-version: the stand-in's own diagnostics counter.
     let mut own_version = 0i64;
     loop {
@@ -316,24 +334,84 @@ fn main() {
                     msg.pointer("/params/textDocument/text").and_then(Value::as_str),
                 )
             {
-                docs.insert(uri.to_string(), text.to_string());
+                let version = msg.pointer("/params/textDocument/version").and_then(Value::as_i64).unwrap_or(0);
+                docs.insert(uri.to_string(), (text.to_string(), version));
                 if !fault("no-diagnostics") {
-                    let mut version = msg.pointer("/params/textDocument/version").cloned().unwrap_or(Value::Null);
+                    let mut label = Some(json!(version));
                     if fault("diagnostics-own-version") {
                         // Its own counter instead: versions the document never had.
                         own_version += 1;
-                        version = json!(own_version);
-                    } else if fault("future-diagnostics-version")
-                        && let Some(n) = version.as_i64()
-                    {
-                        version = json!(n + 1);
+                        label = Some(json!(own_version));
+                    } else if fault("future-diagnostics-version") {
+                        label = Some(json!(version + 1));
                     }
-                    publish_diagnostics(&mut out, &faults, units, uri, text, version);
+                    if fault("unversioned-diagnostics") {
+                        label = None;
+                    }
+                    publish_diagnostics(&mut out, &faults, units, uri, text, label);
                 }
                 if fault("big-frame-on-open") {
                     let text = "x".repeat(2 * 1024 * 1024);
                     out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
                 }
+            }
+            if method == "textDocument/didChange"
+                && let (Some(uri), Some(changes)) = (
+                    msg.pointer("/params/textDocument/uri").and_then(Value::as_str),
+                    msg.pointer("/params/contentChanges").and_then(Value::as_array),
+                )
+                && let Some((text, old_version)) = docs.get_mut(uri)
+            {
+                let version = msg.pointer("/params/textDocument/version").and_then(Value::as_i64).unwrap_or(0);
+                let previous_version = *old_version;
+                let old_text = text.clone();
+                if !fault("ignore-changes") {
+                    // The stand-in applies the ranges in the encoding it
+                    // declared; codepoint-changes counts code points.
+                    let apply_units = if fault("codepoint-changes") { Units::CodePoints } else { negotiated_units };
+                    for c in changes {
+                        if let (Some(range), Some(insert)) = (c.get("range"), c.get("text").and_then(Value::as_str)) {
+                            apply_change(text, apply_units, range, insert);
+                        } else if let Some(insert) = c.get("text").and_then(Value::as_str) {
+                            *text = insert.to_string();
+                        }
+                    }
+                }
+                *old_version = version;
+                if !fault("no-diagnostics") {
+                    let mut label = Some(json!(version));
+                    if fault("diagnostics-own-version") {
+                        own_version += 1;
+                        label = Some(json!(own_version));
+                    } else if fault("future-diagnostics-version") {
+                        label = Some(json!(version + 1));
+                    }
+                    // The lawful stale faults publish the previous text's
+                    // diagnostics first, labelled with the previous version.
+                    if fault("stale-diagnostics") || fault("stale-unversioned-diagnostics") {
+                        let stale =
+                            if fault("stale-unversioned-diagnostics") { None } else { Some(json!(previous_version)) };
+                        publish_diagnostics(&mut out, &faults, units, uri, &old_text, stale);
+                    }
+                    // ignore-changes and mislabelled-diagnostics publish the
+                    // previous text, labelled with the new version.
+                    let publish_text =
+                        if fault("ignore-changes") || fault("mislabelled-diagnostics") { &old_text } else { text };
+                    if fault("unversioned-diagnostics") || fault("stale-unversioned-diagnostics") {
+                        label = None;
+                    }
+                    publish_diagnostics(&mut out, &faults, units, uri, publish_text, label);
+                }
+            }
+            if method == "initialized" && fault("register-sync") {
+                // A dynamic registration lspcheck didn't ask for; it answers
+                // it with success.
+                out.frame(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 777,
+                    "method": "client/registerCapability",
+                    "params": {"registerOptions": {"textDocumentDidChange": {}}}
+                }));
             }
             if !initialized && fault("late-reply-to-pre-init-notification") {
                 late_reply = Some(
@@ -499,6 +577,11 @@ fn main() {
             } else {
                 ("utf-16", Units::Utf16)
             };
+            negotiated_units = match encoding {
+                "utf-8" => Units::Bytes,
+                "utf-32" => Units::CodePoints,
+                _ => Units::Utf16,
+            };
             let mut result = json!({
                 "capabilities": {
                     "positionEncoding": encoding,
@@ -514,6 +597,12 @@ fn main() {
             });
             if fault("no-open-close") {
                 result["capabilities"]["textDocumentSync"] = json!({"openClose": false, "change": 0});
+            }
+            if fault("full-sync") {
+                result["capabilities"]["textDocumentSync"] = json!({"openClose": true, "change": 1});
+            }
+            if fault("no-change-sync") {
+                result["capabilities"]["textDocumentSync"] = json!({"openClose": true, "change": 0});
             }
             if fault("no-capabilities") {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
@@ -635,7 +724,10 @@ fn main() {
             | "textDocument/foldingRange"
             | "textDocument/documentHighlight"
             | "textDocument/selectionRange" => {
-                let text = msg.pointer("/params/textDocument/uri").and_then(Value::as_str).and_then(|u| docs.get(u));
+                let text = msg
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .and_then(|u| docs.get(u).map(|(t, _)| t));
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
                 let result = text.map_or(Value::Null, |text| document_answer(&method, &params, text, units));
                 out.frame(&ok(&id, result));
@@ -695,6 +787,54 @@ impl Units {
             Units::CodePoints => s.chars().count(),
         }
     }
+}
+
+/// The byte offset of a position in `text`, counted in `units`, clamping a
+/// character past the end of its line to the line's length; `None` for a
+/// line the document doesn't have, or a character inside a character.
+fn byte_offset(text: &str, units: Units, p: &Value) -> Option<usize> {
+    let line = p["line"].as_u64()? as usize;
+    let character = p["character"].as_u64()? as usize;
+    let mut start = 0;
+    for (n, l) in lines(text).into_iter().enumerate() {
+        if n == line {
+            let limit = character.min(units.of(l));
+            let mut bytes = 0;
+            let mut counted = 0;
+            for c in l.chars() {
+                if counted == limit {
+                    return Some(start + bytes);
+                }
+                counted += match units {
+                    Units::Bytes => c.len_utf8(),
+                    Units::Utf16 => c.len_utf16(),
+                    Units::CodePoints => 1,
+                };
+                if counted > limit {
+                    return None;
+                }
+                bytes += c.len_utf8();
+            }
+            return Some(start + bytes);
+        }
+        start += l.len();
+        let rest = &text[start..];
+        start += if rest.starts_with("\r\n") { 2 } else { 1 };
+    }
+    None
+}
+
+/// Applies one content change to `text`, the range counted in `units`. A
+/// change that doesn't fit is ignored: the stand-in's own texts always fit.
+fn apply_change(text: &mut String, units: Units, range: &Value, insert: &str) {
+    let Some(start) = byte_offset(text, units, &range["start"]) else { return };
+    let Some(end) = byte_offset(text, units, &range["end"]) else { return };
+    let (start, end) = (start.min(end), end.max(start));
+    let mut out = String::with_capacity(text.len() + insert.len());
+    out.push_str(&text[..start]);
+    out.push_str(insert);
+    out.push_str(&text[end..]);
+    *text = out;
 }
 
 /// A document's lines, split at `\n`, `\r\n` and `\r`, without their ends.
@@ -784,14 +924,14 @@ fn document_answer(method: &str, params: &Value, text: &str, units: Units) -> Va
 const ELSEWHERE: &str = "file:///lspcheck-standin/elsewhere.txt";
 
 /// Publishes a warning for each ASCII word of a document, labelled with its
-/// version, plus what the lawful position faults add.
+/// version when there is one, plus what the lawful position faults add.
 fn publish_diagnostics<W: Write>(
     out: &mut Writer<W>,
     faults: &[String],
     units: Units,
     uri: &str,
     text: &str,
-    version: Value,
+    version: Option<Value>,
 ) {
     let fault = |name: &str| faults.iter().any(|f| f == name);
     let mut diagnostics: Vec<Value> = words(text, units)
@@ -829,8 +969,8 @@ fn publish_diagnostics<W: Write>(
         out.frame(&json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}));
     }
     let mut params = json!({"uri": uri, "diagnostics": diagnostics});
-    if !fault("unversioned-diagnostics") {
-        params["version"] = version;
+    if let Some(v) = version {
+        params["version"] = v;
     }
     out.frame(&json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}));
 }

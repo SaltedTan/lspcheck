@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3, D1, D2 and `replay` are done; J7 and D3 to D6 are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3, D1 to D3 and `replay` are done; J7 and D4 to D6 are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -120,12 +120,12 @@ cancelled request until it is cancelled again, for C2 from its first cancel, and
 each until `exit`. A missing response is excused only by something missed while lspcheck was waiting for it.
 
 ### Documents and positions (richer with a profile document)
-D1 and D2 are done; D3 to D6 are planned.
+D1 to D3 are done; D4 to D6 are planned.
 
 | ID | Basis | Check |
 |---|---|---|
 | D1 | MUST | Every judged position in a reply or notification about an open document is at a character boundary of the text it refers to, in the negotiated encoding: never inside a UTF-16 surrogate pair or a UTF-8 multi-byte sequence. Positions past the end of a line or of the document aren't judged, since the spec lets clients clamp them. Splitting a grapheme cluster is lawful. |
-| D2 | MUST | A `version` in `textDocument/publishDiagnostics` for an open document is one lspcheck sent for that URI before the notification was read: the version `didOpen` sent, and a later `didChange`'s once D3 lands. An older version is lawful, and so is none at all; `null` or a non-integer one is a type error for K2, not D2's finding. |
+| D2 | MUST | A `version` in `textDocument/publishDiagnostics` for an open document is one lspcheck sent for that URI before the notification was read: the version `didOpen` sent, and a later `didChange`'s. An older version is lawful, and so is none at all; `null` or a non-integer one is a type error for K2, not D2's finding. |
 | D3 | MUST | After a `didChange`, positions refer to the changed text. lspcheck sends the change the advertised way: an incremental edit replaces a 4-byte character and adds a line, or the full text when the server asked for Full. |
 | D4 | POLICY | A request about a closed document, and one about a URI that was never opened and doesn't exist, each get a response (any result or error), and the server keeps serving. |
 | D5 | MUST | Lines are split at `\n`, `\r\n` and `\r`: positions in a document with CR LF and lone CR line endings fall on character boundaries of the lines the spec defines. |
@@ -141,7 +141,15 @@ Its other lines hold a combining mark, CJK characters, a ZWJ sequence, a flag an
 each request the server advertises (document symbols, folding ranges, links, code lenses, inlay hints, formatting,
 pull diagnostics, and hover, highlights and selection ranges at positions in and around `word`), one at a time, each
 bounded by `--timeout`, with every position counted in the negotiated encoding. It stops sending them after one goes
-unanswered. Then it waits up to 3 s for diagnostics labelled with version 41, and leaves.
+unanswered. Then it waits up to 3 s for diagnostics labelled with version 41.
+
+lspcheck then reads the server's `textDocumentSync` kind (a number or `{change: n}`; absent or `0` means the server
+takes no changes) and, when it takes them, sends one `didChange` to version 42: an incremental sync sends two content
+changes, the first replacing the first emoji of the first line with four emoji (its range computed from lspcheck's own
+text model in the negotiated encoding), the second inserting a line of ten emoji after it, so every later line moves
+down one; a Full sync sends the whole changed text. lspcheck applies its own changes with its own text model to get
+version 42, then sends the same requests again, with positions counted against version 42's text, one at a time, and
+waits up to 3 s for diagnostics labelled with version 42. Then it leaves.
 
 Positions are found by a fixed table of where each reply and `publishDiagnostics` carries them, never by searching
 for `line` and `character` (so a diagnostic's `data`, for instance, is never read). A position counts only when its URI
@@ -171,6 +179,32 @@ versions sent before it. An older version is lawful. A notification without a ve
 unversioned ones counted, and `null` or a non-integer `version` isn't judged here (K2's type check), nor is any URI
 lspcheck didn't open. Every early exit that skips or voids D1 skips or voids D2 too, and a pass over missed evidence
 is `ERROR` for D2 as it is for D1.
+
+D3 judges the positions read after the change was written, against version 42's text (a position is invalid only if it
+is inside a character in every version it may refer to, as for D1):
+
+- **skip:** the server doesn't ask for `didOpen`, or it takes no changes (`textDocumentSync` absent or `0`), so no
+  `didChange` is sent.
+- **error:** the server registered `textDocument/didChange` or `didOpen` dynamically before the change (lspcheck
+  declares no dynamic registration but answers registrations with success, so the server may expect another sync
+  kind); the `didChange` couldn't be sent; or nothing failed but lspcheck missed evidence the server sent from the
+  change on.
+- **fail:** a position read after the change is invalid in version 42, and either (a) D1's judgement of the positions
+  read before the change found informative positions, all valid, with no missed evidence before the change, so the
+  server was seen counting correctly and the fault is in applying the change; or (b) the position falls on a boundary
+  of an *alternative* text, and on no boundary of version 42 under any other encoding's reinterpretation (which would
+  be a counting fault, D1's). The alternative texts are the text before the change (an ignored change, a stale
+  snapshot, or the file read from disk) and, for an incremental sync, the change applied with its range counted in
+  each other encoding. The detail names the first few such positions with which alternative fits.
+- **error:** a position is invalid after the change, but neither (a) nor (b) holds: "can't tell a change-handling
+  fault from a counting fault; see D1".
+- **not-exercised:** the server chose UTF-32, where no offset can fall inside a character, or no informative position
+  was judged after the change.
+- **pass:** otherwise, with the number of informative positions judged after the change.
+
+A UTF-32 reinterpretation is never a guard against (b): no offset falls inside a character there, so it fits every
+position. An alternative text is checked the way a server producing it would count: the text before the change in the
+negotiated encoding, the change applied counting UTF-8 in UTF-8 bytes, and so on.
 
 Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs
 only one versioned publish for the document, so it is exercised wherever diagnostics are labelled.

@@ -46,10 +46,12 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
                      4 informative position(s) on character boundaries, counted in UTF-16 code units; 12 position(s) seen in the opened document, 0 past the end of a line, 0 on a line it doesn't have, 0 in other documents
   PASS  D2  MUST    A diagnostics version is one the document had when the notification was read
                      1 versioned diagnostics notification(s) named a version lspcheck had sent
-28 checks: 25 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
+  PASS  D3  MUST    After a didChange, positions refer to the changed text
+                     5 informative position(s) on character boundaries after the change, counted in UTF-16 code units; 14 position(s) read after the change
+29 checks: 26 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 28 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
+lspcheck is early: it has 29 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
 document positions. [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids,
 documents and robustness.
 
@@ -108,6 +110,14 @@ The same scenario also checks diagnostics versions (D2): when the server labels 
 document with a `version`, it must be one lspcheck sent for it before the notification was read — so a server that
 labels with its own counter, or with one the document never had, fails. An older version is lawful, a notification
 without a version leaves D2 `N/E`, and a `version` that is `null` or not an integer isn't judged here.
+
+The same scenario also checks positions after a change (D3): lspcheck sends a `didChange` the way the server's
+textDocumentSync kind asks (an incremental edit that replaces a 4-byte character and adds a line, or the full text),
+then asks the document requests again and reads the new diagnostics. Every position the server sends after the change
+must refer to the changed text. A position that falls inside a character of the changed text fails D3 when the server
+was seen counting correctly before the change, or when it fits a text the change should have produced (the text before
+the change, or the change applied counting its range in another encoding); otherwise D3 is `ERROR` and D1 carries the
+failure. A server that takes no changes leaves D3 `SKIP`.
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of
