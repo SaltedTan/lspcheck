@@ -133,10 +133,19 @@ pub struct Change {
     pub before: String,
     /// The text after the change, applied in the negotiated encoding.
     pub after: String,
-    /// The alternative texts for D3's rule (b), with the names the detail
     /// The alternative texts D3's rule (b) uses: each text, what it models,
-    /// and the encoding a server producing it would count positions in.
+    /// and the encoding its positions are counted in (the negotiated one: a
+    /// server that mishandles a change still counts positions as agreed).
     pub alternatives: Vec<(String, String, Encoding)>,
+}
+
+/// Whether everything `source` says about `doc` can only refer to versions
+/// sent from `change_at` on: a reply to a request sent after the change, or
+/// diagnostics labelled with such a version. A late reply to an earlier
+/// request, or unlabelled diagnostics, may refer to the text before.
+pub fn only_after(doc: &OpenDoc, source: &Source, change_at: Duration) -> bool {
+    let candidates = candidates(doc, source);
+    !candidates.is_empty() && candidates.iter().all(|v| v.at >= change_at)
 }
 
 /// The alternative texts for D3's rule (b): the text before the change (an
@@ -155,7 +164,9 @@ pub fn alternatives(before: &str, encoding: Encoding, kind: SyncKind) -> Vec<(St
             for c in [&c1, &c2] {
                 t = apply_lenient(&t, e, c).expect("the scenario's change fits its own text");
             }
-            out.push((t, format!("the change applied counting {}", counted_in(e)), e));
+            // Such a server still counts its positions in the negotiated
+            // encoding; only the change's range was counted wrongly.
+            out.push((t, format!("the change applied counting {}", counted_in(e)), encoding));
         }
     }
     out
@@ -1181,6 +1192,19 @@ mod tests {
     }
 
     #[test]
+    fn d3_judges_only_what_can_refer_only_to_the_changed_text() {
+        // Version 41 sent at 10 ms, the change to 42 at 100 ms.
+        let d = doc(&[(10, 41, "a"), (100, 42, "b")]);
+        let at = Duration::from_millis(100);
+        assert!(only_after(&d, &reply(vec![], 120, 130), at), "a reply to a request sent after the change");
+        assert!(only_after(&d, &diagnostics(vec![], 130, Some(42)), at), "diagnostics labelled 42");
+        assert!(!only_after(&d, &reply(vec![], 50, 130), at), "a late reply to a request sent before it");
+        assert!(!only_after(&d, &diagnostics(vec![], 130, None), at), "unlabelled diagnostics read after it");
+        assert!(!only_after(&d, &diagnostics(vec![], 130, Some(41)), at), "stale diagnostics labelled 41");
+        assert!(!only_after(&d, &reply(vec![], 20, 50), at), "a reply read before the change");
+    }
+
+    #[test]
     fn the_scenario_change_and_its_alternatives() {
         let before = doc_a();
         // The incremental change, in each encoding, defines the same text.
@@ -1215,9 +1239,11 @@ mod tests {
         assert_eq!(alts.len(), 3);
         assert_eq!(alts[0], (before.clone(), "the text before the change".to_string(), Encoding::Utf16));
         assert_eq!(alts[1].1, "the change applied counting UTF-8 bytes");
-        assert_eq!(alts[1].2, Encoding::Utf8);
+        // Positions in every alternative are counted in the negotiated
+        // encoding: only the change's range was miscounted.
+        assert_eq!(alts[1].2, Encoding::Utf16);
         assert_eq!(alts[2].1, "the change applied counting code points");
-        assert_eq!(alts[2].2, Encoding::Utf32);
+        assert_eq!(alts[2].2, Encoding::Utf16);
         // Counting c1's range in code points replaces two emoji, not one.
         let (c1, c2) = incremental_changes(&before, Encoding::Utf16);
         let mut t = before.clone();
@@ -1225,6 +1251,11 @@ mod tests {
         t = apply_lenient(&t, Encoding::Utf32, &c2).unwrap();
         assert_eq!(t, alts[2].0);
         assert!(t.starts_with(&("\u{1F600}".repeat(8) + " word")), "counting code points replaces two emoji");
+        // A position inside an emoji at the start of line 0 is inside a
+        // character of every alternative too: no alternative explains it.
+        for (alt, name, e) in &alts {
+            assert_eq!(text::position_status(alt, *e, 0, 1), PositionStatus::InsideCharacter, "{name}");
+        }
         // A Full sync has no range to miscount: only the text before.
         assert_eq!(alternatives(&before, Encoding::Utf16, SyncKind::Full).len(), 1);
     }

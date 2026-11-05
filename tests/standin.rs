@@ -1005,10 +1005,15 @@ fn a_dynamic_registration_of_the_sync_notifications_errors_d3() {
 #[test]
 fn positions_in_a_duplicate_response_are_judged_too() {
     // The first answer is valid; the second, a duplicate (J2's finding),
-    // has a position inside a character, read after the change. The
-    // pre-change positions (the first answer) were valid, so D3's rule (a)
-    // holds and D3 fails too: the position is invalid in the changed text.
-    only_fails(&fault("invalid-duplicate-symbols"), &["D1", "J2", "D3"]);
+    // has a position inside a character. The stand-in does this at both
+    // versions, so the server was seen miscounting before the change and no
+    // alternative text explains the position after it: D3 can't blame the
+    // change, and says so, while D1 carries the failure. (A late duplicate of
+    // a request sent before the change may refer to either version, so D3
+    // doesn't judge it at all.)
+    let r = fault("invalid-duplicate-symbols");
+    passes_except(&r, &[("D1", "fail"), ("J2", "fail"), ("D3", "error")]);
+    assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault"), "{}", r.stdout);
 }
 
 #[test]

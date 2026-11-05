@@ -1566,11 +1566,17 @@ async fn documents(ctx: &mut Ctx<'_>) {
             "the server registered textDocument/didChange or didOpen dynamically; lspcheck declares no dynamic registration, so the server may expect another sync kind",
         ),
         Some(change) => {
-            // D1's judgements of the positions read before and after the
-            // change was written; D3 judges the latter against the changed
-            // text.
+            // D1's judgements of the positions read before the change was
+            // written, and of those that can only refer to the changed text:
+            // a reply to a request sent after the change, or diagnostics
+            // labelled with its version. A late reply to an earlier request,
+            // or unlabelled diagnostics read after the change, may refer to
+            // the text before it; a position invalid there is D1's finding,
+            // not evidence about applying the change.
             let before = documents::judge_positions_where(encoding, &docs, &sources, |s| s.read_at < change.at);
-            let after = documents::judge_positions_where(encoding, &docs, &sources, |s| s.read_at > change.at);
+            let after = documents::judge_positions_where(encoding, &docs, &sources, |s| {
+                documents::only_after(&docs[0], s, change.at)
+            });
             let incomplete_before = ctx.s.incomplete_within(opened_at, change.at);
             let incomplete_change = ctx.s.incomplete_within(change.at, end);
             let (verdict, mut detail) = documents::judge_d3(

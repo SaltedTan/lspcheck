@@ -180,8 +180,9 @@ unversioned ones counted, and `null` or a non-integer `version` isn't judged her
 lspcheck didn't open. Every early exit that skips or voids D1 skips or voids D2 too, and a pass over missed evidence
 is `ERROR` for D2 as it is for D1.
 
-D3 judges the positions read after the change was written, against version 42's text (a position is invalid only if it
-is inside a character in every version it may refer to, as for D1):
+D3 judges the positions that can only refer to the changed text, against version 42's text: replies to requests sent
+after the change, and diagnostics labelled 42. A late reply to a request sent before the change, or unlabelled
+diagnostics, may refer to version 41, so a position in them that is invalid is D1's finding, not D3's:
 
 - **skip:** the server doesn't ask for `didOpen`, or it takes no changes (`textDocumentSync` absent or `0`), so no
   `didChange` is sent.
@@ -203,8 +204,8 @@ is inside a character in every version it may refer to, as for D1):
 - **pass:** otherwise, with the number of informative positions judged after the change.
 
 A UTF-32 reinterpretation is never a guard against (b): no offset falls inside a character there, so it fits every
-position. An alternative text is checked the way a server producing it would count: the text before the change in the
-negotiated encoding, the change applied counting UTF-8 in UTF-8 bytes, and so on.
+position. Positions in every alternative text are counted in the negotiated encoding: a server that ignored the
+change, or counted its range wrongly, still counts its positions as agreed.
 
 Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs
 only one versioned publish for the document, so it is exercised wherever diagnostics are labelled.
