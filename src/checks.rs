@@ -1415,9 +1415,12 @@ async fn documents(ctx: &mut Ctx<'_>) {
             });
         }
     }
+    // Every response to the request, not only the first: a duplicate is J2's
+    // finding, but positions in it are still about the document.
     for a in &asked {
-        let answer = msgs.iter().find(|(at, m)| *at >= a.at && *at < end && m.response_id() == Some(&a.id));
-        if let Some((at, Message { kind: Kind::Response { outcome: Outcome::Result(result), .. }, .. })) = answer {
+        let answers = msgs.iter().filter(|(at, m)| *at >= a.at && *at < end && m.response_id() == Some(&a.id));
+        for (at, m) in answers {
+            let Kind::Response { outcome: Outcome::Result(result), .. } = &m.kind else { continue };
             sources.push(Source {
                 method: a.method.into(),
                 found: text::positions(a.method, &a.params, Some(result)),

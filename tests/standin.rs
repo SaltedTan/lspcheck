@@ -847,6 +847,13 @@ fn positions_counted_in_the_wrong_units_fail_d1() {
 }
 
 #[test]
+fn positions_in_a_duplicate_response_are_judged_too() {
+    // The first answer is valid; the second, a duplicate (J2's finding),
+    // has a position inside a character.
+    only_fails(&fault("invalid-duplicate-symbols"), &["D1", "J2"]);
+}
+
+#[test]
 fn utf32_positions_leave_d1_not_exercised() {
     // No offset can fall inside a character in UTF-32.
     let r = fault("utf32-encoding");

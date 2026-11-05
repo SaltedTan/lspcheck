@@ -111,6 +111,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
     ("utf8-positions-as-utf16", "count positions in UTF-8 bytes while UTF-16 is negotiated"),
     ("codepoint-positions", "count positions in code points while UTF-16 is negotiated"),
+    (
+        "invalid-duplicate-symbols",
+        "after answering documentSymbol, answer it again with a range inside the first character of line 0",
+    ),
     ("utf16-positions-as-utf8", "choose utf-8 when offered, but count positions in UTF-16 code units"),
     ("utf8-encoding", "lawful: choose utf-8 when offered, and count positions in bytes"),
     ("utf32-encoding", "lawful: choose utf-32 when offered, and count positions in code points"),
@@ -598,6 +602,12 @@ fn main() {
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
                 let result = text.map_or(Value::Null, |text| document_answer(&method, &params, text, units));
                 out.frame(&ok(&id, result));
+                if method == "textDocument/documentSymbol" && fault("invalid-duplicate-symbols") {
+                    // Offset 1 of line 0 is inside its first emoji in UTF-8, UTF-16 alike.
+                    let inside = json!({"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}});
+                    let symbol = json!({"name": "x", "kind": 13, "range": inside, "selectionRange": inside});
+                    out.frame(&ok(&id, json!([symbol])));
+                }
             }
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
             "$/lspcheck/unknownRequest" if fault("result-and-error") => out.frame(&json!({
