@@ -1365,11 +1365,18 @@ async fn ask_all(
 }
 
 /// Whether a message is a `client/registerCapability` registering the sync
-/// notifications D3 depends on.
+/// notifications D3 depends on: a registration whose `method` is
+/// `textDocument/didChange` or `textDocument/didOpen`.
 fn sync_registration(m: &Message) -> bool {
     m.method() == Some("client/registerCapability")
-        && (m.value.pointer("/params/registerOptions/textDocumentDidChange").is_some()
-            || m.value.pointer("/params/registerOptions/textDocumentDidOpen").is_some())
+        && m.value.pointer("/params/registrations").and_then(Value::as_array).is_some_and(|regs| {
+            regs.iter().any(|r| {
+                matches!(
+                    r.get("method").and_then(Value::as_str),
+                    Some("textDocument/didChange") | Some("textDocument/didOpen")
+                )
+            })
+        })
 }
 
 /// The version document A is changed to.
@@ -1453,6 +1460,10 @@ async fn documents(ctx: &mut Ctx<'_>) {
     // sends no `didChange`, and D3 skips.
     let mut change: Option<Change> = None;
     let mut registered = false;
+    // Set when the `didChange` couldn't be written: D3 is an error, and the
+    // version-42 requests aren't sent, but D1 and D2 are still judged over
+    // everything read, as on the normal path.
+    let mut change_failed: Option<String> = None;
     if sync != SyncKind::None {
         // A dynamic registration of the sync notifications, read before the
         // change was written: lspcheck declares none but answers it with
@@ -1479,25 +1490,33 @@ async fn documents(ctx: &mut Ctx<'_>) {
             "textDocument": {"uri": uri, "version": DOC_A2_VERSION},
             "contentChanges": content,
         });
-        if let Err(e) = ctx.s.notify("textDocument/didChange", Some(params)).await {
-            let detail = format!("lspcheck couldn't send didChange: {e}");
-            for id in ["D1", "D2", "D3"] {
-                ctx.report(id, Verdict::Error, detail.clone());
+        match ctx.s.notify("textDocument/didChange", Some(params)).await {
+            Ok(()) => {
+                change = Some(Change {
+                    at: change_at,
+                    before: text.clone(),
+                    after: after.clone(),
+                    alternatives: documents::alternatives(&text, encoding, sync),
+                });
+                docs[0].versions.push(Version { at: change_at, number: DOC_A2_VERSION, text: after });
+                // The same requests at version 42, with positions of the
+                // changed text, one at a time as before.
+                ask_all(
+                    ctx,
+                    document_requests(&caps, &uri, &docs[0].versions[1].text, encoding),
+                    &mut asked,
+                    &mut notes,
+                )
+                .await;
+                await_diagnostics(ctx, &uri, DOC_A2_VERSION, from).await;
             }
-            leave(ctx).await;
-            return;
+            Err(e) => {
+                // The change didn't reach the server: D3 is an error, and the
+                // version-42 requests aren't sent. D1 and D2 are still judged
+                // over everything read, as on the normal path.
+                change_failed = Some(format!("lspcheck couldn't send didChange: {e}"));
+            }
         }
-        change = Some(Change {
-            at: change_at,
-            before: text.clone(),
-            after: after.clone(),
-            alternatives: documents::alternatives(&text, encoding, sync),
-        });
-        docs[0].versions.push(Version { at: change_at, number: DOC_A2_VERSION, text: after });
-        // The same requests at version 42, with positions of the changed
-        // text, one at a time as before.
-        ask_all(ctx, document_requests(&caps, &uri, &docs[0].versions[1].text, encoding), &mut asked, &mut notes).await;
-        await_diagnostics(ctx, &uri, DOC_A2_VERSION, from).await;
     }
     let end = leave(ctx).await;
 
@@ -1550,47 +1569,59 @@ async fn documents(ctx: &mut Ctx<'_>) {
         detail = format!("{detail}; {}", notes.join("; "));
     }
     ctx.report("D2", verdict, detail);
-    match change {
-        // The sync kind is None or absent: the client must not send
-        // `didChange`, so there is no change to judge.
-        None => ctx.report(
-            "D3",
-            Verdict::Skip,
-            "the server doesn't take changes (textDocumentSync's change is 0 or absent)",
-        ),
-        // A dynamic registration of the sync notifications, read before the
-        // change was written: the server may expect another sync kind.
-        Some(_) if registered => ctx.report(
-            "D3",
-            Verdict::Error,
-            "the server registered textDocument/didChange or didOpen dynamically; lspcheck declares no dynamic registration, so the server may expect another sync kind",
-        ),
-        Some(change) => {
-            // D1's judgements of the positions read before the change was
-            // written, and of those that can only refer to the changed text:
-            // a reply to a request sent after the change, or diagnostics
-            // labelled with its version. A late reply to an earlier request,
-            // or unlabelled diagnostics read after the change, may refer to
-            // the text before it; a position invalid there is D1's finding,
-            // not evidence about applying the change.
-            let before = documents::judge_positions_where(encoding, &docs, &sources, |s| s.read_at < change.at);
-            let after = documents::judge_positions_where(encoding, &docs, &sources, |s| {
-                documents::only_after(&docs[0], s, change.at)
-            });
-            let incomplete_before = ctx.s.incomplete_within(opened_at, change.at);
-            let incomplete_change = ctx.s.incomplete_within(change.at, end);
-            let (verdict, mut detail) = documents::judge_d3(
-                encoding,
-                &before,
-                &after,
-                &change,
-                incomplete_before.as_deref(),
-                incomplete_change.as_deref(),
-            );
-            if !notes.is_empty() {
-                detail = format!("{detail}; {}", notes.join("; "));
+    if let Some(detail) = change_failed {
+        // The `didChange` didn't reach the server: D3 is an error. D1 and D2
+        // were still judged over everything read, above.
+        ctx.report("D3", Verdict::Error, detail);
+    } else {
+        match change {
+            // The sync kind is None or absent: the client must not send
+            // `didChange`, so there is no change to judge.
+            None => ctx.report(
+                "D3",
+                Verdict::Skip,
+                "the server doesn't take changes (textDocumentSync's change is 0 or absent)",
+            ),
+            // A dynamic registration of the sync notifications, read before
+            // the change was written: the server may expect another sync
+            // kind.
+            Some(_) if registered => ctx.report(
+                "D3",
+                Verdict::Error,
+                "the server registered textDocument/didChange or didOpen dynamically; lspcheck declares no dynamic registration, so the server may expect another sync kind",
+            ),
+            Some(change) => {
+                // D1's judgements of the positions read before the change was
+                // written, and of those that can only refer to the changed
+                // text: a reply to a request sent after the change, or
+                // diagnostics labelled with its version. A late reply to an
+                // earlier request, or unlabelled diagnostics read after the
+                // change, may refer to the text before it; a position invalid
+                // there is D1's finding, not evidence about applying the
+                // change.
+                let before = documents::judge_positions_where(encoding, &docs, &sources, |s| s.read_at < change.at);
+                let after = documents::judge_positions_where(encoding, &docs, &sources, |s| {
+                    documents::only_after(&docs[0], s, change.at)
+                });
+                // The pin: the server reported `word`'s exact span before the
+                // change, counted in the negotiated encoding.
+                let pinned = documents::word_span_pinned(&docs, &sources, encoding, |s| s.read_at < change.at);
+                let incomplete_before = ctx.s.incomplete_within(opened_at, change.at);
+                let incomplete_change = ctx.s.incomplete_within(change.at, end);
+                let (verdict, mut detail) = documents::judge_d3(
+                    encoding,
+                    &before,
+                    &after,
+                    &change,
+                    pinned,
+                    incomplete_before.as_deref(),
+                    incomplete_change.as_deref(),
+                );
+                if !notes.is_empty() {
+                    detail = format!("{detail}; {}", notes.join("; "));
+                }
+                ctx.report("D3", verdict, detail);
             }
-            ctx.report("D3", verdict, detail);
         }
     }
 }
@@ -1905,11 +1936,12 @@ async fn framing(ctx: &mut Ctx<'_>) {
 }
 
 /// Whether the server asks for didOpen and didClose: a sync kind other than
-/// None, or `openClose: true`. Without it the client mustn't send them.
+/// None, or `openClose: true`. Without it the client mustn't send them. A
+/// numeric `textDocumentSync` is read as an integer however it is spelled.
 fn opens_documents(reply: &Message) -> bool {
     let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { return false };
     match result.pointer("/capabilities/textDocumentSync") {
-        Some(Value::Number(kind)) => kind.as_i64().is_some_and(|k| k > 0),
+        Some(Value::Number(kind)) => crate::message::integer_value(kind).is_some_and(|k| k > 0),
         Some(Value::Object(options)) => options.get("openClose") == Some(&Value::Bool(true)),
         _ => false,
     }

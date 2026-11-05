@@ -186,25 +186,31 @@ diagnostics, may refer to version 41, so a position in them that is invalid is D
 
 - **skip:** the server doesn't ask for `didOpen`, or it takes no changes (`textDocumentSync` absent or `0`), so no
   `didChange` is sent.
-- **error:** the server registered `textDocument/didChange` or `didOpen` dynamically before the change (lspcheck
-  declares no dynamic registration but answers registrations with success, so the server may expect another sync
-  kind); the `didChange` couldn't be sent; or nothing failed but lspcheck missed evidence the server sent from the
-  change on.
+- **error:** the server registered `textDocument/didChange` or `didOpen` dynamically before the change (a
+  `client/registerCapability` request whose `params.registrations` array has an entry whose `method` is one of
+  those; lspcheck declares no dynamic registration but answers registrations with success, so the server may
+  expect another sync kind); the `didChange` couldn't be sent; or nothing failed but lspcheck missed evidence the
+  server sent from the change on.
 - **fail:** a position read after the change is invalid in version 42, and either (a) D1's judgement of the positions
-  read before the change found informative positions, all valid, with no missed evidence before the change, so the
-  server was seen counting correctly and the fault is in applying the change; or (b) the position falls on a boundary
-  of an *alternative* text, and on no boundary of version 42 under any other encoding's reinterpretation (which would
-  be a counting fault, D1's). The alternative texts are the text before the change (an ignored change, a stale
-  snapshot, or the file read from disk) and, for an incremental sync, the change applied with its range counted in
-  each other encoding. The detail names the first few such positions with which alternative fits.
+  read before the change found informative positions, all valid, with no missed evidence before the change, and the
+  server reported `word`'s span on line 0 of version 41 exactly as it is counted in the negotiated encoding (the
+  *pin*: a miscounting server reports some other span for it), so the server was seen counting correctly and the
+  fault is in applying the change; or (b) the position falls on a boundary of an *alternative* text, and on no
+  boundary of version 42 under any other encoding's reinterpretation (which would be a counting fault, D1's). The
+  alternative texts are the text before the change (an ignored change, a stale snapshot, or the file read from
+  disk) and, for an incremental sync, the change applied with its range counted in each other encoding. The detail
+  names the first few such positions with which alternative fits.
 - **error:** a position is invalid after the change, but neither (a) nor (b) holds: "can't tell a change-handling
   fault from a counting fault; see D1".
 - **not-exercised:** the server chose UTF-32, where no offset can fall inside a character, or no informative position
   was judged after the change.
 - **pass:** otherwise, with the number of informative positions judged after the change.
 
-A UTF-32 reinterpretation is never a guard against (b): no offset falls inside a character there, so it fits every
-position. Positions in every alternative text are counted in the negotiated encoding: a server that ignored the
+A counting fault is told from a change-handling fault by the pin and by `word`'s span in the changed text: a server
+that applied the change correctly but counted in another encoding reports `word`'s span as it is in the changed text
+under that encoding, which a server that miscounted or mis-applied the change does not. (In code points and UTF-32
+every in-line offset is a boundary, so "on a boundary under another encoding" alone can't separate the two.)
+Positions in every alternative text are counted in the negotiated encoding: a server that ignored the
 change, or counted its range wrongly, still counts its positions as agreed.
 
 Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs

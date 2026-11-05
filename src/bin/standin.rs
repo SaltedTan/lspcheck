@@ -147,6 +147,12 @@ const FAULTS: &[(&str, &str)] = &[
     ("full-sync", "lawful: advertise Full sync, and take the whole text each change"),
     ("no-change-sync", "lawful: advertise openClose without a change kind"),
     ("register-sync", "after initialized, register textDocument/didChange dynamically"),
+    ("register-other", "lawful: after initialized, register workspace/didChangeWatchedFiles dynamically"),
+    ("codepoint-positions-after-change", "count positions in code points from a didChange on, correctly before it"),
+    (
+        "close-stdin-before-change",
+        "on didOpen, publish a bad-boundary diagnostic, then exit so didChange can't be sent",
+    ),
     ("big-frame-on-open", "after publishing diagnostics for an opened document, send a 2 MiB log message"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
@@ -336,6 +342,25 @@ fn main() {
             {
                 let version = msg.pointer("/params/textDocument/version").and_then(Value::as_i64).unwrap_or(0);
                 docs.insert(uri.to_string(), (text.to_string(), version));
+                if fault("close-stdin-before-change") && text.contains("word") {
+                    // Publish version 41's diagnostics with a position inside
+                    // the first character, then exit: the stdin pipe's read
+                    // end closes, so lspcheck's `didChange` can't be
+                    // delivered (D3 is an error) while D1's failure stands.
+                    // Only the documents scenario's document carries "word";
+                    // the framing scenario's text does not, so it is
+                    // unaffected. The message carries non-ASCII text so F2 is
+                    // still exercised.
+                    let params = json!({
+                        "uri": uri,
+                        "version": version,
+                        "diagnostics": [{"range": range(0, 0, 0, 1), "severity": 2, "message": "bad boundary \u{1F600}"}]
+                    });
+                    out.frame(
+                        &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
+                    );
+                    std::process::exit(0);
+                }
                 if !fault("no-diagnostics") {
                     let mut label = Some(json!(version));
                     if fault("diagnostics-own-version") {
@@ -365,6 +390,11 @@ fn main() {
                 let version = msg.pointer("/params/textDocument/version").and_then(Value::as_i64).unwrap_or(0);
                 let previous_version = *old_version;
                 let old_text = text.clone();
+                if fault("codepoint-positions-after-change") {
+                    // From the change on, count positions in code points; the
+                    // change itself is applied in the negotiated encoding.
+                    units = Units::CodePoints;
+                }
                 if !fault("ignore-changes") {
                     // The stand-in applies the ranges in the encoding it
                     // declared; codepoint-changes counts code points.
@@ -402,6 +432,20 @@ fn main() {
                     }
                     publish_diagnostics(&mut out, &faults, units, uri, publish_text, label);
                 }
+                if fault("codepoint-positions-after-change") {
+                    // Mark one character of the all-emoji line (line 1) in
+                    // code points: (1,1) is inside the first emoji in UTF-16
+                    // but a boundary in code points, so it is a counting
+                    // fault (D1's), not a change-handling fault.
+                    let params = json!({
+                        "uri": uri,
+                        "version": version,
+                        "diagnostics": [{"range": range(1, 0, 1, 1), "severity": 2, "message": "emoji"}]
+                    });
+                    out.frame(
+                        &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
+                    );
+                }
             }
             if method == "initialized" && fault("register-sync") {
                 // A dynamic registration lspcheck didn't ask for; it answers
@@ -410,7 +454,17 @@ fn main() {
                     "jsonrpc": "2.0",
                     "id": 777,
                     "method": "client/registerCapability",
-                    "params": {"registerOptions": {"textDocumentDidChange": {}}}
+                    "params": {"registrations": [{"id": "1", "method": "textDocument/didChange", "registerOptions": {"documentSelector": null, "syncKind": 2}}]}
+                }));
+            }
+            if method == "initialized" && fault("register-other") {
+                // A dynamic registration of a method D3 doesn't depend on;
+                // it must not make D3 an error.
+                out.frame(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 777,
+                    "method": "client/registerCapability",
+                    "params": {"registrations": [{"id": "1", "method": "workspace/didChangeWatchedFiles", "registerOptions": {"documents": []}}]}
                 }));
             }
             if !initialized && fault("late-reply-to-pre-init-notification") {

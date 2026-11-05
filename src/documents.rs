@@ -45,6 +45,16 @@ pub fn span_in(text: &str, line: usize, needle: &str, encoding: Encoding) -> (Po
     (Position { line, character: units(at) }, Position { line, character: units(at + needle.len()) })
 }
 
+/// [`span_in`], or `None` if `line` doesn't exist or `needle` isn't on it.
+fn span_in_opt(text: &str, line: usize, needle: &str, encoding: Encoding) -> Option<(Position, Position)> {
+    let lines = text::split_lines(text);
+    let l = lines.get(line)?;
+    let at = l.find(needle)?;
+    let start = text::line_length(&l[..at], encoding);
+    let end = text::line_length(&l[..at + needle.len()], encoding);
+    Some((Position { line, character: start }, Position { line, character: end }))
+}
+
 /// Where `needle` starts and ends on line `line` of document A, counted in
 /// `encoding`.
 pub fn doc_a_span(line: usize, needle: &str, encoding: Encoding) -> (Position, Position) {
@@ -72,11 +82,12 @@ pub enum SyncKind {
 }
 
 /// The sync kind from the initialize result's `textDocumentSync`: a number
-/// or `{change: n}`. Absent, `0` or an unknown value means None.
+/// or `{change: n}`. Absent, `0` or an unknown value means None. A number is
+/// read as an integer however it is spelled, as [`version_number`].
 pub fn sync_kind(result: &Value) -> SyncKind {
     let n = result.get("capabilities").and_then(|c| c.get("textDocumentSync")).and_then(|s| match s {
-        Value::Number(n) => n.as_i64(),
-        Value::Object(o) => o.get("change").and_then(Value::as_i64),
+        Value::Number(n) => crate::message::integer_value(n),
+        Value::Object(o) => o.get("change").and_then(|v| v.as_number().and_then(crate::message::integer_value)),
         _ => None,
     });
     match n {
@@ -330,6 +341,11 @@ pub struct Judged {
     pub invalid: Vec<String>,
     /// The positions in [`Judged::invalid`], in the same order.
     pub invalid_positions: Vec<Position>,
+    /// Every position judged as valid or invalid (not clamped, not on a
+    /// missing line, not in another document), in the order read. Used to
+    /// tell a server that reports `word`'s exact span under another encoding
+    /// (a counting fault) from one that reports a different span.
+    pub all_positions: Vec<Position>,
     /// Positions past the end of their line, which the spec lets clients clamp.
     pub past_end: usize,
     /// Of those, how many would be in bounds counted another way, by counting.
@@ -386,6 +402,7 @@ fn judge_one(j: &mut Judged, encoding: Encoding, texts: &[&Version], p: Position
         texts.iter().map(|v| text::position_status(&v.text, encoding, p.line, p.character)).collect();
     if let Some(i) = statuses.iter().position(|s| *s == PositionStatus::Boundary) {
         j.valid += 1;
+        j.all_positions.push(p);
         // Only text before it on its line can make counting matter.
         let informative = texts.iter().zip(&statuses).skip(i).any(|(v, s)| {
             *s == PositionStatus::Boundary && {
@@ -417,6 +434,7 @@ fn judge_one(j: &mut Judged, encoding: Encoding, texts: &[&Version], p: Position
             versions.join(" or ")
         ));
         j.invalid_positions.push(p);
+        j.all_positions.push(p);
     } else if statuses.contains(&PositionStatus::PastEndOfLine) {
         // Not judged: the client clamps it. In bounds counted another way, it
         // hints at that counting, which D1 can't prove.
@@ -505,61 +523,108 @@ fn counts(j: &Judged) -> String {
     out
 }
 
+/// Whether any source `when` admits reports the exact span of `word` on line
+/// 0 of document A, counted in `encoding`: the pin that proves a server
+/// counts in the negotiated encoding. Document A's line 0 was built so that
+/// `word`'s boundaries land inside a character under each of the four common
+/// mix-ups, so a server that miscounts reports some other span for it. A
+/// `Found` range from any source (a reply or diagnostics) about an opened
+/// document counts.
+pub fn word_span_pinned(
+    docs: &[OpenDoc],
+    sources: &[Source],
+    encoding: Encoding,
+    when: impl Fn(&Source) -> bool,
+) -> bool {
+    let (start, end) = doc_a_span(0, "word", encoding);
+    sources.iter().filter(|s| when(s)).any(|source| {
+        source.found.iter().any(|found| {
+            found.kind == FoundKind::Range
+                && found.at.len() == 2
+                && found.at[0] == start
+                && found.at[1] == end
+                && docs.iter().any(|d| same_uri(&d.uri, &found.uri))
+        })
+    })
+}
+
 /// D3's verdict, judged at the end over the positions read after the change.
 ///
 /// `before` and `after` are D1's judgements of the positions read before and
 /// after `change` was written. A position is invalid after the change only
 /// if it is inside a character in every text it may refer to, the same rule
-/// as D1. `incomplete_before` says why lspcheck may have missed something
-/// the server sent from the `didOpen` to the change, `incomplete` from the
-/// change to the end. The skip (no `didOpen`, no change sent) and the
-/// registration and undelivered-change errors are the scenario's to report.
+/// as D1. `pinned` says the server reported `word`'s exact span before the
+/// change, counted in the negotiated encoding: the proof it counts there.
+/// `incomplete_before` says why lspcheck may have missed something the server
+/// sent from the `didOpen` to the change, `incomplete` from the change to the
+/// end. The skip (no `didOpen`, no change sent) and the registration and
+/// undelivered-change errors are the scenario's to report.
 pub fn judge_d3(
     encoding: Encoding,
     before: &Judged,
     after: &Judged,
     change: &Change,
+    pinned: bool,
     incomplete_before: Option<&str>,
     incomplete: Option<&str>,
 ) -> (Verdict, String) {
     let units = counted_in(encoding);
     // Rule (a): the server was seen counting correctly before the change, so
-    // a fault after it is in applying the change.
-    let counted_right = before.informative > 0 && before.invalid.is_empty() && incomplete_before.is_none();
-    // Rule (b), per invalid position: on a boundary of an alternative text,
-    // counted the way a server producing it would count, and on no boundary
-    // of the changed text under any other encoding's reinterpretation (which
-    // would be a counting fault, D1's). UTF-32 is not a reinterpretation:
-    // no offset falls inside a character there, so it fits everything.
+    // a fault after it is in applying the change. The pin is what makes that
+    // a proof rather than luck: a range exactly matching `word`'s span on
+    // line 0 of version 41, counted in the negotiated encoding, which a
+    // miscounting server can't report.
+    let counted_right = before.informative > 0 && before.invalid.is_empty() && incomplete_before.is_none() && pinned;
+    // A counting fault: the server applied the change correctly (its text is
+    // the changed text) but counted the positions in another encoding. The
+    // tell is that it reports `word`'s exact span as it is in the changed
+    // text under that other encoding — a server that miscounts or mis-applies
+    // the change reports some other span. (In code points and UTF-32 every
+    // in-line offset is a boundary, so "on a boundary under another encoding"
+    // alone can't separate a counting fault from a change-handling fault.)
+    let counting = ENCODINGS.iter().any(|e| {
+        *e != encoding
+            && span_in_opt(&change.after, 0, "word", *e)
+                .is_some_and(|(start, end)| after.all_positions.contains(&start) && after.all_positions.contains(&end))
+    });
+    let mut unexplained: Vec<usize> = Vec::new();
     let mut fits: Vec<(usize, &str)> = Vec::new();
     for (i, p) in after.invalid_positions.iter().enumerate() {
-        let alt = change
+        if counting {
+            continue;
+        }
+        unexplained.push(i);
+        if let Some(name) = change
             .alternatives
             .iter()
             .find(|(t, _, e)| text::position_status(t, *e, p.line, p.character) == PositionStatus::Boundary)
-            .map(|(_, name, _)| name.as_str());
-        let reinterpreted = ENCODINGS.iter().filter(|e| **e != Encoding::Utf32).any(|e| {
-            *e != encoding && text::position_status(&change.after, *e, p.line, p.character) == PositionStatus::Boundary
-        });
-        if let Some(name) = alt
-            && !reinterpreted
+            .map(|(_, name, _)| name.as_str())
         {
             fits.push((i, name));
         }
     }
     if !after.invalid.is_empty() {
-        let more = after.invalid.len().saturating_sub(NAMED);
+        if unexplained.is_empty() {
+            return (
+                Verdict::Error,
+                format!(
+                    "{} position(s) read after the change fall inside a character of version 42, counted in {units}, \
+                     but each is on a boundary of the changed text counted in another encoding; can't tell a \
+                     change-handling fault from a counting fault; see D1",
+                    after.invalid.len()
+                ),
+            );
+        }
+        let more = unexplained.len().saturating_sub(NAMED);
         let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
-        // The first few invalid positions, each with which alternative fits,
-        // where one does.
-        let first: Vec<String> = after
-            .invalid
+        // The first few unexplained positions, each with which alternative
+        // fits, where one does.
+        let first: Vec<String> = unexplained
             .iter()
-            .enumerate()
             .take(NAMED)
-            .map(|(i, d)| match fits.iter().find(|(j, _)| *j == i) {
-                Some((_, name)) => format!("{d} (fits {name})"),
-                None => d.clone(),
+            .map(|&i| match fits.iter().find(|(j, _)| *j == i) {
+                Some((_, name)) => format!("{} (fits {name})", after.invalid[i]),
+                None => after.invalid[i].clone(),
             })
             .collect();
         if counted_right {
@@ -567,9 +632,9 @@ pub fn judge_d3(
                 Verdict::Fail,
                 format!(
                     "{} position(s) read after the change fall inside a character of version 42, counted in {units}, \
-                     and the positions before the change were all on boundaries, so the fault is in applying the \
-                     change: {}{tail}",
-                    after.invalid.len(),
+                     and the server reported word's span exactly before the change, so it counts in {units}; the \
+                     fault is in applying the change: {}{tail}",
+                    unexplained.len(),
                     first.join("; ")
                 ),
             );
@@ -580,7 +645,7 @@ pub fn judge_d3(
                 format!(
                     "{} position(s) read after the change fall inside a character of version 42, counted in {units}, \
                      and fit a text the change should have produced: {}{tail}",
-                    after.invalid.len(),
+                    unexplained.len(),
                     first.join("; ")
                 ),
             );
@@ -590,7 +655,7 @@ pub fn judge_d3(
             format!(
                 "{} position(s) read after the change fall inside a character of version 42, counted in {units}, \
                  but can't tell a change-handling fault from a counting fault; see D1",
-                after.invalid.len()
+                unexplained.len()
             ),
         );
     }
@@ -1082,59 +1147,85 @@ mod tests {
     #[test]
     fn d3_fails_when_the_server_was_seen_counting_correctly() {
         // (a): informative positions before the change, all valid, nothing
-        // missed before it; an invalid position after it.
+        // missed before it, and the pin: the server reported `word`'s span
+        // exactly; an invalid position after it.
         let before = judged(4, 2, &[]);
         let after = judged(4, 2, &["p"]);
-        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &change(), None, None);
+        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &change(), true, None, None);
         assert_eq!(v, Verdict::Fail);
         assert!(
-            detail.starts_with("1 position(s) read after the change fall inside a character of version 42, counted in UTF-16 code units, and the positions before the change were all on boundaries"),
+            detail.starts_with(
+                "1 position(s) read after the change fall inside a character of version 42, counted in UTF-16 code units, and the server reported word's span exactly before the change, so it counts in UTF-16 code units; the fault is in applying the change"
+            ),
             "{detail}"
         );
+        // No pin: the pre-change positions were informative and valid, but
+        // the server never reported `word`'s exact span, so (a) can't hold;
+        // with no alternative fit either, the verdict is an error.
+        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &change(), false, None, None);
+        assert_eq!(v, Verdict::Error);
+        assert!(detail.contains("can't tell a change-handling fault from a counting fault; see D1"), "{detail}");
         // Missed evidence before the change voids (a); with no alternative
         // fit either, the verdict is an error.
-        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &change(), Some("a frame was skipped"), None);
+        let (v, detail) =
+            judge_d3(Encoding::Utf16, &before, &after, &change(), true, Some("a frame was skipped"), None);
         assert_eq!(v, Verdict::Error);
         assert!(detail.contains("can't tell a change-handling fault from a counting fault; see D1"), "{detail}");
         // A failure seen stands even when evidence after the change is missed.
-        let (v, _) = judge_d3(Encoding::Utf16, &before, &after, &change(), None, Some("a frame was skipped"));
+        let (v, _) = judge_d3(Encoding::Utf16, &before, &after, &change(), true, None, Some("a frame was skipped"));
         assert_eq!(v, Verdict::Fail);
     }
 
     #[test]
     fn d3_fails_when_the_position_fits_an_alternative_text() {
-        // (b): no informative positions before the change, but the invalid
-        // position (0,2) is a boundary of the alternative text "ab" counted
-        // in UTF-16, and of the changed text (a, a 4-byte emoji, b) in no
-        // other encoding: inside the surrogate pair in UTF-16, inside the
-        // UTF-8 sequence, and UTF-32 is no reinterpretation at all.
+        // (b): no informative positions before the change, and the invalid
+        // position is not a counting fault: `after` is two emoji, so (0,3) is
+        // inside the second in UTF-16, inside the first in UTF-8, and past
+        // the end in code points. It is a boundary of the alternative text
+        // "abcd", which the change should have produced.
         let before = judged(4, 0, &[]);
         let mut after = judged(2, 0, &["p"]);
-        after.invalid_positions = vec![Position { line: 0, character: 2 }];
+        after.invalid_positions = vec![Position { line: 0, character: 3 }];
         let mut c = change();
-        c.after = "a\u{1F600}b".into();
-        c.alternatives = vec![("ab".into(), "the text before the change".into(), Encoding::Utf16)];
-        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &c, None, None);
+        c.after = "\u{1F600}\u{1F600}".into();
+        c.alternatives = vec![("abcd".into(), "the text before the change".into(), Encoding::Utf16)];
+        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &c, false, None, None);
         assert_eq!(v, Verdict::Fail);
         assert!(
             detail.starts_with("1 position(s) read after the change fall inside a character of version 42, counted in UTF-16 code units, and fit a text the change should have produced"),
             "{detail}"
         );
         assert!(detail.contains("(fits the text before the change)"), "{detail}");
-        // The same position on a boundary of the changed text counted in
-        // another encoding is a counting fault (D1's), not (b)'s.
+        // A counting fault: the server applied the change correctly (its text
+        // is the changed text) but counted in code points, so it reports
+        // `word`'s span as it is in the changed text counted in code points.
+        // Here `after` is three emoji, " word ", three emoji, so `word` is at
+        // code points 4-7; the server reports that span, and the invalid
+        // position (0,4) is explained by the code-point reading: a counting
+        // fault, D1's, not a change-handling fault.
+        let mut after2 = judged(2, 0, &["p"]);
+        after2.invalid_positions = vec![Position { line: 0, character: 4 }];
+        after2.all_positions = vec![Position { line: 0, character: 4 }, Position { line: 0, character: 7 }];
         let mut c = change();
-        c.after = "ab".into(); // (0,2) is a boundary in UTF-16 and UTF-8
-        c.alternatives = vec![("cd".into(), "the text before the change".into(), Encoding::Utf16)];
-        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &c, None, None);
+        c.after = "\u{1F600}\u{1F600}\u{1F600} word \u{1F600}\u{1F600}\u{1F600}".into();
+        c.alternatives = vec![];
+        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after2, &c, false, None, None);
         assert_eq!(v, Verdict::Error, "{detail}");
         assert!(detail.contains("can't tell a change-handling fault from a counting fault; see D1"), "{detail}");
-        // A boundary only in UTF-32 is no reinterpretation: (b) still holds.
+        // The same positions, but the server reports `word` at some other span
+        // (it mis-applied the change, not a counting fault): rule (b) can fire.
+        let mut after3 = judged(2, 0, &["p"]);
+        after3.invalid_positions = vec![Position { line: 0, character: 4 }];
+        after3.all_positions = vec![Position { line: 0, character: 5 }, Position { line: 0, character: 8 }];
         let mut c = change();
-        c.after = "a\u{1F600}b".into(); // (0,2) is a boundary in UTF-32 only
-        c.alternatives = vec![("ab".into(), "the text before the change".into(), Encoding::Utf16)];
-        let (v, _) = judge_d3(Encoding::Utf16, &before, &after, &c, None, None);
-        assert_eq!(v, Verdict::Fail, "UTF-32 fits every position, so it is not a reinterpretation");
+        c.after = "\u{1F600}\u{1F600}\u{1F600} word \u{1F600}\u{1F600}\u{1F600}".into();
+        c.alternatives = vec![(
+            "\u{1F600}\u{1F600}\u{1F600}\u{1F600} word".into(),
+            "the text before the change".into(),
+            Encoding::Utf16,
+        )];
+        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after3, &c, false, None, None);
+        assert_eq!(v, Verdict::Fail, "{detail}");
     }
 
     #[test]
@@ -1143,7 +1234,7 @@ mod tests {
         // a fault: D3 judges only positions invalid in the changed text.
         let before = judged(4, 2, &[]);
         let after = judged(4, 2, &[]);
-        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &change(), None, None);
+        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &change(), false, None, None);
         assert_eq!(v, Verdict::Pass);
         assert!(
             detail.starts_with(
@@ -1152,7 +1243,8 @@ mod tests {
             "{detail}"
         );
         // Missed evidence after the change makes a pass inconclusive.
-        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &change(), None, Some("a frame was skipped"));
+        let (v, detail) =
+            judge_d3(Encoding::Utf16, &before, &after, &change(), false, None, Some("a frame was skipped"));
         assert_eq!(v, Verdict::Error);
         assert!(detail.contains("it may have held a position inside a character of the changed text"), "{detail}");
     }
@@ -1161,11 +1253,11 @@ mod tests {
     fn d3_is_not_exercised_without_evidence() {
         let before = judged(4, 2, &[]);
         // UTF-32: no offset can fall inside a character.
-        let (v, detail) = judge_d3(Encoding::Utf32, &before, &judged(4, 2, &[]), &change(), None, None);
+        let (v, detail) = judge_d3(Encoding::Utf32, &before, &judged(4, 2, &[]), &change(), false, None, None);
         assert_eq!(v, Verdict::NotExercised);
         assert!(detail.contains("the server chose utf-32"), "{detail}");
         // No informative position judged after the change.
-        let (v, detail) = judge_d3(Encoding::Utf16, &before, &judged(4, 0, &[]), &change(), None, None);
+        let (v, detail) = judge_d3(Encoding::Utf16, &before, &judged(4, 0, &[]), &change(), false, None, None);
         assert_eq!(v, Verdict::NotExercised);
         assert!(
             detail.contains("no position with non-ASCII text before it on its line was judged after the change"),
@@ -1174,7 +1266,7 @@ mod tests {
         // Missed evidence after the change, with nothing informative, is an
         // error: the missed frame may have held an informative position.
         let (v, _) =
-            judge_d3(Encoding::Utf16, &before, &judged(4, 0, &[]), &change(), None, Some("a frame was skipped"));
+            judge_d3(Encoding::Utf16, &before, &judged(4, 0, &[]), &change(), false, None, Some("a frame was skipped"));
         assert_eq!(v, Verdict::Error);
     }
 
@@ -1182,7 +1274,7 @@ mod tests {
     fn d3_names_the_first_few_invalid_positions_with_their_fits() {
         let before = judged(4, 2, &[]);
         let after = judged(5, 2, &["p0", "p1", "p2", "p3", "p4"]);
-        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &change(), None, None);
+        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after, &change(), true, None, None);
         assert_eq!(v, Verdict::Fail);
         assert!(
             detail.starts_with("5 position(s) read after the change fall inside a character of version 42"),
@@ -1281,5 +1373,47 @@ mod tests {
         assert_eq!(sync_kind(&caps(r#"{"openClose": true}"#)), SyncKind::None);
         assert_eq!(sync_kind(&serde_json::json!({"capabilities": {}})), SyncKind::None);
         assert_eq!(sync_kind(&serde_json::json!({"capabilities": {"textDocumentSync": 7}})), SyncKind::None);
+        // Integer values however they are spelled: `2.0` and `2e0` are 2,
+        // `1.0` is 1, `0.0` is 0, and `2.5` is not an integer.
+        assert_eq!(sync_kind(&caps(r#"2.0"#)), SyncKind::Incremental);
+        assert_eq!(sync_kind(&caps(r#"1.0"#)), SyncKind::Full);
+        assert_eq!(sync_kind(&caps(r#"2e0"#)), SyncKind::Incremental);
+        assert_eq!(sync_kind(&caps(r#"0.0"#)), SyncKind::None);
+        assert_eq!(sync_kind(&caps(r#"2.5"#)), SyncKind::None);
+        assert_eq!(sync_kind(&caps(r#"{"openClose": true, "change": 2.0}"#)), SyncKind::Incremental);
+        assert_eq!(sync_kind(&caps(r#"{"openClose": true, "change": 1.0}"#)), SyncKind::Full);
+        assert_eq!(sync_kind(&caps(r#"{"openClose": true, "change": 2.5}"#)), SyncKind::None);
+    }
+
+    #[test]
+    fn word_span_pinned_only_by_the_exact_span() {
+        let d = [doc(&[(10, 41, &doc_a())])];
+        let (ws, we) = doc_a_span(0, "word", Encoding::Utf16);
+        let exact = reply(vec![range(URI, (ws.line, ws.character), (we.line, we.character))], 20, 30);
+        // A range exactly matching `word`'s span, about the opened document,
+        // pins the server to the negotiated encoding.
+        assert!(word_span_pinned(&d, std::slice::from_ref(&exact), Encoding::Utf16, |_| true));
+        // A range off by one unit does not.
+        let off = reply(vec![range(URI, (ws.line, ws.character + 1), (we.line, we.character))], 20, 30);
+        assert!(!word_span_pinned(&d, &[off], Encoding::Utf16, |_| true));
+        // A range in a document lspcheck didn't open does not.
+        let foreign =
+            reply(vec![range("file:///w/other.txt", (ws.line, ws.character), (we.line, we.character))], 20, 30);
+        assert!(!word_span_pinned(&d, &[foreign], Encoding::Utf16, |_| true));
+        // A position (not a range) does not.
+        let pos = Source {
+            method: "textDocument/documentSymbol".into(),
+            found: vec![Found { uri: URI.into(), pointer: "[0]".into(), kind: FoundKind::Position, at: vec![ws] }],
+            asked_at: Some(Duration::from_millis(20)),
+            read_at: Duration::from_millis(30),
+            label: None,
+        };
+        assert!(!word_span_pinned(&d, &[pos], Encoding::Utf16, |_| true));
+        // A source the `when` predicate excludes does not.
+        assert!(!word_span_pinned(&d, &[exact], Encoding::Utf16, |_| false));
+        // Counted in another encoding, the span is different, so it does not pin.
+        let (us, ue) = doc_a_span(0, "word", Encoding::Utf32);
+        let counted = reply(vec![range(URI, (us.line, us.character), (ue.line, ue.character))], 20, 30);
+        assert!(!word_span_pinned(&d, &[counted], Encoding::Utf16, |_| true));
     }
 }

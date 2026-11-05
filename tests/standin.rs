@@ -269,6 +269,7 @@ fn lawful_variations_fail_nothing() {
         "stale-diagnostics",
         "stale-unversioned-diagnostics",
         "no-change-sync",
+        "register-other",
     ] {
         let r = fault(name);
         // With no versioned publish for the opened document, D2 has nothing
@@ -967,12 +968,13 @@ fn positions_counted_in_the_wrong_units_fail_d1() {
 #[test]
 fn a_change_the_server_doesnt_apply_fails_d1_and_d3() {
     // The old text's positions, labelled with the new version, are inside
-    // characters of the changed text, and the positions before the change
-    // were seen on boundaries.
+    // characters of the changed text, and the server reported `word`'s span
+    // exactly before the change, so it counts in the negotiated encoding:
+    // the fault is in applying the change.
     let r = fault("ignore-changes");
     only_fails(&r, &["D1", "D3"]);
     assert_eq!(r.status, 1, "D1 and D3 are MUST checks");
-    assert!(r.stdout.contains("the positions before the change were all on boundaries"), "{}", r.stdout);
+    assert!(r.stdout.contains("the server reported word's span exactly before the change"), "{}", r.stdout);
 }
 
 #[test]
@@ -1000,6 +1002,41 @@ fn a_dynamic_registration_of_the_sync_notifications_errors_d3() {
     passes_except(&r, &[("D3", "error")]);
     assert_eq!(r.status, 2, "D3's error is reported");
     assert!(r.stdout.contains("registered textDocument/didChange or didOpen dynamically"), "{}", r.stdout);
+}
+
+#[test]
+fn a_registration_of_another_method_does_not_error_d3() {
+    // A `client/registerCapability` for a method D3 doesn't depend on is
+    // not a dynamic registration of the sync notifications: D3 proceeds
+    // normally and passes.
+    let r = fault("register-other");
+    only_fails(&r, &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn code_point_positions_after_a_correct_change_are_a_counting_fault() {
+    // The stand-in applies the change correctly but counts positions in code
+    // points from the change on. The pre-change positions are correct (so
+    // the pin holds), but the post-change positions are on boundaries of
+    // version 42 counted in code points: a counting fault (D1's), not a
+    // change-handling fault. D3 is an error, not a failure.
+    let r = fault("codepoint-positions-after-change");
+    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    assert_eq!(r.status, 1, "D1 is a MUST check");
+    assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault; see D1"), "{}", r.stdout);
+}
+
+#[test]
+fn an_undeliverable_change_errors_d3_but_keeps_d1s_failure() {
+    // The stand-in publishes version 41's diagnostics with a position inside
+    // the first character, then exits: lspcheck's `didChange` can't be
+    // delivered, so D3 is an error, but D1's failure stands and D2 is still
+    // judged (the diagnostic's version 41 was sent).
+    let r = fault("close-stdin-before-change");
+    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    assert_eq!(r.status, 1, "D1 is a MUST check");
+    assert!(r.stdout.contains("couldn't send didChange"), "{}", r.stdout);
 }
 
 #[test]
