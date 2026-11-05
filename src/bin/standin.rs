@@ -49,16 +49,36 @@ const FAULTS: &[(&str, &str)] = &[
     ("no-capabilities", "leave capabilities out of the initialize result"),
     ("early-replies", "answer guessed request ids before they are sent, then answer unknown requests wrongly"),
     ("wrong-unknown-error", "answer unknown requests with InvalidRequest"),
+    ("string-id-to-number", "reply to a request whose id is a string of digits with that number as id"),
+    ("reply-twice", "answer every lspcheck/probe twice"),
+    ("reply-unsent-id", "after initialize, send a response with an id lspcheck never used"),
+    ("reply-to-notification", "answer an unknown notification with an error whose id is null"),
+    ("reply-to-exit", "answer exit with an error whose id is null before exiting"),
+    ("out-of-range-id", "after initialize, send a request whose id 2147483648 is outside LSP's integer range"),
+    (
+        "fill-stdin-on-initialized",
+        "with the initialize result, ask for a configuration whose answer fills a 64 KiB pipe; stop reading for 3 s",
+    ),
+    ("exit-on-unknown-notification", "exit after the second unknown notification (after any reply to it)"),
+    ("big-reply-to-notification", "answer an unknown notification with a 2 MiB error whose id is null"),
+    ("no-jsonrpc-field", "after initialize, send a window/logMessage notification without \"jsonrpc\""),
+    ("result-and-error", "answer an unknown $/ request with both a result and an error"),
+    ("string-error-code", "answer an unknown $/ request with an error whose code is the string \"-32601\""),
+    (
+        "drop-concurrent",
+        "on a request with an all-digit string id, wait for the next frame and drop the earlier request",
+    ),
     ("ignore-dollar-request", "never answer an unknown $/ request"),
     ("shutdown-result", "return {} from shutdown"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
     ("big-frame-on-exit", "on exit, send one 2 MiB log message before exiting"),
     ("exit-flood", "on exit, write 100,000 small log messages and then a line outside any frame"),
+    ("exit-flood-bad-envelope", "on exit, write 200,000 log messages and then one without \"jsonrpc\""),
     ("exit-status", "exit with status 3 on exit"),
     ("ignore-exit", "ignore exit and stay running"),
     ("split-header", "drop input when a read ends inside a header section, as if each header came in one read"),
     ("split-utf8", "decode each read as UTF-8 on its own, mangling characters split across reads"),
-    ("first-frame-per-read", "keep only the first frame of a read that holds three or more"),
+    ("first-frame-per-read", "keep only the first frame of a read that holds $/setTrace and two more"),
     ("char-length-input", "count the Content-Length of incoming frames in characters, not bytes"),
     ("no-content-type", "ignore incoming frames that have a Content-Type header"),
     ("strict-charset", "ignore incoming frames whose charset isn't spelled utf-8"),
@@ -151,7 +171,17 @@ fn main() {
             // About to wait for input: send what was held back, newest first.
             out.release();
         }
-        let Some((headers, body)) = input.next() else { break };
+        let Some((mut headers, mut body)) = input.next() else { break };
+        // A server that answers only the latest of several concurrent requests:
+        // J6's batch is the only one with an all-digit string id, and lspcheck
+        // writes all four requests before reading, so waiting for the next
+        // frame is guaranteed to succeed. This depends on protocol order, not
+        // on where the OS happened to end its reads.
+        if fault("drop-concurrent") && is_digit_string_request(&body) {
+            let Some(next) = input.next() else { break };
+            eprintln!("standin: drop-concurrent dropped a request");
+            (headers, body) = next;
+        }
         if fault("answers-reordered") && input.ready() {
             out.holding = true;
         }
@@ -169,6 +199,10 @@ fn main() {
         }
         let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        // An answer to one of this server's own requests: nothing to do.
+        if msg.get("method").is_none() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+            continue;
+        }
         if fault("exit-on-string-id") && msg.get("id").is_some_and(Value::is_string) {
             std::process::exit(2);
         }
@@ -225,6 +259,19 @@ fn main() {
             if method == "textDocument/didOpen" && fault("no-open-close") {
                 std::process::exit(4);
             }
+            if initialized
+                && (fault("reply-to-notification") || fault("big-reply-to-notification"))
+                && (method.starts_with("lspcheck/") || method.starts_with("$/lspcheck/"))
+            {
+                let mut reply = err(&Value::Null, -32601, "unknown notification");
+                if fault("big-reply-to-notification") {
+                    reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
+                }
+                out.frame(&reply);
+            }
+            if initialized && method.starts_with("$/lspcheck/") && fault("exit-on-unknown-notification") {
+                std::process::exit(0);
+            }
             if !initialized && fault("late-reply-to-pre-init-notification") {
                 late_reply = Some(
                     json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32002, "message": "not initialized"}}),
@@ -236,6 +283,9 @@ fn main() {
                 );
             }
             if method == "exit" && !fault("ignore-exit") {
+                if fault("reply-to-exit") {
+                    out.frame(&err(&Value::Null, -32601, "unknown notification"));
+                }
                 if fault("big-frame-on-exit") {
                     let text = "x".repeat(2 * 1024 * 1024);
                     out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
@@ -249,6 +299,16 @@ fn main() {
                         json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
                     let mut bytes = out.encode(&log).repeat(100_000);
                     bytes.extend_from_slice(b"goodbye\n");
+                    out.raw(&bytes);
+                }
+                if fault("exit-flood-bad-envelope") {
+                    let log =
+                        json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
+                    let mut bytes = out.encode(&log).repeat(200_000);
+                    let mut bad =
+                        json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
+                    bad.as_object_mut().unwrap().remove("jsonrpc");
+                    bytes.extend(out.encode(&bad));
                     out.raw(&bytes);
                 }
                 let status = if fault("exit-status") {
@@ -265,6 +325,11 @@ fn main() {
         if no_more_answers {
             continue;
         }
+        // A numeric string id turned into a number: the wrong JSON type.
+        let id = match id.as_str().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
+            Some(s) if fault("string-id-to-number") => s.parse::<i64>().map_or(id, |n| json!(n)),
+            _ => id,
+        };
         if method == "initialize" && initialized && !fault("reinitialize") {
             if fault("exit-on-reinitialize") {
                 std::process::exit(3);
@@ -294,8 +359,15 @@ fn main() {
                 if fault(name) {
                     let body =
                         "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":4,\"message\":\"é";
-                    let next = format!("{line}\r\nContent-Length: 2\r\n\r\n{{}}");
+                    // A well-formed notification follows, so only the framing
+                    // mistake this fault is about can be blamed.
+                    let notice = serde_json::to_vec(
+                        &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}}),
+                    )
+                    .unwrap();
+                    let next = format!("{line}\r\nContent-Length: {}\r\n\r\n", notice.len());
                     out.raw(format!("Content-Length: {}\r\n\r\n{body}{next}", body.len()).as_bytes());
+                    out.raw(&notice);
                 }
             }
             if fault("long-miscount") {
@@ -349,7 +421,32 @@ fn main() {
             if fault("no-capabilities") {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
             }
+            if fault("fill-stdin-on-initialized") {
+                // In the same write as the result, so the client reads both at
+                // once and answers before its next request. `initialized` and
+                // the answer then leave 30 bytes of a 64 KiB pipe: too few for
+                // the client's next request while this server isn't reading.
+                let mut bytes = out.encode(&ok(&id, result));
+                bytes.extend(out.encode(&config_filling(65_536 - 74 - 30)));
+                out.raw(&bytes);
+                // Stop reading before `initialized` can even arrive, so what
+                // the client writes next stays in the pipe.
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                continue;
+            }
             out.frame(&ok(&id, result));
+            if fault("reply-unsent-id") {
+                out.frame(&err(&json!(format!("lspcheck-unsent-{}", std::process::id())), -32601, "no such request"));
+            }
+            if fault("out-of-range-id") {
+                let request = json!({"jsonrpc": "2.0", "id": 2_147_483_648_i64, "method": "window/workDoneProgress/create", "params": {"token": "t"}});
+                out.frame(&request);
+            }
+            if fault("no-jsonrpc-field") {
+                out.frame(
+                    &json!({"method": "window/logMessage", "params": {"type": 4, "message": "no jsonrpc field"}}),
+                );
+            }
             if fault("block-after-init") {
                 let items = vec![json!({"section": "x"}); 40_000];
                 out.frame(&json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": items}}));
@@ -393,6 +490,9 @@ fn main() {
                 &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
             );
         }
+        if fault("reply-twice") && method == "lspcheck/probe" {
+            out.frame(&err(&id, -32601, "method not found"));
+        }
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
@@ -435,6 +535,17 @@ fn main() {
             }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
+            "$/lspcheck/unknownRequest" if fault("result-and-error") => out.frame(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": Value::Null,
+                "error": {"code": -32601, "message": "method not found"}
+            })),
+            "$/lspcheck/unknownRequest" if fault("string-error-code") => out.frame(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": "-32601", "message": "method not found"}
+            })),
             m if m.starts_with("$/") && fault("ignore-dollar-request") => {}
             _ if fault("ignore-unknown-requests") => {}
             _ if fault("wrong-unknown-error") => out.frame(&err(&id, -32600, "unknown")),
@@ -620,6 +731,19 @@ impl CancelOut {
     }
 }
 
+/// A configuration request whose answer from lspcheck, framed, is `size`
+/// bytes or just under: `{"jsonrpc":"2.0","id":"cfg","result":[null,…]}`.
+fn config_filling(size: usize) -> Value {
+    let framed = |n: usize| {
+        // `null` and a comma per item but the last, inside the envelope.
+        let body = r#"{"jsonrpc":"2.0","id":"cfg","result":[]}"#.len() + 5 * n - 1;
+        "Content-Length: \r\n\r\n".len() + body.to_string().len() + body
+    };
+    let n = (1..).take_while(|&n| framed(n) <= size).last().unwrap_or(1);
+    let items = vec![json!({}); n];
+    json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": items}})
+}
+
 /// A response to a cancel notification: JSON-RPC has no id to give back.
 fn cancel_reply() -> Value {
     json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32601, "message": "unhandled notification $/cancelRequest"}})
@@ -699,11 +823,18 @@ impl<R: Read> Input<R> {
         if self.fault("first-frame-per-read") {
             let mut ends = Vec::new();
             let mut at = 0;
-            while let Parsed::Frame(_, used) = self.parse(&self.buf[at..]) {
+            let mut set_trace = false;
+            while let Parsed::Frame((_, body), used) = self.parse(&self.buf[at..]) {
                 at += used;
                 ends.push(at);
+                // Only F4's shape: two requests with $/setTrace between them.
+                // Any notification would also match `initialized` coalescing
+                // with J6's requests, which this fault must not touch.
+                set_trace |= serde_json::from_slice::<Value>(&body).is_ok_and(|v| {
+                    v.get("id").is_none() && v.get("method").and_then(Value::as_str) == Some("$/setTrace")
+                });
             }
-            if ends.len() >= 3 {
+            if ends.len() >= 3 && set_trace {
                 self.buf.truncate(ends[0]);
             }
         }
@@ -748,4 +879,15 @@ impl<R: Read> Input<R> {
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Whether `body` is a request whose id is a non-empty all-digit string. Only
+/// J6 sends one, which is what makes drop-concurrent act in protocol order.
+fn is_digit_string_request(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body).is_ok_and(|v| {
+        v.get("method").is_some_and(Value::is_string)
+            && v.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    })
 }

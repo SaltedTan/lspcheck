@@ -128,6 +128,25 @@ fn only_fails(run: &Run, failing: &[&str]) {
     }
 }
 
+/// Like [`only_fails`], for a server that sends frames lspcheck can't read
+/// (F1): such a frame might have been a response or message the correlation
+/// and envelope checks judge, so J1, J2 and J5 are inconclusive.
+fn only_fails_unread(run: &Run, failing: &[&str]) {
+    for (id, verdict) in &run.verdicts {
+        if id == "L9" && !cfg!(unix) {
+            continue;
+        }
+        let want = if failing.contains(&id.as_str()) {
+            "fail"
+        } else if ["J1", "J2", "J5"].contains(&id.as_str()) {
+            "error"
+        } else {
+            "pass"
+        };
+        assert_eq!(verdict, want, "{id}\n{}", run.stdout);
+    }
+}
+
 #[test]
 fn the_clean_standin_passes_every_check() {
     let r = run(&[], &[]);
@@ -169,12 +188,12 @@ fn stdout_output_outside_frames_fails_f1_in_any_scenario() {
 
 #[test]
 fn a_control_byte_in_a_header_fails_f1() {
-    only_fails(&fault("nul-header"), &["F1"]);
+    only_fails_unread(&fault("nul-header"), &["F1"]);
 }
 
 #[test]
 fn a_content_type_that_isnt_a_media_type_fails_f1() {
-    only_fails(&fault("bad-content-type"), &["F1"]);
+    only_fails_unread(&fault("bad-content-type"), &["F1"]);
 }
 
 #[test]
@@ -186,6 +205,16 @@ fn output_written_just_before_exit_is_still_judged() {
     let r = run(&["--fault", "exit-flood"], &["--exit-timeout", "30"]);
     expect(&r, "F1", "fail");
     assert!(r.stdout.contains("goodbye"), "{}", r.stdout);
+}
+
+#[test]
+fn messages_still_queued_at_exit_are_classified() {
+    // 200,000 valid notifications, then one without "jsonrpc", are written
+    // after exit. The last one is J5's failure even though it is still queued
+    // when the server exits; a slow runner may take a while to read it all, so
+    // the exit allowance is generous.
+    let r = run(&["--fault", "exit-flood-bad-envelope"], &["--exit-timeout", "30"]);
+    expect(&r, "J5", "fail");
 }
 
 #[test]
@@ -229,7 +258,7 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
 fn a_content_length_counted_in_characters_fails_f2() {
     let r = fault("char-length");
     // The frame can't be read either, so F1 fails too.
-    only_fails(&r, &["F1", "F2"]);
+    only_fails_unread(&r, &["F1", "F2"]);
     assert!(r.stdout.contains("counts characters, but"), "{}", r.stdout);
     // Also with whitespace after the JSON, or an extension header before the next frame's Content-Length.
     for other in ["newline-after-body", "extension-header", "long-header"] {
@@ -242,16 +271,16 @@ fn a_content_length_counted_in_characters_fails_f2() {
 #[test]
 fn a_correctly_counted_body_that_isnt_json_fails_f1_not_f2() {
     let r = fault("trailing-junk");
-    only_fails(&r, &["F1"]);
+    only_fails_unread(&r, &["F1"]);
 }
 
 #[test]
 fn a_body_the_next_header_line_would_complete_fails_f1_not_f2() {
     // Joined to the next frame's first header line, the body would be JSON,
     // but the next header section starts where the body was declared to end.
-    only_fails(&fault("json-into-next-header"), &["F1"]);
+    only_fails_unread(&fault("json-into-next-header"), &["F1"]);
     // Even when that header line isn't valid.
-    only_fails(&fault("json-into-bad-header"), &["F1"]);
+    only_fails_unread(&fault("json-into-bad-header"), &["F1"]);
 }
 
 #[test]
@@ -286,12 +315,16 @@ fn escaped_non_ascii_output_leaves_f2_not_exercised() {
 #[test]
 fn a_server_lost_on_the_f2_probe_doesnt_fail_what_follows() {
     // The probe for F2's evidence has a string id, and this server exits on
-    // it. F3's last part comes after it, and isn't run.
+    // it. F3's last part comes after it, and isn't run. The same exit leaves
+    // the concurrent string-id requests unanswered, so J6 fails: that is the
+    // rule this server breaks, not an artefact of what follows.
     let r = fault("exit-on-string-id");
     expect(&r, "F2", "not-exercised");
     expect(&r, "F3", "pass");
+    expect(&r, "J1", "not-exercised");
+    expect(&r, "J6", "fail");
     assert!(r.stdout.contains("the part that splits multibyte characters wasn't run"), "{}", r.stdout);
-    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+    assert!(r.verdicts.iter().all(|(id, v)| v != "fail" || id == "J6"), "{}", r.stdout);
 }
 
 #[test]
@@ -309,6 +342,10 @@ fn frames_coalesced_in_one_write_must_all_be_read() {
     let r = fault("first-frame-per-read");
     only_fails(&r, &["F4"]);
     assert!(r.stdout.contains("1 of 2 requests went unanswered"), "{}", r.stdout);
+    // Even when slow reads make the server read each frame separately, the
+    // fault must act on F4's shape only: `initialized` coalescing with J6's
+    // requests isn't a read of three frames with $/setTrace in it.
+    only_fails(&run(&["--fault", "first-frame-per-read", "--fault", "slow-reads"], &[]), &["F4"]);
 }
 
 #[test]
@@ -403,13 +440,100 @@ fn a_refused_initialize_is_an_error_not_a_failure() {
 
 #[test]
 fn replies_sent_before_their_requests_dont_count() {
-    only_fails(&fault("early-replies"), &["J4"]);
+    // The guessed ids are never sent, so they are unasked responses (J2); the
+    // fault also answers unknown requests wrongly (J4).
+    only_fails(&fault("early-replies"), &["J2", "J4"]);
 }
 
 #[test]
 fn wrong_unknown_method_errors_fail_j4() {
     only_fails(&fault("wrong-unknown-error"), &["J4"]);
     only_fails(&fault("ignore-dollar-request"), &["J4"]);
+}
+
+#[test]
+fn a_string_id_answered_as_a_number_fails_j1() {
+    let r = fault("string-id-to-number");
+    // The concurrent request whose id was changed never gets a reply with its
+    // own id, so J6 fails too: one fault, two rules.
+    only_fails(&r, &["J1", "J6"]);
+    assert!(r.stdout.contains("where lspcheck sent"), "{}", r.stdout);
+}
+
+#[test]
+fn duplicate_and_unsent_responses_fail_j2() {
+    only_fails(&fault("reply-twice"), &["J2"]);
+    let r = fault("reply-unsent-id");
+    only_fails(&r, &["J2"]);
+    assert!(r.stdout.contains("which lspcheck never sent"), "{}", r.stdout);
+}
+
+#[test]
+fn a_reply_to_a_notification_fails_j3() {
+    let r = fault("reply-to-notification");
+    only_fails(&r, &["J3"]);
+    assert!(r.stdout.contains("a notification was answered"), "{}", r.stdout);
+    // The replies were seen before the server stopped answering, so they
+    // stand even though the probes that end J3's window go unanswered.
+    let r = run(&["--fault", "reply-to-notification", "--fault", "exit-on-unknown-notification"], &[]);
+    only_fails(&r, &["J3"]);
+}
+
+#[test]
+fn a_skipped_reply_to_a_notification_makes_j3_inconclusive() {
+    // The only reply to the unknown notifications is over the inspection
+    // limit, so lspcheck can't say whether a notification was answered.
+    let r = run(&["--fault", "big-reply-to-notification"], &["--max-frame-mib", "1"]);
+    expect(&r, "J3", "error");
+    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+}
+
+#[test]
+fn replies_to_exit_and_out_of_range_ids_are_judged() {
+    // A reply to `exit` answers a notification too.
+    only_fails(&fault("reply-to-exit"), &["J3"]);
+    // LSP's integer is signed 32-bit, ids included.
+    let r = fault("out-of-range-id");
+    only_fails(&r, &["J5"]);
+    assert!(r.stdout.contains("2147483648"), "{}", r.stdout);
+}
+
+/// The concurrent requests can't all be written by their deadline, because
+/// the server stopped reading with a full pipe; that is lspcheck's problem,
+/// not a missing reply. (The pipe arithmetic is Linux's.)
+#[cfg(target_os = "linux")]
+#[test]
+fn concurrent_requests_that_cant_be_written_in_time_are_an_error() {
+    // The server stops reading before `initialized` arrives, so `initialized`
+    // and lspcheck's answer fill the pipe whatever the read grouping.
+    for extra in [&[][..], &["--fault", "slow-reads"][..]] {
+        let mut args = vec!["--fault", "fill-stdin-on-initialized"];
+        args.extend_from_slice(extra);
+        let r = run(&args, &["--timeout", "1"]);
+        expect(&r, "J6", "error");
+        assert!(r.stdout.contains("couldn't send a request"), "{}", r.stdout);
+    }
+}
+
+#[test]
+fn malformed_envelopes_fail_j5() {
+    only_fails(&fault("no-jsonrpc-field"), &["J5"]);
+    // These mangle the reply the $/ unknown request waits on, so J4 fails too:
+    // a response with both result and error, or an error with a string code,
+    // is not MethodNotFound either.
+    only_fails(&fault("result-and-error"), &["J4", "J5"]);
+    only_fails(&fault("string-error-code"), &["J4", "J5"]);
+}
+
+#[test]
+fn dropping_a_concurrent_request_fails_j6() {
+    // Protocol order decides this, not where the OS ended its reads: J6's batch
+    // is the only one with an all-digit string id, and all four requests are
+    // written before any reply is read, so the next frame is always there.
+    let r = fault("drop-concurrent");
+    only_fails(&r, &["J6"]);
+    assert!(r.stdout.contains("were not answered"), "{}", r.stdout);
+    assert!(r.server_stderr.contains("drop-concurrent dropped"), "{}", r.stdout);
 }
 
 #[test]
@@ -504,8 +628,9 @@ fn a_cancelled_request_still_gets_exactly_one_response() {
     only_fails(&r, &["C1"]);
     assert!(r.stdout.contains("no response after $/cancelRequest"), "{}", r.stdout);
     // A cancelled request that gets both the error and a result was answered twice.
+    // It is also a second response to one request, which is J2's rule.
     let r = fault("cancelled-reply-twice");
-    only_fails(&r, &["C1"]);
+    only_fails(&r, &["C1", "J2"]);
     assert!(r.stdout.contains("answered twice"), "{}", r.stdout);
     // A result, -32800, or another error is lawful for what it contains.
     only_fails(&fault("defer-until-next"), &[]);
@@ -514,9 +639,11 @@ fn a_cancelled_request_still_gets_exactly_one_response() {
 #[test]
 fn cancelling_an_unknown_or_finished_request_produces_nothing() {
     // Holding R's reply keeps C1's cancel from reaching a finished request, so
-    // these faults act only on C2's unknown id.
+    // these faults act only on C2's unknown id. That id was reserved by
+    // `fresh_id` but never sent, so the reply also carries an id lspcheck never
+    // sent: J2's rule, as well as C2's.
     let r = run(&["--fault", "defer-until-next", "--fault", "cancel-unknown-reply"], &[]);
-    only_fails(&r, &["C2"]);
+    only_fails(&r, &["C2", "J2"]);
     assert!(r.stdout.contains("for an id never sent"), "{}", r.stdout);
     // A server that stops answering might still send a reply to a cancel
     // later, so C3 can't be judged.
@@ -528,7 +655,8 @@ fn cancelling_an_unknown_or_finished_request_produces_nothing() {
 
 #[test]
 fn replying_to_a_cancel_notification_fails_c3() {
-    only_fails(&fault("reply-to-cancel"), &["C3"]);
+    // The reply has no id, so it also answers a notification (J3).
+    only_fails(&fault("reply-to-cancel"), &["C3", "J3"]);
 }
 
 #[test]
@@ -540,12 +668,14 @@ fn replies_to_cancels_after_the_next_answer_still_count() {
         args.extend(faults.iter().flat_map(|f| ["--fault", f]));
         run(&args, &[])
     };
-    only_fails(&late(&["cancel-unknown-reply"]), &["C2"]);
-    only_fails(&late(&["reply-to-cancel"]), &["C3"]);
+    // The unknown id was reserved but never sent, so J2 fails too; an id-less
+    // reply to a cancel also answers a notification, which is J3's rule.
+    only_fails(&late(&["cancel-unknown-reply"]), &["C2", "J2"]);
+    only_fails(&late(&["reply-to-cancel"]), &["C3", "J3"]);
     // A second answer to the cancelled request, read before the cancels of
-    // C2 were sent, is C1's finding, not C2's.
+    // C2 were sent, is C1's finding, not C2's (and a duplicate for J2).
     let r = late(&["cancelled-reply-twice"]);
-    only_fails(&r, &["C1"]);
+    only_fails(&r, &["C1", "J2"]);
     assert!(r.stdout.contains("answered twice"), "{}", r.stdout);
 }
 
@@ -566,9 +696,18 @@ fn c3_counts_only_id_less_replies_read_after_the_first_cancel() {
     // have answered either, so C3 can't be judged, but it doesn't fail.
     let r = fault("null-reply-after-first-probe");
     assert_ne!(r.verdicts["C3"], "fail", "{}", r.stdout);
+    // It is read after `initialized` and before `exit`, so it answers a
+    // notification, which J3 judges across the scenarios with well-formed
+    // input.
+    expect(&r, "J3", "fail");
     let r = fault("initialized-reply-after-cancel");
     expect(&r, "C3", "error");
-    assert!(r.verdicts.iter().all(|(id, v)| v == "pass" || id == "C3" || (id == "L9" && !cfg!(unix))), "{}", r.stdout);
+    expect(&r, "J3", "fail");
+    assert!(
+        r.verdicts.iter().all(|(id, v)| v == "pass" || id == "C3" || id == "J3" || (id == "L9" && !cfg!(unix))),
+        "{}",
+        r.stdout
+    );
     // A malformed answer to shutdown still carries shutdown's id.
     expect(&fault("shutdown-no-jsonrpc"), "C3", "pass");
 }

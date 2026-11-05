@@ -12,7 +12,7 @@
 
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
-use crate::session::{self, CallError, Finish, Options, Problem, Session, WaitError, WriteError};
+use crate::session::{self, CallError, Finish, Options, Problem, Session, Unmatched, WaitError, WriteError};
 use crate::transcript;
 use crate::transport;
 use serde::Serialize;
@@ -81,6 +81,9 @@ pub const CATALOGUE: &[CheckInfo] = &[
     check!("F6", Framing, Must, "A Content-Type header with charset=utf-8 from the client is accepted", "headerPart"),
     check!("F7", Framing, Should, "The legacy charset=utf8 spelling from the client is accepted", "contentPart"),
     check!("F8", Framing, Should, "A Content-Type the server sends declares UTF-8", "contentPart"),
+    check!("J1", JsonRpc, Must, "A reply keeps its request's id: a number stays a number, exactly", "responseMessage"),
+    check!("J2", JsonRpc, Must, "Exactly one response per request: none duplicated or unasked", "responseMessage"),
+    check!("J3", JsonRpc, Must, "Notifications get no response, including unknown and $/ ones", "notificationMessage"),
     check!(
         "J4",
         JsonRpc,
@@ -88,6 +91,14 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "An unknown request gets MethodNotFound (-32601), including a $/ request",
         "dollarRequests"
     ),
+    check!(
+        "J5",
+        JsonRpc,
+        Must,
+        "Envelopes are well formed: jsonrpc 2.0, one of result/error, an integer code",
+        "responseMessage"
+    ),
+    check!("J6", JsonRpc, Must, "Concurrent requests are each answered with the right id", "requestMessage"),
     check!(
         "L1",
         Lifecycle,
@@ -109,7 +120,7 @@ pub const CATALOGUE: &[CheckInfo] = &[
 ];
 
 /// Checks judged from every scenario's observations.
-pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "L9"];
+pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "J1", "J2", "J3", "J5", "L9"];
 
 pub fn info(id: &str) -> &'static CheckInfo {
     CATALOGUE.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("unknown check {id}"))
@@ -189,6 +200,20 @@ pub struct Observations {
     pub scan_error: Option<String>,
     pub not_stopped: Vec<ProcInfo>,
     pub limit: Option<(Duration, String)>,
+    /// Every message the server sent, in order.
+    pub messages: Vec<(Duration, Message)>,
+    /// When lspcheck sent `initialized`, if it did.
+    pub initialized_at: Option<Duration>,
+    /// Why evidence since `initialized` is incomplete, if it is.
+    pub j3_incomplete: Option<String>,
+    /// When a write of lspcheck's that stopped partway through a frame began.
+    pub abandoned_at: Option<Duration>,
+    /// How the json-rpc scenario's dedicated J3 exercise went, if it ran.
+    pub j3_exercise: Option<(Verdict, String)>,
+    /// Responses that matched no outstanding request, classified.
+    pub unmatched: Vec<Unmatched>,
+    /// Requests that were answered, with when their response was read.
+    pub answered: Vec<(Duration, Id)>,
 }
 
 /// One scenario's verdicts and observations.
@@ -210,6 +235,7 @@ pub struct Scenario {
 
 pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "lifecycle", checks: &["L2", "J4", "L4", "L6"] },
+    Scenario { name: "json-rpc", checks: &["J6"] },
     Scenario { name: "pre-initialize", checks: &["L1"] },
     Scenario { name: "exit-without-shutdown", checks: &["L7"] },
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
@@ -229,8 +255,18 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
             runs.push(run_scenario(s, cfg).await?);
         }
     }
-    let cross: Vec<CheckResult> =
-        [judge_f1(&runs), judge_f2(&runs), judge_f8(&runs), judge_l9(&runs)].into_iter().collect();
+    let cross: Vec<CheckResult> = [
+        judge_f1(&runs),
+        judge_f2(&runs),
+        judge_f8(&runs),
+        unless_unreadable(&runs, judge_j1(&runs)),
+        unless_unreadable(&runs, judge_j2(&runs)),
+        judge_j3(&runs),
+        unless_unreadable(&runs, judge_j5(&runs)),
+        judge_l9(&runs),
+    ]
+    .into_iter()
+    .collect();
     runs.push(ScenarioRun { name: "all", results: cross, observed: None, transcript: None });
     for run in &mut runs {
         run.results.retain(|r| wants(r.id));
@@ -269,9 +305,10 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
             return Ok(unstarted(format!("could not start {}: {e}", cfg.server.display())));
         }
     };
-    let mut ctx = Ctx { s: session, cfg, root, results: Vec::new(), scenario: name };
+    let mut ctx = Ctx { s: session, cfg, root, results: Vec::new(), scenario: name, j3_exercise: None };
     match name {
         "lifecycle" => lifecycle(&mut ctx).await,
+        "json-rpc" => json_rpc(&mut ctx).await,
         "pre-initialize" => pre_initialize(&mut ctx).await,
         "exit-without-shutdown" => exit_without_shutdown(&mut ctx).await,
         "framing" => framing(&mut ctx).await,
@@ -280,7 +317,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         "end-of-input" => end_of_input(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
-    let Ctx { s, mut results, .. } = ctx;
+    let Ctx { s, mut results, j3_exercise, .. } = ctx;
     let finish = s.finish(cfg.leftover_grace).await;
     for id in scenario.checks {
         if !results.iter().any(|r| r.id == *id) {
@@ -316,10 +353,10 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         None => None,
     };
     drop(workspace);
-    Ok(ScenarioRun { name, results, observed: Some(observations(finish)), transcript })
+    Ok(ScenarioRun { name, results, observed: Some(observations(finish, j3_exercise)), transcript })
 }
 
-fn observations(f: Finish) -> Observations {
+fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observations {
     Observations {
         problems: f.problems,
         content_types: f.content_types,
@@ -332,6 +369,13 @@ fn observations(f: Finish) -> Observations {
         scan_error: f.scan_error,
         not_stopped: f.not_stopped,
         limit: f.limit,
+        messages: f.messages,
+        initialized_at: f.initialized_at,
+        j3_incomplete: f.j3_incomplete,
+        abandoned_at: f.abandoned_at,
+        j3_exercise,
+        unmatched: f.unmatched,
+        answered: f.answered,
     }
 }
 
@@ -345,6 +389,8 @@ struct Ctx<'a> {
     root: PathBuf,
     results: Vec<CheckResult>,
     scenario: &'static str,
+    /// How the json-rpc scenario's dedicated J3 exercise went.
+    j3_exercise: Option<(Verdict, String)>,
 }
 
 /// Why initialization didn't succeed.
@@ -501,6 +547,171 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
         Some(status) if status.code() == Some(0) => ctx.pass("L6"),
         Some(status) => ctx.fail("L6", format!("exited with {}", session::describe_status(status))),
         None => ctx.fail("L6", format!("still running {} s after exit", ctx.cfg.exit_timeout.as_secs())),
+    }
+}
+
+/// Concurrent requests, then notifications that must not be answered.
+async fn json_rpc(ctx: &mut Ctx<'_>) {
+    if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
+        ctx.initialize().await
+    {
+        ctx.report("J6", Verdict::Error, format!("initialize didn't succeed: {why}"));
+        ctx.j3_exercise = Some((Verdict::Error, format!("initialize didn't succeed: {why}")));
+        return;
+    }
+    let t = ctx.cfg.request_timeout;
+    check_j6(ctx, t).await;
+    // J3 is judged across every scenario with well-formed input; this dedicated
+    // exercise is what guarantees unknown and $/ notifications were sent.
+    ctx.j3_exercise = Some(check_j3(ctx, t).await);
+
+    // Leave politely so the server isn't killed mid-thought.
+    if ctx.s.call("shutdown", None, t).await.is_ok() {
+        let _ = ctx.s.notify("exit", None).await;
+        let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    }
+}
+
+/// Four requests written before any reply is read: each must be answered with
+/// its exact id, in any order.
+async fn check_j6(ctx: &mut Ctx<'_>, t: Duration) {
+    let started = ctx.s.elapsed();
+    // Two numeric ids and two string ids. The digit string catches a server
+    // that turns numeric strings into numbers; the other catches the rest.
+    let digit = format!("{:06}", session::random_u64() % 1_000_000);
+    let text = format!("lspcheck-{}", session::random_u64() % 1_000_000_000);
+    let ids = [ctx.s.fresh_id(), ctx.s.fresh_id(), Id::Str(digit), Id::Str(text)];
+    let bodies: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|id| {
+            let body =
+                serde_json::to_vec(&message::request(id, PROBE, Some(json!({})))).expect("JSON values serialize");
+            transport::encode(&body)
+        })
+        .collect();
+    // One deadline covers registering, writing and waiting for all four.
+    let deadline = Instant::now() + t;
+    let mut failure = None;
+    let mut registered = 0;
+    for (i, id) in ids.iter().enumerate() {
+        if let Err(e) = ctx.s.begin_request(id, deadline).await {
+            failure = Some(format!("lspcheck couldn't register a request: {e}"));
+            registered = i;
+            break;
+        }
+        registered = i + 1;
+    }
+    if failure.is_none() {
+        for (i, body) in bodies.iter().enumerate() {
+            // The shared deadline, not a fresh write timeout: a write that
+            // can't finish by then is an error like any other, and the time
+            // left to wait for the replies mustn't shrink with every write.
+            if let Err(e) = ctx.s.write_split(body, &[], Duration::ZERO, deadline).await {
+                // The server may have seen part of the failed write, so those
+                // ids are aborted; the earlier, whole ones stay outstanding.
+                ids[i..].iter().for_each(|id| ctx.s.abort_request(id));
+                failure = Some(format!("lspcheck couldn't send a request: {e}"));
+                break;
+            }
+        }
+    } else {
+        ids[..registered].iter().for_each(|id| ctx.s.abort_request(id));
+    }
+    if let Some(why) = failure {
+        return ctx.report("J6", Verdict::Error, why);
+    }
+
+    let mut missing = Vec::new();
+    let mut closed = false;
+    for id in &ids {
+        match ctx.s.wait_response(id, deadline).await {
+            Ok(_) => {}
+            Err(WaitError::Timeout) => missing.push(id.clone()),
+            Err(WaitError::Closed) => {
+                missing.push(id.clone());
+                closed = true;
+                break;
+            }
+        }
+    }
+    if missing.is_empty() {
+        return ctx.pass("J6");
+    }
+    let list: Vec<String> = missing.iter().map(Id::to_string).collect();
+    let mut detail = format!(
+        "{} of {} concurrent requests were not answered with their id: {}",
+        missing.len(),
+        ids.len(),
+        list.join(", ")
+    );
+    if closed {
+        detail.push_str(" (the server closed its stdout)");
+    }
+    let unasked = ctx.s.unmatched_ids(started);
+    if !unasked.is_empty() {
+        let list: Vec<String> = unasked.iter().map(Id::to_string).collect();
+        detail.push_str(&format!("; meanwhile responses with unmatched ids arrived: {}", list.join(", ")));
+    }
+    ctx.fail_absent("J6", detail);
+}
+
+/// Two unknown notifications, then two probes: nothing must answer the
+/// notifications. The second probe's reply ends the window, so a late reply
+/// still counts. This is the guaranteed exercise behind J3's cross-scenario
+/// verdict, so it returns rather than reports.
+async fn check_j3(ctx: &mut Ctx<'_>, t: Duration) -> (Verdict, String) {
+    const UNKNOWN: [&str; 2] = ["lspcheck/unknownNotification", "$/lspcheck/unknownNotification"];
+    let before = ctx.s.messages.len();
+    let from = ctx.s.elapsed();
+    for method in UNKNOWN {
+        if let Err(e) = ctx.s.notify(method, Some(json!({}))).await {
+            return (Verdict::Error, format!("lspcheck couldn't send {method}: {e}"));
+        }
+    }
+    // A reply could still be coming after a probe fails, so keep what was
+    // already read: a reply seen there is a failure either way.
+    let mut probe_error = None;
+    for _ in 0..2 {
+        if let Err(e) = ctx.s.call(PROBE, Some(json!({})), t).await {
+            probe_error = Some(e);
+            break;
+        }
+    }
+    // The second probe's answer, or where lspcheck gave up waiting for it,
+    // ends the window.
+    let to = ctx.s.elapsed();
+    let replies: Vec<String> = ctx.s.messages[before..].iter().filter_map(|(_, m)| reply_to_notification(m)).collect();
+    if !replies.is_empty() {
+        let more = replies.len() - 1;
+        let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+        return (Verdict::Fail, format!("a notification was answered with {}{tail}", replies[0]));
+    }
+    if let Some(e) = probe_error {
+        return (Verdict::Error, format!("couldn't tell: the server stopped answering ({e})"));
+    }
+    // A frame skipped or unreadable in the window could have been the reply.
+    match ctx.s.incomplete_within(from, to) {
+        Some(why) => {
+            (Verdict::Error, format!("inconclusive, because {why}: it may have held a reply to a notification"))
+        }
+        None => (Verdict::Pass, String::new()),
+    }
+}
+
+/// Whether a message is a response where a notification's reply would be, and
+/// how to describe it.
+fn reply_to_notification(m: &Message) -> Option<String> {
+    match &m.kind {
+        Kind::Response { id: Id::Null, outcome } => {
+            Some(format!("a response with id null ({})", describe_outcome(outcome)))
+        }
+        Kind::Invalid(_)
+            if (m.value.get("result").is_some() || m.value.get("error").is_some())
+                && m.value.get("id").is_none_or(Value::is_null) =>
+        {
+            Some(format!("a response without an id: {}", session::preview(m.value.to_string().as_bytes())))
+        }
+        _ => None,
     }
 }
 
@@ -1361,6 +1572,220 @@ fn judge_f8(runs: &[ScenarioRun]) -> CheckResult {
     cross("F8", runs, failures, "", true)
 }
 
+/// `r`, or an error when it would pass but a frame lspcheck couldn't read
+/// (see F1) might have been a response or message the check judges.
+fn unless_unreadable(runs: &[ScenarioRun], r: CheckResult) -> CheckResult {
+    if r.verdict != Verdict::Pass {
+        return r;
+    }
+    let unread = observed(runs).find_map(|(name, o)| {
+        o.problems.iter().find(|(_, p)| !matches!(p, Problem::Garbage(_))).map(|(at, _)| (name, *at))
+    });
+    match unread {
+        Some((name, at)) => CheckResult {
+            verdict: Verdict::Error,
+            detail: format!("inconclusive: in {name} at {} ms, a frame couldn't be read (see F1)", at.as_millis()),
+            ..r
+        },
+        None => r,
+    }
+}
+
+fn judge_j1(runs: &[ScenarioRun]) -> CheckResult {
+    let failures = observed(runs)
+        .filter_map(|(name, o)| {
+            let bad: Vec<&Unmatched> = o.unmatched.iter().filter(|u| u.loose.is_some()).collect();
+            let first = bad.first()?;
+            let more = bad.len() - 1;
+            let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+            let sent = first.loose.as_ref().expect("filtered for a loosely equal id");
+            Some(format!(
+                "in {name} at {} ms: a response id {} where lspcheck sent {sent}{tail}",
+                first.at.as_millis(),
+                first.id
+            ))
+        })
+        .collect();
+    let r = cross("J1", runs, failures, "", true);
+    if r.verdict != Verdict::Pass {
+        return r;
+    }
+    // A matching value proves little unless both JSON types were seen: a
+    // server that always answers with a number would pass every numeric id.
+    let answered: Vec<&Id> = observed(runs).flat_map(|(_, o)| o.answered.iter().map(|(_, id)| id)).collect();
+    let numbers = answered.iter().any(|id| matches!(id, Id::Num { .. }));
+    let strings = answered.iter().any(|id| matches!(id, Id::Str(_)));
+    if numbers && strings {
+        return r;
+    }
+    let missing = match (numbers, strings) {
+        (false, false) => "a numeric or a string",
+        (false, true) => "a numeric",
+        _ => "a string",
+    };
+    result("all", "J1", Verdict::NotExercised, format!("no request with {missing} id was answered with exactly its id"))
+}
+
+/// Whether an unmatched response breaks J2, rather than being lawful (a
+/// null id) or J1's finding (an id only loosely equal to one sent).
+fn j2_blames(u: &Unmatched) -> bool {
+    u.loose.is_none() && u.id != Id::Null && !u.aborted && (u.duplicate || u.early || u.unsent)
+}
+
+fn describe_unmatched(u: &Unmatched) -> String {
+    if u.duplicate {
+        format!("a second response for id {}, whose request was already answered", u.id)
+    } else if u.early {
+        format!("a response id {} read before its request was sent", u.id)
+    } else {
+        format!("a response id {}, which lspcheck never sent", u.id)
+    }
+}
+
+fn judge_j2(runs: &[ScenarioRun]) -> CheckResult {
+    let failures = observed(runs)
+        .filter_map(|(name, o)| {
+            let bad: Vec<&Unmatched> = o.unmatched.iter().filter(|u| j2_blames(u)).collect();
+            let first = bad.first()?;
+            let more = bad.len() - 1;
+            let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+            Some(format!("in {name} at {} ms: {}{tail}", first.at.as_millis(), describe_unmatched(first)))
+        })
+        .collect();
+    let r = cross("J2", runs, failures, "", true);
+    if r.verdict == Verdict::Pass && observed(runs).all(|(_, o)| o.answered.is_empty() && o.unmatched.is_empty()) {
+        return result("all", "J2", Verdict::NotExercised, "the server sent no response lspcheck could judge");
+    }
+    r
+}
+
+/// The scenarios whose input is all well-formed, so a response without an id
+/// answers some notification. `framing` is left out because its variants can
+/// make a server misread the input (a null-id ParseError is then lawful), and
+/// `pre-initialize` because L1 judges what happens there.
+const J3_SCENARIOS: &[&str] =
+    &["lifecycle", "json-rpc", "after-initialize", "cancellation", "end-of-input", "exit-without-shutdown"];
+
+/// J3 across the scenarios in [`J3_SCENARIOS`]: no response without an id
+/// (`id` missing or null) is read after `initialized`, to the end of the
+/// session (a reply to `exit` answers a notification too), or until a write
+/// of lspcheck's stopped partway through a frame: the server may answer that
+/// malformed input with a null-id error. (Such a write also makes the
+/// session's evidence incomplete, so a pass becomes an error.)
+fn judge_j3(runs: &[ScenarioRun]) -> CheckResult {
+    let mut failures = Vec::new();
+    let mut incomplete: Option<(&'static str, String)> = None;
+    let mut exercise: Option<(Verdict, String)> = None;
+    for (name, o) in observed(runs).filter(|(name, _)| J3_SCENARIOS.contains(name)) {
+        if name == "json-rpc" {
+            exercise = o.j3_exercise.clone();
+        }
+        let Some(from) = o.initialized_at else { continue };
+        let to = o.abandoned_at.unwrap_or(Duration::MAX);
+        if let Some((at, what)) = o.messages.iter().find_map(|(at, m)| {
+            if *at < from || *at >= to {
+                return None;
+            }
+            reply_to_notification(m).map(|what| (*at, what))
+        }) {
+            failures.push(format!("in {name} at {} ms, a notification was answered: {what}", at.as_millis()));
+        }
+        if incomplete.is_none()
+            && let Some(why) = &o.j3_incomplete
+        {
+            incomplete = Some((name, why.clone()));
+        }
+    }
+    if !failures.is_empty() {
+        return result("all", "J3", Verdict::Fail, failures.join("; "));
+    }
+    match exercise {
+        Some((Verdict::Error, why)) => return result("all", "J3", Verdict::Error, why),
+        Some((Verdict::Fail, why)) => return result("all", "J3", Verdict::Fail, why),
+        Some((Verdict::Pass, _)) => {}
+        Some(_) => unreachable!("check_j3 returns a pass, failure or error"),
+        None => {
+            return result(
+                "all",
+                "J3",
+                Verdict::Error,
+                "the json-rpc scenario didn't send its unknown notifications, so J3 wasn't exercised",
+            );
+        }
+    }
+    if let Some((name, why)) = incomplete {
+        return result("all", "J3", Verdict::Error, format!("inconclusive: in {name}, {why}"));
+    }
+    result("all", "J3", Verdict::Pass, "no response answered a notification")
+}
+
+/// Why a message's `params`, if it has one, isn't a structured value.
+fn params_problem(m: &Message) -> Option<String> {
+    let params = m.value.get("params")?;
+    if params.is_object() || params.is_array() {
+        return None;
+    }
+    Some(format!(
+        "params is {}, not an object or an array: {}",
+        params,
+        session::preview(m.value.to_string().as_bytes())
+    ))
+}
+
+/// Why a message isn't a well-formed JSON-RPC 2.0 envelope, if it isn't.
+fn envelope_problem(m: &Message) -> Option<String> {
+    match &m.kind {
+        Kind::Invalid(why) => Some(format!("an invalid message: {why}")),
+        Kind::Response { outcome: Outcome::Malformed(why), .. } => Some(format!("a response that {why}")),
+        Kind::Response { outcome: Outcome::Error { code: None, error, .. }, .. } => {
+            Some(format!("an error whose code isn't an integer: {}", session::preview(error.to_string().as_bytes())))
+        }
+        Kind::Response { outcome: Outcome::Error { code: Some(code), .. }, .. } if i32::try_from(*code).is_err() => {
+            Some(format!("an error code {code}, outside LSP's integer range"))
+        }
+        Kind::Response { outcome: Outcome::Error { message: None, error, .. }, .. } => {
+            Some(format!("an error whose message isn't a string: {}", session::preview(error.to_string().as_bytes())))
+        }
+        // A response's id is a string, a number or null. Numbers must be whole
+        // and in LSP's integer range (signed 32-bit): `2.0` is an integer id,
+        // `2.5` and `2147483648` aren't.
+        Kind::Response { id: Id::Other(raw), .. } => {
+            Some(format!("a response with id {raw}, which is neither a string, a number nor null"))
+        }
+        Kind::Response { id: id @ Id::Num { raw, .. }, .. } if !id.is_lsp_integer() => {
+            Some(format!("a response with id {raw}, which isn't an integer in LSP's range"))
+        }
+        Kind::Request { id, .. } => match id {
+            Id::Null => Some("a request with id null".into()),
+            Id::Other(raw) => Some(format!("a request with id {raw}, which is neither a string nor a number")),
+            Id::Num { raw, .. } if !id.is_lsp_integer() => {
+                Some(format!("a request with id {raw}, which isn't an integer in LSP's range"))
+            }
+            _ => params_problem(m),
+        },
+        Kind::Notification { .. } => params_problem(m),
+        _ => None,
+    }
+}
+
+fn judge_j5(runs: &[ScenarioRun]) -> CheckResult {
+    let failures = observed(runs)
+        .filter_map(|(name, o)| {
+            let bad: Vec<(Duration, String)> =
+                o.messages.iter().filter_map(|(at, m)| envelope_problem(m).map(|why| (*at, why))).collect();
+            let (at, why) = bad.first()?;
+            let more = bad.len() - 1;
+            let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+            Some(format!("in {name} at {} ms: {why}{tail}", at.as_millis()))
+        })
+        .collect();
+    let r = cross("J5", runs, failures, "", true);
+    if r.verdict == Verdict::Pass && observed(runs).all(|(_, o)| o.messages.is_empty()) {
+        return result("all", "J5", Verdict::NotExercised, "the server sent no readable message");
+    }
+    r
+}
+
 fn judge_l9(runs: &[ScenarioRun]) -> CheckResult {
     let all = observed(runs).collect::<Vec<_>>();
     if all.iter().any(|(_, o)| o.coverage == Coverage::None) {
@@ -1506,6 +1931,13 @@ mod tests {
                 scan_error: scan_error.map(str::to_string),
                 not_stopped: Vec::new(),
                 limit: None,
+                messages: Vec::new(),
+                initialized_at: None,
+                j3_incomplete: None,
+                abandoned_at: None,
+                j3_exercise: None,
+                unmatched: Vec::new(),
+                answered: Vec::new(),
             }),
             transcript: None,
         }
@@ -1522,6 +1954,97 @@ mod tests {
         // Without the leak, the failed search makes the result unknown.
         let runs = [observed_run("lifecycle", vec![], None), observed_run("pre-initialize", vec![], Some("no /proc"))];
         assert_eq!(judge_l9(&runs).verdict, Verdict::Error);
+    }
+
+    #[test]
+    fn j3_doesnt_blame_a_parse_error_for_lspchecks_own_truncated_output() {
+        // After a write of lspcheck's stopped partway through a frame, a
+        // null-id ParseError lawfully answers that malformed input.
+        let parse_error =
+            Message::parse(br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#).unwrap();
+        let run = |abandoned_at: Option<Duration>| {
+            let mut r = observed_run("lifecycle", vec![], None);
+            let o = r.observed.as_mut().unwrap();
+            o.initialized_at = Some(Duration::from_millis(10));
+            o.abandoned_at = abandoned_at;
+            o.messages = vec![(Duration::from_millis(500), parse_error.clone())];
+            let mut exercise = observed_run("json-rpc", vec![], None);
+            exercise.observed.as_mut().unwrap().j3_exercise = Some((Verdict::Pass, String::new()));
+            [r, exercise]
+        };
+        assert_eq!(judge_j3(&run(None)).verdict, Verdict::Fail);
+        assert_ne!(judge_j3(&run(Some(Duration::from_millis(100)))).verdict, Verdict::Fail);
+        // A reply read before the truncated write began still counts.
+        assert_eq!(judge_j3(&run(Some(Duration::from_millis(600)))).verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn j5_recognises_bad_envelopes() {
+        let bad = |s: &str| envelope_problem(&Message::parse(s.as_bytes()).unwrap());
+        // Both or neither of result and error.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{}}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1}"#).is_some());
+        // A missing or wrong jsonrpc field.
+        assert!(bad(r#"{"id":1,"result":null}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"1.0","id":1,"result":null}"#).is_some());
+        // An error code that isn't an integer, or a message that isn't a string.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"error":{"code":"-32601","message":"x"}}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":7}}"#).is_some());
+        // Request ids that JSON-RPC doesn't allow.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":null,"method":"m"}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1.5,"method":"m"}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":true,"method":"m"}"#).is_some());
+        // Response ids: a string, a whole number or null. `2.0` is a whole
+        // number spelled with a fraction, so it stays lawful.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":true,"result":null}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":[1],"result":null}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":2.5,"result":null}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":2.0,"result":null}"#).is_none());
+        // params, when present, is an object or an array.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"method":"m","params":3}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","method":"m","params":"x"}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","method":"m","params":null}"#).is_some());
+        // Well-formed envelopes.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"method":"m"}"#).is_none());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"method":"m","params":{}}"#).is_none());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"method":"m","params":[]}"#).is_none());
+        assert!(bad(r#"{"jsonrpc":"2.0","method":"m"}"#).is_none());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).is_none());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"x"}}"#).is_none());
+    }
+
+    #[test]
+    fn j2_blames_only_unexplained_unmatched_responses() {
+        let u = |id: Id| Unmatched {
+            at: Duration::ZERO,
+            id,
+            duplicate: false,
+            unsent: false,
+            early: false,
+            aborted: false,
+            loose: None,
+        };
+        let mut unsent = u(Id::int(1));
+        unsent.unsent = true;
+        assert!(j2_blames(&unsent));
+        let mut duplicate = u(Id::int(1));
+        duplicate.duplicate = true;
+        assert!(j2_blames(&duplicate));
+        let mut early = u(Id::int(1));
+        early.early = true;
+        assert!(j2_blames(&early));
+        // A response to a write that failed, a null id, and J1's loose ids are
+        // lawful as far as J2 is concerned.
+        let mut aborted = u(Id::int(1));
+        aborted.aborted = true;
+        assert!(!j2_blames(&aborted));
+        let mut null = u(Id::Null);
+        null.unsent = true;
+        assert!(!j2_blames(&null));
+        let mut loose = u(Id::int(1));
+        loose.unsent = true;
+        loose.loose = Some(Id::Str("1".into()));
+        assert!(!j2_blames(&loose));
     }
 
     #[test]

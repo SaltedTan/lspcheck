@@ -193,6 +193,25 @@ struct Evidence {
     done: bool,
 }
 
+/// A response that matched no outstanding request, with what explains it.
+#[derive(Debug, Clone)]
+pub struct Unmatched {
+    /// When it was read.
+    pub at: Duration,
+    pub id: Id,
+    /// A request with this id had already been answered.
+    pub duplicate: bool,
+    /// lspcheck never sent a request with this id in this session.
+    pub unsent: bool,
+    /// The request with this id was registered only after this response was read.
+    pub early: bool,
+    /// The request's write failed, so the server may have seen part of it.
+    pub aborted: bool,
+    /// An id lspcheck sent that is only loosely equal to this one (a number
+    /// spelled as a string, or a number equal only after rounding).
+    pub loose: Option<Id>,
+}
+
 /// What remains when a session ends.
 #[derive(Debug)]
 pub struct Finish {
@@ -217,10 +236,19 @@ pub struct Finish {
     pub transcript: Vec<Event>,
     /// Every message the session consumed.
     pub messages: Vec<(Duration, Message)>,
+    /// When lspcheck sent `initialized`, if it did.
+    pub initialized_at: Option<Duration>,
+    /// Why evidence since `initialized` is incomplete, if it is.
+    /// A response without an id read in that window could have been skipped.
+    pub j3_incomplete: Option<String>,
+    /// When a write of lspcheck's that stopped partway through a frame began.
+    pub abandoned_at: Option<Duration>,
     /// Every stream problem in the whole of stdout.
     pub problems: Vec<(Duration, Problem)>,
-    /// Responses that matched no outstanding request (unknown, early, or repeated ids).
-    pub unmatched: Vec<(Duration, Id)>,
+    /// Responses that matched no outstanding request, with what explains them.
+    pub unmatched: Vec<Unmatched>,
+    /// Requests that were answered, with when their response was read.
+    pub answered: Vec<(Duration, Id)>,
     /// `Content-Type` values the server sent.
     pub content_types: Vec<(Duration, String)>,
     /// When the first readable frame with non-ASCII text in its body arrived.
@@ -268,15 +296,26 @@ pub struct Session {
     evidence: Arc<Mutex<Evidence>>,
     /// Every message consumed, in order.
     pub messages: Vec<(Duration, Message)>,
+    /// When lspcheck sent `initialized`, if it did.
+    initialized_at: Option<Duration>,
     /// When and why this session's own actions left evidence incomplete.
     own_limit: Option<(Duration, String)>,
-    /// Set when a write stopped partway through a frame.
-    abandoned: bool,
+    /// When a write that stopped partway through a frame began: from then on
+    /// the server may lawfully answer malformed input with errors whose id
+    /// is null.
+    abandoned: Option<Duration>,
     /// Requests sent and not yet answered, with when they were sent.
     pending: HashMap<Id, Duration>,
     /// Requests answered: the index of the response in `messages`.
     answers: HashMap<Id, usize>,
-    used_ids: HashSet<Id>,
+    /// Every id a request was sent with, and when it was registered.
+    used_ids: HashMap<Id, Duration>,
+    /// Ids handed out by [`Session::fresh_id`], sent or not.
+    reserved: HashSet<Id>,
+    /// Ids whose write failed before the whole request reached the server.
+    aborted: HashSet<Id>,
+    /// Requests that were answered, with when the response was read.
+    answered: Vec<(Duration, Id)>,
     unmatched: Vec<(Duration, Id)>,
     group: Group,
     exit: Option<ExitStatus>,
@@ -351,11 +390,15 @@ impl Session {
             transcript,
             evidence,
             messages: Vec::new(),
+            initialized_at: None,
             own_limit: None,
-            abandoned: false,
+            abandoned: None,
             pending: HashMap::new(),
             answers: HashMap::new(),
-            used_ids: HashSet::new(),
+            used_ids: HashMap::new(),
+            reserved: HashSet::new(),
+            aborted: HashSet::new(),
+            answered: Vec::new(),
             unmatched: Vec::new(),
             group,
             exit: None,
@@ -416,12 +459,20 @@ impl Session {
     /// the rest from being recorded). An unanswered request makes the
     /// evidence incomplete from when it was read.
     pub fn take_in(&mut self) {
+        self.take_queued(true);
+    }
+
+    /// Records everything already in the channel without waiting. With
+    /// `mark_requests`, a server request lspcheck never answered also makes the
+    /// evidence incomplete from when it was read (as `take_in` does).
+    fn take_queued(&mut self, mark_requests: bool) {
         while let Ok((at, inbound)) = self.rx.try_recv() {
             match inbound {
                 Inbound::Message(m) => {
                     // A server waiting for this answer may be holding back
                     // what it would have sent next.
-                    if let Kind::Request { method, .. } = &m.kind
+                    if mark_requests
+                        && let Kind::Request { method, .. } = &m.kind
                         && self.own_limit.is_none()
                     {
                         self.own_limit = Some((at, format!("lspcheck didn't answer the server's {method} request")));
@@ -459,7 +510,8 @@ impl Session {
         deadline: Instant,
     ) -> Result<(), WriteError> {
         let deadline = deadline.min(Instant::now() + self.opts.write_timeout);
-        if self.abandoned {
+        let began = self.start.elapsed();
+        if self.abandoned.is_some() {
             return Err(WriteError::Abandoned);
         }
         let Some(stdin) = self.stdin.as_mut() else { return Err(WriteError::Closed) };
@@ -506,7 +558,7 @@ impl Session {
         if let Err(e) = &outcome {
             self.note(format!("write stopped after {written} of {} bytes: {e}", bytes.len()));
             if written > 0 && written < bytes.len() && self.stdin.is_some() {
-                self.abandoned = true;
+                self.abandoned = Some(began);
                 self.limit_self(format!(
                     "lspcheck's write stopped partway through a frame ({e}), so it sent nothing more"
                 ));
@@ -529,6 +581,15 @@ impl Session {
     }
 
     async fn send_until(&mut self, value: &Value, deadline: Instant) -> Result<(), WriteError> {
+        // From `initialized` on, a response without an id answers a
+        // notification. Recorded before the write so that a response read
+        // while it is in progress is still counted.
+        if value.get("id").is_none()
+            && value.get("method").and_then(Value::as_str) == Some("initialized")
+            && self.initialized_at.is_none()
+        {
+            self.initialized_at = Some(self.start.elapsed());
+        }
         let body = serde_json::to_vec(value).expect("JSON values serialize");
         self.write_until(&transport::encode(&body), deadline).await
     }
@@ -539,7 +600,9 @@ impl Session {
         loop {
             let n = (random_u64() % (i32::MAX as u64)) as i64 + 1;
             let id = Id::int(n);
-            if self.used_ids.insert(id.clone()) {
+            // Handed-out ids are reserved but count as sent only once
+            // registered, so a reply to one never sent stays unasked (J2).
+            if !self.used_ids.contains_key(&id) && self.reserved.insert(id.clone()) {
                 return id;
             }
         }
@@ -547,7 +610,12 @@ impl Session {
 
     /// Whether lspcheck has sent a request with this id in this session.
     pub fn sent(&self, id: &Id) -> bool {
-        self.used_ids.contains(id)
+        self.used_ids.contains_key(id)
+    }
+
+    /// The ids of unmatched responses read at or after `since`.
+    pub fn unmatched_ids(&self, since: Duration) -> Vec<Id> {
+        self.unmatched.iter().filter(|(at, _)| *at >= since).map(|(_, id)| id.clone()).collect()
     }
 
     /// Sends a request, registering it so only a later response can answer it.
@@ -591,7 +659,7 @@ impl Session {
         if Instant::now() >= deadline {
             return Err(WriteError::Timeout);
         }
-        self.used_ids.insert(id.clone());
+        self.used_ids.insert(id.clone(), self.start.elapsed());
         self.answers.remove(id);
         self.pending.insert(id.clone(), self.start.elapsed());
         Ok(())
@@ -600,6 +668,7 @@ impl Session {
     /// Forgets a request registered with [`Session::begin_request`] that couldn't be written.
     pub fn abort_request(&mut self, id: &Id) {
         self.pending.remove(id);
+        self.aborted.insert(id.clone());
     }
 
     pub async fn notify(&mut self, method: &str, params: Option<Value>) -> Result<(), WriteError> {
@@ -676,6 +745,7 @@ impl Session {
             Some(&sent) if at >= sent => {
                 self.pending.remove(id);
                 self.answers.insert(id.clone(), self.messages.len() - 1);
+                self.answered.push((at, id.clone()));
             }
             _ => self.unmatched.push((at, id.clone())),
         }
@@ -864,9 +934,16 @@ impl Session {
         while !self.evidence.lock().expect("evidence lock").done && Instant::now() < deadline {
             sleep(Duration::from_millis(10)).await;
         }
-        // Classify responses that arrived and weren't waited for, briefly.
-        self.drain(Instant::now() + Duration::from_millis(200)).await;
+        // The stdout task has stopped (or the bound above expired), so
+        // everything it read is already queued. Record it all without waiting:
+        // every process has been stopped, so no server request can be answered,
+        // and the work is bounded by --max-output-mib.
+        self.take_queued(false);
         self.group.close();
+        // A response without an id read after `initialized` could be a reply
+        // to a notification (`exit` included); anything lspcheck missed since
+        // makes judging J3 inconclusive.
+        let j3_incomplete = self.initialized_at.and_then(|from| self.incomplete_within(from, self.start.elapsed()));
         let mut evidence = std::mem::take(&mut *self.evidence.lock().expect("evidence lock"));
         if !evidence.done && evidence.limit.is_none() {
             evidence.limit = Some((
@@ -877,6 +954,25 @@ impl Session {
         let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
         let whole = evidence.done && !evidence.cut;
         let (miscounted, unchecked) = miscounted_frames(&evidence.unparsed, &transcript, whole);
+        // Whether an unmatched reply is a duplicate, early, aborted or only
+        // loosely equal needs the whole session's state, not the moment it
+        // was read: a guessed id may be sent later, and a write may fail
+        // after the reply.
+        let unmatched = std::mem::take(&mut self.unmatched)
+            .into_iter()
+            .map(|(at, id)| {
+                let sent_at = self.used_ids.get(&id).copied();
+                Unmatched {
+                    at,
+                    duplicate: self.answers.contains_key(&id),
+                    unsent: sent_at.is_none(),
+                    early: sent_at.is_some_and(|sent| sent > at),
+                    aborted: self.aborted.contains(&id),
+                    loose: self.used_ids.keys().find(|sent| message::loosely_equal(&id, sent)).cloned(),
+                    id,
+                }
+            })
+            .collect();
         Finish {
             exit: if killed { None } else { self.exit },
             killed,
@@ -888,8 +984,12 @@ impl Session {
             own_limit: self.own_limit.take(),
             transcript,
             messages: std::mem::take(&mut self.messages),
+            initialized_at: self.initialized_at,
+            j3_incomplete,
+            abandoned_at: self.abandoned,
             problems: evidence.problems,
-            unmatched: std::mem::take(&mut self.unmatched),
+            unmatched,
+            answered: std::mem::take(&mut self.answered),
             content_types: evidence.content_types,
             non_ascii: evidence.non_ascii,
             miscounted,
