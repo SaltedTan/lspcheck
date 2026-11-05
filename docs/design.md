@@ -99,9 +99,9 @@ cancel can come at any time, so the verdicts are given at the end, over everythi
   and C2 when after; a response carrying the never-sent id fails C2, and so does a plain request that goes unanswered
   after the cancels;
 - a response without an id (`id` missing or `null`) can't be matched to the notification it answers, and until `exit`
-  lspcheck sends only `initialized` and the cancels. One read before the first cancel was written answers
-  `initialized`. C3 fails when, after that, two such responses arrived, or one did and another came before; a single
-  one after the cancels may be a late reply to `initialized`, so C3 is `error`.
+  lspcheck sends only `initialized` and the cancels. C3 fails on one read after the first cancel was written whose
+  text names `$/cancelRequest` (as a MethodNotFound message usually does); any other is `error` for C3, since it may
+  answer `initialized` (answering any notification is J3's failure).
 
 If the server stopped answering, what it didn't send can't be judged, so those checks are `error`. A pass is also
 `error` when lspcheck missed something where that check's evidence would be: a frame it skipped or couldn't read, a

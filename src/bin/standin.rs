@@ -82,7 +82,10 @@ const FAULTS: &[(&str, &str)] = &[
         "on shutdown, send its answer, a huge configuration request and an error with id null, then stop reading",
     ),
     ("big-frame-on-cancel", "after answering a cancelled request, send a 2 MiB log message"),
-    ("initialized-reply-after-cancel", "answer initialized with an error whose id is null, once a cancel arrives"),
+    (
+        "initialized-reply-after-cancel",
+        "answer initialized twice with an error whose id is null, once a cancel arrives",
+    ),
     ("big-frame-after-drop", "after cancelled-no-reply drops a request, send a 2 MiB log message with the next answer"),
     ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
@@ -202,7 +205,9 @@ fn main() {
             // A notification.
             if method == "$/cancelRequest" {
                 if std::mem::take(&mut initialized_reply) {
-                    out.frame(&err(&Value::Null, -32601, "unknown notification"));
+                    for _ in 0..2 {
+                        out.frame(&err(&Value::Null, -32601, "unknown notification"));
+                    }
                 }
                 if fault("reply-to-cancel") {
                     cancel_out.send(&mut out, cancel_reply());
@@ -617,7 +622,7 @@ impl CancelOut {
 
 /// A response to a cancel notification: JSON-RPC has no id to give back.
 fn cancel_reply() -> Value {
-    json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32800, "message": "request cancelled"}})
+    json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32601, "message": "unhandled notification $/cancelRequest"}})
 }
 
 /// Frames read from stdin, with the reading faults applied. Reads go

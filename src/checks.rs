@@ -850,13 +850,18 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         (*id == unknown || (*id == r && after_r_cancel(*at))).then(|| (id.clone(), describe_response(m)))
     });
     // C3. Until `exit` the only notifications lspcheck sends are
-    // `initialized` and the cancels, and nothing says which one a response
-    // without an id answers. One read before the first cancel was written
-    // answers `initialized`; after that, at most one can be `initialized`'s.
-    let (before, after): (Vec<_>, Vec<_>) = (0..msgs.len())
-        .filter(|&i| msgs[i].0 < end)
-        .filter_map(|i| idless_reply(&msgs[i].0, &msgs[i].1).map(|what| (msgs[i].0, what)))
-        .partition(|(at, _)| *at < written_at);
+    // `initialized` and the cancels, and JSON-RPC gives a response without an
+    // id nothing that says which one it answers, so only one that names
+    // `$/cancelRequest` (as a MethodNotFound message usually does) is known
+    // to answer a cancel. Any of them answers some notification, which J3
+    // judges.
+    let after: Vec<(String, bool)> = window(after_send)
+        .filter(|&i| msgs[i].0 >= written_at)
+        .filter_map(|i| {
+            let (at, m) = &msgs[i];
+            idless_reply(at, m).map(|what| (what, m.value.to_string().contains("cancelRequest")))
+        })
+        .collect();
     ctx.report("C1", c1.0, c1.1);
 
     if let Some((id, what)) = offending {
@@ -887,21 +892,16 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     }
 
     // C3.
-    if after.len() >= 2 || (!after.is_empty() && !before.is_empty()) {
+    if let Some((what, _)) = after.iter().find(|(_, named)| *named) {
+        ctx.fail("C3", format!("{what}, answering a $/cancelRequest notification"));
+    } else if let Some((what, _)) = after.first() {
         let more = if after.len() > 1 { format!(" (and {} more)", after.len() - 1) } else { String::new() };
-        ctx.fail(
-            "C3",
-            format!(
-                "{}{more}; besides the cancels lspcheck had sent only `initialized`, and at most one reply can be its",
-                after[0].1
-            ),
-        );
-    } else if let [(_, what)] = after.as_slice() {
         ctx.report(
             "C3",
             Verdict::Error,
             format!(
-                "{what}, after the first cancel; it may have answered `initialized` instead, so it can't be judged"
+                "{what}{more} after the first cancel; nothing in it says whether it answers `initialized` or a cancel \
+                 (either way it answers a notification, see J3)"
             ),
         );
     } else if let Some(why) = &stopped {
