@@ -237,13 +237,14 @@ fn the_clean_standin_passes_every_check() {
     only_fails(&r, &[]);
     assert_eq!(r.status, 0, "{}", r.stdout);
     assert_eq!(r.verdicts.len(), lspcheck::checks::CATALOGUE.len());
-    // D1 and D2 passed on evidence, not for lack of it.
+    // D1, D2 and D3 passed on evidence, not for lack of it.
     assert!(r.stdout.contains("informative position(s) on character boundaries"), "{}", r.stdout);
     assert!(
         r.stdout.contains("versioned diagnostics notification(s) named a version lspcheck had sent"),
         "{}",
         r.stdout
     );
+    assert!(r.stdout.contains("informative position(s) on character boundaries after the change"), "{}", r.stdout);
 }
 
 #[test]
@@ -264,12 +265,24 @@ fn lawful_variations_fail_nothing() {
         "positions-in-data",
         "no-diagnostics",
         "unversioned-diagnostics",
+        "full-sync",
+        "stale-diagnostics",
+        "stale-unversioned-diagnostics",
+        "no-change-sync",
+        "register-other",
     ] {
         let r = fault(name);
         // With no versioned publish for the opened document, D2 has nothing
-        // to judge and is not exercised instead of passing.
-        let d2 = if matches!(name, "no-diagnostics" | "unversioned-diagnostics") { "not-exercised" } else { "pass" };
-        passes_except(&r, &[("D2", d2)]);
+        // to judge and is not exercised instead of passing. A server that
+        // takes no changes gives D3 none to judge, so it skips.
+        let mut expected: Vec<(&str, &str)> = Vec::new();
+        if matches!(name, "no-diagnostics" | "unversioned-diagnostics") {
+            expected.push(("D2", "not-exercised"));
+        }
+        if name == "no-change-sync" {
+            expected.push(("D3", "skip"));
+        }
+        passes_except(&r, &expected);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
     }
 }
@@ -456,7 +469,16 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
     // Nor can it read D1's document, whose emoji put its input out of step:
     // no position or versioned diagnostics come back, which says nothing
     // about how it counts them.
-    passes_except(&r, &[("F5", "fail"), ("F2", "not-exercised"), ("D1", "not-exercised"), ("D2", "not-exercised")]);
+    passes_except(
+        &r,
+        &[
+            ("F5", "fail"),
+            ("F2", "not-exercised"),
+            ("D1", "not-exercised"),
+            ("D2", "not-exercised"),
+            ("D3", "not-exercised"),
+        ],
+    );
     // F3's multibyte part depends on F5, and says it wasn't run.
     assert!(r.stdout.contains("wasn't run, because F5 didn't pass"), "{}", r.stdout);
 }
@@ -524,10 +546,10 @@ fn strict_turns_should_failures_into_status_1() {
 #[test]
 fn bad_initialize_results_fail_l2() {
     // D1 can't count positions in an encoding lspcheck didn't offer, and D2
-    // can't judge versions without it either; without capabilities the
-    // server doesn't ask for didOpen, so both are skipped.
-    passes_except(&fault("bad-encoding"), &[("L2", "fail"), ("D1", "error"), ("D2", "error")]);
-    passes_except(&fault("no-capabilities"), &[("L2", "fail"), ("D1", "skip"), ("D2", "skip")]);
+    // and D3 can't judge without it either; without capabilities the server
+    // doesn't ask for didOpen, so all three are skipped.
+    passes_except(&fault("bad-encoding"), &[("L2", "fail"), ("D1", "error"), ("D2", "error"), ("D3", "error")]);
+    passes_except(&fault("no-capabilities"), &[("L2", "fail"), ("D1", "skip"), ("D2", "skip"), ("D3", "skip")]);
 }
 
 #[test]
@@ -915,7 +937,7 @@ fn unreadable_frames_make_other_failures_inconclusive() {
 #[test]
 fn a_server_that_doesnt_open_documents_skips_d1() {
     let r = fault("no-open-close");
-    passes_except(&r, &[("D1", "skip"), ("D2", "skip")]);
+    passes_except(&r, &[("D1", "skip"), ("D2", "skip"), ("D3", "skip")]);
     assert_eq!(r.status, 0, "{}", r.stdout);
 }
 
@@ -924,7 +946,6 @@ fn positions_counted_in_the_wrong_units_fail_d1() {
     for (name, diagnosis) in [
         ("utf8-positions-as-utf16", "on a boundary if counted in UTF-8 bytes"),
         ("codepoint-positions", "on a boundary if counted in code points"),
-        ("utf16-positions-as-utf8", "on a boundary if counted in UTF-16 code units"),
     ] {
         let r = fault(name);
         only_fails(&r, &["D1"]);
@@ -932,20 +953,113 @@ fn positions_counted_in_the_wrong_units_fail_d1() {
         assert!(r.stdout.contains("inside a character of version 41"), "{name}\n{}", r.stdout);
         assert!(r.stdout.contains(diagnosis), "{name}\n{}", r.stdout);
     }
+    // Counting UTF-16 units under UTF-8: the positions after the change are
+    // invalid too, but each fits the changed text counted in UTF-16, so D3
+    // can't tell a change-handling fault from a counting fault and is an
+    // error; D1 carries the failure.
+    let r = fault("utf16-positions-as-utf8");
+    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    assert_eq!(r.status, 1, "D1 is a MUST check");
+    assert!(r.stdout.contains("inside a character of version 41"), "{}", r.stdout);
+    assert!(r.stdout.contains("on a boundary if counted in UTF-16 code units"), "{}", r.stdout);
+    assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault; see D1"), "{}", r.stdout);
+}
+
+#[test]
+fn a_change_the_server_doesnt_apply_fails_d1_and_d3() {
+    // The old text's positions, labelled with the new version: some, on the
+    // inserted emoji line, are on no boundary of the changed text counted any
+    // way, but on a boundary of the text before the change.
+    let r = fault("ignore-changes");
+    only_fails(&r, &["D1", "D3"]);
+    assert_eq!(r.status, 1, "D1 and D3 are MUST checks");
+    assert!(r.stdout.contains("(fits the text before the change)"), "{}", r.stdout);
+}
+
+#[test]
+fn change_ranges_counted_in_code_points_fail_d1_and_d3_is_an_error() {
+    // The stand-in replaces two emoji where lspcheck's range names one, so
+    // its positions on line 0 land inside characters of the changed text.
+    // Each is also an in-line offset of the changed text counted in code
+    // points, so a server that applied the change and counts code points
+    // would report the same: D3 can't blame the change, and D1 fails.
+    let r = fault("codepoint-changes");
+    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault"), "{}", r.stdout);
+}
+
+#[test]
+fn diagnostics_of_the_previous_text_labelled_with_the_new_version_fail_d1_and_d3() {
+    let r = fault("mislabelled-diagnostics");
+    only_fails(&r, &["D1", "D3"]);
+    assert_eq!(r.status, 1, "D1 and D3 are MUST checks");
+}
+
+#[test]
+fn a_dynamic_registration_of_the_sync_notifications_errors_d3() {
+    // lspcheck declares no dynamic registration but answers it with success,
+    // so the server may expect another sync kind: D3 is an error, not a
+    // failure, and nothing else is affected.
+    let r = fault("register-sync");
+    passes_except(&r, &[("D3", "error")]);
+    assert_eq!(r.status, 2, "D3's error is reported");
+    assert!(r.stdout.contains("registered textDocument/didChange or didOpen dynamically"), "{}", r.stdout);
+}
+
+#[test]
+fn a_registration_of_another_method_does_not_error_d3() {
+    // A `client/registerCapability` for a method D3 doesn't depend on is
+    // not a dynamic registration of the sync notifications: D3 proceeds
+    // normally and passes.
+    let r = fault("register-other");
+    only_fails(&r, &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn code_point_positions_after_a_correct_change_are_a_counting_fault() {
+    // The stand-in applies the change correctly but counts positions in code
+    // points from the change on. The pre-change positions are correct (so
+    // the pin holds), but the post-change positions are on boundaries of
+    // version 42 counted in code points: a counting fault (D1's), not a
+    // change-handling fault. D3 is an error, not a failure.
+    let r = fault("codepoint-positions-after-change");
+    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    assert_eq!(r.status, 1, "D1 is a MUST check");
+    assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault; see D1"), "{}", r.stdout);
+}
+
+#[test]
+fn an_undeliverable_change_errors_d3_but_keeps_d1s_failure() {
+    // The stand-in publishes version 41's diagnostics with a position inside
+    // the first character, then exits: lspcheck's `didChange` can't be
+    // delivered, so D3 is an error, but D1's failure stands and D2 is still
+    // judged (the diagnostic's version 41 was sent).
+    let r = fault("close-stdin-before-change");
+    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    assert_eq!(r.status, 1, "D1 is a MUST check");
+    assert!(r.stdout.contains("couldn't send didChange"), "{}", r.stdout);
 }
 
 #[test]
 fn positions_in_a_duplicate_response_are_judged_too() {
     // The first answer is valid; the second, a duplicate (J2's finding),
-    // has a position inside a character.
-    only_fails(&fault("invalid-duplicate-symbols"), &["D1", "J2"]);
+    // has a position inside a character. The stand-in does this at both
+    // versions, so the server was seen miscounting before the change and no
+    // alternative text explains the position after it: D3 can't blame the
+    // change, and says so, while D1 carries the failure. (A late duplicate of
+    // a request sent before the change may refer to either version, so D3
+    // doesn't judge it at all.)
+    let r = fault("invalid-duplicate-symbols");
+    passes_except(&r, &[("D1", "fail"), ("J2", "fail"), ("D3", "error")]);
+    assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault"), "{}", r.stdout);
 }
 
 #[test]
 fn utf32_positions_leave_d1_not_exercised() {
     // No offset can fall inside a character in UTF-32.
     let r = fault("utf32-encoding");
-    passes_except(&r, &[("D1", "not-exercised")]);
+    passes_except(&r, &[("D1", "not-exercised"), ("D3", "not-exercised")]);
     assert!(r.stdout.contains("the server chose utf-32"), "{}", r.stdout);
 }
 
@@ -989,7 +1103,7 @@ fn diagnostics_without_a_version_leave_d2_not_exercised() {
     // No version at all is lawful, and gives D2 nothing to judge.
     let r = fault("unversioned-diagnostics");
     expect(&r, "D2", "not-exercised");
-    assert!(r.stdout.contains("1 without a version, which is lawful"), "{}", r.stdout);
+    assert!(r.stdout.contains("2 without a version, which is lawful"), "{}", r.stdout);
     // Nor is there anything when the server never publishes.
     expect(&fault("no-diagnostics"), "D2", "not-exercised");
 }

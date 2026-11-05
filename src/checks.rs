@@ -10,11 +10,11 @@
 //! lspcheck hit one of its own inspection limits is reported as an error,
 //! because the missing evidence might explain it.
 
-use crate::documents::{self, DOC_A_LINES, OpenDoc, Published, Source, Version};
+use crate::documents::{self, Change, OpenDoc, Published, Source, SyncKind, Version};
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
 use crate::session::{self, CallError, Finish, Options, Problem, Recv, Session, Unmatched, WaitError, WriteError};
-use crate::text::{self, Encoding, Position};
+use crate::text::{self, ContentChange, Encoding, Position};
 use crate::transcript;
 use crate::transport;
 use serde::Serialize;
@@ -134,6 +134,7 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "A diagnostics version is one the document had when the notification was read",
         "publishDiagnosticsParams"
     ),
+    check!("D3", Documents, Must, "After a didChange, positions refer to the changed text", "textDocumentSync"),
 ];
 
 /// Checks judged from every scenario's observations.
@@ -258,7 +259,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
-    Scenario { name: "documents", checks: &["D1", "D2"] },
+    Scenario { name: "documents", checks: &["D1", "D2", "D3"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
@@ -1247,18 +1248,21 @@ fn advertises(caps: &Value, name: &str) -> bool {
     matches!(caps.get(name), Some(Value::Bool(true) | Value::Object(_)))
 }
 
-/// The advertised requests about document A at `uri`, with their params.
-/// Every position sent is counted in the negotiated encoding.
-fn document_requests(caps: &Value, uri: &str, encoding: Encoding) -> Vec<(&'static str, Value)> {
+/// The advertised requests about a document at `uri`, with their params.
+/// Every position sent is counted in the negotiated encoding, of `text`.
+fn document_requests(caps: &Value, uri: &str, text: &str, encoding: Encoding) -> Vec<(&'static str, Value)> {
     let pos = |p: Position| json!({"line": p.line, "character": p.character});
     let doc = json!({"uri": uri});
-    let (word, _) = documents::doc_a_span(0, "word", encoding);
+    let lines = text::split_lines(text);
+    let (word, _) = documents::span_in(text, 0, "word", encoding);
     // `word` is ASCII, so two units in is inside it in every encoding.
     let inside = Position { line: 0, character: word.character + 2 };
-    let l0_end = Position { line: 0, character: text::line_length(DOC_A_LINES[0], encoding) };
-    let (_, name_end) = documents::doc_a_span(2, "name", encoding);
+    let l0_end = Position { line: 0, character: text::line_length(lines[0], encoding) };
+    // `name` is on line 2 of version 41 and line 3 of version 42.
+    let name_line = lines.iter().position(|l| l.contains("name")).expect("the document has a name");
+    let (_, name_end) = documents::span_in(text, name_line, "name", encoding);
     // The empty line after the final newline ends the document.
-    let whole = json!({"start": {"line": 0, "character": 0}, "end": {"line": DOC_A_LINES.len(), "character": 0}});
+    let whole = json!({"start": {"line": 0, "character": 0}, "end": {"line": lines.len() - 1, "character": 0}});
     [
         ("documentSymbolProvider", "textDocument/documentSymbol", json!({"textDocument": doc})),
         ("foldingRangeProvider", "textDocument/foldingRange", json!({"textDocument": doc})),
@@ -1333,51 +1337,95 @@ async fn await_diagnostics(ctx: &mut Ctx<'_>, uri: &str, version: i64, from: usi
     }
 }
 
+/// Sends the advertised requests one at a time, so a reply always refers to
+/// the version current when it was asked. No reply, or an error, is simply
+/// no evidence: the rest are not sent, and the note says so.
+async fn ask_all(
+    ctx: &mut Ctx<'_>,
+    requests: Vec<(&'static str, Value)>,
+    asked: &mut Vec<Asked>,
+    notes: &mut Vec<String>,
+) {
+    for (method, params) in requests {
+        match ask(ctx, method, params).await {
+            Ok((a, answer)) => {
+                asked.push(a);
+                if let Err(e) = answer {
+                    let why = describe_call_error(&CallError::Wait(e), ctx.cfg.request_timeout);
+                    notes.push(format!("{method} went unanswered ({why}), so no more requests were sent"));
+                    break;
+                }
+            }
+            Err(e) => {
+                notes.push(format!("lspcheck couldn't send {method} ({e}), so no more requests were sent"));
+                break;
+            }
+        }
+    }
+}
+
+/// Whether a message is a `client/registerCapability` registering the sync
+/// notifications D3 depends on: a registration whose `method` is
+/// `textDocument/didChange` or `textDocument/didOpen`.
+fn sync_registration(m: &Message) -> bool {
+    m.method() == Some("client/registerCapability")
+        && m.value.pointer("/params/registrations").and_then(Value::as_array).is_some_and(|regs| {
+            regs.iter().any(|r| {
+                matches!(
+                    r.get("method").and_then(Value::as_str),
+                    Some("textDocument/didChange") | Some("textDocument/didOpen")
+                )
+            })
+        })
+}
+
+/// The version document A is changed to.
+const DOC_A2_VERSION: i64 = 42;
+
 /// Documents: lspcheck opens document A, asks the server's advertised
 /// requests about it one at a time, and waits a while for diagnostics. Every
 /// position the server sends about it must fall on a character boundary of
-/// the text it refers to, in the negotiated encoding (D1), and every
-/// `version` its diagnostics carry for the document must be one lspcheck
-/// sent for it before the notification was read (D2).
+/// the text it refers to, in the negotiated encoding (D1), every `version`
+/// its diagnostics carry for the document must be one lspcheck sent for it
+/// before the notification was read (D2), and after the `didChange` lspcheck
+/// sends, positions must refer to the changed text (D3).
 ///
 /// A position or a version can arrive at any time (diagnostics especially),
-/// so both verdicts are given at the end, over everything read before
+/// so all three verdicts are given at the end, over everything read before
 /// lspcheck sent `exit`.
 async fn documents(ctx: &mut Ctx<'_>) {
     let params = documents_initialize_params(&ctx.root);
     let reply = match ctx.initialize_with(params).await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
-            ctx.report("D1", Verdict::Error, format!("initialize didn't succeed: {why}"));
-            ctx.report("D2", Verdict::Error, format!("initialize didn't succeed: {why}"));
+            let detail = format!("initialize didn't succeed: {why}");
+            for id in ["D1", "D2", "D3"] {
+                ctx.report(id, Verdict::Error, detail.clone());
+            }
             return;
         }
     };
     if !opens_documents(&reply) {
-        ctx.report(
-            "D1",
-            Verdict::Skip,
-            "the server doesn't ask for didOpen (textDocumentSync), so lspcheck opens no document",
-        );
-        ctx.report(
-            "D2",
-            Verdict::Skip,
-            "the server doesn't ask for didOpen (textDocumentSync), so lspcheck opens no document",
-        );
+        let detail = "the server doesn't ask for didOpen (textDocumentSync), so lspcheck opens no document";
+        for id in ["D1", "D2", "D3"] {
+            ctx.report(id, Verdict::Skip, detail);
+        }
         leave(ctx).await;
         return;
     }
     let encoding = match negotiated_encoding(&reply) {
         Ok(e) => e,
         Err(why) => {
-            ctx.report("D1", Verdict::Error, why.clone());
-            ctx.report("D2", Verdict::Error, why);
+            for id in ["D1", "D2", "D3"] {
+                ctx.report(id, Verdict::Error, why.clone());
+            }
             leave(ctx).await;
             return;
         }
     };
     let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { unreachable!() };
     let caps = result.get("capabilities").cloned().unwrap_or(Value::Null);
+    let sync = documents::sync_kind(result);
 
     // Document A, saved in the workspace as an editor would open it.
     let path = ctx.root.join("doc.txt");
@@ -1391,35 +1439,85 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let opened_at = ctx.s.elapsed();
     let doc = json!({"uri": uri, "languageId": "plaintext", "version": DOC_A_VERSION, "text": text});
     if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await {
-        ctx.report("D1", Verdict::Error, format!("lspcheck couldn't send didOpen: {e}"));
-        ctx.report("D2", Verdict::Error, format!("lspcheck couldn't send didOpen: {e}"));
+        let detail = format!("lspcheck couldn't send didOpen: {e}");
+        for id in ["D1", "D2", "D3"] {
+            ctx.report(id, Verdict::Error, detail.clone());
+        }
         leave(ctx).await;
         return;
     }
-    let docs = [OpenDoc { uri: uri.clone(), versions: vec![Version { at: opened_at, number: DOC_A_VERSION, text }] }];
+    let mut docs = [OpenDoc {
+        uri: uri.clone(),
+        versions: vec![Version { at: opened_at, number: DOC_A_VERSION, text: text.clone() }],
+    }];
 
-    // One request at a time, so a reply always refers to the version current
-    // when it was asked. No reply, or an error, is simply no evidence.
-    let t = ctx.cfg.request_timeout;
     let mut asked = Vec::new();
     let mut notes = Vec::new();
-    for (method, params) in document_requests(&caps, &uri, encoding) {
-        match ask(ctx, method, params).await {
-            Ok((a, answer)) => {
-                asked.push(a);
-                if let Err(e) = answer {
-                    let why = describe_call_error(&CallError::Wait(e), t);
-                    notes.push(format!("{method} went unanswered ({why}), so no more requests were sent"));
-                    break;
-                }
+    ask_all(ctx, document_requests(&caps, &uri, &text, encoding), &mut asked, &mut notes).await;
+    await_diagnostics(ctx, &uri, DOC_A_VERSION, from).await;
+
+    // The change to version 42, the advertised way. A sync kind of None
+    // sends no `didChange`, and D3 skips.
+    let mut change: Option<Change> = None;
+    let mut registered = false;
+    // Set when the `didChange` couldn't be written: D3 is an error, and the
+    // version-42 requests aren't sent, but D1 and D2 are still judged over
+    // everything read, as on the normal path.
+    let mut change_failed: Option<String> = None;
+    if sync != SyncKind::None {
+        // A dynamic registration of the sync notifications, read before the
+        // change was written: lspcheck declares none but answers it with
+        // success, so the server may expect another sync kind. D3 is an
+        // error, and the change is still sent, so D1 and D2 keep their
+        // evidence.
+        registered = ctx.s.messages.iter().any(|(_, m)| sync_registration(m));
+        let (changes, after) = documents::scenario_change(&text, encoding, sync);
+        let change_at = ctx.s.elapsed();
+        let content: Vec<Value> = changes
+            .iter()
+            .map(|c| match c {
+                ContentChange::Full(t) => json!({"text": t}),
+                ContentChange::Text { range, text } => json!({
+                    "range": {
+                        "start": {"line": range.start.line, "character": range.start.character},
+                        "end": {"line": range.end.line, "character": range.end.character},
+                    },
+                    "text": text,
+                }),
+            })
+            .collect();
+        let params = json!({
+            "textDocument": {"uri": uri, "version": DOC_A2_VERSION},
+            "contentChanges": content,
+        });
+        match ctx.s.notify("textDocument/didChange", Some(params)).await {
+            Ok(()) => {
+                change = Some(Change {
+                    at: change_at,
+                    before: text.clone(),
+                    after: after.clone(),
+                    alternatives: documents::alternatives(&text, encoding, sync),
+                });
+                docs[0].versions.push(Version { at: change_at, number: DOC_A2_VERSION, text: after });
+                // The same requests at version 42, with positions of the
+                // changed text, one at a time as before.
+                ask_all(
+                    ctx,
+                    document_requests(&caps, &uri, &docs[0].versions[1].text, encoding),
+                    &mut asked,
+                    &mut notes,
+                )
+                .await;
+                await_diagnostics(ctx, &uri, DOC_A2_VERSION, from).await;
             }
             Err(e) => {
-                notes.push(format!("lspcheck couldn't send {method} ({e}), so no more requests were sent"));
-                break;
+                // The change didn't reach the server: D3 is an error, and the
+                // version-42 requests aren't sent. D1 and D2 are still judged
+                // over everything read, as on the normal path.
+                change_failed = Some(format!("lspcheck couldn't send didChange: {e}"));
             }
         }
     }
-    await_diagnostics(ctx, &uri, DOC_A_VERSION, from).await;
     let end = leave(ctx).await;
 
     // Everything read before `exit` was sent: diagnostics, and the replies
@@ -1471,6 +1569,49 @@ async fn documents(ctx: &mut Ctx<'_>) {
         detail = format!("{detail}; {}", notes.join("; "));
     }
     ctx.report("D2", verdict, detail);
+    if let Some(detail) = change_failed {
+        // The `didChange` didn't reach the server: D3 is an error. D1 and D2
+        // were still judged over everything read, above.
+        ctx.report("D3", Verdict::Error, detail);
+    } else {
+        match change {
+            // The sync kind is None or absent: the client must not send
+            // `didChange`, so there is no change to judge.
+            None => ctx.report(
+                "D3",
+                Verdict::Skip,
+                "the server doesn't take changes (textDocumentSync's change is 0 or absent)",
+            ),
+            // A dynamic registration of the sync notifications, read before
+            // the change was written: the server may expect another sync
+            // kind.
+            Some(_) if registered => ctx.report(
+                "D3",
+                Verdict::Error,
+                "the server registered textDocument/didChange or didOpen dynamically; lspcheck declares no dynamic registration, so the server may expect another sync kind",
+            ),
+            Some(change) => {
+                // D1's judgements of the positions read before the change was
+                // written, and of those that can only refer to the changed
+                // text: a reply to a request sent after the change, or
+                // diagnostics labelled with its version. A late reply to an
+                // earlier request, or unlabelled diagnostics read after the
+                // change, may refer to the text before it; a position invalid
+                // there is D1's finding, not evidence about applying the
+                // change.
+                let after = documents::judge_positions_where(encoding, &docs, &sources, |s| {
+                    documents::only_after(&docs[0], s, change.at)
+                });
+                let incomplete_change = ctx.s.incomplete_within(change.at, end);
+                let (verdict, mut detail) =
+                    documents::judge_d3(encoding, &after, &change, incomplete_change.as_deref());
+                if !notes.is_empty() {
+                    detail = format!("{detail}; {}", notes.join("; "));
+                }
+                ctx.report("D3", verdict, detail);
+            }
+        }
+    }
 }
 
 /// End of input without exit, as when the editor goes away.
@@ -1783,11 +1924,12 @@ async fn framing(ctx: &mut Ctx<'_>) {
 }
 
 /// Whether the server asks for didOpen and didClose: a sync kind other than
-/// None, or `openClose: true`. Without it the client mustn't send them.
+/// None, or `openClose: true`. Without it the client mustn't send them. A
+/// numeric `textDocumentSync` is read as an integer however it is spelled.
 fn opens_documents(reply: &Message) -> bool {
     let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { return false };
     match result.pointer("/capabilities/textDocumentSync") {
-        Some(Value::Number(kind)) => kind.as_i64().is_some_and(|k| k > 0),
+        Some(Value::Number(kind)) => crate::message::integer_value(kind).is_some_and(|k| k > 0),
         Some(Value::Object(options)) => options.get("openClose") == Some(&Value::Bool(true)),
         _ => false,
     }
