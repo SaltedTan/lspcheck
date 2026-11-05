@@ -299,6 +299,8 @@ pub struct Session {
     answers: HashMap<Id, usize>,
     /// Every id a request was sent with, and when it was registered.
     used_ids: HashMap<Id, Duration>,
+    /// Ids handed out by [`Session::fresh_id`], sent or not.
+    reserved: HashSet<Id>,
     /// Ids whose write failed before the whole request reached the server.
     aborted: HashSet<Id>,
     /// Requests that were answered, with when the response was read.
@@ -382,6 +384,7 @@ impl Session {
             pending: HashMap::new(),
             answers: HashMap::new(),
             used_ids: HashMap::new(),
+            reserved: HashSet::new(),
             aborted: HashSet::new(),
             answered: Vec::new(),
             unmatched: Vec::new(),
@@ -567,8 +570,9 @@ impl Session {
         loop {
             let n = (random_u64() % (i32::MAX as u64)) as i64 + 1;
             let id = Id::int(n);
-            if !self.used_ids.contains_key(&id) {
-                self.used_ids.insert(id.clone(), self.start.elapsed());
+            // Handed-out ids are reserved but count as sent only once
+            // registered, so a reply to one never sent stays unasked (J2).
+            if !self.used_ids.contains_key(&id) && self.reserved.insert(id.clone()) {
                 return id;
             }
         }
