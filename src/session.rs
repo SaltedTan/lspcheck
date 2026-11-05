@@ -410,10 +410,18 @@ impl Session {
         skipped.or(unread).or(since)
     }
 
-    /// Takes in everything the server has sent that was already read, without
-    /// waiting for more.
-    pub async fn take_in(&mut self) {
-        self.absorb(Instant::now() + self.opts.write_timeout).await;
+    /// Records everything the server has sent that was already read, without
+    /// waiting for more and without answering its requests (for when
+    /// lspcheck is done talking: an answer that can't be written mustn't keep
+    /// the rest from being recorded).
+    pub fn take_in(&mut self) {
+        while let Ok((at, inbound)) = self.rx.try_recv() {
+            match inbound {
+                Inbound::Message(m) => self.accept(at, &m),
+                Inbound::Closed | Inbound::Stopped => self.stdout_closed = true,
+                Inbound::Problem(_) => {}
+            }
+        }
     }
 
     /// Writes bytes exactly as given, within the write timeout.

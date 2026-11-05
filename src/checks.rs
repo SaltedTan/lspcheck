@@ -698,14 +698,10 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     };
     let t = ctx.cfg.request_timeout;
 
-    // A plain request first, so that a reply to `initialized` is read before
-    // the cancels and isn't taken for a reply to one (C3).
-    let barrier_from = ctx.s.messages.len();
-    let c3_from = match ctx.s.call(PROBE, Some(json!({})), t).await {
-        Ok(m) => m.response_id().and_then(|id| response_index(&ctx.s.messages, id, barrier_from)).map(|i| i + 1),
-        Err(_) => None,
-    };
-    let Some(c3_from) = c3_from else {
+    // A plain request first, so that a reply to `initialized` is most likely
+    // read before the cancels (C3 only counts replies read after the first
+    // cancel was written).
+    if ctx.s.call(PROBE, Some(json!({})), t).await.is_err() {
         for id in CHECKS {
             ctx.report(id, Verdict::Error, "not judged: the plain request sent after `initialized` went unanswered");
         }
@@ -753,7 +749,8 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         }
     };
     let answer = ctx.s.wait_response(&r, deadline).await;
-    // When lspcheck stopped waiting for R, for the downgrade in `run_scenario`.
+    // When lspcheck stopped waiting for R: only a frame it missed between
+    // writing R and then could have been R's answer.
     let r_waited = ctx.s.elapsed();
     let first = answer.as_ref().ok().and_then(|_| response_index(&ctx.s.messages, &r, after_send));
 
@@ -775,7 +772,9 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     // When the cancel for R was sent: a second response to R read before it
     // is C1's finding, one read after it may answer this cancel.
     let mut r_cancelled_at: Option<Duration> = None;
-    let mut c2_problem: Option<(CallError, Duration)> = None;
+    // A plain request in C2 that went unanswered: the error, and when it was
+    // sent and when lspcheck stopped waiting.
+    let mut c2_problem: Option<(CallError, Duration, Duration)> = None;
     let mut c2_unsent: Option<WriteError> = None;
     if stopped.is_none() {
         let targets: &[&Id] = if first.is_some() { &[&unknown, &r] } else { &[&unknown] };
@@ -789,8 +788,9 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             if *cancelled == &r {
                 r_cancelled_at = Some(at);
             }
+            let asked = ctx.s.elapsed();
             if let Err(e) = ctx.s.call(PROBE, Some(json!({})), t).await {
-                c2_problem = Some((e, ctx.s.elapsed()));
+                c2_problem = Some((e, asked, ctx.s.elapsed()));
                 stopped = Some("the server stopped answering (see C2)".into());
                 break;
             }
@@ -811,24 +811,27 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         (Err(wait), _) => {
             let e = CallError::Wait(*wait);
             let why = format!("{which}: no response after $/cancelRequest ({})", describe_call_error(&e, t));
-            (Verdict::Fail, why, Some(r_waited))
+            match ctx.s.incomplete_within(written_at, r_waited) {
+                Some(missed) => (Verdict::Error, format!("inconclusive, because {missed}: {why}")),
+                None => (Verdict::Fail, why),
+            }
         }
         (Ok(m), Some(first)) => {
             let how = describe_cancelled_answer(m);
             let again = window(first + 1).find(|&i| msgs[i].1.response_id() == Some(&r) && !after_r_cancel(msgs[i].0));
             if let Some(i) = again {
                 let then = describe_response(&msgs[i].1);
-                (Verdict::Fail, format!("{which} was answered twice: {how}, then {then}"), None)
+                (Verdict::Fail, format!("{which} was answered twice: {how}, then {then}"))
             } else if let Some(e) = &c1_probe {
                 let why = format!(
                     "inconclusive: {which}: {how}, but the plain request that followed {}, so a second reply could still come",
                     describe_call_error(e, t)
                 );
-                (Verdict::Error, why, None)
+                (Verdict::Error, why)
             } else if let Some(why) = &incomplete {
-                (Verdict::Error, inconclusive(why, &format!("a second response to {which}")), None)
+                (Verdict::Error, inconclusive(why, &format!("a second response to {which}")))
             } else {
-                (Verdict::Pass, format!("{which}: {how}, and only once"), None)
+                (Verdict::Pass, format!("{which}: {how}, and only once"))
             }
         }
         (Ok(_), None) => unreachable!("an answered request is recorded in messages"),
@@ -839,15 +842,19 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         let id = m.response_id()?;
         (*id == unknown || (*id == r && after_r_cancel(*at))).then(|| (id.clone(), describe_response(m)))
     });
-    // C3. After the barrier the only notifications lspcheck sent before `exit`
-    // are the cancels, so a response with no usable id answers one of them.
-    let violation = window(c3_from).find_map(|i| {
+    // C3. From the first cancel until `exit` the only notifications lspcheck
+    // sent are the cancels, so a response with no usable id answers one of
+    // them. (A malformed message that does carry an id is J5's business.)
+    let violation = window(after_send).filter(|&i| msgs[i].0 >= written_at).find_map(|i| {
         let (at, m) = &msgs[i];
         match &m.kind {
             Kind::Response { id: Id::Null, outcome } => {
                 Some(format!("at {} ms, sent {} with id null", at.as_millis(), describe_outcome(outcome)))
             }
-            Kind::Invalid(_) if m.value.get("result").is_some() || m.value.get("error").is_some() => {
+            Kind::Invalid(_)
+                if (m.value.get("result").is_some() || m.value.get("error").is_some())
+                    && m.value.get("id").is_none_or(Value::is_null) =>
+            {
                 let text = session::preview(m.value.to_string().as_bytes());
                 Some(format!("at {} ms, sent a response without an id: {text}", at.as_millis()))
             }
@@ -856,7 +863,6 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     });
 
     ctx.report("C1", c1.0, c1.1);
-    ctx.results.last_mut().expect("just reported").absent_at = c1.2;
 
     if let Some((id, what)) = offending {
         let whose = if id == r { "the finished request" } else { "an id never sent" };
@@ -865,17 +871,18 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         ctx.report("C2", Verdict::Error, "not judged: the server stopped answering (see C1)");
     } else if let Some(e) = c2_unsent {
         ctx.report("C2", Verdict::Error, format!("lspcheck couldn't send a $/cancelRequest: {e}"));
-    } else if let Some((e, waited)) = c2_problem {
+    } else if let Some((e, asked, waited)) = c2_problem {
         let why = format!(
             "the server stopped answering after cancelling an unknown or finished request ({})",
             describe_call_error(&e, t)
         );
-        match e {
-            CallError::Wait(_) => {
-                ctx.fail("C2", why);
-                ctx.results.last_mut().expect("just reported").absent_at = Some(waited);
+        // Only a frame lspcheck missed while waiting could have been the answer.
+        match (e, ctx.s.incomplete_within(asked, waited)) {
+            (CallError::Write(_), _) => ctx.report("C2", Verdict::Error, why),
+            (CallError::Wait(_), Some(missed)) => {
+                ctx.report("C2", Verdict::Error, format!("inconclusive, because {missed}: {why}"))
             }
-            CallError::Write(_) => ctx.report("C2", Verdict::Error, why),
+            (CallError::Wait(_), None) => ctx.fail("C2", why),
         }
     } else if let Some(why) = &incomplete {
         ctx.report("C2", Verdict::Error, inconclusive(why, "a reply to one of the cancels"));
@@ -908,7 +915,7 @@ async fn leave(ctx: &mut Ctx<'_>) -> Duration {
     if shut && ctx.s.notify("exit", None).await.is_ok() {
         let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
     }
-    ctx.s.take_in().await;
+    ctx.s.take_in();
     end
 }
 

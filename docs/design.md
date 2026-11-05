@@ -89,17 +89,18 @@ whole, because a missing reply to it can't be told apart from a slow start.
 | C2 | MUST | Cancelling an unknown id or an already-answered id produces nothing and the server keeps serving. |
 | C3 | MUST | No response to `$/cancelRequest` itself. |
 
-C1 to C3 share one scenario. After `initialize`, a plain request's answer marks where C3 starts looking, so that a
-reply to `initialized` isn't taken for a reply to a cancel. lspcheck then sends one request (`workspace/symbol` when the
+C1 to C3 share one scenario. After `initialize`, a plain request makes it likely that any reply to `initialized` is
+read before the cancels, since C3 counts only replies read after the first cancel was written. lspcheck then sends one request (`workspace/symbol` when the
 server advertises `workspaceSymbolProvider`, otherwise an unknown-method probe) and its `$/cancelRequest` before reading
 anything, waits for the request's response, and sends a plain request. Next it cancels an id it never sent and then the
 finished request, each followed by a plain request, and finally shuts the server down. A reply to a cancel can come at
 any time, so the verdicts are given at the end, over everything read before `exit` was sent: a second response to the
 cancelled request fails C1 when it was read before lspcheck cancelled that request again, and C2 when after; a response
 carrying the never-sent id fails C2, and so does a plain request that goes unanswered after the cancels; a response with
-id `null`, or an object with `result` or `error` but no id, fails C3. If the server stopped answering, what it didn't
+id `null`, or an object with `result` or `error` and no id, fails C3. If the server stopped answering, what it didn't
 send can't be judged, so those checks are `error`, and so are passes when a frame lspcheck skipped or couldn't read came
-before `exit` (it may have held the reply).
+between the cancelled request and `exit` (it may have held the reply). A missing response is excused the same way only
+by a frame missed while lspcheck was waiting for it.
 
 ### Documents and positions (richer with a profile document)
 | ID | Basis | Check |

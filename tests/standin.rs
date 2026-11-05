@@ -560,6 +560,28 @@ fn a_skipped_frame_makes_cancellation_passes_inconclusive() {
 }
 
 #[test]
+fn c3_counts_only_id_less_replies_read_after_the_first_cancel() {
+    // A reply to `initialized` read before any cancel was sent can't answer one.
+    expect(&fault("null-reply-after-first-probe"), "C3", "pass");
+    // A malformed answer to shutdown still carries shutdown's id.
+    expect(&fault("shutdown-no-jsonrpc"), "C3", "pass");
+}
+
+#[test]
+fn a_reply_queued_behind_an_unanswerable_request_is_still_judged() {
+    // The id-null reply arrives with shutdown's answer, behind a request whose
+    // answer lspcheck can't write because the server stopped reading.
+    expect(&fault("shutdown-block"), "C3", "fail");
+}
+
+#[test]
+fn a_frame_skipped_before_the_cancelled_request_doesnt_excuse_its_absence() {
+    let r =
+        run(&["--fault", "big-frame", "--fault", "cancelled-no-reply"], &["--max-frame-mib", "1", "--timeout", "3"]);
+    expect(&r, "C1", "fail");
+}
+
+#[test]
 fn a_frame_skipped_after_a_cancelled_request_went_unanswered_doesnt_excuse_it() {
     // The oversized frame comes only after lspcheck stopped waiting for the
     // cancelled request, so it can't have been its answer.

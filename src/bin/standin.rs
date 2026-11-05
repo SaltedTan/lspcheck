@@ -75,6 +75,12 @@ const FAULTS: &[(&str, &str)] = &[
     ("reply-to-cancel", "answer every $/cancelRequest with an error whose id is null"),
     ("late-cancel-replies", "send what the cancel faults send only after answering the next request"),
     ("big-cancel-replies", "pad what the cancel faults send with 2 MiB of error data"),
+    ("null-reply-after-first-probe", "after initialize, follow the first answer with an error whose id is null"),
+    ("shutdown-no-jsonrpc", "leave \"jsonrpc\" out of the answer to shutdown"),
+    (
+        "shutdown-block",
+        "on shutdown, send its answer, a huge configuration request and an error with id null, then stop reading",
+    ),
     ("big-frame-after-drop", "after cancelled-no-reply drops a request, send a 2 MiB log message with the next answer"),
     ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
@@ -130,6 +136,8 @@ fn main() {
         CancelOut { late: fault("late-cancel-replies"), big: fault("big-cancel-replies"), held: Vec::new() };
     // Set when cancelled-no-reply drops a request, for big-frame-after-drop.
     let mut dropped = false;
+    // For null-reply-after-first-probe: whether a request was answered since initialize.
+    let mut answered_one = false;
     let mut children: Vec<Child> = Vec::new();
     loop {
         if !input.ready() {
@@ -391,7 +399,23 @@ fn main() {
                     pipe.flush().unwrap();
                     std::process::exit(0);
                 }
-                out.frame(&ok(&id, result));
+                if fault("shutdown-block") {
+                    // One write, so lspcheck reads all three before it can
+                    // send exit; the configuration answer can't be written.
+                    let items = vec![json!({"section": "x"}); 40_000];
+                    let config = json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": items}});
+                    let mut bytes = out.encode(&ok(&id, result));
+                    bytes.extend(out.encode(&config));
+                    bytes.extend(out.encode(&cancel_reply()));
+                    out.raw(&bytes);
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    std::process::exit(1);
+                }
+                let mut reply = ok(&id, result);
+                if fault("shutdown-no-jsonrpc") {
+                    reply.as_object_mut().unwrap().remove("jsonrpc");
+                }
+                out.frame(&reply);
             }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
@@ -399,6 +423,10 @@ fn main() {
             _ if fault("ignore-unknown-requests") => {}
             _ if fault("wrong-unknown-error") => out.frame(&err(&id, -32600, "unknown")),
             _ => out.frame(&err(&id, -32601, "method not found")),
+        }
+        if !std::mem::replace(&mut answered_one, true) && fault("null-reply-after-first-probe") {
+            // As if `initialized` had been answered late.
+            out.frame(&err(&Value::Null, -32601, "unknown notification"));
         }
         cancel_out.flush(&mut out);
     }
