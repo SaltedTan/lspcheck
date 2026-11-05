@@ -114,10 +114,10 @@ without a version leaves D2 `N/E`, and a `version` that is `null` or not an inte
 The same scenario also checks positions after a change (D3): lspcheck sends a `didChange` the way the server's
 textDocumentSync kind asks (an incremental edit that replaces a 4-byte character and adds a line, or the full text),
 then asks the document requests again and reads the new diagnostics. Every position the server sends after the change
-must refer to the changed text. A position that falls inside a character of the changed text fails D3 when the server
-was seen counting correctly before the change, or when it fits a text the change should have produced (the text before
-the change, or the change applied counting its range in another encoding); otherwise D3 is `ERROR` and D1 carries the
-failure. A server that takes no changes leaves D3 `SKIP`.
+must refer to the changed text. A position that falls inside a character of the changed text fails D3 when no other
+reading of the changed text explains it (counted in another encoding) and a text the change should have produced does
+(the text before the change, or the change applied counting its range in another encoding); otherwise D3 is `ERROR`
+and D1 carries the failure. A server that takes no changes leaves D3 `SKIP`.
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of

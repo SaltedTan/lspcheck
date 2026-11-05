@@ -23,8 +23,8 @@
   - D3, positions after a change: the `documents` scenario now sends a `didChange` the way the server's
     `textDocumentSync` kind asks (an incremental edit that replaces a 4-byte character and adds a line, or the full
     text), then asks the document requests again and reads the new diagnostics. A position that falls inside a
-    character of the changed text fails D3 when the server was seen counting correctly before the change, or when it
-    fits a text the change should have produced; otherwise D3 is an error and D1 carries the failure. A server that
+    character of the changed text fails D3 when no other counting of the changed text explains it and a text the
+    change should have produced does; otherwise D3 is an error and D1 carries the failure. A server that
     takes no changes leaves D3 skipped.
 - The text model behind the upcoming document checks (`src/text.rs`): the spec's line split, the UTF-8/UTF-16/UTF-32
   position encodings, the character-boundary test, applying content changes, and the table of the positions a reply

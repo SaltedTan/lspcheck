@@ -1599,24 +1599,12 @@ async fn documents(ctx: &mut Ctx<'_>) {
                 // change, may refer to the text before it; a position invalid
                 // there is D1's finding, not evidence about applying the
                 // change.
-                let before = documents::judge_positions_where(encoding, &docs, &sources, |s| s.read_at < change.at);
                 let after = documents::judge_positions_where(encoding, &docs, &sources, |s| {
                     documents::only_after(&docs[0], s, change.at)
                 });
-                // The pin: the server reported `word`'s exact span before the
-                // change, counted in the negotiated encoding.
-                let pinned = documents::word_span_pinned(&docs, &sources, encoding, |s| s.read_at < change.at);
-                let incomplete_before = ctx.s.incomplete_within(opened_at, change.at);
                 let incomplete_change = ctx.s.incomplete_within(change.at, end);
-                let (verdict, mut detail) = documents::judge_d3(
-                    encoding,
-                    &before,
-                    &after,
-                    &change,
-                    pinned,
-                    incomplete_before.as_deref(),
-                    incomplete_change.as_deref(),
-                );
+                let (verdict, mut detail) =
+                    documents::judge_d3(encoding, &after, &change, incomplete_change.as_deref());
                 if !notes.is_empty() {
                     detail = format!("{detail}; {}", notes.join("; "));
                 }

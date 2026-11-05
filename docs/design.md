@@ -191,27 +191,24 @@ diagnostics, may refer to version 41, so a position in them that is invalid is D
   those; lspcheck declares no dynamic registration but answers registrations with success, so the server may
   expect another sync kind); the `didChange` couldn't be sent; or nothing failed but lspcheck missed evidence the
   server sent from the change on.
-- **fail:** a position read after the change is invalid in version 42, and either (a) D1's judgement of the positions
-  read before the change found informative positions, all valid, with no missed evidence before the change, and the
-  server reported `word`'s span on line 0 of version 41 exactly as it is counted in the negotiated encoding (the
-  *pin*: a miscounting server reports some other span for it), so the server was seen counting correctly and the
-  fault is in applying the change; or (b) the position falls on a boundary of an *alternative* text, and on no
-  boundary within its line of version 42 under any other encoding, UTF-32 included (which would be a counting fault,
-  D1's). Rule (b) therefore fires only for positions past a line's end under every other reading. The
-  alternative texts are the text before the change (an ignored change, a stale snapshot, or the file read from
-  disk) and, for an incremental sync, the change applied with its range counted in each other encoding. The detail
-  names the first few such positions with which alternative fits.
-- **error:** a position is invalid after the change, but neither (a) nor (b) holds: "can't tell a change-handling
-  fault from a counting fault; see D1".
+- **fail:** a position read after the change is inside a character of version 42 in the negotiated encoding, on no
+  boundary within its line of version 42 under any other encoding (UTF-8, UTF-16 or UTF-32), and on a boundary of an
+  *alternative* text, counted in the negotiated encoding. The alternative texts are the text before the change (an
+  ignored change, a stale snapshot, or the file read from disk) and, for an incremental sync, the change applied with
+  its range counted in each other encoding. No reading of the changed text explains such a position, and a text the
+  change should have produced does. The detail names the first few, each with the alternative it fits.
+- **error:** a position is invalid after the change, but some other reading of the changed text explains it, or no
+  alternative does: "can't tell a change-handling fault from a counting fault; see D1".
 - **not-exercised:** the server chose UTF-32, where no offset can fall inside a character, or no informative position
   was judged after the change.
 - **pass:** otherwise, with the number of informative positions judged after the change.
 
-A counting fault is told from a change-handling fault by the pin and by `word`'s span in the changed text: a server
-that applied the change correctly but counted in another encoding reports `word`'s span as it is in the changed text
-under that encoding, which a server that miscounted or mis-applied the change does not; when it does, neither (a)
-nor (b) holds. (In code points every in-line offset is a boundary, so the per-position guard belongs to (b) only: on
-(a) it would excuse every server.)
+Valid positions before the change are never taken as proof that the server counts correctly, so they never blame the
+change: a coincidence (code-point offsets that equal UTF-16 ones), an echo of a position lspcheck sent, or a server
+that counts some positions one way and some another all look the same. In code points every in-line offset is a
+boundary, so a change mishandled only on line 0 usually stays `ERROR` (D1 fails it); positions on the inserted line,
+whose offsets in the old text run past its code-point length, are what separate an ignored change from a counting
+fault.
 Positions in every alternative text are counted in the negotiated encoding: a server that ignored the
 change, or counted its range wrongly, still counts its positions as agreed.
 

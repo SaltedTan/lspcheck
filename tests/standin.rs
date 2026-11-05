@@ -967,23 +967,25 @@ fn positions_counted_in_the_wrong_units_fail_d1() {
 
 #[test]
 fn a_change_the_server_doesnt_apply_fails_d1_and_d3() {
-    // The old text's positions, labelled with the new version, are inside
-    // characters of the changed text, and the server reported `word`'s span
-    // exactly before the change, so it counts in the negotiated encoding:
-    // the fault is in applying the change.
+    // The old text's positions, labelled with the new version: some, on the
+    // inserted emoji line, are on no boundary of the changed text counted any
+    // way, but on a boundary of the text before the change.
     let r = fault("ignore-changes");
     only_fails(&r, &["D1", "D3"]);
     assert_eq!(r.status, 1, "D1 and D3 are MUST checks");
-    assert!(r.stdout.contains("the server reported word's span exactly before the change"), "{}", r.stdout);
+    assert!(r.stdout.contains("(fits the text before the change)"), "{}", r.stdout);
 }
 
 #[test]
-fn change_ranges_counted_in_code_points_fail_d1_and_d3() {
+fn change_ranges_counted_in_code_points_fail_d1_and_d3_is_an_error() {
     // The stand-in replaces two emoji where lspcheck's range names one, so
-    // its `word` and line ends land inside characters of the changed text.
+    // its positions on line 0 land inside characters of the changed text.
+    // Each is also an in-line offset of the changed text counted in code
+    // points, so a server that applied the change and counts code points
+    // would report the same: D3 can't blame the change, and D1 fails.
     let r = fault("codepoint-changes");
-    only_fails(&r, &["D1", "D3"]);
-    assert_eq!(r.status, 1, "D1 and D3 are MUST checks");
+    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault"), "{}", r.stdout);
 }
 
 #[test]
