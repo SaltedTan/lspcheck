@@ -27,7 +27,8 @@
   naming the workspace and the files it held.
 - `lspcheck replay`: re-runs one recorded session against a server, recreating its workspace and re-sending every
   client write in order. It reports each request's outcome against the recorded one, the exit status recorded versus
-  now, and how many server-to-client requests were answered; it judges no check.
+  now, and how many server-to-client requests were answered; it judges no check. Replay preserves stdin-close events,
+  only skips complete server responses, and refuses to overwrite output files or workspace contents it does not own.
 - Inspection limits (`--max-output-mib`, `--max-frame-mib`) that make results inconclusive rather than failed, when the
   missing output could explain them. Requests lspcheck couldn't deliver give errors, not failures.
 - `lspcheck-standin`, a test server with switchable faults.

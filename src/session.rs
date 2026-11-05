@@ -84,6 +84,7 @@ pub enum EventKind {
     },
     Stderr(Vec<u8>),
     StdoutClosed,
+    StdinClosed,
     Exited(String),
     Note(String),
     /// The workspace the server runs in and the files in it, so a transcript
@@ -688,7 +689,9 @@ impl Session {
 
     /// Closes the server's stdin.
     pub fn close_stdin(&mut self) {
-        self.stdin = None;
+        if self.stdin.take().is_some() {
+            record(&self.transcript, self.start.elapsed(), EventKind::StdinClosed);
+        }
     }
 
     /// Takes in what has already been read, without waiting for more and
@@ -1040,7 +1043,7 @@ async fn read_stdout(
             }
         };
         let problem = match chunk {
-            Chunk::Frame { headers, body, start } => {
+            Chunk::Frame { headers, body, start, .. } => {
                 content_types(&mut ev, &headers);
                 match Message::parse(&body) {
                     Ok(m) => {

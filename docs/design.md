@@ -218,16 +218,17 @@ Without a profile: an empty temp workspace and a `plaintext` document. Generic c
 - `--json`: versioned `report-v1` schema (checks, basis, verdict, evidence, timings, server argv, checker version,
   host OS/arch, profile hash). `--junit` for CI test tabs; `--markdown` for a GitHub step summary.
 - `--transcripts DIR`: one JSONL per session with direction, monotonic timestamp, raw bytes (base64 when not UTF-8),
-  how the reader split them into frames, and stderr. Each file opens with a meta line naming the workspace and the
+  how the reader split them into frames, and stderr. Each file includes a meta line naming the workspace and the
   files it held, so a replay can recreate it.
 - `lspcheck replay TRANSCRIPT -- SERVER`: re-runs one recorded session against a server. It recreates the recorded
-  workspace (refusing an existing non-empty one, and removing it afterwards), re-sends every client write in order
-  (gaps of 200 ms or more kept as pauses), and answers server-to-client requests with the same auto-answers a live run
+  workspace (refusing a non-empty or symlink path; preserving an existing empty directory), re-sends every client write
+  in order (gaps under 200 ms kept as pauses), and answers server-to-client requests with the same auto-answers a live run
   uses. It reports each request's outcome against the recorded one (result / error code / no reply), the exit status
   recorded versus now, and how many server-to-client requests were answered. It judges no check: the summary says to
-  run `lspcheck --only ID` to judge. `--transcript FILE` writes the replay's own transcript (never overwriting the
-  input); transcripts without a workspace line replay in the current directory with a note. Exit 0 when the replay ran,
-  2 for usage errors and unreadable transcripts.
+  run `lspcheck --only ID` to judge. `--transcript FILE` writes the replay's own transcript without overwriting an
+  existing path. Transcripts without a workspace line replay in the current directory with a note. The transcript
+  includes `{"dir":"meta","event":"stdin closed"}` when lspcheck closes stdin. Exit 0 when the replay ran, 2 for usage
+  errors and unreadable transcripts.
 
 ## Architecture
 Single crate, `src/` modules:

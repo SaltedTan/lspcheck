@@ -111,13 +111,19 @@ fn main() {
             p.set_file_name(format!("{stem}.replay.jsonl"));
             p
         });
-        let overwrites = match (output.canonicalize(), transcript.canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => output == transcript,
-        };
-        if overwrites {
-            eprintln!("lspcheck replay: the replay transcript would overwrite the input {}", transcript.display());
-            std::process::exit(2);
+        match std::fs::symlink_metadata(&output) {
+            Ok(_) => {
+                eprintln!(
+                    "lspcheck replay: output {} already exists; pass --transcript to choose another path or remove it",
+                    output.display()
+                );
+                std::process::exit(2);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("lspcheck replay: can't inspect output {}: {e}", output.display());
+                std::process::exit(2);
+            }
         }
         process::enable_subreaper();
         let server_cmd = ServerCommand::new(&server);

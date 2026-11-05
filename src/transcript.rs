@@ -16,7 +16,17 @@ use std::path::Path;
 
 /// Writes `events` to `path` as JSON Lines.
 pub fn write(path: &Path, events: &[Event]) -> std::io::Result<()> {
-    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    write_events(std::fs::File::create(path)?, events)
+}
+
+/// Writes `events` to a new path as JSON Lines, refusing to replace anything.
+pub fn write_new(path: &Path, events: &[Event]) -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    write_events(file, events)
+}
+
+fn write_events(file: std::fs::File, events: &[Event]) -> std::io::Result<()> {
+    let mut out = std::io::BufWriter::new(file);
     for e in events {
         let t = e.at.as_secs_f64() * 1000.0;
         let line = match &e.kind {
@@ -27,6 +37,7 @@ pub fn write(path: &Path, events: &[Event]) -> std::io::Result<()> {
             }
             EventKind::Stderr(b) => with_bytes(json!({"t_ms": t, "dir": "err"}), b),
             EventKind::StdoutClosed => json!({"t_ms": t, "dir": "meta", "event": "stdout closed"}),
+            EventKind::StdinClosed => json!({"t_ms": t, "dir": "meta", "event": "stdin closed"}),
             EventKind::Exited(how) => {
                 json!({"t_ms": t, "dir": "meta", "event": "exited", "how": how})
             }
