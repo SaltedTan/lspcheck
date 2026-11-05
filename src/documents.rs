@@ -86,6 +86,12 @@ pub struct Published {
     pub read_at: Duration,
 }
 
+/// A document version's value, when it is a JSON integer that fits, however
+/// it is spelled: `42`, `42.0` and `4.2e1` are all 42.
+pub fn version_number(v: &Value) -> Option<i64> {
+    v.as_number().and_then(crate::message::integer_value)
+}
+
 /// Whether two URIs name the same document: equal as written, or equal
 /// after percent-decoding and lower-casing a Windows drive letter.
 pub fn same_uri(a: &str, b: &str) -> bool {
@@ -351,7 +357,7 @@ pub fn judge_d2(docs: &[OpenDoc], published: &[Published], incomplete: Option<&s
     let (mut checked, mut unversioned, mut unjudged) = (0usize, 0usize, 0usize);
     for p in published {
         let Some(doc) = docs.iter().find(|d| same_uri(&d.uri, &p.uri)) else { continue };
-        let Some(n) = p.version.as_ref().and_then(Value::as_i64) else {
+        let Some(n) = p.version.as_ref().and_then(version_number) else {
             match p.version {
                 None => unversioned += 1,
                 Some(_) => unjudged += 1,
@@ -713,6 +719,24 @@ mod tests {
         let (v, detail) = judge_d2(&d, &[publish("file:///w/other.txt", serde_json::json!(999), 50)], None);
         assert_eq!(v, Verdict::NotExercised);
         assert_eq!(detail, "no versioned diagnostics notification for an opened document arrived");
+    }
+
+    #[test]
+    fn d2_judges_integer_versions_however_they_are_spelled() {
+        let d = [doc(&[(10, 41, "a")])];
+        let parsed = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        // 41.0 and 4.1e1 are version 41, which was sent.
+        for text in ["41.0", "4.1e1", "410e-1"] {
+            let (v, detail) = judge_d2(&d, &[publish(URI, parsed(text), 50)], None);
+            assert_eq!(v, Verdict::Pass, "{text}: {detail}");
+        }
+        // 42.0 and 4.2e1 are version 42, which wasn't.
+        for text in ["42.0", "4.2e1"] {
+            let (v, detail) = judge_d2(&d, &[publish(URI, parsed(text), 50)], None);
+            assert_eq!(v, Verdict::Fail, "{text}: {detail}");
+            assert!(detail.contains("carries version 42"), "{text}: {detail}");
+        }
+        assert_eq!(version_number(&parsed("41.5")), None);
     }
 
     #[test]

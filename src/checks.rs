@@ -1310,7 +1310,7 @@ async fn ask(
 fn labelled_diagnostics(m: &Message, uri: &str, version: i64) -> bool {
     m.method() == Some(PUBLISH_DIAGNOSTICS)
         && m.value.pointer("/params/uri").and_then(Value::as_str).is_some_and(|u| documents::same_uri(u, uri))
-        && m.value.pointer("/params/version").and_then(Value::as_i64) == Some(version)
+        && m.value.pointer("/params/version").and_then(documents::version_number) == Some(version)
 }
 
 /// Reads until diagnostics for `uri` labelled `version` have been read (from
@@ -1436,7 +1436,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
                 found: text::positions(PUBLISH_DIAGNOSTICS, &params, None),
                 asked_at: None,
                 read_at: *at,
-                label: params.get("version").and_then(Value::as_i64),
+                label: params.get("version").and_then(documents::version_number),
             });
         }
     }
