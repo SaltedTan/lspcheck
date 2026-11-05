@@ -42,6 +42,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("ignore-pre-init-requests", "never answer requests before initialize"),
     ("reply-to-pre-init-notification", "answer a notification before initialize with an error whose id is null"),
     ("late-reply-to-pre-init-notification", "like reply-to-pre-init-notification, after the next request's answer"),
+    ("replay-gate", "ask a client request and answer it only after the client answers workspace/configuration"),
     ("reinitialize", "answer a second initialize as if it were the first"),
     ("exit-on-reinitialize", "exit on a second initialize"),
     ("post-shutdown-results", "answer requests after shutdown normally"),
@@ -175,6 +176,7 @@ fn main() {
     }
     let mut input = Input { inner: std::io::stdin().lock(), buf: Vec::new(), faults: faults.clone() };
     let (mut initialized, mut shut_down) = (false, false);
+    let mut replay_gate_id: Option<Value> = None;
     // A reply to a notification, held until the next request has been answered.
     let mut late_reply: Option<Value> = None;
     // A workspace/symbol request whose reply waits for the next message.
@@ -231,6 +233,12 @@ fn main() {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
         // An answer to one of this server's own requests: nothing to do.
         if msg.get("method").is_none() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+            if fault("replay-gate")
+                && msg.get("id").is_some_and(|id| id == "cfg")
+                && let Some(id) = replay_gate_id.take()
+            {
+                out.frame(&ok(&id, Value::Null));
+            }
             continue;
         }
         if fault("exit-on-string-id") && msg.get("id").is_some_and(Value::is_string) {
@@ -338,6 +346,9 @@ fn main() {
                 );
             }
             if method == "exit" && !fault("ignore-exit") {
+                if fault("replay-gate") && replay_gate_id.is_some() {
+                    std::process::exit(9);
+                }
                 if fault("reply-to-exit") {
                     out.frame(&err(&Value::Null, -32601, "unknown notification"));
                 }
@@ -385,6 +396,13 @@ fn main() {
             Some(s) if fault("string-id-to-number") => s.parse::<i64>().map_or(id, |n| json!(n)),
             _ => id,
         };
+        if fault("replay-gate") && method == "m" {
+            replay_gate_id = Some(id);
+            out.frame(
+                &json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": []}}),
+            );
+            continue;
+        }
         if method == "initialize" && initialized && !fault("reinitialize") {
             if fault("exit-on-reinitialize") {
                 std::process::exit(3);

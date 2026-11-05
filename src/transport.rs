@@ -30,7 +30,7 @@ pub struct Header {
 pub enum Chunk {
     /// A complete frame: its headers, exactly `Content-Length` body bytes,
     /// and where in the stream the body starts.
-    Frame { headers: Vec<Header>, body: Vec<u8>, start: usize },
+    Frame { headers: Vec<Header>, body: Vec<u8>, start: usize, frame_start: usize },
     /// Bytes outside any frame, such as a log line written to stdout.
     Garbage(Vec<u8>),
     /// A header section that isn't valid. The reader skips past it.
@@ -60,7 +60,7 @@ pub struct FrameReader {
     /// The stream offset of `buf[0]`.
     offset: usize,
     /// A frame whose body is being read: its headers, length, and where the body starts.
-    pending: Option<(Vec<Header>, usize, usize)>,
+    pending: Option<(Vec<Header>, usize, usize, usize)>,
     /// An oversized body being skipped: its headers, length, and bytes left.
     skipping: Option<(Vec<Header>, usize, usize)>,
     /// Set after [`Chunk::HeaderLimit`]: everything after is discarded.
@@ -108,14 +108,14 @@ impl FrameReader {
                 self.synced = true;
                 continue;
             }
-            if let Some((_, len, _)) = &self.pending {
+            if let Some((_, len, _, _)) = &self.pending {
                 let len = *len;
                 if self.buf.len() < len {
                     break;
                 }
-                let (headers, _, start) = self.pending.take().expect("pending frame");
+                let (headers, _, start, frame_start) = self.pending.take().expect("pending frame");
                 let body = self.take(len);
-                out.push(Chunk::Frame { headers, body, start });
+                out.push(Chunk::Frame { headers, body, start, frame_start });
                 self.synced = true;
                 continue;
             }
@@ -124,7 +124,7 @@ impl FrameReader {
             }
             if self.synced {
                 match self.try_header_here() {
-                    Here::Parsed(headers, len) => self.start_body(headers, len),
+                    Here::Parsed(headers, len, frame_start) => self.start_body(headers, len, frame_start),
                     Here::Wait => break,
                     Here::NotAHeader => self.synced = false,
                     Here::TooLong => {
@@ -150,9 +150,10 @@ impl FrameReader {
             let window = &self.buf[..self.buf.len().min(self.max_header)];
             match find(window, b"\r\n\r\n") {
                 Some(end) => {
+                    let frame_start = self.offset;
                     let block = self.take(end + 4);
                     match parse_header_block(&block[..end]) {
-                        Ok((headers, len)) => self.start_body(headers, len),
+                        Ok((headers, len)) => self.start_body(headers, len, frame_start),
                         Err(reason) => out.push(Chunk::BadHeader { block, reason }),
                     }
                 }
@@ -172,12 +173,17 @@ impl FrameReader {
         out
     }
 
-    fn start_body(&mut self, headers: Vec<Header>, len: usize) {
+    fn start_body(&mut self, headers: Vec<Header>, len: usize, frame_start: usize) {
         if len > self.max_body {
             self.skipping = Some((headers, len, len));
         } else {
-            self.pending = Some((headers, len, self.offset));
+            self.pending = Some((headers, len, self.offset, frame_start));
         }
+    }
+
+    /// Whether no bytes or frame body are pending from an earlier feed.
+    pub fn is_idle(&self) -> bool {
+        self.buf.is_empty() && self.pending.is_none() && self.skipping.is_none() && !self.stopped
     }
 
     /// Removes the first `n` buffered bytes, keeping track of the stream offset.
@@ -199,8 +205,9 @@ impl FrameReader {
         match find(window, b"\r\n\r\n") {
             Some(end) => match parse_header_block(&self.buf[..end]) {
                 Ok((headers, len)) => {
+                    let frame_start = self.offset;
                     self.take(end + 4);
-                    Here::Parsed(headers, len)
+                    Here::Parsed(headers, len, frame_start)
                 }
                 Err(_) => Here::NotAHeader,
             },
@@ -219,7 +226,7 @@ impl FrameReader {
         let rest = std::mem::take(&mut self.buf);
         if let Some((headers, content_length, left)) = self.skipping.take() {
             out.push(Chunk::Truncated { headers, content_length, received: content_length - left });
-        } else if let Some((headers, content_length, _)) = self.pending.take() {
+        } else if let Some((headers, content_length, _, _)) = self.pending.take() {
             out.push(Chunk::Truncated { headers, content_length, received: rest.len() });
         } else if !rest.is_empty() {
             let header_like = (self.synced && invalid_line_end(&rest).is_none()) || find_anchor(&rest) == Some(0);
@@ -234,7 +241,7 @@ impl FrameReader {
 }
 
 enum Here {
-    Parsed(Vec<Header>, usize),
+    Parsed(Vec<Header>, usize, usize),
     Wait,
     NotAHeader,
     TooLong,
@@ -592,6 +599,14 @@ mod tests {
                 })
                 .collect();
             assert_eq!(starts, vec![4 + 21, 4 + 21 + 2 + 21], "split at {split}");
+            let frame_starts: Vec<usize> = out
+                .iter()
+                .filter_map(|c| match c {
+                    Chunk::Frame { frame_start, .. } => Some(*frame_start),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(frame_starts, vec![4, 4 + 21 + 2], "split at {split}");
         }
     }
 
@@ -627,9 +642,9 @@ mod tests {
             read_all(&stream),
             vec![
                 Chunk::Garbage(b"starting server\n".to_vec()),
-                Chunk::Frame { headers: cl("2"), body: b"{}".to_vec(), start: 37 },
+                Chunk::Frame { headers: cl("2"), body: b"{}".to_vec(), start: 37, frame_start: 16 },
                 Chunk::Garbage(b"oops".to_vec()),
-                Chunk::Frame { headers: cl("2"), body: b"[]".to_vec(), start: 64 },
+                Chunk::Frame { headers: cl("2"), body: b"[]".to_vec(), start: 64, frame_start: 43 },
             ]
         );
     }

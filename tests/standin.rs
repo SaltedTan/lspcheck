@@ -7,6 +7,8 @@
 
 #![cfg(feature = "standin")]
 
+use lspcheck::message::{Kind, Message};
+use lspcheck::transport::{Chunk, FrameReader};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
@@ -29,6 +31,17 @@ struct Run {
 /// Runs `lspcheck [lspcheck_args] -- <server>` with a watchdog.
 fn run_command(lspcheck_args: &[&str], server: &[&str], cwd: Option<&std::path::Path>) -> Run {
     let dir = tempfile::tempdir().unwrap();
+    run_command_in(lspcheck_args, server, cwd, dir.path().join("t"))
+}
+
+/// The same, with the transcripts directory chosen by the caller.
+fn run_command_in(
+    lspcheck_args: &[&str],
+    server: &[&str],
+    cwd: Option<&std::path::Path>,
+    transcripts: std::path::PathBuf,
+) -> Run {
+    let dir = tempfile::tempdir().unwrap();
     let report = dir.path().join("report.json");
     let mut cmd = Command::new(LSPCHECK);
     // Defaults the caller can override.
@@ -41,7 +54,7 @@ fn run_command(lspcheck_args: &[&str], server: &[&str], cwd: Option<&std::path::
         .arg("--json")
         .arg(&report)
         .arg("--transcripts")
-        .arg(dir.path().join("t"))
+        .arg(&transcripts)
         .arg("--")
         .args(server)
         .stdout(Stdio::piped())
@@ -75,7 +88,7 @@ fn run_command(lspcheck_args: &[&str], server: &[&str], cwd: Option<&std::path::
         .map(|r| (r["id"].as_str().unwrap().to_string(), r["verdict"].as_str().unwrap().to_string()))
         .collect();
     let mut server_stderr = String::new();
-    if let Ok(entries) = std::fs::read_dir(dir.path().join("t")) {
+    if let Ok(entries) = std::fs::read_dir(&transcripts) {
         for entry in entries {
             let path = entry.unwrap().path();
             for line in std::fs::read_to_string(&path).unwrap().lines() {
@@ -93,6 +106,71 @@ fn run_command(lspcheck_args: &[&str], server: &[&str], cwd: Option<&std::path::
 fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
     let server: Vec<&str> = std::iter::once(STANDIN).chain(standin_args.iter().copied()).collect();
     run_command(lspcheck_args, &server, None)
+}
+
+/// Like [`run`], but keeps the transcripts directory alive and returns it.
+fn run_with_transcripts(standin_args: &[&str], lspcheck_args: &[&str]) -> (Run, std::path::PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let server: Vec<&str> = std::iter::once(STANDIN).chain(standin_args.iter().copied()).collect();
+    let t = dir.path().join("t");
+    (run_command_in(lspcheck_args, &server, None, t.clone()), t, dir)
+}
+
+/// Runs `lspcheck replay <transcript> [args] -- <server>` with a watchdog.
+fn replay(transcript: &std::path::Path, lspcheck_args: &[&str], server: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(LSPCHECK);
+    // The subcommand comes first: top-level flags don't parse before it.
+    cmd.arg("replay").arg(transcript);
+    for (flag, value) in [("--timeout", "5"), ("--exit-timeout", "5")] {
+        if !lspcheck_args.contains(&flag) {
+            cmd.args([flag, value]);
+        }
+    }
+    cmd.args(lspcheck_args).arg("--").args(server).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let started = Instant::now();
+    let mut child = cmd.spawn().unwrap();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if started.elapsed() > WATCHDOG {
+            let _ = child.kill();
+            panic!("replay ran longer than {WATCHDOG:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The workspace a transcript was recorded in.
+fn recorded_workspace(transcript: &std::path::Path) -> std::path::PathBuf {
+    for line in std::fs::read_to_string(transcript).unwrap().lines() {
+        let v: Value = serde_json::from_str(line).unwrap();
+        if let Some(p) = v["workspace"].as_str() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    panic!("no workspace line in {}", transcript.display());
+}
+
+fn recorded_request_count(transcript: &std::path::Path) -> usize {
+    let text = std::fs::read_to_string(transcript).unwrap();
+    let mut reader = FrameReader::default();
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["dir"] == "out")
+        .filter_map(|event| {
+            event["data"]
+                .as_str()
+                .map(|s| s.as_bytes().to_vec())
+                .or_else(|| event["data_base64"].as_str().and_then(lspcheck::transcript::base64_decode))
+        })
+        .flat_map(|bytes| reader.feed(&bytes))
+        .filter_map(|chunk| match chunk {
+            Chunk::Frame { body, .. } => Message::parse(&body).ok(),
+            _ => None,
+        })
+        .filter(|message| matches!(message.kind, Kind::Request { .. }))
+        .count()
 }
 
 fn fault(name: &str) -> Run {
@@ -927,4 +1005,264 @@ fn a_version_for_a_uri_lspcheck_never_opened_isnt_judged() {
         "{}",
         r.stdout
     );
+}
+
+// --- replay -----------------------------------------------------------------
+
+#[test]
+fn replay_reproduces_a_clean_recording() {
+    let (r, t, _keep) = run_with_transcripts(&[], &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let started = Instant::now();
+    let out = replay(&t.join("lifecycle.jsonl"), &["--timeout", "30"], &[STANDIN]);
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(started.elapsed() < Duration::from_secs(20), "replay took {:?}", started.elapsed());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Every recorded reply was reproduced: nothing went unanswered.
+    assert!(!stdout.contains("no reply"), "{stdout}");
+    assert!(stdout.contains("result -> result"), "{stdout}");
+    assert!(stdout.contains("error -32601 -> error -32601"), "{stdout}");
+    assert!(stdout.contains("status 0 -> status 0"), "{stdout}");
+    let replay_transcript = std::fs::read_to_string(t.join("lifecycle.replay.jsonl")).unwrap();
+    assert!(!replay_transcript.contains("no reply to id"), "{replay_transcript}");
+    // The replay's own transcript is written next to the input by default.
+    assert!(t.join("lifecycle.replay.jsonl").exists());
+}
+
+#[test]
+fn replay_shows_a_missing_reply_against_a_faulty_server() {
+    let (r, t, _keep) = run_with_transcripts(&[], &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let out = replay(&t.join("lifecycle.jsonl"), &[], &[STANDIN, "--fault", "ignore-unknown-requests"]);
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The unknown requests got errors in the recording and nothing in the replay.
+    assert!(stdout.contains("error -32601 -> no reply"), "{stdout}");
+    // The requests the faulty server does answer are still reproduced.
+    assert!(stdout.contains("result -> result"), "{stdout}");
+}
+
+#[test]
+fn replay_recreates_and_removes_the_workspace() {
+    let (r, t, _keep) = run_with_transcripts(&[], &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let ws = recorded_workspace(&t.join("framing.jsonl"));
+    assert!(!ws.exists(), "the original workspace is gone");
+    let out = replay(&t.join("framing.jsonl"), &[], &[STANDIN]);
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("recreated, removed"), "{stdout}");
+    assert!(!ws.exists(), "the replay removes the workspace it recreated");
+}
+
+#[test]
+fn replay_of_the_documents_scenario_recreates_its_document() {
+    let (r, t, _keep) = run_with_transcripts(&[], &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let transcript = t.join("documents.jsonl");
+    // doc.txt is written after the scenario starts, so a later workspace
+    // line records it.
+    let last = std::fs::read_to_string(&transcript)
+        .unwrap()
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["workspace"].is_string())
+        .expect("a workspace line");
+    assert!(last["files"]["doc.txt"].as_str().is_some_and(|t| !t.is_empty()), "{last}");
+    let ws = recorded_workspace(&transcript);
+    let out = replay(&transcript, &[], &[STANDIN]);
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("recreated, removed"), "{stdout}");
+    assert!(stdout.contains("result -> result"), "{stdout}");
+    assert!(!stdout.contains("no reply"), "{stdout}");
+    assert!(!ws.exists(), "the replay removes the workspace it recreated");
+
+    let second = replay(&t.join("documents.replay.jsonl"), &[], &[STANDIN]);
+    assert_eq!(second.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&second.stderr));
+    let second_transcript = std::fs::read_to_string(t.join("documents.replay.replay.jsonl")).unwrap();
+    let workspace_line = second_transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["workspace"].is_string())
+        .expect("replay records its recreated workspace");
+    assert!(workspace_line["files"]["doc.txt"].as_str().is_some_and(|text| !text.is_empty()), "{workspace_line}");
+}
+
+#[test]
+fn replay_refuses_a_non_empty_workspace() {
+    let (r, t, _keep) = run_with_transcripts(&[], &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let ws = recorded_workspace(&t.join("framing.jsonl"));
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("not-recorded.txt"), "x").unwrap();
+    let out = replay(&t.join("framing.jsonl"), &[], &[STANDIN]);
+    assert_eq!(out.status.code().unwrap_or(-1), 2, "{}", String::from_utf8_lossy(&out.stdout));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(ws.to_str().unwrap()), "{stderr}");
+    std::fs::remove_dir_all(&ws).unwrap();
+}
+
+#[test]
+fn replay_refuses_to_overwrite_its_input() {
+    let (r, t, _keep) = run_with_transcripts(&[], &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let input = t.join("lifecycle.jsonl");
+    let out = replay(&input, &["--transcript", input.to_str().unwrap()], &[STANDIN]);
+    assert_eq!(out.status.code().unwrap_or(-1), 2, "{}", String::from_utf8_lossy(&out.stdout));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already exists"), "{stderr}");
+    assert!(stderr.contains("--transcript"), "{stderr}");
+    assert!(std::fs::read_to_string(&input).unwrap().contains("\"dir\":\"out\""));
+}
+
+#[test]
+fn replay_refuses_an_existing_output_without_changing_it() {
+    let (r, t, _keep) = run_with_transcripts(&[], &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let input = t.join("lifecycle.jsonl");
+    let output = t.join("chosen-output.jsonl");
+    std::fs::write(&output, "preserve me").unwrap();
+    let result = replay(&input, &["--transcript", output.to_str().unwrap()], &[STANDIN]);
+    assert_eq!(result.status.code().unwrap_or(-1), 2);
+    assert_eq!(std::fs::read_to_string(output).unwrap(), "preserve me");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("already exists"));
+}
+
+#[cfg(unix)]
+#[test]
+fn replay_refuses_a_hard_link_to_its_input_as_output() {
+    let (r, t, _keep) = run_with_transcripts(&[], &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let input = t.join("lifecycle.jsonl");
+    let before = std::fs::read(&input).unwrap();
+    let alias = t.join("input-hard-link.jsonl");
+    std::fs::hard_link(&input, &alias).unwrap();
+    let result = replay(&input, &["--transcript", alias.to_str().unwrap()], &[STANDIN]);
+    assert_eq!(result.status.code().unwrap_or(-1), 2);
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+    assert!(String::from_utf8_lossy(&result.stderr).contains("already exists"));
+}
+
+#[test]
+fn replay_does_not_send_the_next_write_before_a_skipped_step_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("gate.jsonl");
+    let request = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","id":1,"method":"m"}"#);
+    let response = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","id":1,"result":null}"#);
+    let server_answer = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","id":"cfg","result":[]}"#);
+    let exit = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","method":"exit"}"#);
+    let lines = [
+        serde_json::json!({"t_ms":0,"dir":"out","data":String::from_utf8(request).unwrap()}).to_string(),
+        serde_json::json!({"t_ms":10,"dir":"in","data":String::from_utf8(response).unwrap()}).to_string(),
+        serde_json::json!({"t_ms":20,"dir":"out","data":String::from_utf8(server_answer).unwrap()}).to_string(),
+        serde_json::json!({"t_ms":320,"dir":"out","data":String::from_utf8(exit).unwrap()}).to_string(),
+        serde_json::json!({"t_ms":330,"dir":"meta","event":"exited","how":"status 0"}).to_string(),
+    ];
+    std::fs::write(&input, lines.join("\n")).unwrap();
+    let output = replay(&input, &[], &[STANDIN, "--fault", "replay-gate"]);
+    assert_eq!(output.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&output.stderr));
+    let summary = String::from_utf8_lossy(&output.stdout);
+    assert!(summary.contains("result -> result"), "{summary}");
+    assert!(summary.contains("status 0 -> status 1"), "{summary}");
+}
+
+#[test]
+fn replay_reports_reused_ids_as_separate_request_occurrences() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("reused-id.jsonl");
+    let initialize = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    let initialize_reply = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+    let probe = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","id":1,"method":"m"}"#);
+    let probe_reply = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601}}"#);
+    let exit = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","method":"exit"}"#);
+    let lines = [
+        serde_json::json!({"t_ms":0,"dir":"out","data":String::from_utf8(initialize).unwrap()}).to_string(),
+        serde_json::json!({"t_ms":1,"dir":"in","data":String::from_utf8(initialize_reply).unwrap()}).to_string(),
+        serde_json::json!({"t_ms":2,"dir":"out","data":String::from_utf8(probe).unwrap()}).to_string(),
+        serde_json::json!({"t_ms":3,"dir":"in","data":String::from_utf8(probe_reply).unwrap()}).to_string(),
+        serde_json::json!({"t_ms":4,"dir":"out","data":String::from_utf8(exit).unwrap()}).to_string(),
+    ];
+    std::fs::write(&input, lines.join("\n")).unwrap();
+    let output = replay(&input, &[], &[STANDIN]);
+    assert_eq!(output.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&output.stderr));
+    let summary = String::from_utf8_lossy(&output.stdout);
+    assert!(summary.contains("1: result -> result"), "{summary}");
+    assert!(summary.contains("1: error -32601 -> error -32601"), "{summary}");
+}
+
+#[test]
+fn replay_marks_a_request_unattributable_when_its_id_is_still_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("pending-id.jsonl");
+    let request = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","id":1,"method":"m"}"#);
+    let response = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","id":1,"result":null}"#);
+    let exit = lspcheck::transport::encode(br#"{"jsonrpc":"2.0","method":"exit"}"#);
+    let combined = [request.as_slice(), request.as_slice()].concat();
+    let lines = [
+        serde_json::json!({"t_ms":0,"dir":"out","data":String::from_utf8(combined).unwrap()}).to_string(),
+        serde_json::json!({"t_ms":1,"dir":"in","data":String::from_utf8(response).unwrap()}).to_string(),
+        serde_json::json!({"t_ms":2,"dir":"out","data":String::from_utf8(exit).unwrap()}).to_string(),
+    ];
+    std::fs::write(&input, lines.join("\n")).unwrap();
+    let output = replay(&input, &[], &[STANDIN]);
+    assert_eq!(output.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&output.stderr));
+    let summary = String::from_utf8_lossy(&output.stdout);
+    assert!(summary.contains("not attributable (id reused while pending)"), "{summary}");
+}
+
+#[test]
+fn replay_of_end_of_input_closes_stdin_at_the_recorded_point() {
+    let (r, transcripts, _keep) = run_with_transcripts(&[], &["--only", "L8"]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let input = transcripts.join("end-of-input.jsonl");
+    let recorded_exit = std::fs::read_to_string(&input)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["event"] == "exited")
+        .expect("recorded exit")["how"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let output = replay(&input, &[], &[STANDIN]);
+    assert_eq!(output.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&output.stderr));
+    let summary = String::from_utf8_lossy(&output.stdout);
+    assert!(summary.contains(&format!("{recorded_exit} -> {recorded_exit}")), "{summary}");
+    assert!(!summary.contains("stopped by lspcheck"), "{summary}");
+    let replayed = std::fs::read_to_string(transcripts.join("end-of-input.replay.jsonl")).unwrap();
+    assert!(replayed.contains("\"event\":\"stdin closed\""), "{replayed}");
+}
+
+#[test]
+fn replay_summary_lists_every_request_in_the_framing_recording() {
+    let (r, transcripts, _keep) = run_with_transcripts(&[], &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let recording = transcripts.join("framing.jsonl");
+    let expected = recorded_request_count(&recording);
+    assert_eq!(expected, 11, "the framing scenario's expected request count");
+    let output = replay(&recording, &[], &[STANDIN]);
+    assert_eq!(output.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&output.stderr));
+    let count = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with("    ") && line.contains(" -> "))
+        .count();
+    assert_eq!(count, expected, "{}", String::from_utf8_lossy(&output.stdout));
+}
+
+#[test]
+fn replay_of_a_transcript_without_a_workspace_notes_it() {
+    let (r, t, _keep) = run_with_transcripts(&[], &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    // An older transcript: the same bytes, minus the workspace line.
+    let input = t.join("lifecycle.jsonl");
+    let text = std::fs::read_to_string(&input).unwrap();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.contains("\"workspace\"")).collect();
+    let old = t.join("old.jsonl");
+    std::fs::write(&old, lines.join("\n") + "\n").unwrap();
+    let out = replay(&old, &[], &[STANDIN]);
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("none recorded"), "{stdout}");
 }

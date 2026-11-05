@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3 and D1, D2 are done; J7, D3 to D6 and `replay` are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3, D1, D2 and `replay` are done; J7 and D3 to D6 are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -218,7 +218,19 @@ Without a profile: an empty temp workspace and a `plaintext` document. Generic c
 - `--json`: versioned `report-v1` schema (checks, basis, verdict, evidence, timings, server argv, checker version,
   host OS/arch, profile hash). `--junit` for CI test tabs; `--markdown` for a GitHub step summary.
 - `--transcripts DIR`: one JSONL per session with direction, monotonic timestamp, raw bytes (base64 when not UTF-8),
-  how the reader split them into frames, and stderr. `replay` re-sends the client side and waits for the recorded replies.
+  how the reader split them into frames, and stderr. Each file includes a meta line naming the workspace and the
+  files it held, so a replay can recreate it.
+- `lspcheck replay TRANSCRIPT -- SERVER`: re-runs one recorded session against a server. It recreates the recorded
+  workspace (refusing a non-empty or symlink path; preserving an existing empty directory), re-sends every client write
+  in order (gaps under 200 ms kept as pauses), and answers server-to-client requests with the same auto-answers a live run
+  uses. It reports each request's outcome against the recorded one (result / error code / no reply), the exit status
+  recorded versus now, and how many server-to-client requests were answered. An outcome is the first response with
+  the request's id read after the write holding the request's last byte began, before the id was next sent and before
+  lspcheck began stopping the server; both runs are matched the same way. It judges no check: the summary says to
+  run `lspcheck --only ID` to judge. `--transcript FILE` writes the replay's own transcript without overwriting an
+  existing path. Transcripts without a workspace line replay in the current directory with a note. The transcript
+  includes `{"dir":"meta","event":"stdin closed"}` when lspcheck closes stdin. Exit 0 when the replay ran, 2 for usage
+  errors and unreadable transcripts.
 
 ## Architecture
 Single crate, `src/` modules:

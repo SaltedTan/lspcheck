@@ -84,8 +84,15 @@ pub enum EventKind {
     },
     Stderr(Vec<u8>),
     StdoutClosed,
+    StdinClosed,
     Exited(String),
     Note(String),
+    /// The workspace the server runs in and the files in it, so a transcript
+    /// can be replayed in a recreated workspace.
+    Workspace {
+        path: PathBuf,
+        files: Vec<(String, String)>,
+    },
 }
 
 /// Something wrong with the server's output stream.
@@ -211,6 +218,10 @@ pub struct Unmatched {
     /// spelled as a string, or a number equal only after rounding).
     pub loose: Option<Id>,
 }
+
+/// The note recorded when lspcheck starts stopping a server that is still
+/// running; what the server sends after it is a reaction to being stopped.
+pub const STOPPING_NOTE: &str = "lspcheck is stopping the server";
 
 /// What remains when a session ends.
 #[derive(Debug)]
@@ -417,6 +428,11 @@ impl Session {
 
     pub fn note(&self, text: impl Into<String>) {
         record(&self.transcript, self.start.elapsed(), EventKind::Note(text.into()));
+    }
+
+    /// Records the workspace and the files in it, for [`crate::replay`].
+    pub fn record_workspace(&self, path: PathBuf, files: Vec<(String, String)>) {
+        record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files });
     }
 
     /// Why evidence is incomplete so far, if it is: an inspection limit,
@@ -677,7 +693,9 @@ impl Session {
 
     /// Closes the server's stdin.
     pub fn close_stdin(&mut self) {
-        self.stdin = None;
+        if self.stdin.take().is_some() {
+            record(&self.transcript, self.start.elapsed(), EventKind::StdinClosed);
+        }
     }
 
     /// Takes in what has already been read, without waiting for more and
@@ -855,7 +873,7 @@ impl Session {
         let mut killed = false;
         if self.is_alive() {
             killed = true;
-            self.note("lspcheck is stopping the server");
+            self.note(STOPPING_NOTE);
             #[cfg(unix)]
             {
                 self.group.signal(nix::sys::signal::Signal::SIGTERM);
@@ -1029,7 +1047,7 @@ async fn read_stdout(
             }
         };
         let problem = match chunk {
-            Chunk::Frame { headers, body, start } => {
+            Chunk::Frame { headers, body, start, .. } => {
                 content_types(&mut ev, &headers);
                 match Message::parse(&body) {
                     Ok(m) => {

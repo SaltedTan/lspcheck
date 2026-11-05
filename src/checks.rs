@@ -329,6 +329,9 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         }
     };
     let mut ctx = Ctx { s: session, cfg, root, results: Vec::new(), scenario: name, j3_exercise: None };
+    // The workspace, so a transcript of this scenario can be replayed in a
+    // recreated one (files written later are recorded when they are written).
+    ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
     match name {
         "lifecycle" => lifecycle(&mut ctx).await,
         "json-rpc" => json_rpc(&mut ctx).await,
@@ -1382,6 +1385,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     if let Err(e) = std::fs::write(&path, &text) {
         ctx.s.note(format!("couldn't write {}: {e}", path.display()));
     }
+    ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
     let uri = file_uri(&path);
     let from = ctx.s.messages.len();
     let opened_at = ctx.s.elapsed();
@@ -1711,6 +1715,7 @@ async fn framing(ctx: &mut Ctx<'_>) {
             let path = ctx.root.join("lspcheck-utf8.txt");
             let text = format!("ASCII line\n{MULTIBYTE}\nlast line\n");
             let _ = std::fs::write(&path, &text);
+            ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
             let doc = json!({"uri": file_uri(&path), "languageId": "plaintext", "version": 1, "text": text});
             ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await.map_err(|e| e.to_string())
         } else {
@@ -2207,6 +2212,24 @@ pub fn initialize_params(root: &Path) -> Value {
             }
         }
     })
+}
+
+/// The files in a workspace, as (relative name, text) pairs, for the
+/// workspace line of a transcript.
+fn workspace_files(root: &Path) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                files.push((entry.file_name().to_string_lossy().into_owned(), text));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
 }
 
 /// A `file:` URI for an absolute path, percent-encoding all but unreserved bytes.
