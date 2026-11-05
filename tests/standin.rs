@@ -289,6 +289,9 @@ fn lawful_variations_fail_nothing() {
         if name == "no-change-sync" {
             expected.push(("D3", "skip"));
         }
+        if name == "no-diagnostics" {
+            expected.push(("D5", "not-exercised"));
+        }
         passes_except(&r, &expected);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
     }
@@ -487,6 +490,7 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
             ("D2", "not-exercised"),
             ("D3", "not-exercised"),
             ("D4", "error"),
+            ("D5", "not-exercised"),
         ],
     );
     assert!(r.stdout.contains("but the server had already stopped answering"), "{}", r.stdout);
@@ -560,10 +564,13 @@ fn bad_initialize_results_fail_l2() {
     // and D3 can't judge without it either; without capabilities the server
     // doesn't ask for didOpen, so all three are skipped, and it advertises no
     // document request, so D4 skips too.
-    passes_except(&fault("bad-encoding"), &[("L2", "fail"), ("D1", "error"), ("D2", "error"), ("D3", "error")]);
+    passes_except(
+        &fault("bad-encoding"),
+        &[("L2", "fail"), ("D1", "error"), ("D2", "error"), ("D3", "error"), ("D5", "error")],
+    );
     passes_except(
         &fault("no-capabilities"),
-        &[("L2", "fail"), ("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D4", "skip")],
+        &[("L2", "fail"), ("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D4", "skip"), ("D5", "skip")],
     );
 }
 
@@ -952,7 +959,7 @@ fn unreadable_frames_make_other_failures_inconclusive() {
 #[test]
 fn a_server_that_doesnt_open_documents_skips_d1() {
     let r = fault("no-open-close");
-    passes_except(&r, &[("D1", "skip"), ("D2", "skip"), ("D3", "skip")]);
+    passes_except(&r, &[("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D5", "skip")]);
     // D4 still runs: doc.txt on disk, never opened.
     assert!(r.stdout.contains("the document on disk (never opened)"), "{}", r.stdout);
     assert_eq!(r.status, 0, "{}", r.stdout);
@@ -1000,7 +1007,15 @@ fn positions_counted_in_the_wrong_units_fail_d1() {
         ("codepoint-positions", "on a boundary if counted in code points"),
     ] {
         let r = fault(name);
-        only_fails(&r, &["D1"]);
+        // D1 fails; D5 is an error (counting fault) or passes, depending on
+        // whether the evidence is complete. Neither is a failure.
+        expect(&r, "D1", "fail");
+        assert!(
+            matches!(r.verdicts.get("D5").map(String::as_str), Some("pass") | Some("error")),
+            "D5 is {}\n{}",
+            r.verdicts.get("D5").map_or("missing".to_string(), |v| v.clone()),
+            r.stdout
+        );
         assert_eq!(r.status, 1, "D1 is a MUST check");
         assert!(r.stdout.contains("inside a character of version 41"), "{name}\n{}", r.stdout);
         assert!(r.stdout.contains(diagnosis), "{name}\n{}", r.stdout);
@@ -1010,7 +1025,7 @@ fn positions_counted_in_the_wrong_units_fail_d1() {
     // can't tell a change-handling fault from a counting fault and is an
     // error; D1 carries the failure.
     let r = fault("utf16-positions-as-utf8");
-    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D5", "error")]);
     assert_eq!(r.status, 1, "D1 is a MUST check");
     assert!(r.stdout.contains("inside a character of version 41"), "{}", r.stdout);
     assert!(r.stdout.contains("on a boundary if counted in UTF-16 code units"), "{}", r.stdout);
@@ -1076,7 +1091,7 @@ fn code_point_positions_after_a_correct_change_are_a_counting_fault() {
     // version 42 counted in code points: a counting fault (D1's), not a
     // change-handling fault. D3 is an error, not a failure.
     let r = fault("codepoint-positions-after-change");
-    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D5", "error")]);
     assert_eq!(r.status, 1, "D1 is a MUST check");
     assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault; see D1"), "{}", r.stdout);
 }
@@ -1089,7 +1104,7 @@ fn an_undeliverable_change_errors_d3_but_keeps_d1s_failure() {
     // judged (the diagnostic's version 41 was sent). The server is gone, so
     // D4 can't be judged either.
     let r = fault("close-stdin-before-change");
-    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D4", "error")]);
+    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D4", "error"), ("D5", "error")]);
     assert_eq!(r.status, 1, "D1 is a MUST check");
     assert!(r.stdout.contains("couldn't send didChange"), "{}", r.stdout);
 }
@@ -1112,7 +1127,7 @@ fn positions_in_a_duplicate_response_are_judged_too() {
 fn utf32_positions_leave_d1_not_exercised() {
     // No offset can fall inside a character in UTF-32.
     let r = fault("utf32-encoding");
-    passes_except(&r, &[("D1", "not-exercised"), ("D3", "not-exercised")]);
+    passes_except(&r, &[("D1", "not-exercised"), ("D3", "not-exercised"), ("D5", "not-exercised")]);
     assert!(r.stdout.contains("the server chose utf-32"), "{}", r.stdout);
 }
 
@@ -1156,7 +1171,7 @@ fn diagnostics_without_a_version_leave_d2_not_exercised() {
     // No version at all is lawful, and gives D2 nothing to judge.
     let r = fault("unversioned-diagnostics");
     expect(&r, "D2", "not-exercised");
-    assert!(r.stdout.contains("2 without a version, which is lawful"), "{}", r.stdout);
+    assert!(r.stdout.contains("3 without a version, which is lawful"), "{}", r.stdout);
     // Nor is there anything when the server never publishes.
     expect(&fault("no-diagnostics"), "D2", "not-exercised");
 }

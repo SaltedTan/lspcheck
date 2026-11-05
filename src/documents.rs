@@ -36,6 +36,113 @@ pub fn doc_a() -> String {
     DOC_A_LINES.iter().map(|l| format!("{l}\n")).collect()
 }
 
+/// The lines of document B, the line-ending document: a lone CR, a CR LF,
+/// then LF lines, with a final newline after the last.
+///
+/// - B0: `x`, ends in a lone `\r`.
+/// - B1: eight emoji, ends in `\r\n`.
+/// - B2: ` word` (leading space), ends in `\n`.
+/// - B3: eight emoji, ends in `\n`.
+/// - B4: ` name` (leading space), ends in `\n`.
+///
+/// Each wrong line split moves the `word` line (and, for two of the three,
+/// the `name` line) onto an emoji line, where the odd offsets 1 and 5 fall
+/// inside a character in UTF-8 and UTF-16 alike.
+pub const DOC_B_LINES: [&str; 5] = [
+    "x",
+    "\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}",
+    " word",
+    "\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}",
+    " name",
+];
+
+/// Document B's text, with its ends of line: B0 ends in a lone `\r`, B1 in
+/// `\r\n`, and B2 to B4 in `\n`.
+pub fn doc_b() -> String {
+    let mut out = String::new();
+    for (i, l) in DOC_B_LINES.iter().enumerate() {
+        out.push_str(l);
+        out.push_str(match i {
+            0 => "\r",
+            1 => "\r\n",
+            _ => "\n",
+        });
+    }
+    out
+}
+
+/// A line split the spec doesn't allow, that a server may use anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrongSplit {
+    /// Split at `\n` only; a `\r` is an ordinary character.
+    LfOnly,
+    /// Split at `\n` and `\r\n`, but not a lone `\r`.
+    NoLoneCr,
+    /// Count `\r\n` as two breaks, so it leaves an empty line between.
+    CrLfTwo,
+}
+
+/// The name of a wrong split, for a failure detail.
+pub fn wrong_split_name(s: WrongSplit) -> &'static str {
+    match s {
+        WrongSplit::LfOnly => "a line split at `\\n` only",
+        WrongSplit::NoLoneCr => "a line split at `\\n` and `\\r\\n`, not a lone `\\r`",
+        WrongSplit::CrLfTwo => "`\\r\\n` counted as two breaks",
+    }
+}
+
+/// The three wrong line splits, in the order a detail names them.
+pub const WRONG_SPLITS: [WrongSplit; 3] = [WrongSplit::LfOnly, WrongSplit::NoLoneCr, WrongSplit::CrLfTwo];
+
+/// Splits `text` into lines the way `split` does, without each line's end.
+pub fn split_lines_wrong(text: &str, split: WrongSplit) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_break = match split {
+            WrongSplit::LfOnly => bytes[i] == b'\n',
+            // A `\r\n` is one break (at the `\r`); a `\n` not preceded by a `\r`
+            // is one; a lone `\r` is not a break.
+            WrongSplit::NoLoneCr => {
+                (bytes[i] == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
+                    || (bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n')
+            }
+            // Every `\r` and `\n` is a break, so a `\r\n` leaves an empty line.
+            WrongSplit::CrLfTwo => bytes[i] == b'\n' || bytes[i] == b'\r',
+        };
+        if is_break {
+            out.push(&text[start..i]);
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(&text[start..]);
+    out
+}
+
+/// Where `(line, character)` falls in `text` split the way `split` does,
+/// counted in `encoding`.
+pub fn position_status_wrong(
+    text: &str,
+    split: WrongSplit,
+    encoding: Encoding,
+    line: usize,
+    character: usize,
+) -> PositionStatus {
+    match split_lines_wrong(text, split).get(line) {
+        None => PositionStatus::NoLine,
+        Some(line) => match text::offset_to_bytes(line, encoding, character) {
+            Ok(_) => PositionStatus::Boundary,
+            Err(text::OffsetError::InsideCharacter) => PositionStatus::InsideCharacter,
+            Err(text::OffsetError::PastEnd) => PositionStatus::PastEndOfLine,
+        },
+    }
+}
+
 /// Where `needle` starts and ends on line `line` of `text`, counted in
 /// `encoding`.
 pub fn span_in(text: &str, line: usize, needle: &str, encoding: Encoding) -> (Position, Position) {
@@ -220,6 +327,17 @@ pub struct OpenDoc {
     pub uri: String,
     /// Every version sent, oldest first.
     pub versions: Vec<Version>,
+}
+
+/// Document B, the line-ending document: its URI and the window it was open.
+/// It is never changed, so it has one version and D5 judges against its text.
+#[derive(Debug, Clone)]
+pub struct DocB {
+    pub uri: String,
+    /// When lspcheck began writing its `didOpen`.
+    pub opened_at: Duration,
+    /// When lspcheck began writing its `didClose`, if it sent one.
+    pub closed_at: Option<Duration>,
 }
 
 /// Something the server sent that may carry positions.
@@ -611,6 +729,107 @@ pub fn judge_d3(encoding: Encoding, after: &Judged, change: &Change, incomplete:
         format!(
             "{} informative position(s) on character boundaries after the change, counted in {units}; {} position(s) read after the change",
             after.informative, after.seen
+        ),
+    )
+}
+
+/// D5's verdict, judged at the end over the positions read while document B
+/// was open, against B's text (which is never changed).
+///
+/// B's lines are split the spec's way, at `\n`, `\r\n` and `\r`. A position
+/// about B is invalid when it falls inside a character of B in the
+/// negotiated encoding. D5 fails only when such a position is explained by a
+/// line split the spec doesn't allow, and by no reading of B: it is on no
+/// boundary of B counted in any other encoding (a counting fault is D1's),
+/// and it is on a boundary of B under one of the three wrong splits, counted
+/// in the negotiated encoding. A position invalid under the spec's split but
+/// explained by no wrong split is an `error`, since it can't be told from a
+/// counting fault. `incomplete` says why lspcheck may have missed something
+/// the server sent while B was open.
+pub fn judge_d5(encoding: Encoding, text: &str, j: &Judged, incomplete: Option<&str>) -> (Verdict, String) {
+    let units = counted_in(encoding);
+    let mut fits: Vec<(usize, &str)> = Vec::new();
+    for (i, p) in j.invalid_positions.iter().enumerate() {
+        // A boundary of B in any other encoding, under the spec's split, is a
+        // counting fault (D1's), not a line-splitting fault.
+        let reread = ENCODINGS.iter().any(|e| {
+            *e != encoding && text::position_status(text, *e, p.line, p.character) == PositionStatus::Boundary
+        });
+        if reread {
+            continue;
+        }
+        if let Some(name) = WRONG_SPLITS
+            .iter()
+            .find(|s| position_status_wrong(text, **s, encoding, p.line, p.character) == PositionStatus::Boundary)
+            .map(|s| wrong_split_name(*s))
+        {
+            fits.push((i, name));
+        }
+    }
+    if !fits.is_empty() {
+        // A failure that was seen stands, whatever else was missed.
+        let more = fits.len().saturating_sub(NAMED);
+        let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
+        let first: Vec<String> =
+            fits.iter().take(NAMED).map(|(i, name)| format!("{} (fits {name})", j.invalid[*i])).collect();
+        return (
+            Verdict::Fail,
+            format!(
+                "{} position(s) about the line-ending document fall inside a character of it, counted in {units}, \
+                 on no boundary of it counted any other way, and on a boundary of it under a line split the spec \
+                 doesn't allow: {}{tail}",
+                fits.len(),
+                first.join("; ")
+            ),
+        );
+    }
+    if !j.invalid.is_empty() {
+        return (
+            Verdict::Error,
+            format!(
+                "{} position(s) about the line-ending document fall inside a character of it, counted in {units}, \
+                 but can't tell a line-splitting fault from a counting fault; see D1",
+                j.invalid.len()
+            ),
+        );
+    }
+    if encoding == Encoding::Utf32 {
+        return (
+            Verdict::NotExercised,
+            format!(
+                "the server chose utf-32, in which no offset can fall inside a character; {} position(s) about the line-ending document",
+                j.seen
+            ),
+        );
+    }
+    // What lspcheck missed may have held positions, informative ones included.
+    if let Some(why) = incomplete {
+        return (
+            Verdict::Error,
+            format!(
+                "inconclusive, because {why}: it may have held a position inside a character of the line-ending document; \
+                 {} position(s) about it",
+                j.seen
+            ),
+        );
+    }
+    // B's first line is ASCII, so no position on it is informative; the count
+    // is exactly the informative positions on lines 1 to 4, the lines after a
+    // `\r` or `\r\n`.
+    if j.informative == 0 {
+        return (
+            Verdict::NotExercised,
+            format!(
+                "no position with non-ASCII text before it on its line was judged about the line-ending document; {} position(s) about it",
+                j.seen
+            ),
+        );
+    }
+    (
+        Verdict::Pass,
+        format!(
+            "{} informative position(s) on character boundaries about the line-ending document, counted in {units}; {} position(s) about it",
+            j.informative, j.seen
         ),
     )
 }
@@ -1284,5 +1503,150 @@ mod tests {
         assert_eq!(sync_kind(&caps(r#"{"openClose": true, "change": 2.0}"#)), SyncKind::Incremental);
         assert_eq!(sync_kind(&caps(r#"{"openClose": true, "change": 1.0}"#)), SyncKind::Full);
         assert_eq!(sync_kind(&caps(r#"{"openClose": true, "change": 2.5}"#)), SyncKind::None);
+    }
+
+    // --- D5: the line-ending document -------------------------------------
+
+    fn judged_d5(invalid: &[(usize, usize)], informative: usize, seen: usize) -> Judged {
+        let positions: Vec<Position> = invalid.iter().map(|(l, c)| Position { line: *l, character: *c }).collect();
+        Judged {
+            seen,
+            elsewhere: 0,
+            valid: seen - invalid.len(),
+            informative,
+            invalid: invalid.iter().map(|(l, c)| format!("{l}:{c}")).collect(),
+            invalid_positions: positions.clone(),
+            all_positions: positions,
+            past_end: 0,
+            past_end_fits: Vec::new(),
+            no_line: 0,
+            before_open: 0,
+        }
+    }
+
+    #[test]
+    fn doc_b_has_the_briefs_lines_and_ends() {
+        let text = doc_b();
+        let lines = text::split_lines(&text);
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0], "x");
+        assert_eq!(lines[1], "\u{1F600}".repeat(8));
+        assert_eq!(lines[2], " word");
+        assert_eq!(lines[3], "\u{1F600}".repeat(8));
+        assert_eq!(lines[4], " name");
+        assert_eq!(lines[5], "");
+        // The ends: B0 lone `\r`, B1 `\r\n`, B2 to B4 `\n`.
+        assert!(text.starts_with("x\r"));
+        assert!(text.contains(&format!("{}\r\n", "\u{1F600}".repeat(8))));
+        assert!(text.contains(" word\n"));
+        assert!(text.ends_with(" name\n"));
+    }
+
+    #[test]
+    fn doc_b_word_and_name_map_onto_emoji_lines() {
+        let text = doc_b();
+        let spec = text::split_lines(&text);
+        let emoji = |s: &str| !s.is_empty() && s.chars().all(|c| c == '\u{1F600}');
+        // Under each wrong split, `word` sits on a line whose spec-split
+        // counterpart is an emoji line; `name` does too, except under
+        // `\r\n`-as-two, where it lands on the trailing empty line.
+        for &split in &WRONG_SPLITS {
+            let lines = split_lines_wrong(&text, split);
+            let word_line = lines.iter().position(|l| l.contains("word")).unwrap();
+            let name_line = lines.iter().position(|l| l.contains("name")).unwrap();
+            assert!(emoji(spec[word_line]), "word: spec line {word_line} is not emoji under {split:?}");
+            if split != WrongSplit::CrLfTwo {
+                assert!(emoji(spec[name_line]), "name: spec line {name_line} is not emoji under {split:?}");
+            }
+            // Offsets 1 and 5 on an emoji line fall inside a character, counted
+            // in UTF-16 and UTF-8.
+            for e in [Encoding::Utf16, Encoding::Utf8] {
+                for off in [1usize, 5] {
+                    assert_eq!(
+                        text::position_status(spec[word_line], e, 0, off),
+                        PositionStatus::InsideCharacter,
+                        "word offset {off} in {e:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn d5_clean_passes() {
+        let j = judged_d5(&[], 4, 4);
+        let (v, d) = judge_d5(Encoding::Utf16, &doc_b(), &j, None);
+        assert_eq!(v, Verdict::Pass);
+        assert!(d.contains("informative"), "{d}");
+    }
+
+    #[test]
+    fn d5_counting_fault_is_an_error() {
+        // (1,1) is inside a character of the emoji line in UTF-16, but a boundary
+        // of it in UTF-32: a counting fault, not a line-splitting fault.
+        let j = judged_d5(&[(1, 1)], 3, 4);
+        let (v, d) = judge_d5(Encoding::Utf16, &doc_b(), &j, None);
+        assert_eq!(v, Verdict::Error);
+        assert!(d.contains("can't tell"), "{d}");
+    }
+
+    #[test]
+    fn d5_utf32_is_not_exercised() {
+        let j = judged_d5(&[], 4, 4);
+        let (v, d) = judge_d5(Encoding::Utf32, &doc_b(), &j, None);
+        assert_eq!(v, Verdict::NotExercised);
+        assert!(d.contains("utf-32"), "{d}");
+    }
+
+    #[test]
+    fn d5_no_informative_position_is_not_exercised() {
+        let j = judged_d5(&[], 0, 2);
+        let (v, d) = judge_d5(Encoding::Utf16, &doc_b(), &j, None);
+        assert_eq!(v, Verdict::NotExercised);
+        assert!(d.contains("no position"), "{d}");
+    }
+
+    #[test]
+    fn d5_incomplete_evidence_is_an_error() {
+        let j = judged_d5(&[], 4, 4);
+        let (v, d) = judge_d5(Encoding::Utf16, &doc_b(), &j, Some("the reply to the didOpen was missed"));
+        assert_eq!(v, Verdict::Error);
+        assert!(d.contains("inconclusive"), "{d}");
+    }
+
+    // The fail condition's second clause excludes a position that is on an
+    // in-line boundary of B in any other encoding. For document B the
+    // stand-in's word/name positions (offsets 1 and 5 on the emoji lines) are
+    // inside a character in UTF-16 and UTF-8 but on a boundary in UTF-32, so
+    // they are counting faults (D1's), not line-splitting faults: D5 is an
+    // error on B's own evidence, never a fail. This test pins that.
+    #[test]
+    fn d5_b_positions_are_utf32_boundaries_so_an_error() {
+        let text = doc_b();
+        let spec = text::split_lines(&text);
+        for (line, off) in [(1usize, 1usize), (1, 5), (3, 1), (3, 5)] {
+            // Inside a character of the spec split, counted in UTF-16 and UTF-8...
+            assert_eq!(
+                text::position_status(spec[line], Encoding::Utf16, 0, off),
+                PositionStatus::InsideCharacter,
+                "({line},{off}) UTF-16"
+            );
+            assert_eq!(
+                text::position_status(spec[line], Encoding::Utf8, 0, off),
+                PositionStatus::InsideCharacter,
+                "({line},{off}) UTF-8"
+            );
+            // ...but on a boundary in UTF-32: a counting fault, so D5 is an error.
+            assert_eq!(
+                text::position_status(spec[line], Encoding::Utf32, 0, off),
+                PositionStatus::Boundary,
+                "({line},{off}) UTF-32"
+            );
+        }
+        // And so the verdict is an error, not a fail.
+        let j = judged_d5(&[(1, 1), (1, 5), (3, 1), (3, 5)], 0, 4);
+        let (v, d) = judge_d5(Encoding::Utf16, &text, &j, None);
+        assert_eq!(v, Verdict::Error, "{d}");
+        assert!(d.contains("can't tell"), "{d}");
     }
 }

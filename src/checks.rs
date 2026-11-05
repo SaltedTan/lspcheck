@@ -142,6 +142,7 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "A request about a document that isn't open gets a response, and the server keeps serving",
         "textDocumentSync"
     ),
+    check!("D5", Documents, Must, "Lines are split at \\n, \\r\\n and \\r", "textDocumentSync"),
 ];
 
 /// Checks judged from every scenario's observations.
@@ -266,7 +267,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
-    Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4"] },
+    Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
@@ -1261,11 +1262,13 @@ fn document_requests(caps: &Value, uri: &str, text: &str, encoding: Encoding) ->
     let pos = |p: Position| json!({"line": p.line, "character": p.character});
     let doc = json!({"uri": uri});
     let lines = text::split_lines(text);
-    let (word, _) = documents::span_in(text, 0, "word", encoding);
+    // `word` is on line 0 of document A and line 2 of document B; find it.
+    let word_line = lines.iter().position(|l| l.contains("word")).expect("the document has a word");
+    let (word, _) = documents::span_in(text, word_line, "word", encoding);
     // `word` is ASCII, so two units in is inside it in every encoding.
-    let inside = Position { line: 0, character: word.character + 2 };
-    let l0_end = Position { line: 0, character: text::line_length(lines[0], encoding) };
-    // `name` is on line 2 of version 41 and line 3 of version 42.
+    let inside = Position { line: word_line, character: word.character + 2 };
+    let l0_end = Position { line: word_line, character: text::line_length(lines[word_line], encoding) };
+    // `name` is on line 2 of version 41, line 3 of version 42, and line 4 of B.
     let name_line = lines.iter().position(|l| l.contains("name")).expect("the document has a name");
     let (_, name_end) = documents::span_in(text, name_line, "name", encoding);
     // The empty line after the final newline ends the document.
@@ -1391,6 +1394,9 @@ fn sync_registration(m: &Message) -> bool {
 /// The version document A is changed to.
 const DOC_A2_VERSION: i64 = 42;
 
+/// Document B's version, sent in its `didOpen`.
+const DOC_B_VERSION: i64 = 7;
+
 /// Documents: lspcheck opens document A, asks the server's advertised
 /// requests about it one at a time, and waits a while for diagnostics. Every
 /// position the server sends about it must fall on a character boundary of
@@ -1419,7 +1425,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let caps = result.get("capabilities").cloned().unwrap_or(Value::Null);
     if !opens_documents(&reply) {
         let detail = "the server doesn't ask for didOpen (textDocumentSync), so lspcheck opens no document";
-        for id in ["D1", "D2", "D3"] {
+        for id in ["D1", "D2", "D3", "D5"] {
             ctx.report(id, Verdict::Skip, detail);
         }
         // D4 still runs: doc.txt on disk, never opened.
@@ -1434,7 +1440,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let encoding = match negotiated_encoding(&reply) {
         Ok(e) => e,
         Err(why) => {
-            for id in ["D1", "D2", "D3"] {
+            for id in ["D1", "D2", "D3", "D5"] {
                 ctx.report(id, Verdict::Error, why.clone());
             }
             // D4 doesn't need the encoding, and runs with the document
@@ -1463,13 +1469,13 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let doc = json!({"uri": uri, "languageId": "plaintext", "version": DOC_A_VERSION, "text": text});
     if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await {
         let detail = format!("lspcheck couldn't send didOpen: {e}");
-        for id in ["D1", "D2", "D3"] {
+        for id in ["D1", "D2", "D3", "D5"] {
             ctx.report(id, Verdict::Error, detail.clone());
         }
         leave(ctx).await;
         return;
     }
-    let mut docs = [OpenDoc {
+    let mut docs = vec![OpenDoc {
         uri: uri.clone(),
         versions: vec![Version { at: opened_at, number: DOC_A_VERSION, text: text.clone() }],
     }];
@@ -1545,6 +1551,49 @@ async fn documents(ctx: &mut Ctx<'_>) {
             }
         }
     }
+    // D5: open document B, with its mix of line endings, after the version-42
+    // requests and diagnostics wait, before D4's `didClose`. B is a second
+    // opened document, so D1 and D2 judge its positions and publishes too; D3
+    // concerns only A. B is closed before D4 runs, so D4's requests concern
+    // only A and `missing.txt`, as before.
+    let b_path = ctx.root.join("crlf.txt");
+    let b_text = documents::doc_b();
+    if let Err(e) = std::fs::write(&b_path, &b_text) {
+        ctx.s.note(format!("couldn't write {}: {e}", b_path.display()));
+    }
+    ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+    let b_uri = file_uri(&b_path);
+    let b_from = ctx.s.messages.len();
+    let b_opened_at = ctx.s.elapsed();
+    let b_doc = json!({
+        "uri": b_uri,
+        "languageId": "plaintext",
+        "version": DOC_B_VERSION,
+        "text": b_text.clone(),
+    });
+    let mut b_opened = false;
+    if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": b_doc}))).await {
+        ctx.report("D5", Verdict::Error, format!("lspcheck couldn't send didOpen for the line-ending document: {e}"));
+    } else {
+        b_opened = true;
+        docs.push(OpenDoc {
+            uri: b_uri.clone(),
+            versions: vec![Version { at: b_opened_at, number: DOC_B_VERSION, text: b_text.clone() }],
+        });
+        // The advertised requests about B, with positions on B2 and B4. A
+        // stall here doesn't affect D4, which concerns only A.
+        let _ = ask_all(ctx, document_requests(&caps, &b_uri, &b_text, encoding), &mut asked, &mut notes).await;
+        await_diagnostics(ctx, &b_uri, DOC_B_VERSION, b_from).await;
+    }
+    // Close B before D4 runs, so D4's requests concern only A and missing.txt.
+    let b_closed_at = if b_opened {
+        match ctx.s.notify("textDocument/didClose", Some(json!({"textDocument": {"uri": b_uri}}))).await {
+            Ok(()) => Some(ctx.s.elapsed()),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     // D4: the document is closed, so a request about it, one about a URI
     // that was never opened and doesn't exist, and a plain request, each
     // get a response, and the server keeps serving.
@@ -1646,6 +1695,21 @@ async fn documents(ctx: &mut Ctx<'_>) {
                 ctx.report("D3", verdict, detail);
             }
         }
+    }
+    // D5: judged over the positions read while B was open, before its
+    // `didClose` if sent. B's text is never changed, so there is no
+    // after-change judgement as in D3.
+    if b_opened {
+        let b_end = b_closed_at.map_or(end, |at| at.min(end));
+        let judged_b = documents::judge_positions_where(encoding, &docs, &sources, |s| {
+            s.found.iter().any(|f| documents::same_uri(&f.uri, &b_uri))
+        });
+        let incomplete_b = ctx.s.incomplete_within(b_opened_at, b_end);
+        let (verdict, mut detail) = documents::judge_d5(encoding, &b_text, &judged_b, incomplete_b.as_deref());
+        if !notes.is_empty() {
+            detail = format!("{detail}; {}", notes.join("; "));
+        }
+        ctx.report("D5", verdict, detail);
     }
 }
 

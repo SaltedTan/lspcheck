@@ -31,6 +31,12 @@
     doesn't exist, and a plain request, each awaited alone. Each must get a response — any result or error is
     lawful, including one read from disk — and the server must keep serving. A server that advertises none of the
     document requests leaves D4 skipped; D4 still runs when the server doesn't ask for `didOpen`.
+  - D5, line endings: the `documents` scenario now opens a second document, B, whose lines end in `\r`, `\r\n` and
+    `\n`, and sends the advertised document requests about it. A position about B that falls inside a character of
+    B in the negotiated encoding, on no boundary of B counted any other way, and on a boundary of B under a line
+    split the spec doesn't allow (LF only, CRLF as two breaks, or no lone CR) fails D5. A position that fits the
+    spec's split in some other encoding is a counting fault (D1's), not a line-splitting fault, so D5 is an error
+    and D1 carries the failure. UTF-32 leaves D5 not exercised, because no offset can fall inside a character.
 - The text model behind the upcoming document checks (`src/text.rs`): the spec's line split, the UTF-8/UTF-16/UTF-32
   position encodings, the character-boundary test, applying content changes, and the table of the positions a reply
   refers to.
