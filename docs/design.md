@@ -233,6 +233,26 @@ have changed it), so neither D4's replies nor later diagnostics are judged by th
 - **pass:** all three are answered. The detail records each outcome: result (null, empty, or non-empty) or the
   error code, for the closed document, the never-opened one, and the probe.
 
+Before D4, lspcheck opens document B, `crlf.txt` at version 7: `x` ending in a lone `\r`, eight emoji ending in
+`\r\n`, nine spaces and `word`, eight emoji, and eleven spaces and `name`, the last three ending in `\n`. It sends
+the advertised requests with positions on `word` and `name`, waits for B's diagnostics, and closes B. Each wrong split
+moves `word` onto an emoji line, at offsets 9 and 13: past the end of eight emoji in code points, and inside a
+character in UTF-8 and UTF-16. So no counting of the spec's lines explains them. D5 is judged over what is about B
+and was read while B was open:
+
+- **skip:** as D1.
+- **fail:** a position about B is inside a character of B under the spec's split, in the negotiated encoding; on no
+  in-line boundary of B under the spec's split in any other encoding (UTF-8, UTF-16 or UTF-32); and on a boundary of
+  B under a split the spec doesn't allow (`\n` only; `\n` and `\r\n` but no lone `\r`; `\r\n` as two breaks),
+  counted in the negotiated encoding. The detail names every wrong split each position fits.
+- **error:** a position about B is invalid, but that doesn't hold ("can't tell a line-splitting fault from a counting
+  fault; see D1"); B's `didOpen` couldn't be sent; or nothing failed but evidence was missed while B was open.
+- **not-exercised:** UTF-32, or no informative position about B.
+- **pass:** otherwise.
+
+The design's original rule (a), "D1's positions in LF-only document A were informative and all valid", is left out
+for the reason D3 dropped its own: valid positions elsewhere never prove the server splits B's lines correctly.
+
 Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs
 only one versioned publish for the document, so it is exercised wherever diagnostics are labelled. D4 runs wherever
 a document request is advertised.

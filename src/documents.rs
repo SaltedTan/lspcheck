@@ -51,9 +51,13 @@ pub fn doc_a() -> String {
 pub const DOC_B_LINES: [&str; 5] = [
     "x",
     "\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}",
-    " word",
+    // `word` at 9..13 and `name` at 11..15: odd offsets past the end of an
+    // 8-emoji line in code points, inside a character of it in UTF-8 and
+    // UTF-16. A wrong split puts them on such a line, where no counting of
+    // the spec's lines explains them.
+    "         word",
     "\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}",
-    " name",
+    "           name",
 ];
 
 /// Document B's text, with its ends of line: B0 ends in a lone `\r`, B1 in
@@ -114,7 +118,8 @@ pub fn split_lines_wrong(text: &str, split: WrongSplit) -> Vec<&str> {
         };
         if is_break {
             out.push(&text[start..i]);
-            i += 1;
+            // Under NoLoneCr a `\r\n` is one break: skip both bytes.
+            i += if split == WrongSplit::NoLoneCr && bytes[i] == b'\r' { 2 } else { 1 };
             start = i;
         } else {
             i += 1;
@@ -748,7 +753,7 @@ pub fn judge_d3(encoding: Encoding, after: &Judged, change: &Change, incomplete:
 /// the server sent while B was open.
 pub fn judge_d5(encoding: Encoding, text: &str, j: &Judged, incomplete: Option<&str>) -> (Verdict, String) {
     let units = counted_in(encoding);
-    let mut fits: Vec<(usize, &str)> = Vec::new();
+    let mut fits: Vec<(usize, String)> = Vec::new();
     for (i, p) in j.invalid_positions.iter().enumerate() {
         // A boundary of B in any other encoding, under the spec's split, is a
         // counting fault (D1's), not a line-splitting fault.
@@ -758,12 +763,15 @@ pub fn judge_d5(encoding: Encoding, text: &str, j: &Judged, incomplete: Option<&
         if reread {
             continue;
         }
-        if let Some(name) = WRONG_SPLITS
+        // Every wrong split it fits: on B's ASCII lines several may, and
+        // the detail shouldn't single one out.
+        let names: Vec<&str> = WRONG_SPLITS
             .iter()
-            .find(|s| position_status_wrong(text, **s, encoding, p.line, p.character) == PositionStatus::Boundary)
+            .filter(|s| position_status_wrong(text, **s, encoding, p.line, p.character) == PositionStatus::Boundary)
             .map(|s| wrong_split_name(*s))
-        {
-            fits.push((i, name));
+            .collect();
+        if !names.is_empty() {
+            fits.push((i, names.join(", or ")));
         }
     }
     if !fits.is_empty() {
@@ -1531,9 +1539,9 @@ mod tests {
         assert_eq!(lines.len(), 6);
         assert_eq!(lines[0], "x");
         assert_eq!(lines[1], "\u{1F600}".repeat(8));
-        assert_eq!(lines[2], " word");
+        assert_eq!(lines[2], format!("{}word", " ".repeat(9)));
         assert_eq!(lines[3], "\u{1F600}".repeat(8));
-        assert_eq!(lines[4], " name");
+        assert_eq!(lines[4], format!("{}name", " ".repeat(11)));
         assert_eq!(lines[5], "");
         // The ends: B0 lone `\r`, B1 `\r\n`, B2 to B4 `\n`.
         assert!(text.starts_with("x\r"));
@@ -1558,16 +1566,23 @@ mod tests {
             if split != WrongSplit::CrLfTwo {
                 assert!(emoji(spec[name_line]), "name: spec line {name_line} is not emoji under {split:?}");
             }
-            // Offsets 1 and 5 on an emoji line fall inside a character, counted
-            // in UTF-16 and UTF-8.
-            for e in [Encoding::Utf16, Encoding::Utf8] {
-                for off in [1usize, 5] {
+            // `word`'s offsets (9 and 13), on the emoji line the spec split
+            // puts them on, are inside a character in UTF-16 and UTF-8 and past
+            // the end in code points: no counting of the spec's lines explains
+            // them. On the wrong split's own line they are boundaries.
+            for off in [9usize, 13] {
+                for e in [Encoding::Utf16, Encoding::Utf8] {
                     assert_eq!(
                         text::position_status(spec[word_line], e, 0, off),
                         PositionStatus::InsideCharacter,
-                        "word offset {off} in {e:?}"
+                        "word offset {off} in {e:?} under {split:?}"
                     );
                 }
+                assert_eq!(
+                    text::position_status(spec[word_line], Encoding::Utf32, 0, off),
+                    PositionStatus::PastEndOfLine
+                );
+                assert_eq!(text::position_status(lines[word_line], Encoding::Utf16, 0, off), PositionStatus::Boundary);
             }
         }
     }
@@ -1607,43 +1622,25 @@ mod tests {
     }
 
     #[test]
-    fn d5_incomplete_evidence_is_an_error() {
-        let j = judged_d5(&[], 4, 4);
-        let (v, d) = judge_d5(Encoding::Utf16, &doc_b(), &j, Some("the reply to the didOpen was missed"));
-        assert_eq!(v, Verdict::Error);
-        assert!(d.contains("inconclusive"), "{d}");
+    fn wrong_splits_split_as_named() {
+        let text = "a\rb\r\nc\nd";
+        assert_eq!(split_lines_wrong(text, WrongSplit::LfOnly), vec!["a\rb\r", "c", "d"]);
+        assert_eq!(split_lines_wrong(text, WrongSplit::NoLoneCr), vec!["a\rb", "c", "d"]);
+        assert_eq!(split_lines_wrong(text, WrongSplit::CrLfTwo), vec!["a", "b", "", "c", "d"]);
     }
 
-    // The fail condition's second clause excludes a position that is on an
-    // in-line boundary of B in any other encoding. For document B the
-    // stand-in's word/name positions (offsets 1 and 5 on the emoji lines) are
-    // inside a character in UTF-16 and UTF-8 but on a boundary in UTF-32, so
-    // they are counting faults (D1's), not line-splitting faults: D5 is an
-    // error on B's own evidence, never a fail. This test pins that.
     #[test]
-    fn d5_b_positions_are_utf32_boundaries_so_an_error() {
+    fn d5_wrong_splits_fail_on_bs_own_evidence() {
+        // `word` reported at 9..13 on the spec's emoji lines 1 and 3, as each
+        // wrong split puts it, is explained by a wrong split and by no counting
+        // of the spec's lines: D5 fails.
         let text = doc_b();
-        let spec = text::split_lines(&text);
-        for (line, off) in [(1usize, 1usize), (1, 5), (3, 1), (3, 5)] {
-            // Inside a character of the spec split, counted in UTF-16 and UTF-8...
-            assert_eq!(
-                text::position_status(spec[line], Encoding::Utf16, 0, off),
-                PositionStatus::InsideCharacter,
-                "({line},{off}) UTF-16"
-            );
-            assert_eq!(
-                text::position_status(spec[line], Encoding::Utf8, 0, off),
-                PositionStatus::InsideCharacter,
-                "({line},{off}) UTF-8"
-            );
-            // ...but on a boundary in UTF-32: a counting fault, so D5 is an error.
-            assert_eq!(
-                text::position_status(spec[line], Encoding::Utf32, 0, off),
-                PositionStatus::Boundary,
-                "({line},{off}) UTF-32"
-            );
-        }
-        // And so the verdict is an error, not a fail.
+        let j = judged_d5(&[(1, 9), (1, 13), (3, 9), (3, 13)], 0, 4);
+        let (v, d) = judge_d5(Encoding::Utf16, &text, &j, None);
+        assert_eq!(v, Verdict::Fail, "{d}");
+        assert!(d.contains("fits"), "{d}");
+        // Offsets 1 and 5 on the same lines are in-line code-point offsets: a
+        // counting fault may explain them, so D5 can't blame the split.
         let j = judged_d5(&[(1, 1), (1, 5), (3, 1), (3, 5)], 0, 4);
         let (v, d) = judge_d5(Encoding::Utf16, &text, &j, None);
         assert_eq!(v, Verdict::Error, "{d}");

@@ -1586,11 +1586,13 @@ async fn documents(ctx: &mut Ctx<'_>) {
         await_diagnostics(ctx, &b_uri, DOC_B_VERSION, b_from).await;
     }
     // Close B before D4 runs, so D4's requests concern only A and missing.txt.
+    // When lspcheck began closing B: from then on the server may answer
+    // about it from disk, so nothing about B read later is judged. Set even
+    // if the write fails partway.
     let b_closed_at = if b_opened {
-        match ctx.s.notify("textDocument/didClose", Some(json!({"textDocument": {"uri": b_uri}}))).await {
-            Ok(()) => Some(ctx.s.elapsed()),
-            Err(_) => None,
-        }
+        let began = ctx.s.elapsed();
+        let _ = ctx.s.notify("textDocument/didClose", Some(json!({"textDocument": {"uri": b_uri}}))).await;
+        Some(began)
     } else {
         None
     };
@@ -1641,6 +1643,9 @@ async fn documents(ctx: &mut Ctx<'_>) {
             });
         }
     }
+    // What is about B and was read after B's close isn't judged, as for A.
+    let about_b = |s: &Source| s.found.iter().any(|f| documents::same_uri(&f.uri, &b_uri));
+    sources.retain(|s| !(about_b(s) && b_closed_at.is_some_and(|at| s.read_at >= at)));
     let judged = documents::judge_positions(encoding, &docs, &sources);
     let incomplete = ctx.s.incomplete_within(opened_at, end);
     let (verdict, mut detail) = documents::judge_d1(encoding, &judged, incomplete.as_deref());
@@ -1683,7 +1688,8 @@ async fn documents(ctx: &mut Ctx<'_>) {
                 // change, may refer to the text before it; a position invalid
                 // there is D1's finding, not evidence about applying the
                 // change.
-                let after = documents::judge_positions_where(encoding, &docs, &sources, |s| {
+                // Document A only: B is never changed.
+                let after = documents::judge_positions_where(encoding, &docs[..1], &sources, |s| {
                     documents::only_after(&docs[0], s, change.at)
                 });
                 let incomplete_change = ctx.s.incomplete_within(change.at, end);
@@ -1701,9 +1707,10 @@ async fn documents(ctx: &mut Ctx<'_>) {
     // after-change judgement as in D3.
     if b_opened {
         let b_end = b_closed_at.map_or(end, |at| at.min(end));
-        let judged_b = documents::judge_positions_where(encoding, &docs, &sources, |s| {
-            s.found.iter().any(|f| documents::same_uri(&f.uri, &b_uri))
-        });
+        // Document B only, while it was open.
+        let b_docs: Vec<OpenDoc> = docs.iter().filter(|d| documents::same_uri(&d.uri, &b_uri)).cloned().collect();
+        let judged_b =
+            documents::judge_positions_where(encoding, &b_docs, &sources, |s| about_b(s) && s.read_at < b_end);
         let incomplete_b = ctx.s.incomplete_within(b_opened_at, b_end);
         let (verdict, mut detail) = documents::judge_d5(encoding, &b_text, &judged_b, incomplete_b.as_deref());
         if !notes.is_empty() {

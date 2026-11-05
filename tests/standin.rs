@@ -1002,20 +1002,19 @@ fn stopping_after_an_unopened_request_fails_d4() {
 
 #[test]
 fn positions_counted_in_the_wrong_units_fail_d1() {
-    for (name, diagnosis) in [
-        ("utf8-positions-as-utf16", "on a boundary if counted in UTF-8 bytes"),
-        ("codepoint-positions", "on a boundary if counted in code points"),
+    // Byte counting under UTF-16 runs past line ends (not judged) or lands
+    // on boundaries after the change and on B. Code-point counting lands
+    // inside characters after the change and on B too, but each such
+    // position is an in-line code-point offset, so D3 and D5 can't blame the
+    // change or the line split: an error each, with D1 failing.
+    for (name, diagnosis, others) in [
+        ("utf8-positions-as-utf16", "on a boundary if counted in UTF-8 bytes", &[][..]),
+        ("codepoint-positions", "on a boundary if counted in code points", &[("D3", "error"), ("D5", "error")][..]),
     ] {
         let r = fault(name);
-        // D1 fails; D5 is an error (counting fault) or passes, depending on
-        // whether the evidence is complete. Neither is a failure.
-        expect(&r, "D1", "fail");
-        assert!(
-            matches!(r.verdicts.get("D5").map(String::as_str), Some("pass") | Some("error")),
-            "D5 is {}\n{}",
-            r.verdicts.get("D5").map_or("missing".to_string(), |v| v.clone()),
-            r.stdout
-        );
+        let mut expected = vec![("D1", "fail")];
+        expected.extend_from_slice(others);
+        passes_except(&r, &expected);
         assert_eq!(r.status, 1, "D1 is a MUST check");
         assert!(r.stdout.contains("inside a character of version 41"), "{name}\n{}", r.stdout);
         assert!(r.stdout.contains(diagnosis), "{name}\n{}", r.stdout);
@@ -1030,6 +1029,23 @@ fn positions_counted_in_the_wrong_units_fail_d1() {
     assert!(r.stdout.contains("inside a character of version 41"), "{}", r.stdout);
     assert!(r.stdout.contains("on a boundary if counted in UTF-16 code units"), "{}", r.stdout);
     assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault; see D1"), "{}", r.stdout);
+}
+
+#[test]
+fn splitting_lines_the_wrong_way_fails_d1_and_d5() {
+    // The detail names every wrong split a position fits, the fault's own
+    // among them.
+    for (name, split) in [
+        ("lf-only-lines", "a line split at `\\n` only"),
+        ("crlf-two-breaks", "`\\r\\n` counted as two breaks"),
+        ("no-lone-cr", "not a lone `\\r`"),
+    ] {
+        let r = fault(name);
+        only_fails(&r, &["D1", "D5"]);
+        assert_eq!(r.status, 1, "D1 and D5 are MUST checks");
+        assert!(r.stdout.contains("under a line split the spec doesn't allow"), "{name}\n{}", r.stdout);
+        assert!(r.stdout.contains(split), "{name}: {split}\n{}", r.stdout);
+    }
 }
 
 #[test]
