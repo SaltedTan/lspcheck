@@ -568,13 +568,6 @@ fn c3_counts_only_id_less_replies_read_after_the_first_cancel() {
 }
 
 #[test]
-fn a_reply_queued_behind_an_unanswerable_request_is_still_judged() {
-    // The id-null reply arrives with shutdown's answer, behind a request whose
-    // answer lspcheck can't write because the server stopped reading.
-    expect(&fault("shutdown-block"), "C3", "fail");
-}
-
-#[test]
 fn a_frame_skipped_before_the_cancelled_request_doesnt_excuse_its_absence() {
     let r =
         run(&["--fault", "big-frame", "--fault", "cancelled-no-reply"], &["--max-frame-mib", "1", "--timeout", "3"]);

@@ -96,3 +96,25 @@ time.sleep(30)
     assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
     s.finish(Duration::from_millis(200)).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn taking_in_what_was_read_doesnt_wait_on_an_answer_it_cant_write() {
+    // On shutdown this server sends its answer, a configuration request whose
+    // answer is bigger than a pipe, and an error with id null, then stops
+    // reading. Everything it sent must still be recorded, promptly.
+    let mut s = Session::start(&standin(&["--fault", "shutdown-block"]), Options::default()).await.unwrap();
+    let t = Duration::from_secs(5);
+    s.call("initialize", Some(json!({"processId": null, "rootUri": null, "capabilities": {}})), t).await.unwrap();
+    s.notify("initialized", Some(json!({}))).await.unwrap();
+    s.call("shutdown", None, t).await.unwrap();
+    // Let the stdout task read the rest; it is already written.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::timeout(Duration::from_secs(5), async { s.take_in() })
+        .await
+        .expect("take_in waited on an answer the server can't read");
+    assert!(
+        s.messages.iter().any(|(_, m)| m.value.get("id") == Some(&serde_json::Value::Null)),
+        "the reply after the configuration request wasn't recorded"
+    );
+    s.finish(Duration::from_millis(200)).await;
+}
