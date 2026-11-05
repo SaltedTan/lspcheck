@@ -12,7 +12,7 @@
 
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
-use crate::session::{self, CallError, Finish, Options, Problem, Session, WaitError, WriteError};
+use crate::session::{self, CallError, Finish, Options, Problem, Session, Unmatched, WaitError, WriteError};
 use crate::transcript;
 use crate::transport;
 use serde::Serialize;
@@ -81,6 +81,9 @@ pub const CATALOGUE: &[CheckInfo] = &[
     check!("F6", Framing, Must, "A Content-Type header with charset=utf-8 from the client is accepted", "headerPart"),
     check!("F7", Framing, Should, "The legacy charset=utf8 spelling from the client is accepted", "contentPart"),
     check!("F8", Framing, Should, "A Content-Type the server sends declares UTF-8", "contentPart"),
+    check!("J1", JsonRpc, Must, "A reply keeps its request's id: a number stays a number, exactly", "responseMessage"),
+    check!("J2", JsonRpc, Must, "Exactly one response per request: none duplicated or unasked", "responseMessage"),
+    check!("J3", JsonRpc, Must, "Notifications get no response, including unknown and $/ ones", "notificationMessage"),
     check!(
         "J4",
         JsonRpc,
@@ -88,6 +91,14 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "An unknown request gets MethodNotFound (-32601), including a $/ request",
         "dollarRequests"
     ),
+    check!(
+        "J5",
+        JsonRpc,
+        Must,
+        "Envelopes are well formed: jsonrpc 2.0, one of result/error, an integer code",
+        "responseMessage"
+    ),
+    check!("J6", JsonRpc, Must, "Concurrent requests are each answered with the right id", "requestMessage"),
     check!(
         "L1",
         Lifecycle,
@@ -109,7 +120,7 @@ pub const CATALOGUE: &[CheckInfo] = &[
 ];
 
 /// Checks judged from every scenario's observations.
-pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "L9"];
+pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "J1", "J2", "J5", "L9"];
 
 pub fn info(id: &str) -> &'static CheckInfo {
     CATALOGUE.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("unknown check {id}"))
@@ -189,6 +200,12 @@ pub struct Observations {
     pub scan_error: Option<String>,
     pub not_stopped: Vec<ProcInfo>,
     pub limit: Option<(Duration, String)>,
+    /// Every message the server sent, in order.
+    pub messages: Vec<(Duration, Message)>,
+    /// Responses that matched no outstanding request, classified.
+    pub unmatched: Vec<Unmatched>,
+    /// Requests that were answered, with when their response was read.
+    pub answered: Vec<(Duration, Id)>,
 }
 
 /// One scenario's verdicts and observations.
@@ -210,6 +227,7 @@ pub struct Scenario {
 
 pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "lifecycle", checks: &["L2", "J4", "L4", "L6"] },
+    Scenario { name: "json-rpc", checks: &["J6", "J3"] },
     Scenario { name: "pre-initialize", checks: &["L1"] },
     Scenario { name: "exit-without-shutdown", checks: &["L7"] },
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
@@ -229,8 +247,17 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
             runs.push(run_scenario(s, cfg).await?);
         }
     }
-    let cross: Vec<CheckResult> =
-        [judge_f1(&runs), judge_f2(&runs), judge_f8(&runs), judge_l9(&runs)].into_iter().collect();
+    let cross: Vec<CheckResult> = [
+        judge_f1(&runs),
+        judge_f2(&runs),
+        judge_f8(&runs),
+        judge_j1(&runs),
+        judge_j2(&runs),
+        judge_j5(&runs),
+        judge_l9(&runs),
+    ]
+    .into_iter()
+    .collect();
     runs.push(ScenarioRun { name: "all", results: cross, observed: None, transcript: None });
     for run in &mut runs {
         run.results.retain(|r| wants(r.id));
@@ -272,6 +299,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
     let mut ctx = Ctx { s: session, cfg, root, results: Vec::new(), scenario: name };
     match name {
         "lifecycle" => lifecycle(&mut ctx).await,
+        "json-rpc" => json_rpc(&mut ctx).await,
         "pre-initialize" => pre_initialize(&mut ctx).await,
         "exit-without-shutdown" => exit_without_shutdown(&mut ctx).await,
         "framing" => framing(&mut ctx).await,
@@ -332,6 +360,9 @@ fn observations(f: Finish) -> Observations {
         scan_error: f.scan_error,
         not_stopped: f.not_stopped,
         limit: f.limit,
+        messages: f.messages,
+        unmatched: f.unmatched,
+        answered: f.answered,
     }
 }
 
@@ -501,6 +532,147 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
         Some(status) if status.code() == Some(0) => ctx.pass("L6"),
         Some(status) => ctx.fail("L6", format!("exited with {}", session::describe_status(status))),
         None => ctx.fail("L6", format!("still running {} s after exit", ctx.cfg.exit_timeout.as_secs())),
+    }
+}
+
+/// Concurrent requests, then notifications that must not be answered.
+async fn json_rpc(ctx: &mut Ctx<'_>) {
+    if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
+        ctx.initialize().await
+    {
+        for id in ["J6", "J3"] {
+            ctx.report(id, Verdict::Error, format!("initialize didn't succeed: {why}"));
+        }
+        return;
+    }
+    let t = ctx.cfg.request_timeout;
+    check_j6(ctx, t).await;
+    check_j3(ctx, t).await;
+
+    // Leave politely so the server isn't killed mid-thought.
+    if ctx.s.call("shutdown", None, t).await.is_ok() {
+        let _ = ctx.s.notify("exit", None).await;
+        let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    }
+}
+
+/// Four requests written before any reply is read: each must be answered with
+/// its exact id, in any order.
+async fn check_j6(ctx: &mut Ctx<'_>, t: Duration) {
+    let started = ctx.s.elapsed();
+    // Two numeric ids and two string ids. The digit string catches a server
+    // that turns numeric strings into numbers; the other catches the rest.
+    let digit = format!("{:06}", session::random_u64() % 1_000_000);
+    let text = format!("lspcheck-{}", session::random_u64() % 1_000_000_000);
+    let ids = [ctx.s.fresh_id(), ctx.s.fresh_id(), Id::Str(digit), Id::Str(text)];
+    let bodies: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|id| {
+            let body =
+                serde_json::to_vec(&message::request(id, PROBE, Some(json!({})))).expect("JSON values serialize");
+            transport::encode(&body)
+        })
+        .collect();
+    // One deadline covers registering, writing and waiting for all four.
+    let deadline = Instant::now() + t;
+    let mut failure = None;
+    let mut registered = 0;
+    for (i, id) in ids.iter().enumerate() {
+        if let Err(e) = ctx.s.begin_request(id, deadline).await {
+            failure = Some(format!("lspcheck couldn't register a request: {e}"));
+            registered = i;
+            break;
+        }
+        registered = i + 1;
+    }
+    if failure.is_none() {
+        for (i, body) in bodies.iter().enumerate() {
+            if let Err(e) = ctx.s.write_raw(body).await {
+                // The server may have seen part of the failed write, so those
+                // ids are aborted; the earlier, whole ones stay outstanding.
+                ids[i..].iter().for_each(|id| ctx.s.abort_request(id));
+                failure = Some(format!("lspcheck couldn't send a request: {e}"));
+                break;
+            }
+        }
+    } else {
+        ids[..registered].iter().for_each(|id| ctx.s.abort_request(id));
+    }
+    if let Some(why) = failure {
+        return ctx.report("J6", Verdict::Error, why);
+    }
+
+    let mut missing = Vec::new();
+    let mut closed = false;
+    for id in &ids {
+        match ctx.s.wait_response(id, deadline).await {
+            Ok(_) => {}
+            Err(WaitError::Timeout) => missing.push(id.clone()),
+            Err(WaitError::Closed) => {
+                missing.push(id.clone());
+                closed = true;
+                break;
+            }
+        }
+    }
+    if missing.is_empty() {
+        return ctx.pass("J6");
+    }
+    let list: Vec<String> = missing.iter().map(Id::to_string).collect();
+    let mut detail = format!(
+        "{} of {} concurrent requests were not answered with their id: {}",
+        missing.len(),
+        ids.len(),
+        list.join(", ")
+    );
+    if closed {
+        detail.push_str(" (the server closed its stdout)");
+    }
+    let unasked = ctx.s.unmatched_ids(started);
+    if !unasked.is_empty() {
+        let list: Vec<String> = unasked.iter().map(Id::to_string).collect();
+        detail.push_str(&format!("; meanwhile responses with unmatched ids arrived: {}", list.join(", ")));
+    }
+    ctx.fail_absent("J6", detail);
+}
+
+/// Two unknown notifications, then two probes: nothing must answer the
+/// notifications. The second probe's reply ends the window, so a late reply
+/// still counts.
+async fn check_j3(ctx: &mut Ctx<'_>, t: Duration) {
+    const UNKNOWN: [&str; 2] = ["lspcheck/unknownNotification", "$/lspcheck/unknownNotification"];
+    let before = ctx.s.messages.len();
+    for method in UNKNOWN {
+        if let Err(e) = ctx.s.notify(method, Some(json!({}))).await {
+            return ctx.report("J3", Verdict::Error, format!("lspcheck couldn't send {method}: {e}"));
+        }
+    }
+    for _ in 0..2 {
+        if let Err(e) = ctx.s.call(PROBE, Some(json!({})), t).await {
+            // A reply could still be coming, so this says nothing either way.
+            return ctx.report("J3", Verdict::Error, format!("couldn't tell: the server stopped answering ({e})"));
+        }
+    }
+    let replies: Vec<String> = ctx.s.messages[before..].iter().filter_map(|(_, m)| reply_to_notification(m)).collect();
+    if replies.is_empty() {
+        return ctx.pass("J3");
+    }
+    let more = replies.len() - 1;
+    let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+    ctx.fail("J3", format!("a notification was answered with {}{tail}", replies[0]));
+}
+
+/// Whether a message is a response where a notification's reply would be, and
+/// how to describe it.
+fn reply_to_notification(m: &Message) -> Option<String> {
+    match &m.kind {
+        Kind::Response { id: Id::Null, outcome } => {
+            Some(format!("a response with id null ({})", describe_outcome(outcome)))
+        }
+        Kind::Invalid(_) if m.value.get("result").is_some() || m.value.get("error").is_some() => {
+            Some(format!("a response without an id: {}", session::preview(m.value.to_string().as_bytes())))
+        }
+        _ => None,
     }
 }
 
@@ -1361,6 +1533,113 @@ fn judge_f8(runs: &[ScenarioRun]) -> CheckResult {
     cross("F8", runs, failures, "", true)
 }
 
+fn judge_j1(runs: &[ScenarioRun]) -> CheckResult {
+    let failures = observed(runs)
+        .filter_map(|(name, o)| {
+            let bad: Vec<&Unmatched> = o.unmatched.iter().filter(|u| u.loose.is_some()).collect();
+            let first = bad.first()?;
+            let more = bad.len() - 1;
+            let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+            let sent = first.loose.as_ref().expect("filtered for a loosely equal id");
+            Some(format!(
+                "in {name} at {} ms: a response id {} where lspcheck sent {sent}{tail}",
+                first.at.as_millis(),
+                first.id
+            ))
+        })
+        .collect();
+    let r = cross("J1", runs, failures, "", true);
+    if r.verdict != Verdict::Pass {
+        return r;
+    }
+    // A matching value proves little unless both JSON types were seen: a
+    // server that always answers with a number would pass every numeric id.
+    let answered: Vec<&Id> = observed(runs).flat_map(|(_, o)| o.answered.iter().map(|(_, id)| id)).collect();
+    let numbers = answered.iter().any(|id| matches!(id, Id::Num { .. }));
+    let strings = answered.iter().any(|id| matches!(id, Id::Str(_)));
+    if numbers && strings {
+        return r;
+    }
+    let missing = match (numbers, strings) {
+        (false, false) => "a numeric or a string",
+        (false, true) => "a numeric",
+        _ => "a string",
+    };
+    result("all", "J1", Verdict::NotExercised, format!("no request with {missing} id was answered with exactly its id"))
+}
+
+/// Whether an unmatched response breaks J2, rather than being lawful (a
+/// null id) or J1's finding (an id only loosely equal to one sent).
+fn j2_blames(u: &Unmatched) -> bool {
+    u.loose.is_none() && u.id != Id::Null && !u.aborted && (u.duplicate || u.early || u.unsent)
+}
+
+fn describe_unmatched(u: &Unmatched) -> String {
+    if u.duplicate {
+        format!("a second response for id {}, whose request was already answered", u.id)
+    } else if u.early {
+        format!("a response id {} read before its request was sent", u.id)
+    } else {
+        format!("a response id {}, which lspcheck never sent", u.id)
+    }
+}
+
+fn judge_j2(runs: &[ScenarioRun]) -> CheckResult {
+    let failures = observed(runs)
+        .filter_map(|(name, o)| {
+            let bad: Vec<&Unmatched> = o.unmatched.iter().filter(|u| j2_blames(u)).collect();
+            let first = bad.first()?;
+            let more = bad.len() - 1;
+            let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+            Some(format!("in {name} at {} ms: {}{tail}", first.at.as_millis(), describe_unmatched(first)))
+        })
+        .collect();
+    let r = cross("J2", runs, failures, "", true);
+    if r.verdict == Verdict::Pass && observed(runs).all(|(_, o)| o.answered.is_empty() && o.unmatched.is_empty()) {
+        return result("all", "J2", Verdict::NotExercised, "the server sent no response lspcheck could judge");
+    }
+    r
+}
+
+/// Why a message isn't a well-formed JSON-RPC 2.0 envelope, if it isn't.
+fn envelope_problem(m: &Message) -> Option<String> {
+    match &m.kind {
+        Kind::Invalid(why) => Some(format!("an invalid message: {why}")),
+        Kind::Response { outcome: Outcome::Malformed(why), .. } => Some(format!("a response that {why}")),
+        Kind::Response { outcome: Outcome::Error { code: None, error, .. }, .. } => {
+            Some(format!("an error whose code isn't an integer: {}", session::preview(error.to_string().as_bytes())))
+        }
+        Kind::Response { outcome: Outcome::Error { message: None, error, .. }, .. } => {
+            Some(format!("an error whose message isn't a string: {}", session::preview(error.to_string().as_bytes())))
+        }
+        Kind::Request { id, .. } => match id {
+            Id::Null => Some("a request with id null".into()),
+            Id::Other(raw) => Some(format!("a request with id {raw}, which is neither a string nor a number")),
+            Id::Num { raw, .. } if !id.is_integer() => Some(format!("a request with the non-integer id {raw}")),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn judge_j5(runs: &[ScenarioRun]) -> CheckResult {
+    let failures = observed(runs)
+        .filter_map(|(name, o)| {
+            let bad: Vec<(Duration, String)> =
+                o.messages.iter().filter_map(|(at, m)| envelope_problem(m).map(|why| (*at, why))).collect();
+            let (at, why) = bad.first()?;
+            let more = bad.len() - 1;
+            let tail = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+            Some(format!("in {name} at {} ms: {why}{tail}", at.as_millis()))
+        })
+        .collect();
+    let r = cross("J5", runs, failures, "", true);
+    if r.verdict == Verdict::Pass && observed(runs).all(|(_, o)| o.messages.is_empty()) {
+        return result("all", "J5", Verdict::NotExercised, "the server sent no readable message");
+    }
+    r
+}
+
 fn judge_l9(runs: &[ScenarioRun]) -> CheckResult {
     let all = observed(runs).collect::<Vec<_>>();
     if all.iter().any(|(_, o)| o.coverage == Coverage::None) {
@@ -1506,6 +1785,9 @@ mod tests {
                 scan_error: scan_error.map(str::to_string),
                 not_stopped: Vec::new(),
                 limit: None,
+                messages: Vec::new(),
+                unmatched: Vec::new(),
+                answered: Vec::new(),
             }),
             transcript: None,
         }
@@ -1522,6 +1804,63 @@ mod tests {
         // Without the leak, the failed search makes the result unknown.
         let runs = [observed_run("lifecycle", vec![], None), observed_run("pre-initialize", vec![], Some("no /proc"))];
         assert_eq!(judge_l9(&runs).verdict, Verdict::Error);
+    }
+
+    #[test]
+    fn j5_recognises_bad_envelopes() {
+        let bad = |s: &str| envelope_problem(&Message::parse(s.as_bytes()).unwrap());
+        // Both or neither of result and error.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{}}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1}"#).is_some());
+        // A missing or wrong jsonrpc field.
+        assert!(bad(r#"{"id":1,"result":null}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"1.0","id":1,"result":null}"#).is_some());
+        // An error code that isn't an integer, or a message that isn't a string.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"error":{"code":"-32601","message":"x"}}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":7}}"#).is_some());
+        // Request ids that JSON-RPC doesn't allow.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":null,"method":"m"}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1.5,"method":"m"}"#).is_some());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":true,"method":"m"}"#).is_some());
+        // Well-formed envelopes.
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"method":"m"}"#).is_none());
+        assert!(bad(r#"{"jsonrpc":"2.0","method":"m"}"#).is_none());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).is_none());
+        assert!(bad(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"x"}}"#).is_none());
+    }
+
+    #[test]
+    fn j2_blames_only_unexplained_unmatched_responses() {
+        let u = |id: Id| Unmatched {
+            at: Duration::ZERO,
+            id,
+            duplicate: false,
+            unsent: false,
+            early: false,
+            aborted: false,
+            loose: None,
+        };
+        let mut unsent = u(Id::int(1));
+        unsent.unsent = true;
+        assert!(j2_blames(&unsent));
+        let mut duplicate = u(Id::int(1));
+        duplicate.duplicate = true;
+        assert!(j2_blames(&duplicate));
+        let mut early = u(Id::int(1));
+        early.early = true;
+        assert!(j2_blames(&early));
+        // A response to a write that failed, a null id, and J1's loose ids are
+        // lawful as far as J2 is concerned.
+        let mut aborted = u(Id::int(1));
+        aborted.aborted = true;
+        assert!(!j2_blames(&aborted));
+        let mut null = u(Id::Null);
+        null.unsent = true;
+        assert!(!j2_blames(&null));
+        let mut loose = u(Id::int(1));
+        loose.unsent = true;
+        loose.loose = Some(Id::Str("1".into()));
+        assert!(!j2_blames(&loose));
     }
 
     #[test]

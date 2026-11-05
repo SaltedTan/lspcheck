@@ -286,12 +286,16 @@ fn escaped_non_ascii_output_leaves_f2_not_exercised() {
 #[test]
 fn a_server_lost_on_the_f2_probe_doesnt_fail_what_follows() {
     // The probe for F2's evidence has a string id, and this server exits on
-    // it. F3's last part comes after it, and isn't run.
+    // it. F3's last part comes after it, and isn't run. The same exit leaves
+    // the concurrent string-id requests unanswered, so J6 fails: that is the
+    // rule this server breaks, not an artefact of what follows.
     let r = fault("exit-on-string-id");
     expect(&r, "F2", "not-exercised");
     expect(&r, "F3", "pass");
+    expect(&r, "J1", "not-exercised");
+    expect(&r, "J6", "fail");
     assert!(r.stdout.contains("the part that splits multibyte characters wasn't run"), "{}", r.stdout);
-    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+    assert!(r.verdicts.iter().all(|(id, v)| v != "fail" || id == "J6"), "{}", r.stdout);
 }
 
 #[test]
@@ -403,13 +407,56 @@ fn a_refused_initialize_is_an_error_not_a_failure() {
 
 #[test]
 fn replies_sent_before_their_requests_dont_count() {
-    only_fails(&fault("early-replies"), &["J4"]);
+    // The guessed ids are never sent, so they are unasked responses (J2); the
+    // fault also answers unknown requests wrongly (J4).
+    only_fails(&fault("early-replies"), &["J2", "J4"]);
 }
 
 #[test]
 fn wrong_unknown_method_errors_fail_j4() {
     only_fails(&fault("wrong-unknown-error"), &["J4"]);
     only_fails(&fault("ignore-dollar-request"), &["J4"]);
+}
+
+#[test]
+fn a_string_id_answered_as_a_number_fails_j1() {
+    let r = fault("string-id-to-number");
+    // The concurrent request whose id was changed never gets a reply with its
+    // own id, so J6 fails too: one fault, two rules.
+    only_fails(&r, &["J1", "J6"]);
+    assert!(r.stdout.contains("where lspcheck sent"), "{}", r.stdout);
+}
+
+#[test]
+fn duplicate_and_unsent_responses_fail_j2() {
+    only_fails(&fault("reply-twice"), &["J2"]);
+    let r = fault("reply-unsent-id");
+    only_fails(&r, &["J2"]);
+    assert!(r.stdout.contains("which lspcheck never sent"), "{}", r.stdout);
+}
+
+#[test]
+fn a_reply_to_a_notification_fails_j3() {
+    let r = fault("reply-to-notification");
+    only_fails(&r, &["J3"]);
+    assert!(r.stdout.contains("a notification was answered"), "{}", r.stdout);
+}
+
+#[test]
+fn malformed_envelopes_fail_j5() {
+    only_fails(&fault("no-jsonrpc-field"), &["J5"]);
+    // These mangle the reply the $/ unknown request waits on, so J4 fails too:
+    // a response with both result and error, or an error with a string code,
+    // is not MethodNotFound either.
+    only_fails(&fault("result-and-error"), &["J4", "J5"]);
+    only_fails(&fault("string-error-code"), &["J4", "J5"]);
+}
+
+#[test]
+fn dropping_a_concurrent_request_fails_j6() {
+    let r = fault_taking_effect("drop-concurrent", "drop-concurrent dropped");
+    only_fails(&r, &["J6"]);
+    assert!(r.stdout.contains("were not answered"), "{}", r.stdout);
 }
 
 #[test]

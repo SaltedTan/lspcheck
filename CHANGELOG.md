@@ -7,6 +7,8 @@
   - F3 to F7, how the server reads its input: split writes, coalesced frames, multibyte text, and the client's
     `Content-Type` header in both charset spellings;
   - J4, MethodNotFound for unknown requests;
+  - J1 to J3, J5 and J6, JSON-RPC correlation: ids preserved, one response per request, none to a notification,
+    well-formed envelopes, and concurrent requests with numeric and string ids;
   - L1 to L8, the initialize, shutdown and exit lifecycle, including a second initialize, requests after shutdown,
     and the end of input without exit;
   - L9, leftover processes;

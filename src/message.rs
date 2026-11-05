@@ -90,6 +90,39 @@ impl Id {
             Id::Other(_) => "another JSON type",
         }
     }
+
+    /// Whether this is a whole number. LSP requests use integer ids.
+    pub fn is_integer(&self) -> bool {
+        match self {
+            Id::Num { raw, .. } => {
+                serde_json::from_str::<Value>(raw).ok().and_then(|v| integer_value(v.as_number()?)).is_some()
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether two ids are only loosely equal: the same number spelled as a string
+/// and a number, or numbers that become equal when rounded through `f64` but
+/// are not exactly equal. Such a reply kept the right value but the wrong JSON
+/// type or precision, which J1 reports.
+pub fn loosely_equal(a: &Id, b: &Id) -> bool {
+    match (a, b) {
+        (Id::Str(s), Id::Num { canon, .. }) | (Id::Num { canon, .. }, Id::Str(s)) => {
+            canonical_number(s).is_some_and(|c| &c == canon)
+        }
+        // `f64` is how a server that parses ids as doubles loses precision.
+        (Id::Num { canon: a, raw: ra }, Id::Num { canon: b, raw: rb }) => {
+            if a == b {
+                return false;
+            }
+            match (ra.parse::<f64>(), rb.parse::<f64>()) {
+                (Ok(x), Ok(y)) => x.is_finite() && x == y,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 impl std::fmt::Display for Id {
@@ -312,6 +345,39 @@ mod tests {
         assert_ne!(id("9007199254740993"), id("9007199254740992"));
         assert_eq!(id("7.0").to_string(), "7.0", "the received spelling is kept");
         assert_eq!(Id::int(-3).to_value().to_string(), "-3");
+    }
+
+    #[test]
+    fn loosely_equal_ids_cover_type_and_precision_slips() {
+        let num = |s: &str| {
+            Message::parse(format!(r#"{{"jsonrpc":"2.0","id":{s},"result":null}}"#).as_bytes())
+                .unwrap()
+                .response_id()
+                .cloned()
+                .unwrap()
+        };
+        // A server that turned the numeric string into a number, or the other way round.
+        assert!(loosely_equal(&num("\"123\""), &Id::int(123)));
+        assert!(loosely_equal(&Id::int(123), &num("\"123\"")));
+        assert!(!loosely_equal(&num("\"lspcheck-1\""), &Id::int(1)));
+        assert!(!loosely_equal(&num("\"7\""), &Id::int(8)));
+        // Two different numbers that a double can't tell apart.
+        assert!(loosely_equal(&num("9007199254740993"), &num("9007199254740992")));
+        assert!(!loosely_equal(&num("7.0"), &num("7")));
+        assert!(!loosely_equal(&num("\"7\""), &num("\"7\"")));
+    }
+
+    #[test]
+    fn whole_numbers_are_the_only_valid_numeric_request_ids() {
+        assert!(Id::int(7).is_integer());
+        assert!(Id::int(-0).is_integer());
+        assert!(!Id::from_value(&serde_json::json!({"not": "a number"})).is_integer());
+        let fraction = Message::parse(br#"{"jsonrpc":"2.0","id":1.5,"method":"m"}"#).unwrap();
+        let Kind::Request { id, .. } = fraction.kind else { panic!("not a request") };
+        assert!(!id.is_integer());
+        let huge = Message::parse(br#"{"jsonrpc":"2.0","id":1e400,"method":"m"}"#).unwrap();
+        let Kind::Request { id, .. } = huge.kind else { panic!("not a request") };
+        assert!(!id.is_integer());
     }
 
     #[test]

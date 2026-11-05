@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: C1 to C3 are done. F1, F2, F8 and L9 are judged across every scenario. Everything else below is planned.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J1 to J6, and L1 to L9. M2 is under way: C1 to C3 are done. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario. J7, documents, transcripts and `replay` are still planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -61,13 +61,19 @@ whole, because a missing reply to it can't be told apart from a slow start.
 ### JSON-RPC correlation
 | ID | Basis | Check |
 |---|---|---|
-| J1 | MUST | A reply's `id` is the same value as the request's: a number stays a number with the same exact value (`7` and `7.0` are the same; no rounding through floating point), and `"7"` stays a string. |
-| J2 | MUST | Exactly one response per request within its deadline; no duplicates, no responses to ids never sent. |
+| J1 | MUST | A reply's `id` is the same value as the request's: a number stays a number with the same exact value (`7` and `7.0` are the same; no rounding through floating point), and `"7"` stays a string. A reply that is only loosely equal (the number spelled as a string, or equal only after rounding) fails with both spellings; a request with a string id and one with a number id must each be answered exactly somewhere in the run. |
+| J2 | MUST | No response is unmatched: no duplicate for a request already answered, none to an id lspcheck never sent, and none read before its request was sent. Responses with a null id and those to a request lspcheck couldn't deliver are lawful; loosely equal ids belong to J1. A request that never got its reply is judged by the check that sent it. |
 | J3 | MUST | No response to notifications, including unknown ones and unknown `$/` ones. |
 | J4 | MUST | An unknown request method gets error `-32601` MethodNotFound; an unknown `$/` request too. |
 | J5 | MUST | Envelopes: `"jsonrpc": "2.0"`, exactly one of `result`/`error`, error `code` an integer and `message` a string. |
 | J6 | MUST | Concurrent requests (sent before any reply) are each answered with the right id; order may differ. |
 | J7 | MUST | Server-to-client requests have well-formed unique ids; the checker answers them (configurable) and checks the server tolerates the answers. |
+
+J1, J2 and J5 are judged across every scenario from the responses and messages seen. The `json-rpc` scenario exercises J6
+and J3: after `initialize`, four requests are written before any reply is read (two numeric ids, one numeric string and
+one non-numeric string), and each must be answered with its exact id in any order; then two unknown notifications are
+followed by two probes that must be answered without any response to the notifications. A notification may be answered
+with an error whose id is `null`, or an object with `result` or `error` but no id; either fails J3.
 
 ### Lifecycle
 | ID | Basis | Check |
@@ -182,9 +188,10 @@ Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, to
 
 ## How we know it works
 - `standin`: a test-only server binary (in the workspace) with fault flags, one per check:
-  `--fault stdout-banner`, `char-length`, `id-to-int`, `reply-twice`, `reply-to-notification`, `no-method-not-found`,
-  `exit-on-shutdown`, `exit-code-0-without-shutdown`, `ignore-eof`, `orphan-child`, `utf8-positions-as-utf16`, …
-  **Every check has a test that fails it on its fault and passes the clean stand-in.** That guards against false greens.
+  `--fault stdout-banner`, `char-length`, `string-id-to-number`, `reply-twice`, `reply-unsent-id`,
+  `reply-to-notification`, `no-jsonrpc-field`, `result-and-error`, `wrong-unknown-error`, `exit-on-shutdown`,
+  `exit-status`, `ignore-eof`, `orphan-child`, `bad-encoding`, … **Every check has a test that fails it on its fault and
+  passes the clean stand-in.** That guards against false greens.
 - Self-tests for the harness: partial frames, stderr floods, a server that stops reading stdin, a hung server, signals
   during spawn, cleanup after a crash.
 - Real servers in CI (pinned versions; results recorded as expected-results files, not required to all pass):

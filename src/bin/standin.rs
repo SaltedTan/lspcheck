@@ -49,6 +49,14 @@ const FAULTS: &[(&str, &str)] = &[
     ("no-capabilities", "leave capabilities out of the initialize result"),
     ("early-replies", "answer guessed request ids before they are sent, then answer unknown requests wrongly"),
     ("wrong-unknown-error", "answer unknown requests with InvalidRequest"),
+    ("string-id-to-number", "reply to a request whose id is a string of digits with that number as id"),
+    ("reply-twice", "answer every lspcheck/probe twice"),
+    ("reply-unsent-id", "after initialize, send a response with an id lspcheck never used"),
+    ("reply-to-notification", "answer an unknown notification with an error whose id is null"),
+    ("no-jsonrpc-field", "after initialize, send a window/logMessage notification without \"jsonrpc\""),
+    ("result-and-error", "answer an unknown $/ request with both a result and an error"),
+    ("string-error-code", "answer an unknown $/ request with an error whose code is the string \"-32601\""),
+    ("drop-concurrent", "when more requests are already buffered, answer only the last of them"),
     ("ignore-dollar-request", "never answer an unknown $/ request"),
     ("shutdown-result", "return {} from shutdown"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
@@ -58,7 +66,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("ignore-exit", "ignore exit and stay running"),
     ("split-header", "drop input when a read ends inside a header section, as if each header came in one read"),
     ("split-utf8", "decode each read as UTF-8 on its own, mangling characters split across reads"),
-    ("first-frame-per-read", "keep only the first frame of a read that holds three or more"),
+    ("first-frame-per-read", "keep only the first frame of a read that holds a notification and two more"),
     ("char-length-input", "count the Content-Length of incoming frames in characters, not bytes"),
     ("no-content-type", "ignore incoming frames that have a Content-Type header"),
     ("strict-charset", "ignore incoming frames whose charset isn't spelled utf-8"),
@@ -225,6 +233,12 @@ fn main() {
             if method == "textDocument/didOpen" && fault("no-open-close") {
                 std::process::exit(4);
             }
+            if initialized
+                && fault("reply-to-notification")
+                && (method.starts_with("lspcheck/") || method.starts_with("$/lspcheck/"))
+            {
+                out.frame(&err(&Value::Null, -32601, "unknown notification"));
+            }
             if !initialized && fault("late-reply-to-pre-init-notification") {
                 late_reply = Some(
                     json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32002, "message": "not initialized"}}),
@@ -265,6 +279,17 @@ fn main() {
         if no_more_answers {
             continue;
         }
+        // A server that assumes one request per read, keeping only the last
+        // when several are buffered: the earlier ones are never answered.
+        if fault("drop-concurrent") && input.ready_request() {
+            eprintln!("standin: drop-concurrent dropped a request");
+            continue;
+        }
+        // A numeric string id turned into a number: the wrong JSON type.
+        let id = match id.as_str().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
+            Some(s) if fault("string-id-to-number") => s.parse::<i64>().map_or(id, |n| json!(n)),
+            _ => id,
+        };
         if method == "initialize" && initialized && !fault("reinitialize") {
             if fault("exit-on-reinitialize") {
                 std::process::exit(3);
@@ -294,8 +319,15 @@ fn main() {
                 if fault(name) {
                     let body =
                         "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":4,\"message\":\"é";
-                    let next = format!("{line}\r\nContent-Length: 2\r\n\r\n{{}}");
+                    // A well-formed notification follows, so only the framing
+                    // mistake this fault is about can be blamed.
+                    let notice = serde_json::to_vec(
+                        &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}}),
+                    )
+                    .unwrap();
+                    let next = format!("{line}\r\nContent-Length: {}\r\n\r\n", notice.len());
                     out.raw(format!("Content-Length: {}\r\n\r\n{body}{next}", body.len()).as_bytes());
+                    out.raw(&notice);
                 }
             }
             if fault("long-miscount") {
@@ -350,6 +382,14 @@ fn main() {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
             }
             out.frame(&ok(&id, result));
+            if fault("reply-unsent-id") {
+                out.frame(&err(&json!(format!("lspcheck-unsent-{}", std::process::id())), -32601, "no such request"));
+            }
+            if fault("no-jsonrpc-field") {
+                out.frame(
+                    &json!({"method": "window/logMessage", "params": {"type": 4, "message": "no jsonrpc field"}}),
+                );
+            }
             if fault("block-after-init") {
                 let items = vec![json!({"section": "x"}); 40_000];
                 out.frame(&json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": items}}));
@@ -393,6 +433,9 @@ fn main() {
                 &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
             );
         }
+        if fault("reply-twice") && method == "lspcheck/probe" {
+            out.frame(&err(&id, -32601, "method not found"));
+        }
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
@@ -435,6 +478,17 @@ fn main() {
             }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
+            "$/lspcheck/unknownRequest" if fault("result-and-error") => out.frame(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": Value::Null,
+                "error": {"code": -32601, "message": "method not found"}
+            })),
+            "$/lspcheck/unknownRequest" if fault("string-error-code") => out.frame(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": "-32601", "message": "method not found"}
+            })),
             m if m.starts_with("$/") && fault("ignore-dollar-request") => {}
             _ if fault("ignore-unknown-requests") => {}
             _ if fault("wrong-unknown-error") => out.frame(&err(&id, -32600, "unknown")),
@@ -674,6 +728,15 @@ impl<R: Read> Input<R> {
         matches!(self.parse(&self.buf), Parsed::Frame(..))
     }
 
+    /// Whether a whole request (rather than a notification) is already buffered.
+    fn ready_request(&self) -> bool {
+        match self.parse(&self.buf) {
+            Parsed::Frame((_, body), _) => serde_json::from_slice::<Value>(&body)
+                .is_ok_and(|v| v.get("id").is_some() && v.get("method").is_some_and(Value::is_string)),
+            _ => false,
+        }
+    }
+
     /// Reads once; false at end of input.
     fn fill(&mut self) -> bool {
         if self.fault("slow-reads") {
@@ -699,11 +762,16 @@ impl<R: Read> Input<R> {
         if self.fault("first-frame-per-read") {
             let mut ends = Vec::new();
             let mut at = 0;
-            while let Parsed::Frame(_, used) = self.parse(&self.buf[at..]) {
+            let mut notification = false;
+            while let Parsed::Frame((_, body), used) = self.parse(&self.buf[at..]) {
                 at += used;
                 ends.push(at);
+                notification |= serde_json::from_slice::<Value>(&body)
+                    .is_ok_and(|v| v.get("method").is_some() && v.get("id").is_none());
             }
-            if ends.len() >= 3 {
+            // Only a read with a notification in it, F4's shape: a read of
+            // only requests is what the drop-concurrent fault covers.
+            if ends.len() >= 3 && notification {
                 self.buf.truncate(ends[0]);
             }
         }

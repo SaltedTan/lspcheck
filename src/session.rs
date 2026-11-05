@@ -193,6 +193,25 @@ struct Evidence {
     done: bool,
 }
 
+/// A response that matched no outstanding request, with what explains it.
+#[derive(Debug, Clone)]
+pub struct Unmatched {
+    /// When it was read.
+    pub at: Duration,
+    pub id: Id,
+    /// A request with this id had already been answered.
+    pub duplicate: bool,
+    /// lspcheck never sent a request with this id in this session.
+    pub unsent: bool,
+    /// The request with this id was registered only after this response was read.
+    pub early: bool,
+    /// The request's write failed, so the server may have seen part of it.
+    pub aborted: bool,
+    /// An id lspcheck sent that is only loosely equal to this one (a number
+    /// spelled as a string, or a number equal only after rounding).
+    pub loose: Option<Id>,
+}
+
 /// What remains when a session ends.
 #[derive(Debug)]
 pub struct Finish {
@@ -219,8 +238,10 @@ pub struct Finish {
     pub messages: Vec<(Duration, Message)>,
     /// Every stream problem in the whole of stdout.
     pub problems: Vec<(Duration, Problem)>,
-    /// Responses that matched no outstanding request (unknown, early, or repeated ids).
-    pub unmatched: Vec<(Duration, Id)>,
+    /// Responses that matched no outstanding request, with what explains them.
+    pub unmatched: Vec<Unmatched>,
+    /// Requests that were answered, with when their response was read.
+    pub answered: Vec<(Duration, Id)>,
     /// `Content-Type` values the server sent.
     pub content_types: Vec<(Duration, String)>,
     /// When the first readable frame with non-ASCII text in its body arrived.
@@ -276,7 +297,12 @@ pub struct Session {
     pending: HashMap<Id, Duration>,
     /// Requests answered: the index of the response in `messages`.
     answers: HashMap<Id, usize>,
-    used_ids: HashSet<Id>,
+    /// Every id a request was sent with, and when it was registered.
+    used_ids: HashMap<Id, Duration>,
+    /// Ids whose write failed before the whole request reached the server.
+    aborted: HashSet<Id>,
+    /// Requests that were answered, with when the response was read.
+    answered: Vec<(Duration, Id)>,
     unmatched: Vec<(Duration, Id)>,
     group: Group,
     exit: Option<ExitStatus>,
@@ -355,7 +381,9 @@ impl Session {
             abandoned: false,
             pending: HashMap::new(),
             answers: HashMap::new(),
-            used_ids: HashSet::new(),
+            used_ids: HashMap::new(),
+            aborted: HashSet::new(),
+            answered: Vec::new(),
             unmatched: Vec::new(),
             group,
             exit: None,
@@ -539,7 +567,8 @@ impl Session {
         loop {
             let n = (random_u64() % (i32::MAX as u64)) as i64 + 1;
             let id = Id::int(n);
-            if self.used_ids.insert(id.clone()) {
+            if !self.used_ids.contains_key(&id) {
+                self.used_ids.insert(id.clone(), self.start.elapsed());
                 return id;
             }
         }
@@ -547,7 +576,12 @@ impl Session {
 
     /// Whether lspcheck has sent a request with this id in this session.
     pub fn sent(&self, id: &Id) -> bool {
-        self.used_ids.contains(id)
+        self.used_ids.contains_key(id)
+    }
+
+    /// The ids of unmatched responses read at or after `since`.
+    pub fn unmatched_ids(&self, since: Duration) -> Vec<Id> {
+        self.unmatched.iter().filter(|(at, _)| *at >= since).map(|(_, id)| id.clone()).collect()
     }
 
     /// Sends a request, registering it so only a later response can answer it.
@@ -591,7 +625,7 @@ impl Session {
         if Instant::now() >= deadline {
             return Err(WriteError::Timeout);
         }
-        self.used_ids.insert(id.clone());
+        self.used_ids.insert(id.clone(), self.start.elapsed());
         self.answers.remove(id);
         self.pending.insert(id.clone(), self.start.elapsed());
         Ok(())
@@ -600,6 +634,7 @@ impl Session {
     /// Forgets a request registered with [`Session::begin_request`] that couldn't be written.
     pub fn abort_request(&mut self, id: &Id) {
         self.pending.remove(id);
+        self.aborted.insert(id.clone());
     }
 
     pub async fn notify(&mut self, method: &str, params: Option<Value>) -> Result<(), WriteError> {
@@ -676,6 +711,7 @@ impl Session {
             Some(&sent) if at >= sent => {
                 self.pending.remove(id);
                 self.answers.insert(id.clone(), self.messages.len() - 1);
+                self.answered.push((at, id.clone()));
             }
             _ => self.unmatched.push((at, id.clone())),
         }
@@ -877,6 +913,25 @@ impl Session {
         let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
         let whole = evidence.done && !evidence.cut;
         let (miscounted, unchecked) = miscounted_frames(&evidence.unparsed, &transcript, whole);
+        // Whether an unmatched reply is a duplicate, early, aborted or only
+        // loosely equal needs the whole session's state, not the moment it
+        // was read: a guessed id may be sent later, and a write may fail
+        // after the reply.
+        let unmatched = std::mem::take(&mut self.unmatched)
+            .into_iter()
+            .map(|(at, id)| {
+                let sent_at = self.used_ids.get(&id).copied();
+                Unmatched {
+                    at,
+                    duplicate: self.answers.contains_key(&id),
+                    unsent: sent_at.is_none(),
+                    early: sent_at.is_some_and(|sent| sent > at),
+                    aborted: self.aborted.contains(&id),
+                    loose: self.used_ids.keys().find(|sent| message::loosely_equal(&id, sent)).cloned(),
+                    id,
+                }
+            })
+            .collect();
         Finish {
             exit: if killed { None } else { self.exit },
             killed,
@@ -889,7 +944,8 @@ impl Session {
             transcript,
             messages: std::mem::take(&mut self.messages),
             problems: evidence.problems,
-            unmatched: std::mem::take(&mut self.unmatched),
+            unmatched,
+            answered: std::mem::take(&mut self.answered),
             content_types: evidence.content_types,
             non_ascii: evidence.non_ascii,
             miscounted,

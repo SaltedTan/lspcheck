@@ -16,7 +16,12 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  F6  MUST    A Content-Type header with charset=utf-8 from the client is accepted
   PASS  F7  SHOULD  The legacy charset=utf8 spelling from the client is accepted
   PASS  F8  SHOULD  A Content-Type the server sends declares UTF-8
+  PASS  J1  MUST    A reply keeps its request's id: a number stays a number, exactly
+  PASS  J2  MUST    Exactly one response per request: none duplicated or unasked
+  PASS  J3  MUST    Notifications get no response, including unknown and $/ ones
   PASS  J4  MUST    An unknown request gets MethodNotFound (-32601), including a $/ request
+  PASS  J5  MUST    Envelopes are well formed: jsonrpc 2.0, one of result/error, an integer code
+  PASS  J6  MUST    Concurrent requests are each answered with the right id
   FAIL  L1  SHOULD  Before initialize, a request gets ServerNotInitialized (-32002) and a notification no reply
                      got result "[]" instead of ServerNotInitialized
   PASS  L2  MUST    initialize returns capabilities and an offered position encoding
@@ -32,11 +37,12 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  C1  MUST    A cancelled request still gets exactly one response
   PASS  C2  MUST    Cancelling an unknown or finished request produces nothing
   PASS  C3  MUST    No response to $/cancelRequest itself
-21 checks: 18 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
+26 checks: 23 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 21 checks so far, covering framing, the lifecycle and cancellation. [The design](docs/design.md) lists the rest, which cover
-framing edge cases, request ids, document positions and robustness.
+lspcheck is early: it has 26 checks so far, covering framing, JSON-RPC correlation, the lifecycle and cancellation.
+[The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, document positions and
+robustness.
 
 ## What it doesn't do
 
@@ -63,7 +69,13 @@ lspcheck list                            # every check, with its specification s
 
 lspcheck runs the server several times, once per scenario, each time with an empty temporary workspace as its working
 directory. A server path with a directory part, such as `./my-server`, is resolved before that; a bare name is looked up
-on `PATH`. The checks on the server's output (F1, F2, F8) and on leftover processes (L9) are judged across every scenario.
+on `PATH`. The checks on the server's output (F1, F2, F8) and on leftover processes (L9) are judged across every
+scenario, as are the JSON-RPC correlation checks J1, J2 and J5.
+
+The JSON-RPC scenario writes four requests, with numeric and string ids, before reading any reply (J6), and then sends
+unknown notifications followed by probes to show that a notification gets no response (J3). A reply whose id only
+loosely matches the request's (a number spelled as a string, or one that lost precision as a double) fails J1, and a
+duplicate, unasked or premature reply fails J2.
 
 The checks on how the server reads its input (F3 to F7) send small requests the server doesn't know, which every server
 must answer, written in different ways: split across many writes, several frames in one write, with a `Content-Type`
