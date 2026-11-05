@@ -43,17 +43,19 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  C3  MUST    No response to $/cancelRequest itself
                      no response answered a $/cancelRequest notification
   PASS  D1  MUST    Positions fall on character boundaries of the text, in the negotiated encoding
-                     4 informative position(s) on character boundaries, counted in UTF-16 code units; 12 position(s) seen in the opened document, 0 past the end of a line, 0 on a line it doesn't have, 0 in other documents
+                     12 informative position(s) on character boundaries, counted in UTF-16 code units; 58 position(s) seen in the opened document, 0 past the end of a line, 0 on a line it doesn't have, 0 in other documents
   PASS  D2  MUST    A diagnostics version is one the document had when the notification was read
-                     1 versioned diagnostics notification(s) named a version lspcheck had sent
+                     3 versioned diagnostics notification(s) named a version lspcheck had sent
   PASS  D3  MUST    After a didChange, positions refer to the changed text
                      5 informative position(s) on character boundaries after the change, counted in UTF-16 code units; 14 position(s) read after the change
   PASS  D4  POLICY  A request about a document that isn't open gets a response, and the server keeps serving
                      all three answered: the closed document got result (empty); the never-opened document got result (empty); the plain request got error -32601
-30 checks: 27 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
+  PASS  D5  MUST    Lines are split at \n, \r\n and \r
+                     3 informative position(s) on character boundaries about the line-ending document, counted in UTF-16 code units; 32 position(s) about it
+31 checks: 28 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 30 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
+lspcheck is early: it has 31 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
 document positions. [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids,
 documents and robustness.
 
@@ -126,6 +128,12 @@ The same scenario also checks documents that aren't open (D4): after the change,
 the workspace that was never opened and doesn't exist, and a plain request, each awaited alone. Each must get a
 response — any result or error is lawful, including one read from disk — and the server must keep serving. A server
 that advertises none of the document requests leaves D4 `SKIP`.
+
+The same scenario also checks line endings (D5): before closing A, lspcheck opens a second document, B, whose lines end
+in a lone `\r`, `\r\n` and `\n`, with a word on two lines that a wrong split moves onto a line of emoji. A position
+about B that falls inside a character fails D5 when no counting of the spec's lines explains it (in any encoding) and
+a split the spec doesn't allow does (`\n` only, `\r\n` counted as two breaks, or no lone `\r`); otherwise D5 is
+`ERROR` and D1 carries the failure.
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of

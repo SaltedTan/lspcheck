@@ -112,6 +112,9 @@ const FAULTS: &[(&str, &str)] = &[
     ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
     ("utf8-positions-as-utf16", "count positions in UTF-8 bytes while UTF-16 is negotiated"),
     ("codepoint-positions", "count positions in code points while UTF-16 is negotiated"),
+    ("lf-only-lines", "split lines at \\n only; a \\r is an ordinary character"),
+    ("crlf-two-breaks", "count \\r\\n as two line breaks, leaving an empty line between"),
+    ("no-lone-cr", "split at \\n and \\r\\n, but not a lone \\r"),
     (
         "invalid-duplicate-symbols",
         "after answering documentSymbol, answer it again with a range inside the first character of line 0",
@@ -163,6 +166,7 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: on didClose, publish unversioned diagnostics for the file on disk, which another tool changed to ASCII",
     ),
     ("drop-first-request", "never answer the first request about a document, then answer normally"),
+    ("stop-at-crlf", "stop answering anything from the first request about crlf.txt"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
     ("escaped-child", "start a child in a new session, with a non-UTF-8 name, that outlives the server"),
@@ -195,6 +199,8 @@ fn main() {
         }
     }
     let fault = |name: &str| faults.iter().any(|f| f == name);
+    // How the stand-in splits lines, per the line-splitting faults.
+    let split = line_split(&faults);
     // Whether a workspace/symbol reply waits to see whether it is cancelled.
     let holds = ["defer-until-next", "cancelled-no-reply", "cancelled-reply-twice", "cancelled-other-error"]
         .iter()
@@ -433,7 +439,7 @@ fn main() {
                     let apply_units = if fault("codepoint-changes") { Units::CodePoints } else { negotiated_units };
                     for c in changes {
                         if let (Some(range), Some(insert)) = (c.get("range"), c.get("text").and_then(Value::as_str)) {
-                            apply_change(text, apply_units, range, insert);
+                            apply_change(text, apply_units, split, range, insert);
                         } else if let Some(insert) = c.get("text").and_then(Value::as_str) {
                             *text = insert.to_string();
                         }
@@ -553,6 +559,13 @@ fn main() {
             continue;
         };
         if no_more_answers {
+            continue;
+        }
+        if fault("stop-at-crlf")
+            && method.starts_with("textDocument/")
+            && msg.pointer("/params/textDocument/uri").and_then(Value::as_str).is_some_and(|u| u.ends_with("crlf.txt"))
+        {
+            no_more_answers = true;
             continue;
         }
         if fault("drop-first-request") && !dropped_first && method.starts_with("textDocument/") {
@@ -850,8 +863,8 @@ fn main() {
                 };
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
                 let result = match (text, disk) {
-                    (Some(t), _) => document_answer(&method, &params, t, units),
-                    (None, Some(t)) => document_answer(&method, &params, &t, units),
+                    (Some(t), _) => document_answer(&method, &params, t, units, split),
+                    (None, Some(t)) => document_answer(&method, &params, &t, units, split),
                     _ => Value::Null,
                 };
                 out.frame(&ok(&id, result));
@@ -916,11 +929,11 @@ impl Units {
 /// The byte offset of a position in `text`, counted in `units`, clamping a
 /// character past the end of its line to the line's length; `None` for a
 /// line the document doesn't have, or a character inside a character.
-fn byte_offset(text: &str, units: Units, p: &Value) -> Option<usize> {
+fn byte_offset(text: &str, units: Units, split: LineSplit, p: &Value) -> Option<usize> {
     let line = p["line"].as_u64()? as usize;
     let character = p["character"].as_u64()? as usize;
     let mut start = 0;
-    for (n, l) in lines(text).into_iter().enumerate() {
+    for (n, l) in lines(text, split).into_iter().enumerate() {
         if n == line {
             let limit = character.min(units.of(l));
             let mut bytes = 0;
@@ -950,9 +963,9 @@ fn byte_offset(text: &str, units: Units, p: &Value) -> Option<usize> {
 
 /// Applies one content change to `text`, the range counted in `units`. A
 /// change that doesn't fit is ignored: the stand-in's own texts always fit.
-fn apply_change(text: &mut String, units: Units, range: &Value, insert: &str) {
-    let Some(start) = byte_offset(text, units, &range["start"]) else { return };
-    let Some(end) = byte_offset(text, units, &range["end"]) else { return };
+fn apply_change(text: &mut String, units: Units, split: LineSplit, range: &Value, insert: &str) {
+    let Some(start) = byte_offset(text, units, split, &range["start"]) else { return };
+    let Some(end) = byte_offset(text, units, split, &range["end"]) else { return };
     let (start, end) = (start.min(end), end.max(start));
     let mut out = String::with_capacity(text.len() + insert.len());
     out.push_str(&text[..start]);
@@ -961,24 +974,74 @@ fn apply_change(text: &mut String, units: Units, range: &Value, insert: &str) {
     *text = out;
 }
 
-/// A document's lines, split at `\n`, `\r\n` and `\r`, without their ends.
-fn lines(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(i) = rest.find(['\n', '\r']) {
-        out.push(&rest[..i]);
-        let skip = if rest[i..].starts_with("\r\n") { 2 } else { 1 };
-        rest = &rest[i + skip..];
+/// How the stand-in splits a document's lines, per the line-splitting faults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineSplit {
+    /// The spec's way: split at `\n`, `\r\n` and `\r`.
+    Spec,
+    /// Split at `\n` only; a `\r` is an ordinary character.
+    LfOnly,
+    /// Count `\r\n` as two breaks, leaving an empty line between.
+    CrLfTwo,
+    /// Split at `\n` and `\r\n`, but not a lone `\r`.
+    NoLoneCr,
+}
+
+/// The line split the stand-in uses, from the active faults.
+fn line_split(faults: &[String]) -> LineSplit {
+    if faults.iter().any(|f| f == "lf-only-lines") {
+        LineSplit::LfOnly
+    } else if faults.iter().any(|f| f == "crlf-two-breaks") {
+        LineSplit::CrLfTwo
+    } else if faults.iter().any(|f| f == "no-lone-cr") {
+        LineSplit::NoLoneCr
+    } else {
+        LineSplit::Spec
     }
-    out.push(rest);
+}
+
+/// A document's lines, split per `split`, without their ends.
+fn lines(text: &str, split: LineSplit) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_break = match split {
+            LineSplit::Spec | LineSplit::CrLfTwo => bytes[i] == b'\n' || bytes[i] == b'\r',
+            LineSplit::LfOnly => bytes[i] == b'\n',
+            LineSplit::NoLoneCr => {
+                if bytes[i] == b'\n' {
+                    i == 0 || bytes[i - 1] != b'\r'
+                } else {
+                    bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n'
+                }
+            }
+        };
+        if is_break {
+            out.push(&text[start..i]);
+            // A `\r\n` is one break (two bytes), except counted as two in CrLfTwo.
+            let skip =
+                if bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' && split != LineSplit::CrLfTwo {
+                    2
+                } else {
+                    1
+                };
+            i += skip;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(&text[start..]);
     out
 }
 
 /// Each ASCII word (`[A-Za-z]+`): its line, its start and end in `units`,
 /// and its text.
-fn words(text: &str, units: Units) -> Vec<(usize, usize, usize, &str)> {
+fn words(text: &str, units: Units, split: LineSplit) -> Vec<(usize, usize, usize, &str)> {
     let mut out = Vec::new();
-    for (n, line) in lines(text).into_iter().enumerate() {
+    for (n, line) in lines(text, split).into_iter().enumerate() {
         let mut start = None;
         for (i, c) in line.char_indices().chain([(line.len(), ' ')]) {
             match (c.is_ascii_alphabetic(), start) {
@@ -999,9 +1062,9 @@ fn range(sl: usize, sc: usize, el: usize, ec: usize) -> Value {
 }
 
 /// The answer to a request about an open document.
-fn document_answer(method: &str, params: &Value, text: &str, units: Units) -> Value {
-    let words = words(text, units);
-    let lines = lines(text);
+fn document_answer(method: &str, params: &Value, text: &str, units: Units, split: LineSplit) -> Value {
+    let words = words(text, units, split);
+    let lines = lines(text, split);
     let at = |p: &Value| (p["line"].as_u64().unwrap_or(0) as usize, p["character"].as_u64().unwrap_or(0) as usize);
     // The word a position touches.
     let word_at = |(line, ch): (usize, usize)| words.iter().find(|(l, s, e, _)| *l == line && *s <= ch && ch <= *e);
@@ -1058,13 +1121,21 @@ fn publish_diagnostics<W: Write>(
     version: Option<Value>,
 ) {
     let fault = |name: &str| faults.iter().any(|f| f == name);
-    let mut diagnostics: Vec<Value> = words(text, units)
+    let split = line_split(faults);
+    let mut diagnostics: Vec<Value> = words(text, units, split)
         .iter()
         .map(|(l, s, e, w)| {
             json!({"range": range(*l, *s, *l, *e), "severity": 2, "source": "standin", "message": format!("word: {w}")})
         })
         .collect();
-    let lines = lines(text);
+    let lines = lines(text, split);
+    // A position on the first line with non-ASCII text, one character in: on a
+    // character boundary with non-ASCII text before it, so informative for D5.
+    if let Some(n) = lines.iter().position(|l| !l.is_ascii()) {
+        let first = lines[n].chars().next().unwrap();
+        let at = units.of(first.to_string().as_str());
+        diagnostics.push(json!({"range": range(n, at, n, at), "severity": 2, "source": "standin", "message": "a position on a non-ASCII line"}));
+    }
     if fault("past-line-end") {
         let end = units.of(lines[0]) + 3;
         diagnostics.push(json!({"range": range(0, 0, 0, end), "severity": 3, "message": "past the line"}));
