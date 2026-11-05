@@ -757,11 +757,12 @@ fn a_frame_skipped_after_a_cancelled_request_went_unanswered_doesnt_excuse_it() 
 
 #[test]
 fn a_server_that_stops_reading_cant_stall_lspcheck() {
-    let r = fault("block-on-config");
+    let r = run(&["--fault", "block-on-config"], &["--startup-timeout", "2"]);
     expect(&r, "L2", "error");
-    // Three scenarios, each bounded by the 5 s startup timeout plus cleanup
-    // (a few seconds); unbounded, it would hit the watchdog.
-    assert!(r.took < Duration::from_secs(60), "took {:?}\n{}", r.took, r.stdout);
+    // Every scenario is bounded by the 2 s startup timeout plus cleanup (a
+    // second or two); unbounded, it would hit the watchdog.
+    let bound = Duration::from_secs(5) * lspcheck::checks::SCENARIOS.len() as u32;
+    assert!(r.took < bound, "took {:?}, more than {bound:?}\n{}", r.took, r.stdout);
 }
 
 #[test]

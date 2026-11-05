@@ -271,26 +271,24 @@ pub fn judge_d1(encoding: Encoding, j: &Judged, incomplete: Option<&str>) -> (Ve
         );
     }
     let counts = counts(j);
-    let missed = incomplete.map(|why| format!("; lspcheck also missed some of what the server sent ({why})"));
     if encoding == Encoding::Utf32 {
         return (
             Verdict::NotExercised,
             format!("the server chose utf-32, in which no offset can fall inside a character; {counts}"),
         );
     }
-    if j.informative == 0 {
-        return (
-            Verdict::NotExercised,
-            format!(
-                "no position with non-ASCII text before it on its line was judged; {counts}{}",
-                missed.unwrap_or_default()
-            ),
-        );
-    }
+    // What lspcheck missed may have held positions, informative ones
+    // included, so with nothing informative judged it can't say "no evidence".
     if let Some(why) = incomplete {
         return (
             Verdict::Error,
-            format!("inconclusive, because {why}: it may have held a position inside a character"),
+            format!("inconclusive, because {why}: it may have held a position inside a character; {counts}"),
+        );
+    }
+    if j.informative == 0 {
+        return (
+            Verdict::NotExercised,
+            format!("no position with non-ASCII text before it on its line was judged; {counts}"),
         );
     }
     (
@@ -502,7 +500,8 @@ mod tests {
         assert_eq!(judge_d1(Encoding::Utf16, &invalid, missed).0, Verdict::Fail);
         // Nothing informative, or UTF-32: not exercised.
         assert_eq!(judge_d1(Encoding::Utf16, &bare, None).0, Verdict::NotExercised);
-        assert_eq!(judge_d1(Encoding::Utf8, &Judged::default(), missed).0, Verdict::NotExercised);
+        // Missed evidence could have held positions, so it's an error, not "none".
+        assert_eq!(judge_d1(Encoding::Utf8, &Judged::default(), missed).0, Verdict::Error);
         assert_eq!(judge_d1(Encoding::Utf32, &informative, None).0, Verdict::NotExercised);
         // A failure names the first few positions and counts the rest.
         let many = Judged { invalid: (0..5).map(|i| format!("p{i}")).collect(), ..Judged::default() };

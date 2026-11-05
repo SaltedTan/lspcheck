@@ -156,12 +156,12 @@ at the end, over everything read before `exit` was sent:
   would have put it on a boundary (such as "on a boundary if counted in UTF-8 bytes"). That diagnosis is detail only.
   A failure seen stands even if evidence elsewhere is incomplete.
 - **not-exercised:** the server chose UTF-32, where no offset can fall inside a character, or no informative position
-  was judged. The detail counts the positions seen, past the end of a line, on lines the document doesn't have, and in
+  was judged and lspcheck missed nothing. The detail counts the positions seen, past the end of a line, on lines the document doesn't have, and in
   other documents. Positions past the end of a line that would fit counted another way are reported as a hint of that
   counting, which D1 can't prove.
 - **error:** `initialize` failed, `didOpen` couldn't be sent, the server chose an encoding lspcheck didn't offer (L2's
-  failure), or D1 would pass but lspcheck missed something the server sent from the `didOpen` on (a frame it skipped
-  or couldn't read, a server request it couldn't answer, or reading that stopped).
+  failure), or nothing failed but lspcheck missed something the server sent from the `didOpen` on (a frame it skipped
+  or couldn't read, a server request it couldn't answer, or reading that stopped), which might have held positions.
 - **pass:** otherwise, with the number of informative positions judged.
 
 Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them.
