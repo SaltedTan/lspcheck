@@ -594,6 +594,18 @@ pub fn judge_d3(
             continue;
         }
         unexplained.push(i);
+        // Rule (b) also needs the position to be unexplained by any other
+        // reading of the changed text: on a boundary within its line under
+        // another encoding, UTF-32 included, it may be a server that applied
+        // the change and counts in that encoding (D1's finding). This guard
+        // is (b)'s only: (a) rests on the pin, and in code points every
+        // in-line offset is a boundary, so it would void (a) for any server.
+        let reread = ENCODINGS.iter().any(|e| {
+            *e != encoding && text::position_status(&change.after, *e, p.line, p.character) == PositionStatus::Boundary
+        });
+        if reread {
+            continue;
+        }
         if let Some(name) = change
             .alternatives
             .iter()
@@ -1212,8 +1224,10 @@ mod tests {
         let (v, detail) = judge_d3(Encoding::Utf16, &before, &after2, &c, false, None, None);
         assert_eq!(v, Verdict::Error, "{detail}");
         assert!(detail.contains("can't tell a change-handling fault from a counting fault; see D1"), "{detail}");
-        // The same positions, but the server reports `word` at some other span
-        // (it mis-applied the change, not a counting fault): rule (b) can fire.
+        // The same position, with `word` reported at some other span: (0,4)
+        // is still on a boundary of the changed text counted in code points,
+        // so a server that applied the change and counts code points explains
+        // it, and (b) doesn't hold.
         let mut after3 = judged(2, 0, &["p"]);
         after3.invalid_positions = vec![Position { line: 0, character: 4 }];
         after3.all_positions = vec![Position { line: 0, character: 5 }, Position { line: 0, character: 8 }];
@@ -1225,7 +1239,18 @@ mod tests {
             Encoding::Utf16,
         )];
         let (v, detail) = judge_d3(Encoding::Utf16, &before, &after3, &c, false, None, None);
-        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert_eq!(v, Verdict::Error, "{detail}");
+        // The reviewer's case: the change applied correctly, then a range
+        // (1,0)-(1,1) on the inserted emoji line counted in code points, with
+        // no `word` span reported. (1,1) fits the old, ASCII-prefixed line 1,
+        // but it is a code-point boundary of the changed text: not (b).
+        let mut after4 = judged(2, 0, &["p"]);
+        after4.invalid_positions = vec![Position { line: 1, character: 1 }];
+        let mut c = change();
+        c.after = "x\n\u{1F600}\u{1F600}\n".into();
+        c.alternatives = vec![("x\nab\n".into(), "the text before the change".into(), Encoding::Utf16)];
+        let (v, detail) = judge_d3(Encoding::Utf16, &before, &after4, &c, false, None, None);
+        assert_eq!(v, Verdict::Error, "{detail}");
     }
 
     #[test]

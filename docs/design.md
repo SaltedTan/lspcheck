@@ -196,7 +196,8 @@ diagnostics, may refer to version 41, so a position in them that is invalid is D
   server reported `word`'s span on line 0 of version 41 exactly as it is counted in the negotiated encoding (the
   *pin*: a miscounting server reports some other span for it), so the server was seen counting correctly and the
   fault is in applying the change; or (b) the position falls on a boundary of an *alternative* text, and on no
-  boundary of version 42 under any other encoding's reinterpretation (which would be a counting fault, D1's). The
+  boundary within its line of version 42 under any other encoding, UTF-32 included (which would be a counting fault,
+  D1's). Rule (b) therefore fires only for positions past a line's end under every other reading. The
   alternative texts are the text before the change (an ignored change, a stale snapshot, or the file read from
   disk) and, for an incremental sync, the change applied with its range counted in each other encoding. The detail
   names the first few such positions with which alternative fits.
@@ -208,8 +209,9 @@ diagnostics, may refer to version 41, so a position in them that is invalid is D
 
 A counting fault is told from a change-handling fault by the pin and by `word`'s span in the changed text: a server
 that applied the change correctly but counted in another encoding reports `word`'s span as it is in the changed text
-under that encoding, which a server that miscounted or mis-applied the change does not. (In code points and UTF-32
-every in-line offset is a boundary, so "on a boundary under another encoding" alone can't separate the two.)
+under that encoding, which a server that miscounted or mis-applied the change does not; when it does, neither (a)
+nor (b) holds. (In code points every in-line offset is a boundary, so the per-position guard belongs to (b) only: on
+(a) it would excuse every server.)
 Positions in every alternative text are counted in the negotiated encoding: a server that ignored the
 change, or counted its range wrongly, still counts its positions as agreed.
 
