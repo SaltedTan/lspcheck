@@ -473,8 +473,9 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
     // The probe with non-ASCII output for F2 isn't sent to a server that can't read it.
     // Nor can it read D1's document, whose emoji put its input out of step:
     // no position or versioned diagnostics come back, which says nothing
-    // about how it counts them. Its D4 requests are misread too, so they go
-    // unanswered: D4 fails on the delivered request.
+    // about how it counts them. It had stopped answering before D4's
+    // requests, so their going unanswered says nothing about documents that
+    // aren't open: D4 is an error.
     passes_except(
         &r,
         &[
@@ -483,9 +484,10 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
             ("D1", "not-exercised"),
             ("D2", "not-exercised"),
             ("D3", "not-exercised"),
-            ("D4", "fail"),
+            ("D4", "error"),
         ],
     );
+    assert!(r.stdout.contains("but the server had already stopped answering"), "{}", r.stdout);
     // F3's multibyte part depends on F5, and says it wasn't run.
     assert!(r.stdout.contains("wasn't run, because F5 didn't pass"), "{}", r.stdout);
 }

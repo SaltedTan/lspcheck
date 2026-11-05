@@ -225,7 +225,9 @@ refer to the file on disk, which has no version in lspcheck's model).
   `documentHighlightProvider` or `selectionRangeProvider`.
 - **fail:** any of the three requests goes unanswered within `--timeout`. It goes through `fail_call`, so it is
   `error` when lspcheck couldn't deliver the request, or when missed evidence could have held the answer.
-- **error:** the `didClose` couldn't be sent, or an earlier step left the session unable to send.
+- **error:** the `didClose` couldn't be sent, or an earlier step left the session unable to send; or a D4 request
+  went unanswered after an earlier request in the scenario had already gone unanswered, since a server that had
+  stopped answering before any document was closed says nothing about documents that aren't open.
 - **pass:** all three are answered. The detail records each outcome: result (null, empty, or non-empty) or the
   error code, for the closed document, the never-opened one, and the probe.
 

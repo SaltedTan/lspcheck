@@ -1346,13 +1346,14 @@ async fn await_diagnostics(ctx: &mut Ctx<'_>, uri: &str, version: i64, from: usi
 
 /// Sends the advertised requests one at a time, so a reply always refers to
 /// the version current when it was asked. No reply, or an error, is simply
-/// no evidence: the rest are not sent, and the note says so.
+/// no evidence: the rest are not sent, and the note says so. Returns why
+/// the server stopped answering, when a request went unanswered.
 async fn ask_all(
     ctx: &mut Ctx<'_>,
     requests: Vec<(&'static str, Value)>,
     asked: &mut Vec<Asked>,
     notes: &mut Vec<String>,
-) {
+) -> Option<String> {
     for (method, params) in requests {
         match ask(ctx, method, params).await {
             Ok((a, answer)) => {
@@ -1360,7 +1361,7 @@ async fn ask_all(
                 if let Err(e) = answer {
                     let why = describe_call_error(&CallError::Wait(e), ctx.cfg.request_timeout);
                     notes.push(format!("{method} went unanswered ({why}), so no more requests were sent"));
-                    break;
+                    return Some(format!("{method} went unanswered ({why})"));
                 }
             }
             Err(e) => {
@@ -1369,6 +1370,7 @@ async fn ask_all(
             }
         }
     }
+    None
 }
 
 /// Whether a message is a `client/registerCapability` registering the sync
@@ -1425,7 +1427,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
         let _ = std::fs::write(&path, documents::doc_a());
         ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
         let uri = file_uri(&path);
-        d4(ctx, &caps, false, &uri).await;
+        d4(ctx, &caps, false, &uri, None).await;
         leave(ctx).await;
         return;
     }
@@ -1441,7 +1443,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
             let _ = std::fs::write(&path, documents::doc_a());
             ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
             let uri = file_uri(&path);
-            d4(ctx, &caps, false, &uri).await;
+            d4(ctx, &caps, false, &uri, None).await;
             leave(ctx).await;
             return;
         }
@@ -1474,7 +1476,8 @@ async fn documents(ctx: &mut Ctx<'_>) {
 
     let mut asked = Vec::new();
     let mut notes = Vec::new();
-    ask_all(ctx, document_requests(&caps, &uri, &text, encoding), &mut asked, &mut notes).await;
+    // Why the server stopped answering before D4, if it did.
+    let mut stalled = ask_all(ctx, document_requests(&caps, &uri, &text, encoding), &mut asked, &mut notes).await;
     await_diagnostics(ctx, &uri, DOC_A_VERSION, from).await;
 
     // The change to version 42, the advertised way. A sync kind of None
@@ -1522,13 +1525,14 @@ async fn documents(ctx: &mut Ctx<'_>) {
                 docs[0].versions.push(Version { at: change_at, number: DOC_A2_VERSION, text: after });
                 // The same requests at version 42, with positions of the
                 // changed text, one at a time as before.
-                ask_all(
+                let stopped = ask_all(
                     ctx,
                     document_requests(&caps, &uri, &docs[0].versions[1].text, encoding),
                     &mut asked,
                     &mut notes,
                 )
                 .await;
+                stalled = stalled.or(stopped);
                 await_diagnostics(ctx, &uri, DOC_A2_VERSION, from).await;
             }
             Err(e) => {
@@ -1542,7 +1546,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     // D4: the document is closed, so a request about it, one about a URI
     // that was never opened and doesn't exist, and a plain request, each
     // get a response, and the server keeps serving.
-    d4(ctx, &caps, true, &uri).await;
+    d4(ctx, &caps, true, &uri, stalled.as_deref()).await;
     let end = leave(ctx).await;
 
     // Everything read before `exit` was sent: diagnostics, and the replies
@@ -1696,8 +1700,11 @@ fn describe_d4_outcome(m: &Message) -> String {
 /// from disk; what is judged is that a response comes, and that the server
 /// keeps serving. The requests are not judged by D1 to D3: the document is
 /// not open, so a reply may refer to the file on disk, which has no version
-/// in lspcheck's model.
-async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str) {
+/// in lspcheck's model. `stalled` says why the server had already stopped
+/// answering earlier in the scenario: then an unanswered D4 request says
+/// nothing about documents that aren't open, so it is an error, not a
+/// failure (a server that answers them anyway still passes).
+async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: Option<&str>) {
     if !ctx.s.is_alive() {
         return ctx.report("D4", Verdict::Error, "not judged: the server exited before the document was closed");
     }
@@ -1729,7 +1736,15 @@ async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str) {
             }
             Ok((_, Err(e))) => {
                 let e = CallError::Wait(e);
-                ctx.fail_call("D4", format!("{label} went unanswered ({})", describe_call_error(&e, t)), &e);
+                let what = format!("{label} went unanswered ({})", describe_call_error(&e, t));
+                if let Some(why) = stalled {
+                    return ctx.report(
+                        "D4",
+                        Verdict::Error,
+                        format!("not judged: {what}, but the server had already stopped answering ({why})"),
+                    );
+                }
+                ctx.fail_call("D4", what, &e);
                 return;
             }
             Err(e) => {
