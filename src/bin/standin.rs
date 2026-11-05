@@ -81,6 +81,8 @@ const FAULTS: &[(&str, &str)] = &[
         "shutdown-block",
         "on shutdown, send its answer, a huge configuration request and an error with id null, then stop reading",
     ),
+    ("big-frame-on-cancel", "after answering a cancelled request, send a 2 MiB log message"),
+    ("initialized-reply-after-cancel", "answer initialized with an error whose id is null, once a cancel arrives"),
     ("big-frame-after-drop", "after cancelled-no-reply drops a request, send a 2 MiB log message with the next answer"),
     ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
@@ -136,6 +138,8 @@ fn main() {
         CancelOut { late: fault("late-cancel-replies"), big: fault("big-cancel-replies"), held: Vec::new() };
     // Set when cancelled-no-reply drops a request, for big-frame-after-drop.
     let mut dropped = false;
+    // For initialized-reply-after-cancel: a reply to `initialized` not sent yet.
+    let mut initialized_reply = fault("initialized-reply-after-cancel");
     // For null-reply-after-first-probe: whether a request was answered since initialize.
     let mut answered_one = false;
     let mut children: Vec<Child> = Vec::new();
@@ -178,6 +182,10 @@ fn main() {
                     out.frame(&err(&deferred_id, -32603, "internal error"));
                 } else {
                     out.frame(&err(&deferred_id, -32800, "request cancelled"));
+                    if fault("big-frame-on-cancel") {
+                        let text = "x".repeat(2 * 1024 * 1024);
+                        out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
+                    }
                     if fault("cancelled-reply-twice") {
                         cancel_out.send(&mut out, ok(&deferred_id, Value::Null));
                     }
@@ -193,6 +201,9 @@ fn main() {
         let Some(id) = msg.get("id").cloned() else {
             // A notification.
             if method == "$/cancelRequest" {
+                if std::mem::take(&mut initialized_reply) {
+                    out.frame(&err(&Value::Null, -32601, "unknown notification"));
+                }
                 if fault("reply-to-cancel") {
                     cancel_out.send(&mut out, cancel_reply());
                 }
@@ -400,8 +411,8 @@ fn main() {
                     std::process::exit(0);
                 }
                 if fault("shutdown-block") {
-                    // One write, so lspcheck reads all three before it can
-                    // send exit; the configuration answer can't be written.
+                    // One write; the configuration answer can't be written
+                    // because this server stops reading.
                     let items = vec![json!({"section": "x"}); 40_000];
                     let config = json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": items}});
                     let mut bytes = out.encode(&ok(&id, result));

@@ -413,11 +413,21 @@ impl Session {
     /// Records everything the server has sent that was already read, without
     /// waiting for more and without answering its requests (for when
     /// lspcheck is done talking: an answer that can't be written mustn't keep
-    /// the rest from being recorded).
+    /// the rest from being recorded). An unanswered request makes the
+    /// evidence incomplete from when it was read.
     pub fn take_in(&mut self) {
         while let Ok((at, inbound)) = self.rx.try_recv() {
             match inbound {
-                Inbound::Message(m) => self.accept(at, &m),
+                Inbound::Message(m) => {
+                    // A server waiting for this answer may be holding back
+                    // what it would have sent next.
+                    if let Kind::Request { method, .. } = &m.kind
+                        && self.own_limit.is_none()
+                    {
+                        self.own_limit = Some((at, format!("lspcheck didn't answer the server's {method} request")));
+                    }
+                    self.accept(at, &m)
+                }
                 Inbound::Closed | Inbound::Stopped => self.stdout_closed = true,
                 Inbound::Problem(_) => {}
             }

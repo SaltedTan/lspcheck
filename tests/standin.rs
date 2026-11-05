@@ -561,10 +561,26 @@ fn a_skipped_frame_makes_cancellation_passes_inconclusive() {
 
 #[test]
 fn c3_counts_only_id_less_replies_read_after_the_first_cancel() {
-    // A reply to `initialized` read before any cancel was sent can't answer one.
-    expect(&fault("null-reply-after-first-probe"), "C3", "pass");
+    // A reply to `initialized` read before any cancel was sent can't answer
+    // one. If it is read only after the first cancel was written, it might
+    // have answered either, so C3 can't be judged, but it doesn't fail.
+    let r = fault("null-reply-after-first-probe");
+    assert_ne!(r.verdicts["C3"], "fail", "{}", r.stdout);
+    let r = fault("initialized-reply-after-cancel");
+    expect(&r, "C3", "error");
+    assert!(r.verdicts.iter().all(|(id, v)| v == "pass" || id == "C3" || (id == "L9" && !cfg!(unix))), "{}", r.stdout);
     // A malformed answer to shutdown still carries shutdown's id.
     expect(&fault("shutdown-no-jsonrpc"), "C3", "pass");
+}
+
+#[test]
+fn a_frame_skipped_during_c1_leaves_c2_judged() {
+    // The oversized log comes right after the cancelled request's answer, so
+    // it is read before C2's cancels and can't be a reply to them.
+    let r = run(&["--fault", "defer-until-next", "--fault", "big-frame-on-cancel"], &["--max-frame-mib", "1"]);
+    expect(&r, "C1", "error");
+    expect(&r, "C2", "pass");
+    expect(&r, "C3", "error");
 }
 
 #[test]
@@ -583,7 +599,8 @@ fn a_frame_skipped_after_a_cancelled_request_went_unanswered_doesnt_excuse_it() 
         &["--max-frame-mib", "1", "--timeout", "3"],
     );
     expect(&r, "C1", "fail");
-    expect(&r, "C2", "error");
+    // It is read before C2's cancels, so C2 is still judged.
+    expect(&r, "C2", "pass");
 }
 
 #[test]

@@ -776,10 +776,13 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     // sent and when lspcheck stopped waiting.
     let mut c2_problem: Option<(CallError, Duration, Duration)> = None;
     let mut c2_unsent: Option<WriteError> = None;
+    // When C2's first cancel was sent: only what came after can be about it.
+    let mut c2_started: Option<Duration> = None;
     if stopped.is_none() {
         let targets: &[&Id] = if first.is_some() { &[&unknown, &r] } else { &[&unknown] };
         for cancelled in targets {
             let at = ctx.s.elapsed();
+            c2_started.get_or_insert(at);
             let note = message::notification("$/cancelRequest", Some(json!({"id": cancelled.to_value()})));
             if let Err(e) = ctx.s.send(&note).await {
                 c2_unsent = Some(e);
@@ -798,8 +801,12 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     }
 
     let end = leave(ctx).await;
-    // Output read before the cancelled request was written can't be about it.
-    let incomplete = ctx.s.incomplete_within(written_at, end);
+    // What lspcheck missed counts against a check only when it was missed
+    // where that check's evidence would be: from R to C2's cancel of R for
+    // C1, from C2's first cancel for C2, and from R for C3.
+    let incomplete_c1 = ctx.s.incomplete_within(written_at, r_cancelled_at.unwrap_or(end));
+    let incomplete_c2 = c2_started.and_then(|from| ctx.s.incomplete_within(from, end));
+    let incomplete_c3 = ctx.s.incomplete_within(written_at, end);
     let inconclusive = |why: &str, what: &str| format!("inconclusive, because {why}: it may have held {what}");
     let after_r_cancel = |at: Duration| r_cancelled_at.is_some_and(|c| at >= c);
     // Indices of the messages read before `end`, from `from` on.
@@ -828,7 +835,7 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
                     describe_call_error(e, t)
                 );
                 (Verdict::Error, why)
-            } else if let Some(why) = &incomplete {
+            } else if let Some(why) = &incomplete_c1 {
                 (Verdict::Error, inconclusive(why, &format!("a second response to {which}")))
             } else {
                 (Verdict::Pass, format!("{which}: {how}, and only once"))
@@ -842,26 +849,14 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         let id = m.response_id()?;
         (*id == unknown || (*id == r && after_r_cancel(*at))).then(|| (id.clone(), describe_response(m)))
     });
-    // C3. From the first cancel until `exit` the only notifications lspcheck
-    // sent are the cancels, so a response with no usable id answers one of
-    // them. (A malformed message that does carry an id is J5's business.)
-    let violation = window(after_send).filter(|&i| msgs[i].0 >= written_at).find_map(|i| {
-        let (at, m) = &msgs[i];
-        match &m.kind {
-            Kind::Response { id: Id::Null, outcome } => {
-                Some(format!("at {} ms, sent {} with id null", at.as_millis(), describe_outcome(outcome)))
-            }
-            Kind::Invalid(_)
-                if (m.value.get("result").is_some() || m.value.get("error").is_some())
-                    && m.value.get("id").is_none_or(Value::is_null) =>
-            {
-                let text = session::preview(m.value.to_string().as_bytes());
-                Some(format!("at {} ms, sent a response without an id: {text}", at.as_millis()))
-            }
-            _ => None,
-        }
-    });
-
+    // C3. Until `exit` the only notifications lspcheck sends are
+    // `initialized` and the cancels, and nothing says which one a response
+    // without an id answers. One read before the first cancel was written
+    // answers `initialized`; after that, at most one can be `initialized`'s.
+    let (before, after): (Vec<_>, Vec<_>) = (0..msgs.len())
+        .filter(|&i| msgs[i].0 < end)
+        .filter_map(|i| idless_reply(&msgs[i].0, &msgs[i].1).map(|what| (msgs[i].0, what)))
+        .partition(|(at, _)| *at < written_at);
     ctx.report("C1", c1.0, c1.1);
 
     if let Some((id, what)) = offending {
@@ -884,7 +879,7 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             }
             (CallError::Wait(_), None) => ctx.fail("C2", why),
         }
-    } else if let Some(why) = &incomplete {
+    } else if let Some(why) = &incomplete_c2 {
         ctx.report("C2", Verdict::Error, inconclusive(why, "a reply to one of the cancels"));
     } else {
         let what = if first.is_some() { "an id never sent and a finished request" } else { "an id never sent" };
@@ -892,17 +887,47 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     }
 
     // C3.
-    if let Some(what) = violation {
+    if after.len() >= 2 || (!after.is_empty() && !before.is_empty()) {
+        let more = if after.len() > 1 { format!(" (and {} more)", after.len() - 1) } else { String::new() };
         ctx.fail(
             "C3",
-            format!("{what}; the only notifications lspcheck had sent since its last answered request were cancels"),
+            format!(
+                "{}{more}; besides the cancels lspcheck had sent only `initialized`, and at most one reply can be its",
+                after[0].1
+            ),
+        );
+    } else if let [(_, what)] = after.as_slice() {
+        ctx.report(
+            "C3",
+            Verdict::Error,
+            format!(
+                "{what}, after the first cancel; it may have answered `initialized` instead, so it can't be judged"
+            ),
         );
     } else if let Some(why) = &stopped {
         ctx.report("C3", Verdict::Error, format!("not judged: {why}, so a reply could still come"));
-    } else if let Some(why) = &incomplete {
+    } else if let Some(why) = &incomplete_c3 {
         ctx.report("C3", Verdict::Error, inconclusive(why, "a reply to a $/cancelRequest"));
     } else {
         ctx.pass_with("C3", "no response answered a $/cancelRequest notification");
+    }
+}
+
+/// How a response without an id (no `id` member, or `id: null`) looks, if
+/// `m` is one. A malformed message that carries an id is J5's business.
+fn idless_reply(at: &Duration, m: &Message) -> Option<String> {
+    match &m.kind {
+        Kind::Response { id: Id::Null, outcome } => {
+            Some(format!("at {} ms, the server sent {} with id null", at.as_millis(), describe_outcome(outcome)))
+        }
+        Kind::Invalid(_)
+            if (m.value.get("result").is_some() || m.value.get("error").is_some())
+                && m.value.get("id").is_none_or(Value::is_null) =>
+        {
+            let text = session::preview(m.value.to_string().as_bytes());
+            Some(format!("at {} ms, the server sent a response without an id: {text}", at.as_millis()))
+        }
+        _ => None,
     }
 }
 

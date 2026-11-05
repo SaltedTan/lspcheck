@@ -116,5 +116,8 @@ async fn taking_in_what_was_read_doesnt_wait_on_an_answer_it_cant_write() {
         s.messages.iter().any(|(_, m)| m.value.get("id") == Some(&serde_json::Value::Null)),
         "the reply after the configuration request wasn't recorded"
     );
+    // The server may be waiting for that answer, so what it didn't send
+    // can't be judged after it.
+    assert!(s.incomplete_within(Duration::ZERO, s.elapsed()).is_some(), "an unanswered request went unnoticed");
     s.finish(Duration::from_millis(200)).await;
 }
