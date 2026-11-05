@@ -179,6 +179,10 @@ struct Evidence {
     problems: Vec<(Duration, Problem)>,
     content_types: Vec<(Duration, String)>,
     limit: Option<(Duration, String)>,
+    /// Every frame skipped for its size, not only the first (`limit`).
+    skipped: Vec<(Duration, String)>,
+    /// When and why lspcheck stopped reading stdout, if it did.
+    stopped: Option<(Duration, String)>,
     /// When the first readable frame with non-ASCII text in its body arrived.
     non_ascii: Option<Duration>,
     /// Frames whose body isn't JSON: when, the Content-Length, and where the body starts.
@@ -383,6 +387,33 @@ impl Session {
             .or(self.own_limit.as_ref())
             .map(|(_, why)| why.clone())
             .or_else(|| unread.then(|| "some of the server's frames couldn't be read (see F1)".to_string()))
+    }
+
+    /// Why lspcheck may have missed something the server sent between `from`
+    /// and `to`, if it may have: a frame in that time it skipped or couldn't
+    /// read, or, from any time before `to`, reading that stopped or a server
+    /// request lspcheck couldn't answer (see [`Session::incomplete`]).
+    pub fn incomplete_within(&self, from: Duration, to: Duration) -> Option<String> {
+        let ev = self.evidence.lock().expect("evidence lock");
+        let during = |at: &Duration| (from..to).contains(at);
+        let skipped = ev.skipped.iter().find(|(at, _)| during(at)).map(|(_, why)| why.clone());
+        let unread = ev
+            .problems
+            .iter()
+            .any(|(at, p)| during(at) && !matches!(p, Problem::Garbage(_)))
+            .then(|| "some of the server's frames couldn't be read (see F1)".to_string());
+        let since = [ev.stopped.as_ref(), self.own_limit.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|(at, _)| *at < to)
+            .map(|(_, why)| why.clone());
+        skipped.or(unread).or(since)
+    }
+
+    /// Takes in everything the server has sent that was already read, without
+    /// waiting for more.
+    pub async fn take_in(&mut self) {
+        self.absorb(Instant::now() + self.opts.write_timeout).await;
     }
 
     /// Writes bytes exactly as given, within the write timeout.
@@ -866,6 +897,7 @@ async fn read_stdout(
         record(&t, at, EventKind::Note(why.clone()));
         let mut ev = evidence.lock().expect("evidence lock");
         ev.cut = true;
+        ev.stopped.get_or_insert((at, why.clone()));
         ev.limit.get_or_insert((at, why));
         drop(ev);
         let _ = tx.send((at, Inbound::Stopped));
@@ -897,9 +929,11 @@ async fn read_stdout(
             }
             Chunk::Oversized { headers, content_length, limit } => {
                 content_types(&mut ev, &headers);
-                ev.limit.get_or_insert((at, format!(
+                let why = format!(
                     "a {content_length}-byte frame is over lspcheck's {limit}-byte inspection limit (--max-frame-mib), so it wasn't checked"
-                )));
+                );
+                ev.skipped.push((at, why.clone()));
+                ev.limit.get_or_insert((at, why));
                 return;
             }
             Chunk::HeaderLimit { limit } => {

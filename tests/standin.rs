@@ -517,15 +517,58 @@ fn cancelling_an_unknown_or_finished_request_produces_nothing() {
     // these faults act only on C2's unknown id.
     let r = run(&["--fault", "defer-until-next", "--fault", "cancel-unknown-reply"], &[]);
     only_fails(&r, &["C2"]);
-    assert!(r.stdout.contains("$/cancelRequest for id"), "{}", r.stdout);
+    assert!(r.stdout.contains("for an id never sent"), "{}", r.stdout);
+    // A server that stops answering might still send a reply to a cancel
+    // later, so C3 can't be judged.
     let r = run(&["--fault", "defer-until-next", "--fault", "stop-after-unknown-cancel"], &[]);
-    only_fails(&r, &["C2"]);
+    expect(&r, "C2", "fail");
+    expect(&r, "C3", "error");
     assert!(r.stdout.contains("stopped answering"), "{}", r.stdout);
 }
 
 #[test]
 fn replying_to_a_cancel_notification_fails_c3() {
     only_fails(&fault("reply-to-cancel"), &["C3"]);
+}
+
+#[test]
+fn replies_to_cancels_after_the_next_answer_still_count() {
+    // A plain request's answer doesn't order what a server says about a
+    // cancel, so replies sent after it are judged too.
+    let late = |faults: &[&str]| {
+        let mut args = vec!["--fault", "defer-until-next", "--fault", "late-cancel-replies"];
+        args.extend(faults.iter().flat_map(|f| ["--fault", f]));
+        run(&args, &[])
+    };
+    only_fails(&late(&["cancel-unknown-reply"]), &["C2"]);
+    only_fails(&late(&["reply-to-cancel"]), &["C3"]);
+    // A second answer to the cancelled request, read before the cancels of
+    // C2 were sent, is C1's finding, not C2's.
+    let r = late(&["cancelled-reply-twice"]);
+    only_fails(&r, &["C1"]);
+    assert!(r.stdout.contains("answered twice"), "{}", r.stdout);
+}
+
+#[test]
+fn a_skipped_frame_makes_cancellation_passes_inconclusive() {
+    // The oversized replies to the cancels are skipped, so lspcheck can't say
+    // they weren't replies.
+    let r = run(&["--fault", "reply-to-cancel", "--fault", "big-cancel-replies"], &["--max-frame-mib", "1"]);
+    for id in ["C1", "C2", "C3"] {
+        expect(&r, id, "error");
+    }
+}
+
+#[test]
+fn a_frame_skipped_after_a_cancelled_request_went_unanswered_doesnt_excuse_it() {
+    // The oversized frame comes only after lspcheck stopped waiting for the
+    // cancelled request, so it can't have been its answer.
+    let r = run(
+        &["--fault", "cancelled-no-reply", "--fault", "big-frame-after-drop"],
+        &["--max-frame-mib", "1", "--timeout", "3"],
+    );
+    expect(&r, "C1", "fail");
+    expect(&r, "C2", "error");
 }
 
 #[test]
