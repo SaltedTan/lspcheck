@@ -159,8 +159,13 @@ fn the_clean_standin_passes_every_check() {
     only_fails(&r, &[]);
     assert_eq!(r.status, 0, "{}", r.stdout);
     assert_eq!(r.verdicts.len(), lspcheck::checks::CATALOGUE.len());
-    // D1 passed on evidence, not for lack of it.
+    // D1 and D2 passed on evidence, not for lack of it.
     assert!(r.stdout.contains("informative position(s) on character boundaries"), "{}", r.stdout);
+    assert!(
+        r.stdout.contains("versioned diagnostics notification(s) named a version lspcheck had sent"),
+        "{}",
+        r.stdout
+    );
 }
 
 #[test]
@@ -183,7 +188,10 @@ fn lawful_variations_fail_nothing() {
         "unversioned-diagnostics",
     ] {
         let r = fault(name);
-        only_fails(&r, &[]);
+        // With no versioned publish for the opened document, D2 has nothing
+        // to judge and is not exercised instead of passing.
+        let d2 = if matches!(name, "no-diagnostics" | "unversioned-diagnostics") { "not-exercised" } else { "pass" };
+        passes_except(&r, &[("D2", d2)]);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
     }
 }
@@ -368,8 +376,9 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
     expect(&r, "F5", "fail");
     // The probe with non-ASCII output for F2 isn't sent to a server that can't read it.
     // Nor can it read D1's document, whose emoji put its input out of step:
-    // no position comes back, which says nothing about how it counts them.
-    passes_except(&r, &[("F5", "fail"), ("F2", "not-exercised"), ("D1", "not-exercised")]);
+    // no position or versioned diagnostics come back, which says nothing
+    // about how it counts them.
+    passes_except(&r, &[("F5", "fail"), ("F2", "not-exercised"), ("D1", "not-exercised"), ("D2", "not-exercised")]);
     // F3's multibyte part depends on F5, and says it wasn't run.
     assert!(r.stdout.contains("wasn't run, because F5 didn't pass"), "{}", r.stdout);
 }
@@ -436,10 +445,11 @@ fn strict_turns_should_failures_into_status_1() {
 
 #[test]
 fn bad_initialize_results_fail_l2() {
-    // D1 can't count positions in an encoding lspcheck didn't offer, and
-    // without capabilities the server doesn't ask for didOpen.
-    passes_except(&fault("bad-encoding"), &[("L2", "fail"), ("D1", "error")]);
-    passes_except(&fault("no-capabilities"), &[("L2", "fail"), ("D1", "skip")]);
+    // D1 can't count positions in an encoding lspcheck didn't offer, and D2
+    // can't judge versions without it either; without capabilities the
+    // server doesn't ask for didOpen, so both are skipped.
+    passes_except(&fault("bad-encoding"), &[("L2", "fail"), ("D1", "error"), ("D2", "error")]);
+    passes_except(&fault("no-capabilities"), &[("L2", "fail"), ("D1", "skip"), ("D2", "skip")]);
 }
 
 #[test]
@@ -827,7 +837,7 @@ fn unreadable_frames_make_other_failures_inconclusive() {
 #[test]
 fn a_server_that_doesnt_open_documents_skips_d1() {
     let r = fault("no-open-close");
-    passes_except(&r, &[("D1", "skip")]);
+    passes_except(&r, &[("D1", "skip"), ("D2", "skip")]);
     assert_eq!(r.status, 0, "{}", r.stdout);
 }
 
@@ -872,4 +882,49 @@ fn a_frame_skipped_after_didopen_makes_a_d1_pass_inconclusive() {
     expect(&r, "D1", "fail");
     // Within the limit, the same server passes.
     only_fails(&fault("big-frame-on-open"), &[]);
+}
+
+#[test]
+fn diagnostics_versions_the_document_never_had_fail_d2() {
+    // The stand-in labels diagnostics with its own counter instead of the
+    // document's version; D1 still judges the positions against version 41,
+    // since an unknown label makes every version sent a candidate.
+    let r = fault("diagnostics-own-version");
+    only_fails(&r, &["D2"]);
+    assert_eq!(r.status, 1, "D2 is a MUST check");
+    assert!(r.stdout.contains("carries version 1,"), "{}", r.stdout);
+    assert!(r.stdout.contains("lspcheck had sent 41"), "{}", r.stdout);
+}
+
+#[test]
+fn a_diagnostics_version_beyond_the_document_fails_d2() {
+    // One past the version lspcheck sent is not a version it had either.
+    let r = fault("future-diagnostics-version");
+    only_fails(&r, &["D2"]);
+    assert_eq!(r.status, 1, "D2 is a MUST check");
+    assert!(r.stdout.contains("carries version 42,"), "{}", r.stdout);
+    assert!(r.stdout.contains("lspcheck had sent 41"), "{}", r.stdout);
+}
+
+#[test]
+fn diagnostics_without_a_version_leave_d2_not_exercised() {
+    // No version at all is lawful, and gives D2 nothing to judge.
+    let r = fault("unversioned-diagnostics");
+    expect(&r, "D2", "not-exercised");
+    assert!(r.stdout.contains("1 without a version, which is lawful"), "{}", r.stdout);
+    // Nor is there anything when the server never publishes.
+    expect(&fault("no-diagnostics"), "D2", "not-exercised");
+}
+
+#[test]
+fn a_version_for_a_uri_lspcheck_never_opened_isnt_judged() {
+    // The foreign publish carries a version lspcheck never sent (999); it
+    // names no document lspcheck opened, so D2 passes on the opened one.
+    let r = fault("foreign-locations");
+    expect(&r, "D2", "pass");
+    assert!(
+        r.stdout.contains("versioned diagnostics notification(s) named a version lspcheck had sent"),
+        "{}",
+        r.stdout
+    );
 }

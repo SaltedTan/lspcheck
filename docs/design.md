@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3 and D1 are done; J7, D2 to D6 and `replay` are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3 and D1, D2 are done; J7, D3 to D6 and `replay` are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -120,12 +120,12 @@ cancelled request until it is cancelled again, for C2 from its first cancel, and
 each until `exit`. A missing response is excused only by something missed while lspcheck was waiting for it.
 
 ### Documents and positions (richer with a profile document)
-D1 is done; D2 to D6 are planned.
+D1 and D2 are done; D3 to D6 are planned.
 
 | ID | Basis | Check |
 |---|---|---|
 | D1 | MUST | Every judged position in a reply or notification about an open document is at a character boundary of the text it refers to, in the negotiated encoding: never inside a UTF-16 surrogate pair or a UTF-8 multi-byte sequence. Positions past the end of a line or of the document aren't judged, since the spec lets clients clamp them. Splitting a grapheme cluster is lawful. |
-| D2 | MUST | A `version` in `textDocument/publishDiagnostics` for an open document is one the document had: one lspcheck sent in `didOpen` or `didChange` for that URI before the notification was read. An older version is lawful. |
+| D2 | MUST | A `version` in `textDocument/publishDiagnostics` for an open document is one lspcheck sent for that URI before the notification was read: the version `didOpen` sent, and a later `didChange`'s once D3 lands. An older version is lawful, and so is none at all; `null` or a non-integer one is a type error for K2, not D2's finding. |
 | D3 | MUST | After a `didChange`, positions refer to the changed text. lspcheck sends the change the advertised way: an incremental edit replaces a 4-byte character and adds a line, or the full text when the server asked for Full. |
 | D4 | POLICY | A request about a closed document, and one about a URI that was never opened and doesn't exist, each get a response (any result or error), and the server keeps serving. |
 | D5 | MUST | Lines are split at `\n`, `\r\n` and `\r`: positions in a document with CR LF and lone CR line endings fall on character boundaries of the lines the spec defines. |
@@ -164,7 +164,16 @@ at the end, over everything read before `exit` was sent:
   or couldn't read, a server request it couldn't answer, or reading that stopped), which might have held positions.
 - **pass:** otherwise, with the number of informative positions judged.
 
-Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them.
+D2 is judged over the same window, by version instead of by position: a `publishDiagnostics` for the opened document
+that carries an integer `version` must name one lspcheck sent for it before the notification was read, so a server
+that labels with its own counter, or with one past the document's, fails; the detail gives the version read and the
+versions sent before it. An older version is lawful. A notification without a version leaves D2 `N/E` with the
+unversioned ones counted, and `null` or a non-integer `version` isn't judged here (K2's type check), nor is any URI
+lspcheck didn't open. Every early exit that skips or voids D1 skips or voids D2 too, and a pass over missed evidence
+is `ERROR` for D2 as it is for D1.
+
+Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs
+only one versioned publish for the document, so it is exercised wherever diagnostics are labelled.
 
 ### Capabilities and robustness
 | ID | Basis | Check |
