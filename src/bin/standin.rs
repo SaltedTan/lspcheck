@@ -53,6 +53,12 @@ const FAULTS: &[(&str, &str)] = &[
     ("reply-twice", "answer every lspcheck/probe twice"),
     ("reply-unsent-id", "after initialize, send a response with an id lspcheck never used"),
     ("reply-to-notification", "answer an unknown notification with an error whose id is null"),
+    ("reply-to-exit", "answer exit with an error whose id is null before exiting"),
+    ("out-of-range-id", "after initialize, send a request whose id 2147483648 is outside LSP's integer range"),
+    (
+        "fill-stdin-on-initialized",
+        "on initialized, ask for a configuration whose answer fills a 64 KiB pipe, then stop reading for 3 s",
+    ),
     ("exit-on-unknown-notification", "exit after the second unknown notification (after any reply to it)"),
     ("big-reply-to-notification", "answer an unknown notification with a 2 MiB error whose id is null"),
     ("no-jsonrpc-field", "after initialize, send a window/logMessage notification without \"jsonrpc\""),
@@ -159,6 +165,8 @@ fn main() {
     let mut initialized_reply = fault("initialized-reply-after-cancel");
     // For null-reply-after-first-probe: whether a request was answered since initialize.
     let mut answered_one = false;
+    // For fill-stdin-on-initialized: pause once `initialized` arrives.
+    let mut pause_on_initialized = false;
     let mut children: Vec<Child> = Vec::new();
     loop {
         if !input.ready() {
@@ -193,6 +201,10 @@ fn main() {
         }
         let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        // An answer to one of this server's own requests: nothing to do.
+        if msg.get("method").is_none() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+            continue;
+        }
         if fault("exit-on-string-id") && msg.get("id").is_some_and(Value::is_string) {
             std::process::exit(2);
         }
@@ -227,6 +239,9 @@ fn main() {
         }
         let Some(id) = msg.get("id").cloned() else {
             // A notification.
+            if method == "initialized" && std::mem::take(&mut pause_on_initialized) {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
             if method == "$/cancelRequest" {
                 if std::mem::take(&mut initialized_reply) {
                     for _ in 0..2 {
@@ -273,6 +288,9 @@ fn main() {
                 );
             }
             if method == "exit" && !fault("ignore-exit") {
+                if fault("reply-to-exit") {
+                    out.frame(&err(&Value::Null, -32601, "unknown notification"));
+                }
                 if fault("big-frame-on-exit") {
                     let text = "x".repeat(2 * 1024 * 1024);
                     out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
@@ -408,9 +426,25 @@ fn main() {
             if fault("no-capabilities") {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
             }
+            if fault("fill-stdin-on-initialized") {
+                // In the same write as the result, so the client reads both at
+                // once and answers before its next request. The answer, with
+                // `initialized` still unread, leaves 30 bytes of a 64 KiB pipe:
+                // too few for the client's next requests while this server
+                // isn't reading.
+                let mut bytes = out.encode(&ok(&id, result));
+                bytes.extend(out.encode(&config_filling(65_536 - 74 - 30)));
+                out.raw(&bytes);
+                pause_on_initialized = true;
+                continue;
+            }
             out.frame(&ok(&id, result));
             if fault("reply-unsent-id") {
                 out.frame(&err(&json!(format!("lspcheck-unsent-{}", std::process::id())), -32601, "no such request"));
+            }
+            if fault("out-of-range-id") {
+                let request = json!({"jsonrpc": "2.0", "id": 2_147_483_648_i64, "method": "window/workDoneProgress/create", "params": {"token": "t"}});
+                out.frame(&request);
             }
             if fault("no-jsonrpc-field") {
                 out.frame(
@@ -699,6 +733,19 @@ impl CancelOut {
             out.frame(&v);
         }
     }
+}
+
+/// A configuration request whose answer from lspcheck, framed, is `size`
+/// bytes or just under: `{"jsonrpc":"2.0","id":"cfg","result":[null,…]}`.
+fn config_filling(size: usize) -> Value {
+    let framed = |n: usize| {
+        // `null` and a comma per item but the last, inside the envelope.
+        let body = r#"{"jsonrpc":"2.0","id":"cfg","result":[]}"#.len() + 5 * n - 1;
+        "Content-Length: \r\n\r\n".len() + body.to_string().len() + body
+    };
+    let n = (1..).take_while(|&n| framed(n) <= size).last().unwrap_or(1);
+    let items = vec![json!({}); n];
+    json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": items}})
 }
 
 /// A response to a cancel notification: JSON-RPC has no id to give back.

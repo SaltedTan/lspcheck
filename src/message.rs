@@ -93,11 +93,19 @@ impl Id {
 
     /// Whether this is a whole number. LSP requests use integer ids.
     pub fn is_integer(&self) -> bool {
+        self.integer().is_some()
+    }
+
+    /// Whether this is a number in LSP's `integer` range (signed 32-bit),
+    /// which numeric ids must be.
+    pub fn is_lsp_integer(&self) -> bool {
+        self.integer().is_some_and(|n| i32::try_from(n).is_ok())
+    }
+
+    fn integer(&self) -> Option<i64> {
         match self {
-            Id::Num { raw, .. } => {
-                serde_json::from_str::<Value>(raw).ok().and_then(|v| integer_value(v.as_number()?)).is_some()
-            }
-            _ => false,
+            Id::Num { raw, .. } => serde_json::from_str::<Value>(raw).ok().and_then(|v| integer_value(v.as_number()?)),
+            _ => None,
         }
     }
 }

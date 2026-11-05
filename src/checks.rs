@@ -204,9 +204,7 @@ pub struct Observations {
     pub messages: Vec<(Duration, Message)>,
     /// When lspcheck sent `initialized`, if it did.
     pub initialized_at: Option<Duration>,
-    /// When lspcheck sent `exit`, if it did.
-    pub exit_at: Option<Duration>,
-    /// Why evidence between `initialized` and `exit` is incomplete, if it is.
+    /// Why evidence since `initialized` is incomplete, if it is.
     pub j3_incomplete: Option<String>,
     /// How the json-rpc scenario's dedicated J3 exercise went, if it ran.
     pub j3_exercise: Option<(Verdict, String)>,
@@ -259,10 +257,10 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
         judge_f1(&runs),
         judge_f2(&runs),
         judge_f8(&runs),
-        judge_j1(&runs),
-        judge_j2(&runs),
+        unless_unreadable(&runs, judge_j1(&runs)),
+        unless_unreadable(&runs, judge_j2(&runs)),
         judge_j3(&runs),
-        judge_j5(&runs),
+        unless_unreadable(&runs, judge_j5(&runs)),
         judge_l9(&runs),
     ]
     .into_iter()
@@ -371,7 +369,6 @@ fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observatio
         limit: f.limit,
         messages: f.messages,
         initialized_at: f.initialized_at,
-        exit_at: f.exit_at,
         j3_incomplete: f.j3_incomplete,
         j3_exercise,
         unmatched: f.unmatched,
@@ -1572,6 +1569,25 @@ fn judge_f8(runs: &[ScenarioRun]) -> CheckResult {
     cross("F8", runs, failures, "", true)
 }
 
+/// `r`, or an error when it would pass but a frame lspcheck couldn't read
+/// (see F1) might have been a response or message the check judges.
+fn unless_unreadable(runs: &[ScenarioRun], r: CheckResult) -> CheckResult {
+    if r.verdict != Verdict::Pass {
+        return r;
+    }
+    let unread = observed(runs).find_map(|(name, o)| {
+        o.problems.iter().find(|(_, p)| !matches!(p, Problem::Garbage(_))).map(|(at, _)| (name, *at))
+    });
+    match unread {
+        Some((name, at)) => CheckResult {
+            verdict: Verdict::Error,
+            detail: format!("inconclusive: in {name} at {} ms, a frame couldn't be read (see F1)", at.as_millis()),
+            ..r
+        },
+        None => r,
+    }
+}
+
 fn judge_j1(runs: &[ScenarioRun]) -> CheckResult {
     let failures = observed(runs)
         .filter_map(|(name, o)| {
@@ -1648,9 +1664,8 @@ const J3_SCENARIOS: &[&str] =
     &["lifecycle", "json-rpc", "after-initialize", "cancellation", "end-of-input", "exit-without-shutdown"];
 
 /// J3 across the scenarios in [`J3_SCENARIOS`]: no response without an id
-/// (`id` missing or null) is read between `initialized` and `exit`. Messages
-/// read before `exit` are judged; a reply to `exit` itself is outside the
-/// window, so it is left to the json-rpc scenario's dedicated exercise.
+/// (`id` missing or null) is read after `initialized`, to the end of the
+/// session (a reply to `exit` answers a notification too).
 fn judge_j3(runs: &[ScenarioRun]) -> CheckResult {
     let mut failures = Vec::new();
     let mut incomplete: Option<(&'static str, String)> = None;
@@ -1660,9 +1675,10 @@ fn judge_j3(runs: &[ScenarioRun]) -> CheckResult {
             exercise = o.j3_exercise.clone();
         }
         let Some(from) = o.initialized_at else { continue };
-        let to = o.exit_at.unwrap_or(Duration::MAX);
+        // Through the end of the session: a reply to `exit` answers a
+        // notification too.
         if let Some((at, what)) = o.messages.iter().find_map(|(at, m)| {
-            if *at < from || *at >= to {
+            if *at < from {
                 return None;
             }
             reply_to_notification(m).map(|what| (*at, what))
@@ -1719,21 +1735,27 @@ fn envelope_problem(m: &Message) -> Option<String> {
         Kind::Response { outcome: Outcome::Error { code: None, error, .. }, .. } => {
             Some(format!("an error whose code isn't an integer: {}", session::preview(error.to_string().as_bytes())))
         }
+        Kind::Response { outcome: Outcome::Error { code: Some(code), .. }, .. } if i32::try_from(*code).is_err() => {
+            Some(format!("an error code {code}, outside LSP's integer range"))
+        }
         Kind::Response { outcome: Outcome::Error { message: None, error, .. }, .. } => {
             Some(format!("an error whose message isn't a string: {}", session::preview(error.to_string().as_bytes())))
         }
-        // A response's id is a string, a number or null. Numbers must be whole:
-        // `2.0` is an integer id, but `2.5` isn't one JSON-RPC allows.
+        // A response's id is a string, a number or null. Numbers must be whole
+        // and in LSP's integer range (signed 32-bit): `2.0` is an integer id,
+        // `2.5` and `2147483648` aren't.
         Kind::Response { id: Id::Other(raw), .. } => {
             Some(format!("a response with id {raw}, which is neither a string, a number nor null"))
         }
-        Kind::Response { id: id @ Id::Num { raw, .. }, .. } if !id.is_integer() => {
-            Some(format!("a response with the non-integer id {raw}"))
+        Kind::Response { id: id @ Id::Num { raw, .. }, .. } if !id.is_lsp_integer() => {
+            Some(format!("a response with id {raw}, which isn't an integer in LSP's range"))
         }
         Kind::Request { id, .. } => match id {
             Id::Null => Some("a request with id null".into()),
             Id::Other(raw) => Some(format!("a request with id {raw}, which is neither a string nor a number")),
-            Id::Num { raw, .. } if !id.is_integer() => Some(format!("a request with the non-integer id {raw}")),
+            Id::Num { raw, .. } if !id.is_lsp_integer() => {
+                Some(format!("a request with id {raw}, which isn't an integer in LSP's range"))
+            }
             _ => params_problem(m),
         },
         Kind::Notification { .. } => params_problem(m),
@@ -1906,7 +1928,6 @@ mod tests {
                 limit: None,
                 messages: Vec::new(),
                 initialized_at: None,
-                exit_at: None,
                 j3_incomplete: None,
                 j3_exercise: None,
                 unmatched: Vec::new(),

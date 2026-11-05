@@ -128,6 +128,25 @@ fn only_fails(run: &Run, failing: &[&str]) {
     }
 }
 
+/// Like [`only_fails`], for a server that sends frames lspcheck can't read
+/// (F1): such a frame might have been a response or message the correlation
+/// and envelope checks judge, so J1, J2 and J5 are inconclusive.
+fn only_fails_unread(run: &Run, failing: &[&str]) {
+    for (id, verdict) in &run.verdicts {
+        if id == "L9" && !cfg!(unix) {
+            continue;
+        }
+        let want = if failing.contains(&id.as_str()) {
+            "fail"
+        } else if ["J1", "J2", "J5"].contains(&id.as_str()) {
+            "error"
+        } else {
+            "pass"
+        };
+        assert_eq!(verdict, want, "{id}\n{}", run.stdout);
+    }
+}
+
 #[test]
 fn the_clean_standin_passes_every_check() {
     let r = run(&[], &[]);
@@ -169,12 +188,12 @@ fn stdout_output_outside_frames_fails_f1_in_any_scenario() {
 
 #[test]
 fn a_control_byte_in_a_header_fails_f1() {
-    only_fails(&fault("nul-header"), &["F1"]);
+    only_fails_unread(&fault("nul-header"), &["F1"]);
 }
 
 #[test]
 fn a_content_type_that_isnt_a_media_type_fails_f1() {
-    only_fails(&fault("bad-content-type"), &["F1"]);
+    only_fails_unread(&fault("bad-content-type"), &["F1"]);
 }
 
 #[test]
@@ -239,7 +258,7 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
 fn a_content_length_counted_in_characters_fails_f2() {
     let r = fault("char-length");
     // The frame can't be read either, so F1 fails too.
-    only_fails(&r, &["F1", "F2"]);
+    only_fails_unread(&r, &["F1", "F2"]);
     assert!(r.stdout.contains("counts characters, but"), "{}", r.stdout);
     // Also with whitespace after the JSON, or an extension header before the next frame's Content-Length.
     for other in ["newline-after-body", "extension-header", "long-header"] {
@@ -252,16 +271,16 @@ fn a_content_length_counted_in_characters_fails_f2() {
 #[test]
 fn a_correctly_counted_body_that_isnt_json_fails_f1_not_f2() {
     let r = fault("trailing-junk");
-    only_fails(&r, &["F1"]);
+    only_fails_unread(&r, &["F1"]);
 }
 
 #[test]
 fn a_body_the_next_header_line_would_complete_fails_f1_not_f2() {
     // Joined to the next frame's first header line, the body would be JSON,
     // but the next header section starts where the body was declared to end.
-    only_fails(&fault("json-into-next-header"), &["F1"]);
+    only_fails_unread(&fault("json-into-next-header"), &["F1"]);
     // Even when that header line isn't valid.
-    only_fails(&fault("json-into-bad-header"), &["F1"]);
+    only_fails_unread(&fault("json-into-bad-header"), &["F1"]);
 }
 
 #[test]
@@ -467,6 +486,26 @@ fn a_skipped_reply_to_a_notification_makes_j3_inconclusive() {
     let r = run(&["--fault", "big-reply-to-notification"], &["--max-frame-mib", "1"]);
     expect(&r, "J3", "error");
     assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+}
+
+#[test]
+fn replies_to_exit_and_out_of_range_ids_are_judged() {
+    // A reply to `exit` answers a notification too.
+    only_fails(&fault("reply-to-exit"), &["J3"]);
+    // LSP's integer is signed 32-bit, ids included.
+    let r = fault("out-of-range-id");
+    only_fails(&r, &["J5"]);
+    assert!(r.stdout.contains("2147483648"), "{}", r.stdout);
+}
+
+/// The concurrent requests can't all be written by their deadline, because
+/// the server stopped reading with a full pipe; that is lspcheck's problem,
+/// not a missing reply. (The pipe arithmetic is Linux's.)
+#[cfg(target_os = "linux")]
+#[test]
+fn concurrent_requests_that_cant_be_written_in_time_are_an_error() {
+    let r = run(&["--fault", "fill-stdin-on-initialized"], &["--timeout", "1"]);
+    expect(&r, "J6", "error");
 }
 
 #[test]

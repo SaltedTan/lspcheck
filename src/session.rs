@@ -238,9 +238,7 @@ pub struct Finish {
     pub messages: Vec<(Duration, Message)>,
     /// When lspcheck sent `initialized`, if it did.
     pub initialized_at: Option<Duration>,
-    /// When lspcheck sent `exit`, if it did.
-    pub exit_at: Option<Duration>,
-    /// Why evidence between `initialized` and `exit` is incomplete, if it is.
+    /// Why evidence since `initialized` is incomplete, if it is.
     /// A response without an id read in that window could have been skipped.
     pub j3_incomplete: Option<String>,
     /// Every stream problem in the whole of stdout.
@@ -298,8 +296,6 @@ pub struct Session {
     pub messages: Vec<(Duration, Message)>,
     /// When lspcheck sent `initialized`, if it did.
     initialized_at: Option<Duration>,
-    /// When lspcheck sent `exit`, if it did.
-    exit_at: Option<Duration>,
     /// When and why this session's own actions left evidence incomplete.
     own_limit: Option<(Duration, String)>,
     /// Set when a write stopped partway through a frame.
@@ -391,7 +387,6 @@ impl Session {
             evidence,
             messages: Vec::new(),
             initialized_at: None,
-            exit_at: None,
             own_limit: None,
             abandoned: false,
             pending: HashMap::new(),
@@ -581,16 +576,14 @@ impl Session {
     }
 
     async fn send_until(&mut self, value: &Value, deadline: Instant) -> Result<(), WriteError> {
-        // The times bound the window in which a response without an id could
-        // answer a notification. Recorded before the write so that a response
-        // read while it is in progress is still inside the window.
-        if value.get("id").is_none() {
-            let at = self.start.elapsed();
-            match value.get("method").and_then(Value::as_str) {
-                Some("initialized") if self.initialized_at.is_none() => self.initialized_at = Some(at),
-                Some("exit") if self.exit_at.is_none() => self.exit_at = Some(at),
-                _ => {}
-            }
+        // From `initialized` on, a response without an id answers a
+        // notification. Recorded before the write so that a response read
+        // while it is in progress is still counted.
+        if value.get("id").is_none()
+            && value.get("method").and_then(Value::as_str) == Some("initialized")
+            && self.initialized_at.is_none()
+        {
+            self.initialized_at = Some(self.start.elapsed());
         }
         let body = serde_json::to_vec(value).expect("JSON values serialize");
         self.write_until(&transport::encode(&body), deadline).await
@@ -942,12 +935,10 @@ impl Session {
         // and the work is bounded by --max-output-mib.
         self.take_queued(false);
         self.group.close();
-        // A response without an id read between `initialized` and `exit` could
-        // be a reply to a notification; anything lspcheck missed in that window
+        // A response without an id read after `initialized` could be a reply
+        // to a notification (`exit` included); anything lspcheck missed since
         // makes judging J3 inconclusive.
-        let j3_incomplete = self
-            .initialized_at
-            .and_then(|from| self.incomplete_within(from, self.exit_at.unwrap_or_else(|| self.start.elapsed())));
+        let j3_incomplete = self.initialized_at.and_then(|from| self.incomplete_within(from, self.start.elapsed()));
         let mut evidence = std::mem::take(&mut *self.evidence.lock().expect("evidence lock"));
         if !evidence.done && evidence.limit.is_none() {
             evidence.limit = Some((
@@ -989,7 +980,6 @@ impl Session {
             transcript,
             messages: std::mem::take(&mut self.messages),
             initialized_at: self.initialized_at,
-            exit_at: self.exit_at,
             j3_incomplete,
             problems: evidence.problems,
             unmatched,
