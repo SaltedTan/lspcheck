@@ -29,11 +29,14 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  L7  SHOULD  exit without shutdown ends the process with status 1
   PASS  L8  POLICY  End of input without exit ends the process
   PASS  L9  POLICY  No descendant process outlives the server
-18 checks: 15 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
+  PASS  C1  MUST    A cancelled request still gets exactly one response
+  PASS  C2  MUST    Cancelling an unknown or finished request produces nothing
+  PASS  C3  MUST    No response to $/cancelRequest itself
+21 checks: 18 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 18 checks so far, covering framing and the lifecycle. [The design](docs/design.md) lists the rest, which cover framing edge
-cases, request ids, cancellation, document positions and robustness.
+lspcheck is early: it has 21 checks so far, covering framing, the lifecycle and cancellation. [The design](docs/design.md) lists the rest, which cover
+framing edge cases, request ids, document positions and robustness.
 
 ## What it doesn't do
 

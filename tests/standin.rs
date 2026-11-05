@@ -146,6 +146,8 @@ fn lawful_variations_fail_nothing() {
         "slow-reads",
         "no-open-close",
         "newline-after-body",
+        "defer-until-next",
+        "cancelled-other-error",
     ] {
         let r = fault(name);
         only_fails(&r, &[]);
@@ -493,6 +495,37 @@ fn a_child_that_leaves_the_group_with_a_non_utf8_name_still_fails_l9() {
     let r = fault("escaped-child");
     only_fails(&r, &["L9"]);
     assert!(r.stdout.contains("\u{fffd}standin"), "{}", r.stdout);
+}
+
+#[test]
+fn a_cancelled_request_still_gets_exactly_one_response() {
+    // A deferred request that is cancelled is never answered.
+    let r = fault("cancelled-no-reply");
+    only_fails(&r, &["C1"]);
+    assert!(r.stdout.contains("no response after $/cancelRequest"), "{}", r.stdout);
+    // A cancelled request that gets both the error and a result was answered twice.
+    let r = fault("cancelled-reply-twice");
+    only_fails(&r, &["C1"]);
+    assert!(r.stdout.contains("answered twice"), "{}", r.stdout);
+    // A result, -32800, or another error is lawful for what it contains.
+    only_fails(&fault("defer-until-next"), &[]);
+}
+
+#[test]
+fn cancelling_an_unknown_or_finished_request_produces_nothing() {
+    // Holding R's reply keeps C1's cancel from reaching a finished request, so
+    // these faults act only on C2's unknown id.
+    let r = run(&["--fault", "defer-until-next", "--fault", "cancel-unknown-reply"], &[]);
+    only_fails(&r, &["C2"]);
+    assert!(r.stdout.contains("$/cancelRequest for id"), "{}", r.stdout);
+    let r = run(&["--fault", "defer-until-next", "--fault", "stop-after-unknown-cancel"], &[]);
+    only_fails(&r, &["C2"]);
+    assert!(r.stdout.contains("stopped answering"), "{}", r.stdout);
+}
+
+#[test]
+fn replying_to_a_cancel_notification_fails_c3() {
+    only_fails(&fault("reply-to-cancel"), &["C3"]);
 }
 
 #[test]

@@ -49,6 +49,7 @@ pub enum Area {
     Framing,
     JsonRpc,
     Lifecycle,
+    Cancellation,
 }
 
 /// A check's identity and documentation.
@@ -102,6 +103,9 @@ pub const CATALOGUE: &[CheckInfo] = &[
     check!("L7", Lifecycle, Should, "exit without shutdown ends the process with status 1", "exit"),
     check!("L8", Lifecycle, Policy, "End of input without exit ends the process", "exit"),
     check!("L9", Lifecycle, Policy, "No descendant process outlives the server", "exit"),
+    check!("C1", Cancellation, Must, "A cancelled request still gets exactly one response", "cancelRequest"),
+    check!("C2", Cancellation, Must, "Cancelling an unknown or finished request produces nothing", "cancelRequest"),
+    check!("C3", Cancellation, Must, "No response to $/cancelRequest itself", "cancelRequest"),
 ];
 
 /// Checks judged from every scenario's observations.
@@ -210,6 +214,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "exit-without-shutdown", checks: &["L7"] },
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
+    Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
@@ -271,6 +276,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         "exit-without-shutdown" => exit_without_shutdown(&mut ctx).await,
         "framing" => framing(&mut ctx).await,
         "after-initialize" => after_initialize(&mut ctx).await,
+        "cancellation" => cancellation(&mut ctx).await,
         "end-of-input" => end_of_input(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
@@ -637,6 +643,243 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
         ),
     }
     if ctx.s.notify("exit", None).await.is_ok() {
+        let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    }
+}
+
+/// Whether the initialize result advertises `workspaceSymbolProvider`, either
+/// as `true` or as an options object.
+fn advertises_symbol(reply: &Message) -> bool {
+    let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { return false };
+    matches!(result.pointer("/capabilities/workspaceSymbolProvider"), Some(Value::Bool(true) | Value::Object(_)))
+}
+
+/// The index in `messages` of the first response to `id` at or after `from`.
+fn response_index(messages: &[(Duration, Message)], id: &Id, from: usize) -> Option<usize> {
+    (from..messages.len()).find(|&i| messages[i].1.response_id() == Some(id))
+}
+
+fn describe_response(m: &Message) -> String {
+    match &m.kind {
+        Kind::Response { outcome, .. } => describe_outcome(outcome),
+        _ => unreachable!("wait_response returns a response"),
+    }
+}
+
+/// How a cancelled request was answered, for C1's detail.
+fn describe_cancelled_answer(m: &Message) -> String {
+    match &m.kind {
+        Kind::Response { outcome: Outcome::Result(_), .. } => "answered with a result".into(),
+        Kind::Response { outcome: Outcome::Error { code: Some(codes::REQUEST_CANCELLED), .. }, .. } => {
+            "answered with RequestCancelled (-32800)".into()
+        }
+        _ => format!("answered with {}", describe_response(m)),
+    }
+}
+
+/// Cancellation: one response to a cancelled request, none to a cancel of an
+/// unknown or finished one, and no response to `$/cancelRequest` itself.
+async fn cancellation(ctx: &mut Ctx<'_>) {
+    const CHECKS: [&str; 3] = ["C1", "C2", "C3"];
+    let reply = match ctx.initialize().await {
+        Ok(reply) => reply,
+        Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
+            for id in CHECKS {
+                ctx.report(id, Verdict::Error, format!("initialize didn't succeed: {why}"));
+            }
+            return;
+        }
+    };
+    let Some(init_id) = reply.response_id().cloned() else { unreachable!("initialize is a request") };
+    let t = ctx.cfg.request_timeout;
+
+    // C1. The request and its cancellation go out before anything is read, so
+    // the server has both when it decides the request's fate. `workspace/symbol`
+    // is used when it is advertised, because the stand-in can hold that one.
+    let (method, params, which) = if advertises_symbol(&reply) {
+        ("workspace/symbol", json!({"query": ""}), "workspace/symbol (the server advertises workspaceSymbolProvider)")
+    } else {
+        (PROBE, json!({}), "lspcheck/probe (the server doesn't advertise workspaceSymbolProvider)")
+    };
+    let r = ctx.s.fresh_id();
+    let request = serde_json::to_vec(&message::request(&r, method, Some(params))).expect("JSON values serialize");
+    let mut bytes = transport::encode(&request);
+    let split = bytes.len();
+    bytes.extend(frame(&message::notification("$/cancelRequest", Some(json!({"id": r.to_value()})))));
+    let deadline = Instant::now() + t;
+    if let Err(e) = ctx.s.begin_request(&r, deadline).await {
+        ctx.report("C1", Verdict::Error, format!("{which}: lspcheck couldn't prepare the request: {e}"));
+        for id in ["C2", "C3"] {
+            ctx.report(id, Verdict::Error, "not judged: the C1 request couldn't be prepared");
+        }
+        return;
+    }
+    // Anything read before the request was written can't answer it.
+    let after_send = ctx.s.messages.len();
+    if let Err(e) = ctx.s.write_split(&bytes, &[split], Duration::ZERO, deadline).await {
+        ctx.s.abort_request(&r);
+        ctx.report(
+            "C1",
+            Verdict::Error,
+            format!("{which}: lspcheck couldn't send the request and its cancellation: {e}"),
+        );
+        for id in ["C2", "C3"] {
+            ctx.report(id, Verdict::Error, "not judged: the C1 request couldn't be sent");
+        }
+        return;
+    }
+    let answer = ctx.s.wait_response(&r, deadline).await;
+    let answered_index = match &answer {
+        Ok(_) => response_index(&ctx.s.messages, &r, after_send),
+        Err(_) => None,
+    };
+    let how = match &answer {
+        Ok(m) => describe_cancelled_answer(m),
+        Err(_) => String::new(),
+    };
+
+    // A plain request after R orders whatever the server says about R before
+    // its own answer, so a second response can't be mistaken for a later one.
+    let probe_from = ctx.s.messages.len();
+    let probe = ctx.s.call(PROBE, Some(json!({})), t).await;
+    let probe_end = probe
+        .as_ref()
+        .ok()
+        .and_then(|m| m.response_id().and_then(|id| response_index(&ctx.s.messages, id, probe_from)))
+        .unwrap_or(ctx.s.messages.len());
+    match (answered_index, &answer) {
+        (Some(first), Ok(_)) => {
+            let duplicate = (first + 1..probe_end)
+                .find(|&i| ctx.s.messages[i].1.response_id() == Some(&r))
+                .map(|i| describe_response(&ctx.s.messages[i].1));
+            if let Some(again) = duplicate {
+                ctx.fail(
+                    "C1",
+                    format!(
+                        "{which} was answered twice: {how}, then {again}, before the next plain request was answered"
+                    ),
+                );
+            } else {
+                match &probe {
+                    Ok(_) => ctx.pass_with("C1", format!("{which}: {how}, and only once")),
+                    Err(CallError::Wait(WaitError::Closed)) => ctx
+                        .pass_with("C1", format!("{which}: {how}, and only once (the server then closed its stdout)")),
+                    Err(e) => ctx.report(
+                        "C1",
+                        Verdict::Error,
+                        format!(
+                            "inconclusive: {which}: {how}, but the plain request that would show a second reply {}",
+                            describe_call_error(e, t)
+                        ),
+                    ),
+                }
+            }
+        }
+        (_, Err(wait)) => {
+            let e = CallError::Wait(*wait);
+            ctx.fail_call(
+                "C1",
+                format!("{which}: no response after $/cancelRequest ({})", describe_call_error(&e, t)),
+                &e,
+            );
+        }
+        (None, Ok(_)) => unreachable!("an answered request is recorded in messages"),
+    }
+
+    // C2. An id never sent, then R (finished, or still pending when C1 failed).
+    // Each cancel is followed by its own plain request, so no read can hold
+    // three of lspcheck's frames: a server that mishandles coalesced frames
+    // (F4) can't make this check fail for the wrong reason.
+    let unknown = ctx.s.fresh_id();
+    let finished = answered_index.is_some();
+    let from = ctx.s.messages.len();
+    // Cancelling a request that is still pending may lawfully cancel it.
+    let watched: Vec<&Id> = if finished { vec![&unknown, &r] } else { vec![&unknown] };
+    let mut send_error = None;
+    let mut probe_error: Option<CallError> = None;
+    let mut end = from;
+    for (i, cancelled) in [&unknown, &r].into_iter().enumerate() {
+        let note = message::notification("$/cancelRequest", Some(json!({"id": cancelled.to_value()})));
+        if let Err(e) = ctx.s.send(&note).await {
+            send_error = Some(e);
+            break;
+        }
+        if !finished && i == 1 {
+            // R is still pending, so a response to it would be lawful.
+            break;
+        }
+        let probe_from = ctx.s.messages.len();
+        match ctx.s.call(PROBE, Some(json!({})), t).await {
+            Ok(m) => {
+                end = m
+                    .response_id()
+                    .and_then(|id| response_index(&ctx.s.messages, id, probe_from))
+                    .unwrap_or(ctx.s.messages.len());
+            }
+            Err(e) => {
+                // Everything read until the deadline is still inspected.
+                end = ctx.s.messages.len();
+                probe_error = Some(e);
+                break;
+            }
+        }
+    }
+    let offending = (from..end).find_map(|i| {
+        let (_, m) = &ctx.s.messages[i];
+        let id = m.response_id()?;
+        watched.contains(&id).then(|| (id.clone(), describe_response(m)))
+    });
+    if let Some((id, what)) = offending {
+        ctx.fail("C2", format!("a $/cancelRequest for id {id} got {what} before the next plain request was answered"));
+    } else if let Some(e) = &send_error {
+        ctx.report("C2", Verdict::Error, format!("lspcheck couldn't send a $/cancelRequest: {e}"));
+    } else {
+        match probe_error {
+            None => {
+                let what = if finished { "an id never sent and a finished request" } else { "an id never sent" };
+                ctx.pass_with("C2", format!("cancelling {what} drew no reply, and the server kept serving"));
+            }
+            Some(e) => ctx.fail_call(
+                "C2",
+                format!(
+                    "the server stopped answering after cancelling an unknown or finished request ({})",
+                    describe_call_error(&e, t)
+                ),
+                &e,
+            ),
+        }
+    }
+
+    // C3. The only notifications sent after initialize are `initialized` and
+    // the cancels, so a response with no usable id answers one of them.
+    let from = ctx.s.messages.iter().rposition(|(_, m)| m.response_id() == Some(&init_id)).map_or(0, |i| i + 1);
+    let violation = (from..ctx.s.messages.len()).find_map(|i| {
+        let (at, m) = &ctx.s.messages[i];
+        match &m.kind {
+            Kind::Response { id: Id::Null, outcome } => {
+                Some((*at, format!("at {} ms, sent {} with id null", at.as_millis(), describe_outcome(outcome))))
+            }
+            Kind::Invalid(_) if m.value.get("result").is_some() || m.value.get("error").is_some() => {
+                let text = session::preview(m.value.to_string().as_bytes());
+                Some((*at, format!("at {} ms, sent a response without an id: {text}", at.as_millis())))
+            }
+            _ => None,
+        }
+    });
+    match violation {
+        Some((_, what)) => ctx.fail(
+            "C3",
+            format!("{what}; lspcheck only sent notifications (`initialized` and `$/cancelRequest`) there, so it answers one"),
+        ),
+        None => ctx.pass_with(
+            "C3",
+            "no response answered `initialized` or either $/cancelRequest notification",
+        ),
+    }
+
+    // Leave politely, as every scenario does.
+    if ctx.s.call("shutdown", None, t).await.is_ok() {
+        let _ = ctx.s.notify("exit", None).await;
         let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
     }
 }

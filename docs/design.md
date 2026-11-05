@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. F1, F2, F8 and L9 are judged across every scenario. Everything else below is planned; M2 is next.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, C1 to C3, and L1 to L9. F1, F2, F8 and L9 are judged across every scenario. The rest of M2 is next.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -88,6 +88,14 @@ whole, because a missing reply to it can't be told apart from a slow start.
 | C1 | MUST | `$/cancelRequest` for a pending request still yields exactly one response: a result, or error `-32800` RequestCancelled (either wins the race lawfully). |
 | C2 | MUST | Cancelling an unknown id or an already-answered id produces nothing and the server keeps serving. |
 | C3 | MUST | No response to `$/cancelRequest` itself. |
+
+C1 to C3 share one scenario. After `initialize`, lspcheck sends one request (`workspace/symbol` when the server
+advertises `workspaceSymbolProvider`, otherwise an unknown-method probe) and its `$/cancelRequest` before reading
+anything, then waits for the request's response. Any response is lawful for its content, but a second response to the
+same id before the next plain request's answer fails C1. It then cancels an id it never sent and the finished request:
+a response carrying either id fails C2, and so does a plain request that goes unanswered after them. C3 fails if any
+response with id `null`, or an object with `result` or `error` but no id, arrived after initialize, since the only
+notifications sent there were `initialized` and the cancels. The scenario then shuts down and exits.
 
 ### Documents and positions (richer with a profile document)
 | ID | Basis | Check |
