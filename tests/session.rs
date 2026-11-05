@@ -96,3 +96,30 @@ time.sleep(30)
     assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
     s.finish(Duration::from_millis(200)).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn taking_in_what_was_read_doesnt_wait_on_an_answer_it_cant_write() {
+    // On shutdown this server sends its answer, a configuration request whose
+    // answer is bigger than a pipe, and an error with id null, then stops
+    // reading. Everything it sent must still be recorded, promptly.
+    let mut s = Session::start(&standin(&["--fault", "shutdown-block"]), Options::default()).await.unwrap();
+    let t = Duration::from_secs(5);
+    s.call("initialize", Some(json!({"processId": null, "rootUri": null, "capabilities": {}})), t).await.unwrap();
+    s.notify("initialized", Some(json!({}))).await.unwrap();
+    s.call("shutdown", None, t).await.unwrap();
+    // The rest is already written; take it in as the stdout task reads it.
+    // Each call returns at once, whatever is still unanswered.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let null_reply = |s: &Session| s.messages.iter().any(|(_, m)| m.value.get("id") == Some(&serde_json::Value::Null));
+    while !null_reply(&s) && std::time::Instant::now() < deadline {
+        let started = std::time::Instant::now();
+        s.take_in();
+        assert!(started.elapsed() < Duration::from_secs(1), "take_in waited on an answer the server can't read");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(null_reply(&s), "the reply after the configuration request wasn't recorded");
+    // The server may be waiting for that answer, so what it didn't send
+    // can't be judged after it.
+    assert!(s.incomplete_within(Duration::ZERO, s.elapsed()).is_some(), "an unanswered request went unnoticed");
+    s.finish(Duration::from_millis(200)).await;
+}

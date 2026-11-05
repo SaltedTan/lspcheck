@@ -146,6 +146,8 @@ fn lawful_variations_fail_nothing() {
         "slow-reads",
         "no-open-close",
         "newline-after-body",
+        "defer-until-next",
+        "cancelled-other-error",
     ] {
         let r = fault(name);
         only_fails(&r, &[]);
@@ -493,6 +495,112 @@ fn a_child_that_leaves_the_group_with_a_non_utf8_name_still_fails_l9() {
     let r = fault("escaped-child");
     only_fails(&r, &["L9"]);
     assert!(r.stdout.contains("\u{fffd}standin"), "{}", r.stdout);
+}
+
+#[test]
+fn a_cancelled_request_still_gets_exactly_one_response() {
+    // A deferred request that is cancelled is never answered.
+    let r = fault("cancelled-no-reply");
+    only_fails(&r, &["C1"]);
+    assert!(r.stdout.contains("no response after $/cancelRequest"), "{}", r.stdout);
+    // A cancelled request that gets both the error and a result was answered twice.
+    let r = fault("cancelled-reply-twice");
+    only_fails(&r, &["C1"]);
+    assert!(r.stdout.contains("answered twice"), "{}", r.stdout);
+    // A result, -32800, or another error is lawful for what it contains.
+    only_fails(&fault("defer-until-next"), &[]);
+}
+
+#[test]
+fn cancelling_an_unknown_or_finished_request_produces_nothing() {
+    // Holding R's reply keeps C1's cancel from reaching a finished request, so
+    // these faults act only on C2's unknown id.
+    let r = run(&["--fault", "defer-until-next", "--fault", "cancel-unknown-reply"], &[]);
+    only_fails(&r, &["C2"]);
+    assert!(r.stdout.contains("for an id never sent"), "{}", r.stdout);
+    // A server that stops answering might still send a reply to a cancel
+    // later, so C3 can't be judged.
+    let r = run(&["--fault", "defer-until-next", "--fault", "stop-after-unknown-cancel"], &[]);
+    expect(&r, "C2", "fail");
+    expect(&r, "C3", "error");
+    assert!(r.stdout.contains("stopped answering"), "{}", r.stdout);
+}
+
+#[test]
+fn replying_to_a_cancel_notification_fails_c3() {
+    only_fails(&fault("reply-to-cancel"), &["C3"]);
+}
+
+#[test]
+fn replies_to_cancels_after_the_next_answer_still_count() {
+    // A plain request's answer doesn't order what a server says about a
+    // cancel, so replies sent after it are judged too.
+    let late = |faults: &[&str]| {
+        let mut args = vec!["--fault", "defer-until-next", "--fault", "late-cancel-replies"];
+        args.extend(faults.iter().flat_map(|f| ["--fault", f]));
+        run(&args, &[])
+    };
+    only_fails(&late(&["cancel-unknown-reply"]), &["C2"]);
+    only_fails(&late(&["reply-to-cancel"]), &["C3"]);
+    // A second answer to the cancelled request, read before the cancels of
+    // C2 were sent, is C1's finding, not C2's.
+    let r = late(&["cancelled-reply-twice"]);
+    only_fails(&r, &["C1"]);
+    assert!(r.stdout.contains("answered twice"), "{}", r.stdout);
+}
+
+#[test]
+fn a_skipped_frame_makes_cancellation_passes_inconclusive() {
+    // The oversized replies to the cancels are skipped, so lspcheck can't say
+    // they weren't replies.
+    let r = run(&["--fault", "reply-to-cancel", "--fault", "big-cancel-replies"], &["--max-frame-mib", "1"]);
+    for id in ["C1", "C2", "C3"] {
+        expect(&r, id, "error");
+    }
+}
+
+#[test]
+fn c3_counts_only_id_less_replies_read_after_the_first_cancel() {
+    // A reply to `initialized` read before any cancel was sent can't answer
+    // one. If it is read only after the first cancel was written, it might
+    // have answered either, so C3 can't be judged, but it doesn't fail.
+    let r = fault("null-reply-after-first-probe");
+    assert_ne!(r.verdicts["C3"], "fail", "{}", r.stdout);
+    let r = fault("initialized-reply-after-cancel");
+    expect(&r, "C3", "error");
+    assert!(r.verdicts.iter().all(|(id, v)| v == "pass" || id == "C3" || (id == "L9" && !cfg!(unix))), "{}", r.stdout);
+    // A malformed answer to shutdown still carries shutdown's id.
+    expect(&fault("shutdown-no-jsonrpc"), "C3", "pass");
+}
+
+#[test]
+fn a_frame_skipped_during_c1_leaves_c2_judged() {
+    // The oversized log comes right after the cancelled request's answer, so
+    // it is read before C2's cancels and can't be a reply to them.
+    let r = run(&["--fault", "defer-until-next", "--fault", "big-frame-on-cancel"], &["--max-frame-mib", "1"]);
+    expect(&r, "C1", "error");
+    expect(&r, "C2", "pass");
+    expect(&r, "C3", "error");
+}
+
+#[test]
+fn a_frame_skipped_before_the_cancelled_request_doesnt_excuse_its_absence() {
+    let r =
+        run(&["--fault", "big-frame", "--fault", "cancelled-no-reply"], &["--max-frame-mib", "1", "--timeout", "3"]);
+    expect(&r, "C1", "fail");
+}
+
+#[test]
+fn a_frame_skipped_after_a_cancelled_request_went_unanswered_doesnt_excuse_it() {
+    // The oversized frame comes only after lspcheck stopped waiting for the
+    // cancelled request, so it can't have been its answer.
+    let r = run(
+        &["--fault", "cancelled-no-reply", "--fault", "big-frame-after-drop"],
+        &["--max-frame-mib", "1", "--timeout", "3"],
+    );
+    expect(&r, "C1", "fail");
+    // It is read before C2's cancels, so C2 is still judged.
+    expect(&r, "C2", "pass");
 }
 
 #[test]

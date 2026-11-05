@@ -66,6 +66,27 @@ const FAULTS: &[(&str, &str)] = &[
     ("ignore-unknown-requests", "never answer requests for unknown methods"),
     ("exit-on-string-id", "exit when a request has a string id"),
     ("answers-reordered", "lawful: answer requests that arrive together in reverse order"),
+    ("defer-until-next", "lawful: hold a workspace/symbol reply until the next message, cancelling it if asked"),
+    ("cancelled-no-reply", "never answer a deferred request that is cancelled"),
+    ("cancelled-reply-twice", "answer a cancelled request with both -32800 and a result"),
+    ("cancelled-other-error", "lawful: answer a cancelled request with InternalError (-32603)"),
+    ("cancel-unknown-reply", "answer a $/cancelRequest for an id that isn't pending with an error carrying it"),
+    ("stop-after-unknown-cancel", "stop answering requests after a $/cancelRequest for an id that isn't pending"),
+    ("reply-to-cancel", "answer every $/cancelRequest with an error whose id is null"),
+    ("late-cancel-replies", "send what the cancel faults send only after answering the next request"),
+    ("big-cancel-replies", "pad what the cancel faults send with 2 MiB of error data"),
+    ("null-reply-after-first-probe", "after initialize, follow the first answer with an error whose id is null"),
+    ("shutdown-no-jsonrpc", "leave \"jsonrpc\" out of the answer to shutdown"),
+    (
+        "shutdown-block",
+        "on shutdown, send its answer, a huge configuration request and an error with id null, then stop reading",
+    ),
+    ("big-frame-on-cancel", "after answering a cancelled request, send a 2 MiB log message"),
+    (
+        "initialized-reply-after-cancel",
+        "answer initialized twice with an error whose id is null, once a cancel arrives",
+    ),
+    ("big-frame-after-drop", "after cancelled-no-reply drops a request, send a 2 MiB log message with the next answer"),
     ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
@@ -99,6 +120,10 @@ fn main() {
         }
     }
     let fault = |name: &str| faults.iter().any(|f| f == name);
+    // Whether a workspace/symbol reply waits to see whether it is cancelled.
+    let holds = ["defer-until-next", "cancelled-no-reply", "cancelled-reply-twice", "cancelled-other-error"]
+        .iter()
+        .any(|name| fault(name));
     let mut out = Writer { out: std::io::stdout().lock(), faults: faults.clone(), holding: false, held: Vec::new() };
     if fault("stdout-banner") {
         out.raw(b"standin starting\n");
@@ -107,6 +132,19 @@ fn main() {
     let (mut initialized, mut shut_down) = (false, false);
     // A reply to a notification, held until the next request has been answered.
     let mut late_reply: Option<Value> = None;
+    // A workspace/symbol request whose reply waits for the next message.
+    let mut deferred: Option<Value> = None;
+    // Set by stop-after-unknown-cancel: requests are no longer answered.
+    let mut no_more_answers = false;
+    // What the cancel faults send, and where: now, or after the next answer.
+    let mut cancel_out =
+        CancelOut { late: fault("late-cancel-replies"), big: fault("big-cancel-replies"), held: Vec::new() };
+    // Set when cancelled-no-reply drops a request, for big-frame-after-drop.
+    let mut dropped = false;
+    // For initialized-reply-after-cancel: a reply to `initialized` not sent yet.
+    let mut initialized_reply = fault("initialized-reply-after-cancel");
+    // For null-reply-after-first-probe: whether a request was answered since initialize.
+    let mut answered_one = false;
     let mut children: Vec<Child> = Vec::new();
     loop {
         if !input.ready() {
@@ -134,8 +172,56 @@ fn main() {
         if fault("exit-on-string-id") && msg.get("id").is_some_and(Value::is_string) {
             std::process::exit(2);
         }
+        // A held reply: a cancel for it decides its answer, and any other
+        // message is handled after the reply, as if the two had been read in
+        // that order.
+        if let Some(deferred_id) = deferred.clone() {
+            let cancels_it = method == "$/cancelRequest" && msg.pointer("/params/id") == Some(&deferred_id);
+            if cancels_it {
+                deferred = None;
+                if fault("cancelled-no-reply") {
+                    dropped = true;
+                } else if fault("cancelled-other-error") {
+                    out.frame(&err(&deferred_id, -32603, "internal error"));
+                } else {
+                    out.frame(&err(&deferred_id, -32800, "request cancelled"));
+                    if fault("big-frame-on-cancel") {
+                        let text = "x".repeat(2 * 1024 * 1024);
+                        out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
+                    }
+                    if fault("cancelled-reply-twice") {
+                        cancel_out.send(&mut out, ok(&deferred_id, Value::Null));
+                    }
+                }
+                if fault("reply-to-cancel") {
+                    cancel_out.send(&mut out, cancel_reply());
+                }
+                continue;
+            }
+            out.frame(&ok(&deferred_id, Value::Null));
+            deferred = None;
+        }
         let Some(id) = msg.get("id").cloned() else {
             // A notification.
+            if method == "$/cancelRequest" {
+                if std::mem::take(&mut initialized_reply) {
+                    for _ in 0..2 {
+                        out.frame(&err(&Value::Null, -32601, "unknown notification"));
+                    }
+                }
+                if fault("reply-to-cancel") {
+                    cancel_out.send(&mut out, cancel_reply());
+                }
+                if let Some(cancelled) = msg.pointer("/params/id")
+                    && fault("cancel-unknown-reply")
+                {
+                    cancel_out.send(&mut out, err(cancelled, -32800, "request cancelled"));
+                }
+                if fault("stop-after-unknown-cancel") {
+                    no_more_answers = true;
+                }
+                continue;
+            }
             if method == "textDocument/didOpen" && fault("no-open-close") {
                 std::process::exit(4);
             }
@@ -176,6 +262,9 @@ fn main() {
             }
             continue;
         };
+        if no_more_answers {
+            continue;
+        }
         if method == "initialize" && initialized && !fault("reinitialize") {
             if fault("exit-on-reinitialize") {
                 std::process::exit(3);
@@ -246,7 +335,12 @@ fn main() {
             initialized = true;
             let encoding = if fault("bad-encoding") { "utf-7" } else { "utf-16" };
             let mut result = json!({
-                "capabilities": {"positionEncoding": encoding, "textDocumentSync": 1, "hoverProvider": true},
+                "capabilities": {
+                    "positionEncoding": encoding,
+                    "textDocumentSync": 1,
+                    "hoverProvider": true,
+                    "workspaceSymbolProvider": true
+                },
                 "serverInfo": {"name": "lspcheck-standin"}
             });
             if fault("no-open-close") {
@@ -289,6 +383,16 @@ fn main() {
             out.frame(&err(&id, -32600, "shutting down"));
             continue;
         }
+        if method == "workspace/symbol" && holds {
+            deferred = Some(id.clone());
+            continue;
+        }
+        if std::mem::take(&mut dropped) && fault("big-frame-after-drop") {
+            let text = "x".repeat(2 * 1024 * 1024);
+            out.frame(
+                &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
+            );
+        }
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
@@ -311,7 +415,23 @@ fn main() {
                     pipe.flush().unwrap();
                     std::process::exit(0);
                 }
-                out.frame(&ok(&id, result));
+                if fault("shutdown-block") {
+                    // One write; the configuration answer can't be written
+                    // because this server stops reading.
+                    let items = vec![json!({"section": "x"}); 40_000];
+                    let config = json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": items}});
+                    let mut bytes = out.encode(&ok(&id, result));
+                    bytes.extend(out.encode(&config));
+                    bytes.extend(out.encode(&cancel_reply()));
+                    out.raw(&bytes);
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    std::process::exit(1);
+                }
+                let mut reply = ok(&id, result);
+                if fault("shutdown-no-jsonrpc") {
+                    reply.as_object_mut().unwrap().remove("jsonrpc");
+                }
+                out.frame(&reply);
             }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
@@ -320,6 +440,11 @@ fn main() {
             _ if fault("wrong-unknown-error") => out.frame(&err(&id, -32600, "unknown")),
             _ => out.frame(&err(&id, -32601, "method not found")),
         }
+        if !std::mem::replace(&mut answered_one, true) && fault("null-reply-after-first-probe") {
+            // As if `initialized` had been answered late.
+            out.frame(&err(&Value::Null, -32601, "unknown notification"));
+        }
+        cancel_out.flush(&mut out);
     }
     // End of input without exit.
     if fault("ignore-eof") {
@@ -463,6 +588,41 @@ fn ok(id: &Value, result: Value) -> Value {
 
 fn err(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+/// Where the cancel faults' messages go: straight out, or held until the
+/// next request has been answered (late-cancel-replies), so a client can't
+/// count on them arriving before that answer.
+struct CancelOut {
+    late: bool,
+    big: bool,
+    held: Vec<Value>,
+}
+
+impl CancelOut {
+    fn send<W: Write>(&mut self, out: &mut Writer<W>, mut v: Value) {
+        if self.big
+            && let Some(error) = v.get_mut("error")
+        {
+            error["data"] = json!("x".repeat(2 * 1024 * 1024));
+        }
+        if self.late {
+            self.held.push(v);
+        } else {
+            out.frame(&v);
+        }
+    }
+
+    fn flush<W: Write>(&mut self, out: &mut Writer<W>) {
+        for v in std::mem::take(&mut self.held) {
+            out.frame(&v);
+        }
+    }
+}
+
+/// A response to a cancel notification: JSON-RPC has no id to give back.
+fn cancel_reply() -> Value {
+    json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32601, "message": "unhandled notification $/cancelRequest"}})
 }
 
 /// Frames read from stdin, with the reading faults applied. Reads go

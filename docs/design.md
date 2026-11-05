@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. F1, F2, F8 and L9 are judged across every scenario. Everything else below is planned; M2 is next.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: C1 to C3 are done. F1, F2, F8 and L9 are judged across every scenario. Everything else below is planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -85,9 +85,29 @@ whole, because a missing reply to it can't be told apart from a slow start.
 ### Cancellation
 | ID | Basis | Check |
 |---|---|---|
-| C1 | MUST | `$/cancelRequest` for a pending request still yields exactly one response: a result, or error `-32800` RequestCancelled (either wins the race lawfully). |
+| C1 | MUST | `$/cancelRequest` for a pending request still yields exactly one response: a result, error `-32800` RequestCancelled (advised), or another error. |
 | C2 | MUST | Cancelling an unknown id or an already-answered id produces nothing and the server keeps serving. |
 | C3 | MUST | No response to `$/cancelRequest` itself. |
+
+C1 to C3 share one scenario. After `initialize` and a plain request, lspcheck sends one request (`workspace/symbol`
+when the server advertises `workspaceSymbolProvider`, otherwise an unknown-method probe) and its `$/cancelRequest`
+before reading anything, waits for the request's response, and sends a plain request. Next it cancels an id it never
+sent and then the finished request, each followed by a plain request, and finally shuts the server down. A reply to a
+cancel can come at any time, so the verdicts are given at the end, over everything read before `exit` was sent:
+
+- a second response to the cancelled request fails C1 when it was read before lspcheck cancelled that request again,
+  and C2 when after; a response carrying the never-sent id fails C2, and so does a plain request that goes unanswered
+  after the cancels;
+- a response without an id (`id` missing or `null`) can't be matched to the notification it answers, and until `exit`
+  lspcheck sends only `initialized` and the cancels. C3 fails on one read after the first cancel was written whose
+  text names `$/cancelRequest` (as a MethodNotFound message usually does); any other is `error` for C3, since it may
+  answer `initialized` (answering any notification is J3's failure).
+
+If the server stopped answering, what it didn't send can't be judged, so those checks are `error`. A pass is also
+`error` when lspcheck missed something where that check's evidence would be: a frame it skipped or couldn't read, a
+server request it couldn't answer (the server may be waiting for it), or reading that stopped. For C1 that is from the
+cancelled request until it is cancelled again, for C2 from its first cancel, and for C3 from the cancelled request,
+each until `exit`. A missing response is excused only by something missed while lspcheck was waiting for it.
 
 ### Documents and positions (richer with a profile document)
 | ID | Basis | Check |
