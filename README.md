@@ -48,10 +48,12 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
                      1 versioned diagnostics notification(s) named a version lspcheck had sent
   PASS  D3  MUST    After a didChange, positions refer to the changed text
                      5 informative position(s) on character boundaries after the change, counted in UTF-16 code units; 14 position(s) read after the change
-29 checks: 26 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
+  PASS  D4  POLICY  A request about a document that isn't open gets a response, and the server keeps serving
+                     all three answered: the closed document got result (empty); the never-opened document got result (empty); the plain request got error -32601
+30 checks: 27 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 29 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
+lspcheck is early: it has 30 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
 document positions. [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids,
 documents and robustness.
 
@@ -118,6 +120,12 @@ must refer to the changed text. A position that falls inside a character of the 
 reading of the changed text explains it (counted in another encoding) and a text the change should have produced does
 (the text before the change, or the change applied counting its range in another encoding); otherwise D3 is `ERROR`
 and D1 carries the failure. A server that takes no changes leaves D3 `SKIP`.
+
+The same scenario also checks documents that aren't open (D4): after the change, lspcheck closes document A with a
+`didClose`, then sends one advertised document request about the closed document, the same request about a file in
+the workspace that was never opened and doesn't exist, and a plain request, each awaited alone. Each must get a
+response — any result or error is lawful, including one read from disk — and the server must keep serving. A server
+that advertises none of the document requests leaves D4 `SKIP`.
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of
