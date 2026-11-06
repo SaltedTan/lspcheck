@@ -264,6 +264,7 @@ fn lawful_variations_fail_nothing() {
         "long-header",
         "answers-reordered",
         "slow-reads",
+        "big-dollar-reply",
         "newline-after-body",
         "defer-until-next",
         "cancelled-other-error",
@@ -363,6 +364,28 @@ fn a_frame_skipped_after_a_missed_reply_doesnt_excuse_it() {
     let r = run(&["--fault", "ignore-dollar-request", "--fault", "big-frame-on-exit"], &["--max-frame-mib", "1"]);
     expect(&r, "J4", "fail");
     expect(&r, "F1", "error");
+}
+
+#[test]
+fn a_frame_skipped_before_a_request_was_sent_doesnt_excuse_its_missing_reply() {
+    // The oversized frame comes before the reply to initialize, long before
+    // J4's and J6's requests are sent, so it can't have held their replies.
+    // The checks judged across the whole stream are still inconclusive.
+    for (f, id) in [("ignore-dollar-request", "J4"), ("drop-concurrent", "J6")] {
+        let r = run(&["--fault", "big-frame", "--fault", f], &["--max-frame-mib", "1"]);
+        expect(&r, id, "fail");
+        expect(&r, "F1", "error");
+    }
+}
+
+#[test]
+fn a_reply_skipped_while_lspcheck_waited_makes_its_absence_inconclusive() {
+    // The $/ request's reply is over the inspection limit, so lspcheck never
+    // sees it: J4 can't say it went unanswered. Within the limit it passes.
+    let r = run(&["--fault", "big-dollar-reply"], &["--max-frame-mib", "1"]);
+    expect(&r, "J4", "error");
+    assert!(r.stdout.contains("inconclusive"), "{}", r.stdout);
+    expect(&fault("big-dollar-reply"), "J4", "pass");
 }
 
 #[test]

@@ -172,9 +172,10 @@ errors and transcripts that can't be read. Replay shows *what changed*; to judge
 
 lspcheck inspects at most `--max-output-mib` (256) of stdout per scenario and frames of at most `--max-frame-mib` (64).
 These are lspcheck's own limits, not protocol rules: past them it keeps reading so the server isn't blocked, but stops
-inspecting. A reply that never arrived is then reported as `ERROR` (inconclusive), not `FAIL`, if the output lspcheck
-didn't inspect began before it stopped waiting, since the reply might have been in it. A failure lspcheck saw
-directly, such as a wrong result, stays `FAIL`. The same happens when some of the server's frames can't be read at
+inspecting. A reply that never arrived is then reported as `ERROR` (inconclusive), not `FAIL`, if lspcheck skipped a
+frame between sending the request and giving up on the reply, or stopped inspecting before it gave up, since the
+reply might have been in what it didn't inspect. A frame skipped before the request was sent can't have held its reply,
+so it excuses nothing. A failure lspcheck saw directly, such as a wrong result, stays `FAIL`. The same happens when some of the server's frames can't be read at
 all, and when lspcheck couldn't finish writing to a server that stopped reading its input: a request lspcheck
 couldn't deliver gives `ERROR`, never `FAIL`. A header section longer than 1 MiB also stops inspection.
 

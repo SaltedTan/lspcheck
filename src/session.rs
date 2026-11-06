@@ -180,6 +180,30 @@ impl std::fmt::Display for WriteError {
     }
 }
 
+/// Why lspcheck may have missed something the server sent between `from`
+/// and `to`: a frame in that time it skipped (timed when the skipping ended)
+/// or couldn't read (a log line loses nothing, so it doesn't count), or,
+/// from any time up to `to`, `ongoing`: reading that stopped, or a server
+/// request lspcheck couldn't answer, after which the server may have held
+/// back what it would have sent.
+fn incomplete_between(
+    skipped: &[(Duration, String)],
+    problems: &[(Duration, Problem)],
+    ongoing: [Option<&(Duration, String)>; 2],
+    from: Duration,
+    to: Duration,
+) -> Option<String> {
+    let during = |at: &Duration| (from..=to).contains(at);
+    let skipped = skipped.iter().find(|(at, _)| during(at)).map(|(_, why)| why.clone());
+    let unread = problems
+        .iter()
+        .any(|(at, p)| during(at) && !matches!(p, Problem::Garbage(_)))
+        .then(|| "some of the server's frames couldn't be read (see F1)".to_string());
+    let since =
+        ongoing.into_iter().flatten().filter(|(at, _)| *at <= to).min_by_key(|(at, _)| *at).map(|(_, why)| why.clone());
+    skipped.or(unread).or(since)
+}
+
 /// What the stdout task observed, independently of what was consumed.
 #[derive(Debug, Default)]
 struct Evidence {
@@ -244,6 +268,10 @@ pub struct Finish {
     /// couldn't answer one of the server's requests), if it was. This can
     /// explain a reply that never came, but not what stdout contained.
     pub own_limit: Option<(Duration, String)>,
+    /// Every frame skipped for its size, timed when the skipping ended.
+    pub skipped: Vec<(Duration, String)>,
+    /// When and why lspcheck stopped reading stdout, if it did.
+    pub stopped: Option<(Duration, String)>,
     pub transcript: Vec<Event>,
     /// Every message the session consumed.
     pub messages: Vec<(Duration, Message)>,
@@ -270,6 +298,14 @@ pub struct Finish {
     /// How many unreadable frames weren't checked for that, because the
     /// work allowed for it ran out.
     pub unchecked: usize,
+}
+
+impl Finish {
+    /// Why lspcheck may have missed something the server sent between `from`
+    /// and `to`, judged over the whole session (see [`Session::incomplete_within`]).
+    pub fn incomplete_within(&self, from: Duration, to: Duration) -> Option<String> {
+        incomplete_between(&self.skipped, &self.problems, [self.stopped.as_ref(), self.own_limit.as_ref()], from, to)
+    }
 }
 
 type Transcript = Arc<Mutex<Vec<Event>>>;
@@ -454,19 +490,7 @@ impl Session {
     /// request lspcheck couldn't answer (see [`Session::incomplete`]).
     pub fn incomplete_within(&self, from: Duration, to: Duration) -> Option<String> {
         let ev = self.evidence.lock().expect("evidence lock");
-        let during = |at: &Duration| (from..to).contains(at);
-        let skipped = ev.skipped.iter().find(|(at, _)| during(at)).map(|(_, why)| why.clone());
-        let unread = ev
-            .problems
-            .iter()
-            .any(|(at, p)| during(at) && !matches!(p, Problem::Garbage(_)))
-            .then(|| "some of the server's frames couldn't be read (see F1)".to_string());
-        let since = [ev.stopped.as_ref(), self.own_limit.as_ref()]
-            .into_iter()
-            .flatten()
-            .find(|(at, _)| *at < to)
-            .map(|(_, why)| why.clone());
-        skipped.or(unread).or(since)
+        incomplete_between(&ev.skipped, &ev.problems, [ev.stopped.as_ref(), self.own_limit.as_ref()], from, to)
     }
 
     /// Records everything the server has sent that was already read, without
@@ -1000,6 +1024,8 @@ impl Session {
             not_stopped,
             limit: evidence.limit,
             own_limit: self.own_limit.take(),
+            skipped: evidence.skipped,
+            stopped: evidence.stopped,
             transcript,
             messages: std::mem::take(&mut self.messages),
             initialized_at: self.initialized_at,

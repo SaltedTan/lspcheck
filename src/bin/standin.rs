@@ -71,6 +71,7 @@ const FAULTS: &[(&str, &str)] = &[
         "on a request with an all-digit string id, wait for the next frame and drop the earlier request",
     ),
     ("ignore-dollar-request", "never answer an unknown $/ request"),
+    ("big-dollar-reply", "lawful: answer an unknown $/ request with MethodNotFound carrying 2 MiB of data"),
     ("shutdown-result", "return {} from shutdown"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
     ("big-frame-on-exit", "on exit, send one 2 MiB log message before exiting"),
@@ -903,6 +904,11 @@ fn main() {
                 "error": {"code": "-32601", "message": "method not found"}
             })),
             m if m.starts_with("$/") && fault("ignore-dollar-request") => {}
+            m if m.starts_with("$/") && fault("big-dollar-reply") => {
+                let mut reply = err(&id, -32601, "method not found");
+                reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
+                out.frame(&reply);
+            }
             _ if fault("ignore-unknown-requests") => {}
             _ if fault("wrong-unknown-error") => out.frame(&err(&id, -32600, "unknown")),
             _ => out.frame(&err(&id, -32601, "method not found")),
