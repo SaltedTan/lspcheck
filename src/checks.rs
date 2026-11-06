@@ -1363,19 +1363,30 @@ async fn ask_all(
     requests: Vec<(&'static str, Value)>,
     asked: &mut Vec<Asked>,
     notes: &mut Vec<String>,
+    undelivered: &mut Vec<(&'static str, String)>,
 ) -> Option<String> {
-    for (method, params) in requests {
+    let methods: Vec<&'static str> = requests.iter().map(|(m, _)| *m).collect();
+    for (i, (method, params)) in requests.into_iter().enumerate() {
         match ask(ctx, method, params).await {
             Ok((a, answer)) => {
                 asked.push(a);
                 if let Err(e) = answer {
+                    let closed = matches!(e, WaitError::Closed);
                     let why = describe_call_error(&CallError::Wait(e), ctx.cfg.request_timeout);
                     notes.push(format!("{method} went unanswered ({why}), so no more requests were sent"));
+                    // The server's output closed: neither this request nor the
+                    // rest of the batch could be answered, as if undelivered.
+                    if closed {
+                        undelivered.extend(methods[i..].iter().map(|m| (*m, format!("{m} was cut off ({why})"))));
+                    }
                     return Some(format!("{method} went unanswered ({why})"));
                 }
             }
             Err(e) => {
                 notes.push(format!("lspcheck couldn't send {method} ({e}), so no more requests were sent"));
+                // This request and the rest of the batch never reached the
+                // server: lspcheck couldn't deliver them.
+                undelivered.extend(methods[i..].iter().map(|m| (*m, format!("lspcheck couldn't send {m} ({e})"))));
                 break;
             }
         }
@@ -1489,8 +1500,12 @@ async fn documents(ctx: &mut Ctx<'_>) {
 
     let mut asked = Vec::new();
     let mut notes = Vec::new();
+    // The document requests lspcheck couldn't deliver, or sent after the
+    // server's output closed: no answer could come (D6 can't pass then).
+    let mut undelivered: Vec<(&'static str, String)> = Vec::new();
     // Why the server stopped answering before D4, if it did.
-    let mut stalled = ask_all(ctx, document_requests(&caps, &uri, &text, encoding), &mut asked, &mut notes).await;
+    let mut stalled =
+        ask_all(ctx, document_requests(&caps, &uri, &text, encoding), &mut asked, &mut notes, &mut undelivered).await;
     await_diagnostics(ctx, &uri, DOC_A_VERSION, from).await;
 
     // The change to version 42, the advertised way. A sync kind of None
@@ -1543,6 +1558,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
                     document_requests(&caps, &uri, &docs[0].versions[1].text, encoding),
                     &mut asked,
                     &mut notes,
+                    &mut undelivered,
                 )
                 .await;
                 // The latest requests say whether the server is answering
@@ -1592,7 +1608,9 @@ async fn documents(ctx: &mut Ctx<'_>) {
         // B's requests are the latest before D4's, so they say whether the
         // server is answering when D4 starts (when any were asked).
         let asked_before = asked.len();
-        let b_stalled = ask_all(ctx, document_requests(&caps, &b_uri, &b_text, encoding), &mut asked, &mut notes).await;
+        let b_stalled =
+            ask_all(ctx, document_requests(&caps, &b_uri, &b_text, encoding), &mut asked, &mut notes, &mut undelivered)
+                .await;
         if asked.len() > asked_before {
             stalled = b_stalled;
         }
@@ -1775,7 +1793,13 @@ async fn documents(ctx: &mut Ctx<'_>) {
                 }
             }
         }
-        let (verdict, mut detail) = documents::judge_d6(&selection, incomplete.as_deref());
+        // A selectionRange request lspcheck couldn't deliver leaves D6
+        // without evidence it should have had: an error, unless a failure
+        // was seen.
+        let undelivered_selection =
+            undelivered.iter().find(|(m, _)| *m == "textDocument/selectionRange").map(|(_, why)| why.clone());
+        let d6_incomplete = incomplete.clone().or(undelivered_selection);
+        let (verdict, mut detail) = documents::judge_d6(&selection, d6_incomplete.as_deref());
         if !notes.is_empty() {
             detail = format!("{detail}; {}", notes.join("; "));
         }

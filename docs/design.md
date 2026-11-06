@@ -250,6 +250,9 @@ and was read while B was open:
 - **not-exercised:** UTF-32, or no informative position about B.
 - **pass:** otherwise.
 
+The design's original rule (a), "D1's positions in LF-only document A were informative and all valid", is left out
+for the reason D3 dropped its own: valid positions elsewhere never prove the server splits B's lines correctly.
+
 D6 judges the `selectionRange` replies to the requests lspcheck sent about the open documents (A at 41 or 42, B at
 7), read while each was open (the same windows D1 uses). The text a reply refers to is the version current when its
 request was sent; it is used only to clamp. For each reply with an array result, compared against the request's own
@@ -260,16 +263,16 @@ request was sent; it is used only to clamp. For each reply with an array result,
   (start ≤ position ≤ end, comparing (line, character) pairs, after clamping each character to its line's length in
   the negotiated encoding); or a `parent.range` doesn't contain its child's range, anywhere up the chain. A seen
   failure stands even when evidence is incomplete. The detail names the first few.
-- **error:** no failure seen, but `incomplete_within` reports missed evidence in the window D1 uses.
-- **not-exercised:** no reply with a non-empty array result (only `null`, errors, or no reply) was judged.
+- **error:** no failure seen, but `incomplete_within` reports missed evidence in the window D1 uses, or a
+  `selectionRange` request couldn't be answered: lspcheck couldn't send it, or the server's output had closed before
+  its reply (the whole rest of a batch is cut off then). D6 doesn't pass on part of its evidence.
+- **not-exercised:** no containment comparison could be made: no reply with an array result (only `null`, errors, or
+  no reply), or only entries that are malformed or on lines the text doesn't have.
 - **pass:** otherwise; the detail says how many replies and entries were judged.
 
 A range on a line the text doesn't have is not judged (counted in the detail); a malformed entry (no `range`, not an
 object, a `parent` that isn't an object) is not judged here — it is a type error for a later check — but is counted.
 The parent chain walk is bounded (1000 levels), and a chain cut short is counted.
-
-The design's original rule (a), "D1's positions in LF-only document A were informative and all valid", is left out
-for the reason D3 dropped its own: valid positions elsewhere never prove the server splits B's lines correctly.
 
 Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs
 only one versioned publish for the document, so it is exercised wherever diagnostics are labelled. D4 runs wherever

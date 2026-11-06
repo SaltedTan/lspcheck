@@ -875,6 +875,9 @@ pub struct SelectionReply {
     pub no_line: usize,
     /// Parent chains cut short at the bound.
     pub cut_chains: usize,
+    /// Containment comparisons actually made (a position in its range, or a
+    /// child in its parent): the evidence a pass needs.
+    pub compared: usize,
 }
 
 /// The `positions` of a `textDocument/selectionRange` request's params.
@@ -951,7 +954,7 @@ fn judge_chain(
             // The first node's range must contain the position.
             if let Some(p) = position {
                 match contains_range(&lines, encoding, rng, Range { start: p, end: p }) {
-                    Some(true) => {}
+                    Some(true) => r.compared += 1,
                     Some(false) => r.failures.push(format!(
                         "selectionRange at version {version}, entry {entry_idx}: range {} doesn't contain the position ({}, {})",
                         fmt_range(rng),
@@ -972,7 +975,7 @@ fn judge_chain(
         let parent_range = as_range(parent.get("range")).expect("checked above");
         // The parent's range must contain the child's.
         match contains_range(&lines, encoding, parent_range, rng) {
-            Some(true) => {}
+            Some(true) => r.compared += 1,
             Some(false) => r.failures.push(format!(
                 "selectionRange at version {version}, entry {entry_idx}: parent {} doesn't contain {}",
                 fmt_range(parent_range),
@@ -1037,10 +1040,11 @@ fn selection_extras(malformed: usize, no_line: usize, cut_chains: usize) -> Stri
 /// no reply with an array result is not exercised.
 pub fn judge_d6(replies: &[SelectionReply], incomplete: Option<&str>) -> (Verdict, String) {
     let mut failures: Vec<String> = Vec::new();
-    let (mut judged, mut entries, mut malformed, mut no_line, mut cut_chains) =
-        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut judged, mut entries, mut malformed, mut no_line, mut cut_chains, mut compared) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     for r in replies {
         judged += 1;
+        compared += r.compared;
         entries += r.entries;
         malformed += r.malformed;
         no_line += r.no_line;
@@ -1078,6 +1082,16 @@ pub fn judge_d6(replies: &[SelectionReply], incomplete: Option<&str>) -> (Verdic
     }
     if judged == 0 {
         return (Verdict::NotExercised, format!("no selectionRange reply with an array result was judged{extras}"));
+    }
+    // Replies whose entries were all malformed or on missing lines gave
+    // nothing to compare: no evidence either way.
+    if compared == 0 {
+        return (
+            Verdict::NotExercised,
+            format!(
+                "{judged} selectionRange reply(s), but no range could be compared with its position or parent{extras}"
+            ),
+        );
     }
     (
         Verdict::Pass,
@@ -2122,6 +2136,38 @@ mod tests {
         .unwrap();
         assert!(r.failures.is_empty(), "{r:?}");
         assert_eq!(r.no_line, 1, "{r:?}");
+    }
+
+    #[test]
+    fn d6_needs_a_comparison_to_pass() {
+        let text = "hello\n";
+        let positions = sel_positions(&[(0, 1), (0, 2)]);
+        // Every entry malformed: a reply, but nothing compared.
+        let bad = judge_selection_reply(text, Encoding::Utf16, 41, &positions, &serde_json::json!([{}, {}])).unwrap();
+        assert_eq!(bad.compared, 0, "{bad:?}");
+        let (v, d) = judge_d6(std::slice::from_ref(&bad), None);
+        assert_eq!(v, Verdict::NotExercised, "{d}");
+        assert!(d.contains("no range could be compared"), "{d}");
+        // Every range on a missing line: the same.
+        let missing = judge_selection_reply(
+            text,
+            Encoding::Utf16,
+            41,
+            &positions,
+            &serde_json::json!([entry(rng(5, 0, 5, 3), None), entry(rng(6, 0, 6, 3), None)]),
+        )
+        .unwrap();
+        assert_eq!(judge_d6(&[missing], None).0, Verdict::NotExercised);
+        // One real comparison is enough.
+        let good = judge_selection_reply(
+            text,
+            Encoding::Utf16,
+            41,
+            &positions,
+            &serde_json::json!([entry(rng(0, 0, 0, 5), None), entry(rng(0, 0, 0, 5), None)]),
+        )
+        .unwrap();
+        assert_eq!(judge_d6(&[bad, good], None).0, Verdict::Pass);
     }
 
     #[test]

@@ -1159,10 +1159,12 @@ fn an_undeliverable_change_errors_d3_but_keeps_d1s_failure() {
     // the first character, then exits: lspcheck's `didChange` can't be
     // delivered, so D3 is an error, but D1's failure stands and D2 is still
     // judged (the diagnostic's version 41 was sent). The server is gone, so
-    // D4 can't be judged either, and no selectionRange request is sent, so
-    // D6 is not exercised.
+    // D4 can't be judged either. The requests at version 41 either can't be
+    // written or are cut off by the closed output, depending on when the
+    // server's exit lands; both leave the selectionRange request unanswerable,
+    // so D6 is an error either way.
     let r = fault("close-stdin-before-change");
-    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D4", "error"), ("D5", "error"), ("D6", "not-exercised")]);
+    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D4", "error"), ("D5", "error"), ("D6", "error")]);
     assert_eq!(r.status, 1, "D1 is a MUST check");
     assert!(r.stdout.contains("couldn't send didChange"), "{}", r.stdout);
 }
@@ -1257,6 +1259,16 @@ fn a_selection_range_outside_its_position_fails_d6() {
     only_fails(&r, &["D6"]);
     assert_eq!(r.status, 1, "D6 is a MUST check");
     assert!(r.stdout.contains("doesn't contain the position"), "{}", r.stdout);
+}
+
+#[test]
+fn a_selection_range_request_cut_off_leaves_d6_an_error() {
+    // Version 41's selection ranges are judged and fine; the server exits at
+    // the first request at version 42, so that selectionRange request can't
+    // be answered. D6 can't pass on half its evidence.
+    let r = fault("exit-at-version-42");
+    passes_except(&r, &[("D4", "error"), ("D5", "error"), ("D6", "error")]);
+    assert!(r.stdout.contains("textDocument/selectionRange was cut off"), "{}", r.stdout);
 }
 
 #[test]

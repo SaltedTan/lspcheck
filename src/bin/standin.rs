@@ -167,6 +167,7 @@ const FAULTS: &[(&str, &str)] = &[
     ),
     ("drop-first-request", "never answer the first request about a document, then answer normally"),
     ("stop-at-crlf", "stop answering anything from the first request about crlf.txt"),
+    ("exit-at-version-42", "exit, without answering, at the first request about a document at version 42"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
     ("escaped-child", "start a child in a new session, with a non-UTF-8 name, that outlives the server"),
@@ -564,6 +565,16 @@ fn main() {
         };
         if no_more_answers {
             continue;
+        }
+        if fault("exit-at-version-42")
+            && method.starts_with("textDocument/")
+            && msg
+                .pointer("/params/textDocument/uri")
+                .and_then(Value::as_str)
+                .and_then(|u| docs.get(u))
+                .is_some_and(|(_, version)| *version == 42)
+        {
+            std::process::exit(0);
         }
         if fault("stop-at-crlf")
             && method.starts_with("textDocument/")
