@@ -640,39 +640,39 @@ async fn check_j6(ctx: &mut Ctx<'_>, t: Duration) {
         .collect();
     // One deadline covers registering, writing and waiting for all four.
     let deadline = Instant::now() + t;
-    let mut failure = None;
-    let mut registered = 0;
     for (i, id) in ids.iter().enumerate() {
         if let Err(e) = ctx.s.begin_request(id, deadline).await {
-            failure = Some(format!("lspcheck couldn't register a request: {e}"));
-            registered = i;
+            ids[..i].iter().for_each(|id| ctx.s.abort_request(id));
+            return ctx.report("J6", Verdict::Error, format!("lspcheck couldn't register a request: {e}"));
+        }
+    }
+    // The requests written whole, and why the rest couldn't be.
+    let mut delivered = ids.len();
+    let mut send_failure = None;
+    for (i, body) in bodies.iter().enumerate() {
+        // The shared deadline, not a fresh write timeout: a write that can't
+        // finish by then is an error like any other, and the time left to
+        // wait for the replies mustn't shrink with every write.
+        if let Err(e) = ctx.s.write_split(body, &[], Duration::ZERO, deadline).await {
+            // The server may have seen part of the failed write, so those ids
+            // are aborted; the earlier, whole ones stay outstanding.
+            ids[i..].iter().for_each(|id| ctx.s.abort_request(id));
+            delivered = i;
+            send_failure = Some(if i == 0 {
+                format!("lspcheck couldn't send a request: {e}")
+            } else {
+                format!("lspcheck couldn't send the rest: {e}")
+            });
             break;
         }
-        registered = i + 1;
-    }
-    if failure.is_none() {
-        for (i, body) in bodies.iter().enumerate() {
-            // The shared deadline, not a fresh write timeout: a write that
-            // can't finish by then is an error like any other, and the time
-            // left to wait for the replies mustn't shrink with every write.
-            if let Err(e) = ctx.s.write_split(body, &[], Duration::ZERO, deadline).await {
-                // The server may have seen part of the failed write, so those
-                // ids are aborted; the earlier, whole ones stay outstanding.
-                ids[i..].iter().for_each(|id| ctx.s.abort_request(id));
-                failure = Some(format!("lspcheck couldn't send a request: {e}"));
-                break;
-            }
-        }
-    } else {
-        ids[..registered].iter().for_each(|id| ctx.s.abort_request(id));
-    }
-    if let Some(why) = failure {
-        return ctx.report("J6", Verdict::Error, why);
     }
 
+    // The delivered requests are still owed a reply: one that goes
+    // unanswered is a failure seen, whatever happened to the rest (a server
+    // that exits on a string id may close its stdin before the next write).
     let mut missing = Vec::new();
     let mut closed = false;
-    for id in &ids {
+    for id in &ids[..delivered] {
         match ctx.s.wait_response(id, deadline).await {
             Ok(_) => {}
             Err(WaitError::Timeout) => missing.push(id.clone()),
@@ -683,25 +683,58 @@ async fn check_j6(ctx: &mut Ctx<'_>, t: Duration) {
             }
         }
     }
+    let unasked = ctx.s.unmatched_ids(started);
+    match j6_outcome(delivered, &missing, closed, send_failure.as_deref(), &unasked) {
+        J6Outcome::Pass => ctx.pass("J6"),
+        J6Outcome::Error(why) => ctx.report("J6", Verdict::Error, why),
+        J6Outcome::Absent(detail) => ctx.fail_absent("J6", detail),
+    }
+}
+
+/// J6's verdict once the waits are over.
+#[derive(Debug, PartialEq)]
+enum J6Outcome {
+    Pass,
+    Error(String),
+    /// Replies that didn't come: a failure, unless missed evidence could have
+    /// held them (`fail_absent` decides).
+    Absent(String),
+}
+
+/// J6's verdict from what was delivered and answered. A delivered request
+/// that went unanswered is a failure seen, even when the rest couldn't be
+/// sent: a server that exits on a string id may close its stdin before
+/// lspcheck's next write, or after it, and the verdict mustn't depend on
+/// which. Only when every delivered request was answered does a request
+/// lspcheck couldn't send make J6 an error.
+fn j6_outcome(delivered: usize, missing: &[Id], closed: bool, send_failure: Option<&str>, unasked: &[Id]) -> J6Outcome {
     if missing.is_empty() {
-        return ctx.pass("J6");
+        return match send_failure {
+            Some(why) if delivered == 0 => J6Outcome::Error(why.to_string()),
+            Some(why) => {
+                J6Outcome::Error(format!("{why}; the {delivered} request(s) delivered before it were answered"))
+            }
+            None => J6Outcome::Pass,
+        };
     }
     let list: Vec<String> = missing.iter().map(Id::to_string).collect();
     let mut detail = format!(
-        "{} of {} concurrent requests were not answered with their id: {}",
+        "{} of {} concurrent requests delivered were not answered with their id: {}",
         missing.len(),
-        ids.len(),
+        delivered,
         list.join(", ")
     );
     if closed {
         detail.push_str(" (the server closed its stdout)");
     }
-    let unasked = ctx.s.unmatched_ids(started);
+    if let Some(why) = send_failure {
+        detail.push_str(&format!("; {why}"));
+    }
     if !unasked.is_empty() {
         let list: Vec<String> = unasked.iter().map(Id::to_string).collect();
         detail.push_str(&format!("; meanwhile responses with unmatched ids arrived: {}", list.join(", ")));
     }
-    ctx.fail_absent("J6", detail);
+    J6Outcome::Absent(detail)
 }
 
 /// Two unknown notifications, then two probes: nothing must answer the
@@ -2711,6 +2744,28 @@ pub fn file_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn j6_fails_on_a_delivered_request_left_unanswered_even_if_the_rest_couldnt_be_sent() {
+        let lost = Id::Str("123456".into());
+        // The server exited on the first string id: that request was
+        // delivered whole and never answered, and the last couldn't be
+        // written. A failure, as when the last write landed first.
+        let why = "lspcheck couldn't send the rest: the server's stdin is closed";
+        let J6Outcome::Absent(detail) = j6_outcome(3, std::slice::from_ref(&lost), true, Some(why), &[]) else {
+            panic!("expected an absence");
+        };
+        assert!(detail.starts_with("1 of 3 concurrent requests delivered were not answered"), "{detail}");
+        assert!(detail.contains(why), "{detail}");
+        // Every delivered request answered, but one couldn't be sent: no
+        // evidence about it, so an error.
+        assert!(matches!(j6_outcome(3, &[], false, Some(why), &[]), J6Outcome::Error(_)));
+        // Nothing delivered: the plain error.
+        let first = "lspcheck couldn't send a request: timed out";
+        assert_eq!(j6_outcome(0, &[], false, Some(first), &[]), J6Outcome::Error(first.into()));
+        // All four delivered and answered.
+        assert_eq!(j6_outcome(4, &[], false, None, &[]), J6Outcome::Pass);
+    }
 
     #[test]
     fn file_uris_encode_reserved_bytes() {
