@@ -248,6 +248,12 @@ fn the_clean_standin_passes_every_check() {
     // D4 passed on evidence: the closed, the never-opened and the plain
     // request were all answered.
     assert!(r.stdout.contains("all three answered"), "{}", r.stdout);
+    // D6 passed on evidence: the selectionRange replies were judged.
+    assert!(
+        r.stdout.contains("every range contains its position, and every parent contains its child"),
+        "{}",
+        r.stdout
+    );
 }
 
 #[test]
@@ -277,6 +283,7 @@ fn lawful_variations_fail_nothing() {
         "closed-from-disk",
         "disk-diagnostics-after-close",
         "drop-first-request",
+        "empty-selection",
     ] {
         let r = fault(name);
         // With no versioned publish for the opened document, D2 has nothing
@@ -491,6 +498,7 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
             ("D3", "not-exercised"),
             ("D4", "error"),
             ("D5", "not-exercised"),
+            ("D6", "not-exercised"),
         ],
     );
     assert!(r.stdout.contains("but the server had already stopped answering"), "{}", r.stdout);
@@ -563,14 +571,23 @@ fn bad_initialize_results_fail_l2() {
     // D1 can't count positions in an encoding lspcheck didn't offer, and D2
     // and D3 can't judge without it either; without capabilities the server
     // doesn't ask for didOpen, so all three are skipped, and it advertises no
-    // document request, so D4 skips too.
+    // document request, so D4 skips too. D6 can't clamp in the bad encoding,
+    // and skips with no capabilities.
     passes_except(
         &fault("bad-encoding"),
-        &[("L2", "fail"), ("D1", "error"), ("D2", "error"), ("D3", "error"), ("D5", "error")],
+        &[("L2", "fail"), ("D1", "error"), ("D2", "error"), ("D3", "error"), ("D5", "error"), ("D6", "error")],
     );
     passes_except(
         &fault("no-capabilities"),
-        &[("L2", "fail"), ("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D4", "skip"), ("D5", "skip")],
+        &[
+            ("L2", "fail"),
+            ("D1", "skip"),
+            ("D2", "skip"),
+            ("D3", "skip"),
+            ("D4", "skip"),
+            ("D5", "skip"),
+            ("D6", "skip"),
+        ],
     );
 }
 
@@ -959,7 +976,7 @@ fn unreadable_frames_make_other_failures_inconclusive() {
 #[test]
 fn a_server_that_doesnt_open_documents_skips_d1() {
     let r = fault("no-open-close");
-    passes_except(&r, &[("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D5", "skip")]);
+    passes_except(&r, &[("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D5", "skip"), ("D6", "skip")]);
     // D4 still runs: doc.txt on disk, never opened.
     assert!(r.stdout.contains("the document on disk (never opened)"), "{}", r.stdout);
     assert_eq!(r.status, 0, "{}", r.stdout);
@@ -1013,13 +1030,19 @@ fn stopping_after_an_unopened_request_fails_d4() {
 #[test]
 fn positions_counted_in_the_wrong_units_fail_d1() {
     // Byte counting under UTF-16 runs past line ends (not judged) or lands
-    // on boundaries after the change and on B. Code-point counting lands
-    // inside characters after the change and on B too, but each such
-    // position is an in-line code-point offset, so D3 and D5 can't blame the
-    // change or the line split: an error each, with D1 failing.
+    // on boundaries after the change and on B; its selection ranges still
+    // contain the positions, so D6 passes. Code-point counting lands inside
+    // characters after the change and on B too, and its selection ranges
+    // don't contain the positions: D1 and D6 fail, and each such position is
+    // an in-line code-point offset, so D3 and D5 can't blame the change or
+    // the line split: an error each.
     for (name, diagnosis, others) in [
         ("utf8-positions-as-utf16", "on a boundary if counted in UTF-8 bytes", &[][..]),
-        ("codepoint-positions", "on a boundary if counted in code points", &[("D3", "error"), ("D5", "error")][..]),
+        (
+            "codepoint-positions",
+            "on a boundary if counted in code points",
+            &[("D3", "error"), ("D5", "error"), ("D6", "fail")][..],
+        ),
     ] {
         let r = fault(name);
         let mut expected = vec![("D1", "fail")];
@@ -1032,9 +1055,10 @@ fn positions_counted_in_the_wrong_units_fail_d1() {
     // Counting UTF-16 units under UTF-8: the positions after the change are
     // invalid too, but each fits the changed text counted in UTF-16, so D3
     // can't tell a change-handling fault from a counting fault and is an
-    // error; D1 carries the failure.
+    // error; D1 carries the failure, and the selection ranges don't contain
+    // the positions, so D6 fails too.
     let r = fault("utf16-positions-as-utf8");
-    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D5", "error")]);
+    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D5", "error"), ("D6", "fail")]);
     assert_eq!(r.status, 1, "D1 is a MUST check");
     assert!(r.stdout.contains("inside a character of version 41"), "{}", r.stdout);
     assert!(r.stdout.contains("on a boundary if counted in UTF-16 code units"), "{}", r.stdout);
@@ -1044,15 +1068,16 @@ fn positions_counted_in_the_wrong_units_fail_d1() {
 #[test]
 fn splitting_lines_the_wrong_way_fails_d1_and_d5() {
     // The detail names every wrong split a position fits, the fault's own
-    // among them.
+    // among them. The selection ranges, built on the wrong split, don't
+    // contain the positions, so D6 fails too.
     for (name, split) in [
         ("lf-only-lines", "a line split at `\\n` only"),
         ("crlf-two-breaks", "`\\r\\n` counted as two breaks"),
         ("no-lone-cr", "not a lone `\\r`"),
     ] {
         let r = fault(name);
-        only_fails(&r, &["D1", "D5"]);
-        assert_eq!(r.status, 1, "D1 and D5 are MUST checks");
+        only_fails(&r, &["D1", "D5", "D6"]);
+        assert_eq!(r.status, 1, "D1, D5 and D6 are MUST checks");
         assert!(r.stdout.contains("under a line split the spec doesn't allow"), "{name}\n{}", r.stdout);
         assert!(r.stdout.contains(split), "{name}: {split}\n{}", r.stdout);
     }
@@ -1062,10 +1087,12 @@ fn splitting_lines_the_wrong_way_fails_d1_and_d5() {
 fn a_change_the_server_doesnt_apply_fails_d1_and_d3() {
     // The old text's positions, labelled with the new version: some, on the
     // inserted emoji line, are on no boundary of the changed text counted any
-    // way, but on a boundary of the text before the change.
+    // way, but on a boundary of the text before the change. The selection
+    // ranges, built on the old text, don't contain the positions of the
+    // changed text, so D6 fails too.
     let r = fault("ignore-changes");
-    only_fails(&r, &["D1", "D3"]);
-    assert_eq!(r.status, 1, "D1 and D3 are MUST checks");
+    only_fails(&r, &["D1", "D3", "D6"]);
+    assert_eq!(r.status, 1, "D1, D3 and D6 are MUST checks");
     assert!(r.stdout.contains("(fits the text before the change)"), "{}", r.stdout);
 }
 
@@ -1075,9 +1102,11 @@ fn change_ranges_counted_in_code_points_fail_d1_and_d3_is_an_error() {
     // its positions on line 0 land inside characters of the changed text.
     // Each is also an in-line offset of the changed text counted in code
     // points, so a server that applied the change and counts code points
-    // would report the same: D3 can't blame the change, and D1 fails.
+    // would report the same: D3 can't blame the change, and D1 fails. The
+    // selection ranges, counted in code points, don't contain the positions,
+    // so D6 fails too.
     let r = fault("codepoint-changes");
-    passes_except(&r, &[("D1", "fail"), ("D3", "error")]);
+    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D6", "fail")]);
     assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault"), "{}", r.stdout);
 }
 
@@ -1115,9 +1144,11 @@ fn code_point_positions_after_a_correct_change_are_a_counting_fault() {
     // points from the change on. The pre-change positions are correct (so
     // the pin holds), but the post-change positions are on boundaries of
     // version 42 counted in code points: a counting fault (D1's), not a
-    // change-handling fault. D3 is an error, not a failure.
+    // change-handling fault. D3 is an error, not a failure. The post-change
+    // selection ranges, counted in code points, don't contain the positions,
+    // so D6 fails too.
     let r = fault("codepoint-positions-after-change");
-    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D5", "error")]);
+    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D5", "error"), ("D6", "fail")]);
     assert_eq!(r.status, 1, "D1 is a MUST check");
     assert!(r.stdout.contains("can't tell a change-handling fault from a counting fault; see D1"), "{}", r.stdout);
 }
@@ -1128,9 +1159,10 @@ fn an_undeliverable_change_errors_d3_but_keeps_d1s_failure() {
     // the first character, then exits: lspcheck's `didChange` can't be
     // delivered, so D3 is an error, but D1's failure stands and D2 is still
     // judged (the diagnostic's version 41 was sent). The server is gone, so
-    // D4 can't be judged either.
+    // D4 can't be judged either, and no selectionRange request is sent, so
+    // D6 is not exercised.
     let r = fault("close-stdin-before-change");
-    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D4", "error"), ("D5", "error")]);
+    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D4", "error"), ("D5", "error"), ("D6", "not-exercised")]);
     assert_eq!(r.status, 1, "D1 is a MUST check");
     assert!(r.stdout.contains("couldn't send didChange"), "{}", r.stdout);
 }
@@ -1213,6 +1245,38 @@ fn a_version_for_a_uri_lspcheck_never_opened_isnt_judged() {
         "{}",
         r.stdout
     );
+}
+
+// --- D6: selection-range containment ----------------------------------------
+
+#[test]
+fn a_selection_range_outside_its_position_fails_d6() {
+    // The range is the word before the position, still on a boundary: it
+    // doesn't contain the position. Only D6 fails.
+    let r = fault("selection-outside");
+    only_fails(&r, &["D6"]);
+    assert_eq!(r.status, 1, "D6 is a MUST check");
+    assert!(r.stdout.contains("doesn't contain the position"), "{}", r.stdout);
+}
+
+#[test]
+fn a_short_selection_range_result_fails_d6() {
+    // One entry fewer than the positions: the array length doesn't match.
+    // Only D6 fails.
+    let r = fault("selection-short");
+    only_fails(&r, &["D6"]);
+    assert_eq!(r.status, 1, "D6 is a MUST check");
+    assert!(r.stdout.contains("entries for"), "{}", r.stdout);
+}
+
+#[test]
+fn a_selection_parent_inside_its_child_fails_d6() {
+    // The parent is a range strictly inside its child: it doesn't contain it.
+    // Only D6 fails.
+    let r = fault("selection-parent-inside");
+    only_fails(&r, &["D6"]);
+    assert_eq!(r.status, 1, "D6 is a MUST check");
+    assert!(r.stdout.contains("doesn't contain"), "{}", r.stdout);
 }
 
 // --- replay -----------------------------------------------------------------

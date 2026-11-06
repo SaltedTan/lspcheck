@@ -143,6 +143,13 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "textDocumentSync"
     ),
     check!("D5", Documents, Must, "Lines are split at \\n, \\r\\n and \\r", "textDocumentSync"),
+    check!(
+        "D6",
+        Documents,
+        Must,
+        "A selectionRange result has one entry per position, each range contains its position, and each parent contains its child",
+        "textDocument_selectionRange"
+    ),
 ];
 
 /// Checks judged from every scenario's observations.
@@ -267,7 +274,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
-    Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5"] },
+    Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5", "D6"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
@@ -1425,7 +1432,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let caps = result.get("capabilities").cloned().unwrap_or(Value::Null);
     if !opens_documents(&reply) {
         let detail = "the server doesn't ask for didOpen (textDocumentSync), so lspcheck opens no document";
-        for id in ["D1", "D2", "D3", "D5"] {
+        for id in ["D1", "D2", "D3", "D5", "D6"] {
             ctx.report(id, Verdict::Skip, detail);
         }
         // D4 still runs: doc.txt on disk, never opened.
@@ -1440,7 +1447,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let encoding = match negotiated_encoding(&reply) {
         Ok(e) => e,
         Err(why) => {
-            for id in ["D1", "D2", "D3", "D5"] {
+            for id in ["D1", "D2", "D3", "D5", "D6"] {
                 ctx.report(id, Verdict::Error, why.clone());
             }
             // D4 doesn't need the encoding, and runs with the document
@@ -1469,7 +1476,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let doc = json!({"uri": uri, "languageId": "plaintext", "version": DOC_A_VERSION, "text": text});
     if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await {
         let detail = format!("lspcheck couldn't send didOpen: {e}");
-        for id in ["D1", "D2", "D3", "D5"] {
+        for id in ["D1", "D2", "D3", "D5", "D6"] {
             ctx.report(id, Verdict::Error, detail.clone());
         }
         leave(ctx).await;
@@ -1725,6 +1732,54 @@ async fn documents(ctx: &mut Ctx<'_>) {
             detail = format!("{detail}; {}", notes.join("; "));
         }
         ctx.report("D5", verdict, detail);
+    }
+    // D6: selectionRange replies about open documents, judged against the
+    // request's own positions, in the text current when the request was
+    // sent. The same windows D1 uses: before A's `didClose`, and for B
+    // before B's. Skipped when the server advertises no
+    // selectionRangeProvider, so no request is sent.
+    if !advertises(&caps, "selectionRangeProvider") {
+        ctx.report(
+            "D6",
+            Verdict::Skip,
+            "the server advertises no selectionRangeProvider, so lspcheck sends no selectionRange request",
+        );
+    } else {
+        let mut selection: Vec<documents::SelectionReply> = Vec::new();
+        // A fresh borrow, so the earlier `msgs` borrow doesn't live across
+        // the mutable borrows above.
+        let d6_msgs = &ctx.s.messages;
+        for a in asked.iter().filter(|a| a.method == "textDocument/selectionRange") {
+            let req_uri = a.params.pointer("/textDocument/uri").and_then(Value::as_str);
+            let Some(doc) = docs.iter().find(|d| req_uri.is_some_and(|u| documents::same_uri(&d.uri, u))) else {
+                continue;
+            };
+            // The same window D1 uses for this document: before its close.
+            let window_end = if b_opened && req_uri.is_some_and(|u| documents::same_uri(u, &b_uri)) {
+                b_closed_at.map_or(end, |at| at.min(end))
+            } else {
+                end
+            };
+            // The version current when the request was sent, used only to
+            // clamp.
+            let Some(version) = doc.versions.iter().rfind(|v| v.at <= a.at) else { continue };
+            let positions = documents::request_positions(&a.params);
+            for (_at, m) in
+                d6_msgs.iter().filter(|(at, m)| *at >= a.at && *at < window_end && m.response_id() == Some(&a.id))
+            {
+                let Kind::Response { outcome: Outcome::Result(result), .. } = &m.kind else { continue };
+                if let Some(r) =
+                    documents::judge_selection_reply(&version.text, encoding, version.number, &positions, result)
+                {
+                    selection.push(r);
+                }
+            }
+        }
+        let (verdict, mut detail) = documents::judge_d6(&selection, incomplete.as_deref());
+        if !notes.is_empty() {
+            detail = format!("{detail}; {}", notes.join("; "));
+        }
+        ctx.report("D6", verdict, detail);
     }
 }
 

@@ -37,6 +37,12 @@
     split the spec doesn't allow (LF only, CRLF as two breaks, or no lone CR) fails D5. A position that fits the
     spec's split in some other encoding is a counting fault (D1's), not a line-splitting fault, so D5 is an error
     and D1 carries the failure. UTF-32 leaves D5 not exercised, because no offset can fall inside a character.
+  - D6, selection ranges: the `documents` scenario now judges the `selectionRange` replies to the requests it sends
+    about the open documents. Each result must have one entry per position, each entry's `range` must contain its
+    position, and each `parent.range` must contain its child's range, all the way up the chain, after clamping each
+    character to its line's length in the negotiated encoding. A range on a line the text doesn't have isn't judged,
+    and a malformed entry is a type error for a later check. A server that advertises no `selectionRangeProvider`
+    leaves D6 skipped; one that answers with only `null`, errors, or no reply leaves it not exercised.
 - The text model behind the upcoming document checks (`src/text.rs`): the spec's line split, the UTF-8/UTF-16/UTF-32
   position encodings, the character-boundary test, applying content changes, and the table of the positions a reply
   refers to.
