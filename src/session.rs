@@ -1186,6 +1186,11 @@ async fn read_stdout(
         for chunk in reader.finish() {
             deliver(began, at, chunk, &mut stopped);
         }
+    } else if let Some(began) = partial_since {
+        // Inspection stopped inside a frame, which may hold anything sent
+        // since it began.
+        let why = "a frame was still unfinished when lspcheck stopped inspecting stdout".to_string();
+        evidence.lock().expect("evidence lock").lost.push((began, at, why));
     }
     record(&t, at, EventKind::StdoutClosed);
     evidence.lock().expect("evidence lock").done = true;

@@ -80,6 +80,15 @@ const FAULTS: &[(&str, &str)] = &[
         "inflated-before-shutdown",
         "before replying to shutdown, start a frame whose 2 MiB body never comes, so it swallows the reply",
     ),
+    (
+        "inflated-on-dollar-request",
+        "before answering an unknown $/ request, start a frame whose 2 MiB body never comes, so it swallows the answer",
+    ),
+    ("flood-on-shutdown", "before replying to shutdown, write 2 MiB of bytes"),
+    (
+        "inflated-on-cancel",
+        "before answering a cancelled request, start a frame whose 2 MiB body never comes, so it swallows the answer",
+    ),
     ("shutdown-result", "return {} from shutdown"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
     ("big-frame-on-exit", "on exit, send one 2 MiB log message before exiting"),
@@ -216,9 +225,15 @@ fn main() {
     // How the stand-in splits lines, per the line-splitting faults.
     let split = line_split(&faults);
     // Whether a workspace/symbol reply waits to see whether it is cancelled.
-    let holds = ["defer-until-next", "cancelled-no-reply", "cancelled-reply-twice", "cancelled-other-error"]
-        .iter()
-        .any(|name| fault(name));
+    let holds = [
+        "defer-until-next",
+        "cancelled-no-reply",
+        "cancelled-reply-twice",
+        "cancelled-other-error",
+        "inflated-on-cancel",
+    ]
+    .iter()
+    .any(|name| fault(name));
     let mut out = Writer { out: std::io::stdout().lock(), faults: faults.clone(), holding: false, held: Vec::new() };
     if fault("stdout-banner") {
         out.raw(b"standin starting\n");
@@ -313,6 +328,9 @@ fn main() {
                 } else if fault("cancelled-other-error") {
                     out.frame(&err(&deferred_id, -32603, "internal error"));
                 } else {
+                    if fault("inflated-on-cancel") {
+                        out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
+                    }
                     out.frame(&err(&deferred_id, -32800, "request cancelled"));
                     if fault("big-frame-on-cancel") {
                         let text = "x".repeat(2 * 1024 * 1024);
@@ -862,6 +880,9 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                     std::process::exit(1);
                 }
+                if fault("flood-on-shutdown") {
+                    out.raw(&vec![b'x'; 2 * 1024 * 1024]);
+                }
                 if fault("inflated-before-shutdown") {
                     out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
                 }
@@ -922,6 +943,10 @@ fn main() {
                 "error": {"code": "-32601", "message": "method not found"}
             })),
             m if m.starts_with("$/") && fault("ignore-dollar-request") => {}
+            m if m.starts_with("$/") && fault("inflated-on-dollar-request") => {
+                out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
+                out.frame(&err(&id, -32601, "method not found"));
+            }
             m if m.starts_with("$/") && fault("big-dollar-reply") => {
                 let mut reply = err(&id, -32601, "method not found");
                 reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));

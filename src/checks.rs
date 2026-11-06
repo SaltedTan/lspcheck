@@ -467,6 +467,14 @@ impl Ctx<'_> {
         self.results.last_mut().expect("just reported").absent_at = Some((since, waited));
     }
 
+    /// A failure because a reply lspcheck waited for from `since` to `waited`
+    /// never arrived, judged before the session ended: what lspcheck only
+    /// later finds it missed in that time still makes it inconclusive.
+    fn fail_absent_between(&mut self, id: &str, since: Duration, waited: Duration, detail: impl Into<String>) {
+        self.fail(id, detail);
+        self.results.last_mut().expect("just reported").absent_at = Some((since, waited));
+    }
+
     /// The verdict for a call sent from `since` on that got no response: a
     /// failure when the request was delivered, and an error when lspcheck
     /// couldn't deliver it.
@@ -1154,14 +1162,19 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     let msgs = &ctx.s.messages;
     let window = |from: usize| (from..msgs.len()).filter(|&i| msgs[i].0 < end);
 
-    // C1.
+    // C1. A missing reply is judged again when the session ends, in case a
+    // frame then unfinished turns out to have swallowed it.
+    let mut c1_absent = None;
     let c1 = match (&answer, first) {
         (Err(wait), _) => {
             let e = CallError::Wait(*wait);
             let why = format!("{which}: no response after $/cancelRequest ({})", describe_call_error(&e, t));
             match ctx.s.incomplete_within(written_at, r_waited) {
                 Some(missed) => (Verdict::Error, format!("inconclusive, because {missed}: {why}")),
-                None => (Verdict::Fail, why),
+                None => {
+                    c1_absent = Some((written_at, r_waited));
+                    (Verdict::Fail, why)
+                }
             }
         }
         (Ok(m), Some(first)) => {
@@ -1203,7 +1216,10 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             idless_reply(at, m).map(|what| (what, m.value.to_string().contains("cancelRequest")))
         })
         .collect();
-    ctx.report("C1", c1.0, c1.1);
+    match c1_absent {
+        Some((since, waited)) => ctx.fail_absent_between("C1", since, waited, c1.1),
+        None => ctx.report("C1", c1.0, c1.1),
+    }
 
     if let Some((id, what)) = offending {
         let whose = if id == r { "the finished request" } else { "an id never sent" };
@@ -1223,7 +1239,7 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             (CallError::Wait(_), Some(missed)) => {
                 ctx.report("C2", Verdict::Error, format!("inconclusive, because {missed}: {why}"))
             }
-            (CallError::Wait(_), None) => ctx.fail("C2", why),
+            (CallError::Wait(_), None) => ctx.fail_absent_between("C2", asked, waited, why),
         }
     } else if let Some(why) = &incomplete_c2 {
         ctx.report("C2", Verdict::Error, inconclusive(why, "a reply to one of the cancels"));
