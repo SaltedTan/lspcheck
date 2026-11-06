@@ -427,6 +427,40 @@ fn a_cancelled_answer_swallowed_by_an_unfinished_frame_is_inconclusive() {
 }
 
 #[test]
+fn verdicts_reached_before_a_frame_was_found_cut_short_are_inconclusive() {
+    // Each fault starts a frame that never ends, inside the window these
+    // checks judge, while they are still judged as passing or not exercised.
+    // The frame is found cut short only when the stream ends; it may have
+    // held what they look for.
+    for (f, ids) in [
+        // The frame starts at shutdown, before the cancellation scenario's
+        // window ends; C1's ends at the cancel, earlier.
+        ("inflated-before-shutdown", &["C2", "C3"][..]),
+        // The frame starts at the change, while document A is open.
+        ("inflated-on-change", &["D1", "D2", "D3", "D5", "D6"][..]),
+        // The frame swallows the framing scenario's plain request, which
+        // would have left the variants not exercised.
+        ("inflated-on-first-probe", &["F3", "F4", "F5", "F6", "F7"][..]),
+    ] {
+        let r = run(&["--fault", f], &["--timeout", "2"]);
+        for id in ids {
+            expect(&r, id, "error");
+        }
+        assert!(
+            r.stdout.contains("inconclusive, because some of the server's frames couldn't be read"),
+            "{f}\n{}",
+            r.stdout
+        );
+        expect(&r, "F1", "fail");
+        for (id, v) in &r.verdicts {
+            if id != "F1" {
+                assert_ne!(v, "fail", "{f}: {id}\n{}", r.stdout);
+            }
+        }
+    }
+}
+
+#[test]
 fn a_reply_skipped_while_lspcheck_waited_makes_its_absence_inconclusive() {
     // The $/ request's reply is over the inspection limit, so lspcheck never
     // sees it: J4 can't say it went unanswered. Within the limit it passes.

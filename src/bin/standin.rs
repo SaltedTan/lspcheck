@@ -85,6 +85,11 @@ const FAULTS: &[(&str, &str)] = &[
         "before answering an unknown $/ request, start a frame whose 2 MiB body never comes, so it swallows the answer",
     ),
     ("flood-on-shutdown", "before replying to shutdown, write 2 MiB of bytes"),
+    ("inflated-on-change", "on a didChange, start a frame whose 2 MiB body never comes, so it swallows what follows"),
+    (
+        "inflated-on-first-probe",
+        "before answering the session's first lspcheck/probe, start a frame whose 2 MiB body never comes",
+    ),
     (
         "inflated-on-cancel",
         "before answering a cancelled request, start a frame whose 2 MiB body never comes, so it swallows the answer",
@@ -258,6 +263,8 @@ fn main() {
     let mut initialized_reply = fault("initialized-reply-after-cancel");
     // For null-reply-after-first-probe: whether a request was answered since initialize.
     let mut answered_one = false;
+    // For inflated-on-first-probe.
+    let mut probed = false;
     let mut children: Vec<Child> = Vec::new();
     // The text of each open document, with the version it was last sent at,
     // and how positions are counted.
@@ -449,6 +456,9 @@ fn main() {
                         &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
                     );
                 }
+            }
+            if method == "textDocument/didChange" && fault("inflated-on-change") {
+                out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
             }
             if method == "textDocument/didChange"
                 && let (Some(uri), Some(changes)) = (
@@ -943,6 +953,11 @@ fn main() {
                 "error": {"code": "-32601", "message": "method not found"}
             })),
             m if m.starts_with("$/") && fault("ignore-dollar-request") => {}
+            "lspcheck/probe" if fault("inflated-on-first-probe") && !probed => {
+                probed = true;
+                out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
+                out.frame(&err(&id, -32601, "method not found"));
+            }
             m if m.starts_with("$/") && fault("inflated-on-dollar-request") => {
                 out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
                 out.frame(&err(&id, -32601, "method not found"));

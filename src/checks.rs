@@ -202,7 +202,27 @@ pub struct CheckResult {
     /// seen directly has none.
     #[serde(skip)]
     pub absent_at: Option<(Duration, Duration)>,
+    /// For a verdict reached during the session on the assumption that
+    /// lspcheck missed nothing in a window: what it would have been
+    /// otherwise. Checked again when the session has ended and everything
+    /// the server sent has been read, since a frame unfinished at the time
+    /// may turn out to have been cut short.
+    #[serde(skip)]
+    pub unless_missed: Option<Recheck>,
 }
+
+/// A verdict's alternative if lspcheck turns out to have missed something
+/// between `from` and `to`. [`MISSED`] in `detail` stands for the reason.
+#[derive(Debug, Clone)]
+pub struct Recheck {
+    pub from: Duration,
+    pub to: Duration,
+    pub verdict: Verdict,
+    pub detail: String,
+}
+
+/// Where a [`Recheck`]'s detail gives the reason something was missed.
+const MISSED: &str = "\u{1}missed\u{1}";
 
 /// How a run is set up.
 #[derive(Debug, Clone)]
@@ -382,6 +402,15 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
             r.detail = format!("inconclusive, because {why}: {}", r.detail);
         }
     }
+    // A verdict reached during the session that assumed nothing was missed
+    // in its window, judged again now that everything read is known.
+    for r in &mut results {
+        let Some(again) = r.unless_missed.take() else { continue };
+        if let Some(why) = finish.incomplete_within(again.from, again.to) {
+            r.verdict = again.verdict;
+            r.detail = again.detail.replace(MISSED, &why);
+        }
+    }
     let transcript = match &cfg.transcripts {
         Some(dir) => {
             let path = dir.join(format!("{name}.jsonl"));
@@ -418,7 +447,7 @@ fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observatio
 }
 
 fn result(scenario: &'static str, id: &str, verdict: Verdict, detail: impl Into<String>) -> CheckResult {
-    CheckResult { id: info(id).id, verdict, detail: detail.into(), scenario, absent_at: None }
+    CheckResult { id: info(id).id, verdict, detail: detail.into(), scenario, absent_at: None, unless_missed: None }
 }
 
 struct Ctx<'a> {
@@ -449,6 +478,37 @@ impl Ctx<'_> {
 
     fn pass(&mut self, id: &str) {
         self.report(id, Verdict::Pass, "");
+    }
+
+    /// Reports a verdict that depends on lspcheck having missed nothing
+    /// between `from` and `to`. `judge` gives the verdict and detail, given
+    /// why something may have been missed if it may have. What lspcheck finds
+    /// only later that it missed in that window is judged again when the
+    /// session ends.
+    fn report_judged(
+        &mut self,
+        id: &str,
+        from: Duration,
+        to: Duration,
+        judge: impl Fn(Option<&str>) -> (Verdict, String),
+    ) {
+        let missed = self.s.incomplete_within(from, to);
+        let (verdict, detail) = judge(missed.as_deref());
+        self.report(id, verdict, detail);
+        if missed.is_none() {
+            let (verdict, detail) = judge(Some(MISSED));
+            self.unless_missed(from, to, verdict, detail);
+        }
+    }
+
+    /// What the result just reported becomes if lspcheck turns out to have
+    /// missed something between `from` and `to`; `detail` gives the reason
+    /// as [`MISSED`]. Nothing, if that is the same verdict.
+    fn unless_missed(&mut self, from: Duration, to: Duration, verdict: Verdict, detail: impl Into<String>) {
+        let r = self.results.last_mut().expect("just reported");
+        if r.verdict != verdict {
+            r.unless_missed = Some(Recheck { from, to, verdict, detail: detail.into() });
+        }
     }
 
     fn pass_with(&mut self, id: &str, detail: impl Into<String>) {
@@ -1165,6 +1225,8 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     // C1. A missing reply is judged again when the session ends, in case a
     // frame then unfinished turns out to have swallowed it.
     let mut c1_absent = None;
+    // A pass that assumed nothing was missed: rechecked at the end.
+    let mut c1_again = None;
     let c1 = match (&answer, first) {
         (Err(wait), _) => {
             let e = CallError::Wait(*wait);
@@ -1192,6 +1254,7 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             } else if let Some(why) = &incomplete_c1 {
                 (Verdict::Error, inconclusive(why, &format!("a second response to {which}")))
             } else {
+                c1_again = Some(inconclusive(MISSED, &format!("a second response to {which}")));
                 (Verdict::Pass, format!("{which}: {how}, and only once"))
             }
         }
@@ -1220,6 +1283,9 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         Some((since, waited)) => ctx.fail_absent_between("C1", since, waited, c1.1),
         None => ctx.report("C1", c1.0, c1.1),
     }
+    if let Some(detail) = c1_again {
+        ctx.unless_missed(written_at, r_cancelled_at.unwrap_or(end), Verdict::Error, detail);
+    }
 
     if let Some((id, what)) = offending {
         let whose = if id == r { "the finished request" } else { "an id never sent" };
@@ -1246,6 +1312,9 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     } else {
         let what = if first.is_some() { "an id never sent and a finished request" } else { "an id never sent" };
         ctx.pass_with("C2", format!("cancelling {what} drew no reply, and the server kept serving"));
+        if let Some(from) = c2_started {
+            ctx.unless_missed(from, end, Verdict::Error, inconclusive(MISSED, "a reply to one of the cancels"));
+        }
     }
 
     // C3.
@@ -1267,6 +1336,7 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         ctx.report("C3", Verdict::Error, inconclusive(why, "a reply to a $/cancelRequest"));
     } else {
         ctx.pass_with("C3", "no response answered a $/cancelRequest notification");
+        ctx.unless_missed(written_at, end, Verdict::Error, inconclusive(MISSED, "a reply to a $/cancelRequest"));
     }
 }
 
@@ -1777,17 +1847,14 @@ async fn documents(ctx: &mut Ctx<'_>) {
     }
     let about_b = |s: &Source| s.found.iter().any(|f| documents::same_uri(&f.uri, &b_uri));
     let judged = documents::judge_positions(encoding, &docs, &sources);
-    let incomplete = ctx.s.incomplete_within(opened_at, end);
-    let (verdict, mut detail) = documents::judge_d1(encoding, &judged, incomplete.as_deref());
-    if !notes.is_empty() {
-        detail = format!("{detail}; {}", notes.join("; "));
-    }
-    ctx.report("D1", verdict, detail);
-    let (verdict, mut detail) = documents::judge_d2(&docs, &published, incomplete.as_deref());
-    if !notes.is_empty() {
-        detail = format!("{detail}; {}", notes.join("; "));
-    }
-    ctx.report("D2", verdict, detail);
+    // Each verdict is judged by what lspcheck missed in its window, now and
+    // again when the session ends (`report_judged`).
+    let with_notes = |(verdict, detail): (Verdict, String)| match notes.is_empty() {
+        true => (verdict, detail),
+        false => (verdict, format!("{detail}; {}", notes.join("; "))),
+    };
+    ctx.report_judged("D1", opened_at, end, |why| with_notes(documents::judge_d1(encoding, &judged, why)));
+    ctx.report_judged("D2", opened_at, end, |why| with_notes(documents::judge_d2(&docs, &published, why)));
     if let Some(detail) = change_failed {
         // The `didChange` didn't reach the server: D3 is an error. D1 and D2
         // were still judged over everything read, above.
@@ -1822,13 +1889,9 @@ async fn documents(ctx: &mut Ctx<'_>) {
                 let after = documents::judge_positions_where(encoding, &docs[..1], &sources, |s| {
                     documents::only_after(&docs[0], s, change.at)
                 });
-                let incomplete_change = ctx.s.incomplete_within(change.at, end);
-                let (verdict, mut detail) =
-                    documents::judge_d3(encoding, &after, &change, incomplete_change.as_deref());
-                if !notes.is_empty() {
-                    detail = format!("{detail}; {}", notes.join("; "));
-                }
-                ctx.report("D3", verdict, detail);
+                ctx.report_judged("D3", change.at, end, |why| {
+                    with_notes(documents::judge_d3(encoding, &after, &change, why))
+                });
             }
         }
     }
@@ -1841,12 +1904,9 @@ async fn documents(ctx: &mut Ctx<'_>) {
         let b_docs: Vec<OpenDoc> = docs.iter().filter(|d| documents::same_uri(&d.uri, &b_uri)).cloned().collect();
         let judged_b =
             documents::judge_positions_where(encoding, &b_docs, &sources, |s| about_b(s) && s.read_at < b_end);
-        let incomplete_b = ctx.s.incomplete_within(b_opened_at, b_end);
-        let (verdict, mut detail) = documents::judge_d5(encoding, &b_text, &judged_b, incomplete_b.as_deref());
-        if !notes.is_empty() {
-            detail = format!("{detail}; {}", notes.join("; "));
-        }
-        ctx.report("D5", verdict, detail);
+        ctx.report_judged("D5", b_opened_at, b_end, |why| {
+            with_notes(documents::judge_d5(encoding, &b_text, &judged_b, why))
+        });
     }
     // D6: selectionRange replies about open documents, judged against the
     // request's own positions, in the text current when the request was
@@ -1895,12 +1955,9 @@ async fn documents(ctx: &mut Ctx<'_>) {
         // was seen.
         let undelivered_selection =
             undelivered.iter().find(|(m, _)| *m == "textDocument/selectionRange").map(|(_, why)| why.clone());
-        let d6_incomplete = incomplete.clone().or(undelivered_selection);
-        let (verdict, mut detail) = documents::judge_d6(&selection, d6_incomplete.as_deref());
-        if !notes.is_empty() {
-            detail = format!("{detail}; {}", notes.join("; "));
-        }
-        ctx.report("D6", verdict, detail);
+        ctx.report_judged("D6", opened_at, end, |why| {
+            with_notes(documents::judge_d6(&selection, why.or(undelivered_selection.as_deref())))
+        });
     }
 }
 
@@ -2199,8 +2256,12 @@ async fn framing(ctx: &mut Ctx<'_>) {
                 }
             }
         };
+        let waited = ctx.s.elapsed();
         for id in CHECKS {
             ctx.report(id, verdict, why.clone());
+            // Not exercised because the reply never came: unless lspcheck
+            // finds at the end that it missed something that could have held it.
+            ctx.unless_missed(Duration::ZERO, waited, Verdict::Error, format!("inconclusive, because {MISSED}: {why}"));
         }
         return;
     }
