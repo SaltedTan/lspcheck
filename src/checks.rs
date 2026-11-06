@@ -197,10 +197,11 @@ pub struct CheckResult {
     /// The scenario the evidence came from, or "all" for cross-cutting checks.
     pub scenario: &'static str,
     /// For a failure because something expected never arrived: when lspcheck
-    /// stopped waiting. Evidence lspcheck didn't see before then could explain
-    /// it. A failure seen directly has none.
+    /// sent what should have been answered, and when it stopped waiting.
+    /// Evidence lspcheck didn't see in between could explain it. A failure
+    /// seen directly has none.
     #[serde(skip)]
-    pub absent_at: Option<Duration>,
+    pub absent_at: Option<(Duration, Duration)>,
 }
 
 /// How a run is set up.
@@ -368,21 +369,15 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         }
     }
     // A failure because something never arrived might be explained by
-    // evidence lspcheck didn't see before it stopped waiting: frames it
-    // skipped, frames it couldn't read (a log line loses nothing, so it
-    // doesn't count), or its own side of the conversation failing. A failure
-    // seen directly, such as a wrong result, stands, and so does one whose
-    // wait ended before anything went unseen.
-    let unread = finish
-        .problems
-        .iter()
-        .find(|(_, p)| !matches!(p, Problem::Garbage(_)))
-        .map(|(at, _)| (*at, "some of the server's frames couldn't be read (see F1)".to_string()));
-    let explanations: Vec<&(Duration, String)> =
-        [&finish.limit, &finish.own_limit, &unread].into_iter().flatten().collect();
+    // evidence lspcheck didn't see while it waited: frames it skipped or
+    // couldn't read after it sent what should have been answered (a log line
+    // loses nothing, so it doesn't count), or, from any time before it
+    // stopped waiting, reading that stopped or its own side of the
+    // conversation failing. A failure seen directly, such as a wrong result,
+    // stands, and so does one whose wait had nothing go unseen.
     for r in results.iter_mut().filter(|r| r.verdict == Verdict::Fail) {
-        let Some(waited) = r.absent_at else { continue };
-        if let Some((_, why)) = explanations.iter().filter(|(at, _)| *at <= waited).min_by_key(|(at, _)| *at) {
+        let Some((since, waited)) = r.absent_at else { continue };
+        if let Some(why) = finish.incomplete_within(since, waited) {
             r.verdict = Verdict::Error;
             r.detail = format!("inconclusive, because {why}: {}", r.detail);
         }
@@ -464,18 +459,28 @@ impl Ctx<'_> {
         self.report(id, Verdict::Fail, detail);
     }
 
-    /// A failure because something expected never arrived.
-    fn fail_absent(&mut self, id: &str, detail: impl Into<String>) {
+    /// A failure because something expected never arrived, in reply to what
+    /// lspcheck sent from `since` on.
+    fn fail_absent(&mut self, id: &str, since: Duration, detail: impl Into<String>) {
         let waited = self.s.elapsed();
         self.fail(id, detail);
-        self.results.last_mut().expect("just reported").absent_at = Some(waited);
+        self.results.last_mut().expect("just reported").absent_at = Some((since, waited));
     }
 
-    /// The verdict for a call that got no response: a failure when the request
-    /// was delivered, and an error when lspcheck couldn't deliver it.
-    fn fail_call(&mut self, id: &str, detail: impl Into<String>, e: &CallError) {
+    /// A failure because a reply lspcheck waited for from `since` to `waited`
+    /// never arrived, judged before the session ended: what lspcheck only
+    /// later finds it missed in that time still makes it inconclusive.
+    fn fail_absent_between(&mut self, id: &str, since: Duration, waited: Duration, detail: impl Into<String>) {
+        self.fail(id, detail);
+        self.results.last_mut().expect("just reported").absent_at = Some((since, waited));
+    }
+
+    /// The verdict for a call sent from `since` on that got no response: a
+    /// failure when the request was delivered, and an error when lspcheck
+    /// couldn't deliver it.
+    fn fail_call(&mut self, id: &str, since: Duration, detail: impl Into<String>, e: &CallError) {
         match e {
-            CallError::Wait(_) => self.fail_absent(id, detail),
+            CallError::Wait(_) => self.fail_absent(id, since, detail),
             CallError::Write(_) => self.report(id, Verdict::Error, detail),
         }
     }
@@ -525,10 +530,11 @@ impl Ctx<'_> {
 
 /// Initialize, probe, shutdown, exit: the path every client takes.
 async fn lifecycle(ctx: &mut Ctx<'_>) {
+    let since = ctx.s.elapsed();
     let reply = match ctx.initialize().await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why)) => return ctx.fail("L2", why),
-        Err(InitFailure::Absent(why)) => return ctx.fail_absent("L2", why),
+        Err(InitFailure::Absent(why)) => return ctx.fail_absent("L2", since, why),
         Err(InitFailure::Blocked(why)) => return ctx.report("L2", Verdict::Error, why),
     };
     judge_l2(ctx, &reply);
@@ -536,7 +542,10 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
     let t = ctx.cfg.request_timeout;
     let mut problems = Vec::new();
     let (mut seen_wrong, mut unsent) = (false, false);
+    // When the first request that went unanswered was sent.
+    let mut since = None;
     for method in ["lspcheck/unknownRequest", "$/lspcheck/unknownRequest"] {
+        let sent = ctx.s.elapsed();
         match ctx.s.call(method, Some(json!({})), t).await {
             Ok(m) => match &m.kind {
                 Kind::Response { outcome: Outcome::Error { code: Some(codes::METHOD_NOT_FOUND), .. }, .. } => {}
@@ -548,6 +557,7 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
             },
             Err(e) => {
                 unsent |= matches!(e, CallError::Write(_));
+                since.get_or_insert(sent);
                 problems.push(format!("{method}: {}", describe_call_error(&e, t)))
             }
         }
@@ -559,9 +569,11 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
     } else if unsent {
         ctx.report("J4", Verdict::Error, problems.join("; "));
     } else {
-        ctx.fail_absent("J4", problems.join("; "));
+        let since = since.expect("a request went unanswered");
+        ctx.fail_absent("J4", since, problems.join("; "));
     }
 
+    let since = ctx.s.elapsed();
     match ctx.s.call("shutdown", None, t).await {
         Ok(m) => match &m.kind {
             Kind::Response { outcome: Outcome::Result(Value::Null), .. } => {
@@ -583,7 +595,7 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
             }
             _ => unreachable!(),
         },
-        Err(e) => return ctx.fail_call("L4", format!("shutdown: {}", describe_call_error(&e, t)), &e),
+        Err(e) => return ctx.fail_call("L4", since, format!("shutdown: {}", describe_call_error(&e, t)), &e),
     }
 
     if !ctx.s.is_alive() {
@@ -699,7 +711,7 @@ async fn check_j6(ctx: &mut Ctx<'_>, t: Duration) {
     match j6_outcome(delivered, &missing, closed, send_failure.as_ref(), &unasked) {
         J6Outcome::Pass => ctx.pass("J6"),
         J6Outcome::Error(why) => ctx.report("J6", Verdict::Error, why),
-        J6Outcome::Absent(detail) => ctx.fail_absent("J6", detail),
+        J6Outcome::Absent(detail) => ctx.fail_absent("J6", started, detail),
     }
 }
 
@@ -839,6 +851,7 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
         ctx.report("L1", Verdict::Error, format!("could not send a notification: {e}"));
         return;
     }
+    let since = ctx.s.elapsed();
     let request = ctx.s.call("workspace/symbol", Some(json!({"query": ""})), t).await;
     // When lspcheck stopped waiting for the answer: only what it missed
     // before then could explain a missing answer.
@@ -879,9 +892,9 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
         Err(e) => match replied {
             Some(replied) => ctx.fail("L1", format!("{replied}; the request got {}", describe_call_error(e, t))),
             None => {
-                ctx.fail_call("L1", describe_call_error(e, t), e);
+                ctx.fail_call("L1", since, describe_call_error(e, t), e);
                 if let Some(r) = ctx.results.last_mut().filter(|r| r.absent_at.is_some()) {
-                    r.absent_at = Some(waited);
+                    r.absent_at = Some((since, waited));
                 }
             }
         },
@@ -911,6 +924,7 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
 
     // L3. Why the server can no longer be relied on, if it can't.
     let mut stopped: Option<&str> = None;
+    let since = ctx.s.elapsed();
     match ctx.s.call("initialize", Some(initialize_params(&ctx.root)), t).await {
         Ok(m) => match &m.kind {
             Kind::Response { outcome: Outcome::Error { code: Some(_), .. }, .. } => {
@@ -920,6 +934,7 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
                         "whether it keeps serving wasn't checked: it didn't answer a plain request before either",
                     );
                 } else {
+                    let since = ctx.s.elapsed();
                     match ctx.s.call(PROBE, Some(json!({})), t).await {
                         Ok(_) => ctx.pass("L3"),
                         Err(e) => {
@@ -928,7 +943,7 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
                                 "after the error for the second initialize, a plain request went unanswered ({})",
                                 describe_call_error(&e, t)
                             );
-                            ctx.fail_call("L3", why, &e);
+                            ctx.fail_call("L3", since, why, &e);
                         }
                     }
                 }
@@ -940,7 +955,12 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
         },
         Err(e) => {
             stopped = Some("the second initialize went unanswered (see L3)");
-            ctx.fail_call("L3", format!("a second initialize went unanswered ({})", describe_call_error(&e, t)), &e);
+            ctx.fail_call(
+                "L3",
+                since,
+                format!("a second initialize went unanswered ({})", describe_call_error(&e, t)),
+                &e,
+            );
         }
     }
 
@@ -954,6 +974,7 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
     if !ctx.s.is_alive() {
         return ctx.report("L5", Verdict::NotExercised, "the server exited after shutdown, before exit (see L4)");
     }
+    let since = ctx.s.elapsed();
     match ctx.s.call("workspace/symbol", Some(json!({"query": ""})), t).await {
         Ok(m) => match &m.kind {
             Kind::Response { outcome: Outcome::Error { code: Some(codes::INVALID_REQUEST), .. }, .. } => ctx.pass("L5"),
@@ -965,6 +986,7 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
         },
         Err(e) => ctx.fail_call(
             "L5",
+            since,
             format!("a request after shutdown went unanswered ({})", describe_call_error(&e, t)),
             &e,
         ),
@@ -1140,14 +1162,19 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     let msgs = &ctx.s.messages;
     let window = |from: usize| (from..msgs.len()).filter(|&i| msgs[i].0 < end);
 
-    // C1.
+    // C1. A missing reply is judged again when the session ends, in case a
+    // frame then unfinished turns out to have swallowed it.
+    let mut c1_absent = None;
     let c1 = match (&answer, first) {
         (Err(wait), _) => {
             let e = CallError::Wait(*wait);
             let why = format!("{which}: no response after $/cancelRequest ({})", describe_call_error(&e, t));
             match ctx.s.incomplete_within(written_at, r_waited) {
                 Some(missed) => (Verdict::Error, format!("inconclusive, because {missed}: {why}")),
-                None => (Verdict::Fail, why),
+                None => {
+                    c1_absent = Some((written_at, r_waited));
+                    (Verdict::Fail, why)
+                }
             }
         }
         (Ok(m), Some(first)) => {
@@ -1189,7 +1216,10 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             idless_reply(at, m).map(|what| (what, m.value.to_string().contains("cancelRequest")))
         })
         .collect();
-    ctx.report("C1", c1.0, c1.1);
+    match c1_absent {
+        Some((since, waited)) => ctx.fail_absent_between("C1", since, waited, c1.1),
+        None => ctx.report("C1", c1.0, c1.1),
+    }
 
     if let Some((id, what)) = offending {
         let whose = if id == r { "the finished request" } else { "an id never sent" };
@@ -1209,7 +1239,7 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             (CallError::Wait(_), Some(missed)) => {
                 ctx.report("C2", Verdict::Error, format!("inconclusive, because {missed}: {why}"))
             }
-            (CallError::Wait(_), None) => ctx.fail("C2", why),
+            (CallError::Wait(_), None) => ctx.fail_absent_between("C2", asked, waited, why),
         }
     } else if let Some(why) = &incomplete_c2 {
         ctx.report("C2", Verdict::Error, inconclusive(why, "a reply to one of the cancels"));
@@ -1968,6 +1998,7 @@ async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: O
             Some(u) => (method, params_for(u)),
             None => (PROBE, json!({})),
         };
+        let since = ctx.s.elapsed();
         match ask(ctx, m, params).await {
             Ok((_, Ok(reply))) => {
                 outcomes.push(format!("{label} got {}", describe_d4_outcome(&reply)));
@@ -1985,7 +2016,7 @@ async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: O
                     );
                     return closed_at;
                 }
-                ctx.fail_call("D4", what, &e);
+                ctx.fail_call("D4", since, what, &e);
                 return closed_at;
             }
             Err(e) => {
@@ -2047,8 +2078,9 @@ const MULTIBYTE: &str = "é ñ ü · € 中文 · 😀 𝄞 · e\u{301}";
 enum Probe {
     /// Every request it carried was answered.
     Answered,
-    /// A response that should have come didn't.
-    Missing(String),
+    /// A response that should have come didn't: why, and when lspcheck began
+    /// sending what should have been answered.
+    Missing(String, Duration),
     /// lspcheck couldn't deliver it.
     Unsent(String),
 }
@@ -2060,6 +2092,7 @@ fn frame(value: &Value) -> Vec<u8> {
 /// Writes `bytes`, which hold the requests `ids`, as separate writes cut at
 /// `cuts`, and waits for every response, all by one deadline.
 async fn exchange(ctx: &mut Ctx<'_>, ids: &[Id], bytes: &[u8], cuts: &[usize]) -> Probe {
+    let since = ctx.s.elapsed();
     let t = ctx.cfg.request_timeout;
     let deadline = Instant::now() + t;
     let started = ctx.s.messages.len();
@@ -2095,7 +2128,7 @@ async fn exchange(ctx: &mut Ctx<'_>, ids: &[Id], bytes: &[u8], cuts: &[usize]) -
     {
         detail = format!("{detail}; the server sent {} with id null", describe_outcome(outcome));
     }
-    Probe::Missing(detail)
+    Probe::Missing(detail, since)
 }
 
 /// Whether the server still answers a plain request after a variant that
@@ -2131,7 +2164,7 @@ async fn settle(ctx: &mut Ctx<'_>, id: &str, what: &str, outcome: Probe) -> Opti
             ctx.pass(id);
             return None;
         }
-        Probe::Missing(why) => ctx.fail_absent(id, format!("{what}: {why}")),
+        Probe::Missing(why, since) => ctx.fail_absent(id, since, format!("{what}: {why}")),
         Probe::Unsent(why) => ctx.report(id, Verdict::Error, format!("{what}: {why}")),
     }
     back_in_step(ctx, &format!("{id} didn't pass")).await

@@ -180,14 +180,42 @@ impl std::fmt::Display for WriteError {
     }
 }
 
+/// Why lspcheck may have missed something the server sent between `from`
+/// and `to`: bytes it skipped or couldn't read as a frame (see
+/// [`Evidence::lost`]) that arrived over a span overlapping that time, or,
+/// from any time up to `to`, `ongoing`: reading that stopped, or a server
+/// request lspcheck couldn't answer, after which the server may have held
+/// back what it would have sent.
+fn incomplete_between(
+    lost: &[(Duration, Duration, String)],
+    ongoing: [Option<&(Duration, String)>; 2],
+    from: Duration,
+    to: Duration,
+) -> Option<String> {
+    let lost = lost.iter().find(|(began, ended, _)| *began <= to && *ended >= from).map(|(_, _, why)| why.clone());
+    let since =
+        ongoing.into_iter().flatten().filter(|(at, _)| *at <= to).min_by_key(|(at, _)| *at).map(|(_, why)| why.clone());
+    lost.or(since)
+}
+
+/// What [`Evidence::lost`] says about bytes that couldn't be read as a frame.
+const UNREAD: &str = "some of the server's frames couldn't be read (see F1)";
+
 /// What the stdout task observed, independently of what was consumed.
 #[derive(Debug, Default)]
 struct Evidence {
     problems: Vec<(Duration, Problem)>,
     content_types: Vec<(Duration, String)>,
     limit: Option<(Duration, String)>,
-    /// Every frame skipped for its size, not only the first (`limit`).
-    skipped: Vec<(Duration, String)>,
+    /// Where content was lost: every frame skipped for its size, and every
+    /// stretch of bytes that couldn't be read as a frame (a log line loses
+    /// nothing, so it isn't one). Each spans from when its first byte arrived
+    /// (or earlier) until it was complete, since a frame that turns out to be
+    /// too long or malformed may have swallowed anything sent meanwhile.
+    lost: Vec<(Duration, Duration, String)>,
+    /// When the bytes the frame reader holds unfinished began arriving, if it
+    /// holds any.
+    partial_since: Option<Duration>,
     /// When and why lspcheck stopped reading stdout, if it did.
     stopped: Option<(Duration, String)>,
     /// When the first readable frame with non-ASCII text in its body arrived.
@@ -244,6 +272,12 @@ pub struct Finish {
     /// couldn't answer one of the server's requests), if it was. This can
     /// explain a reply that never came, but not what stdout contained.
     pub own_limit: Option<(Duration, String)>,
+    /// Where content was lost: frames skipped for their size and bytes that
+    /// couldn't be read as a frame, each from when its first byte arrived
+    /// until it was complete (or the session ended).
+    pub lost: Vec<(Duration, Duration, String)>,
+    /// When and why lspcheck stopped reading stdout, if it did.
+    pub stopped: Option<(Duration, String)>,
     pub transcript: Vec<Event>,
     /// Every message the session consumed.
     pub messages: Vec<(Duration, Message)>,
@@ -270,6 +304,14 @@ pub struct Finish {
     /// How many unreadable frames weren't checked for that, because the
     /// work allowed for it ran out.
     pub unchecked: usize,
+}
+
+impl Finish {
+    /// Why lspcheck may have missed something the server sent between `from`
+    /// and `to`, judged over the whole session (see [`Session::incomplete_within`]).
+    pub fn incomplete_within(&self, from: Duration, to: Duration) -> Option<String> {
+        incomplete_between(&self.lost, [self.stopped.as_ref(), self.own_limit.as_ref()], from, to)
+    }
 }
 
 type Transcript = Arc<Mutex<Vec<Event>>>;
@@ -454,19 +496,7 @@ impl Session {
     /// request lspcheck couldn't answer (see [`Session::incomplete`]).
     pub fn incomplete_within(&self, from: Duration, to: Duration) -> Option<String> {
         let ev = self.evidence.lock().expect("evidence lock");
-        let during = |at: &Duration| (from..to).contains(at);
-        let skipped = ev.skipped.iter().find(|(at, _)| during(at)).map(|(_, why)| why.clone());
-        let unread = ev
-            .problems
-            .iter()
-            .any(|(at, p)| during(at) && !matches!(p, Problem::Garbage(_)))
-            .then(|| "some of the server's frames couldn't be read (see F1)".to_string());
-        let since = [ev.stopped.as_ref(), self.own_limit.as_ref()]
-            .into_iter()
-            .flatten()
-            .find(|(at, _)| *at < to)
-            .map(|(_, why)| why.clone());
-        skipped.or(unread).or(since)
+        incomplete_between(&ev.lost, [ev.stopped.as_ref(), self.own_limit.as_ref()], from, to)
     }
 
     /// Records everything the server has sent that was already read, without
@@ -963,11 +993,17 @@ impl Session {
         // makes judging J3 inconclusive.
         let j3_incomplete = self.initialized_at.and_then(|from| self.incomplete_within(from, self.start.elapsed()));
         let mut evidence = std::mem::take(&mut *self.evidence.lock().expect("evidence lock"));
+        let now = self.start.elapsed();
         if !evidence.done && evidence.limit.is_none() {
-            evidence.limit = Some((
-                self.start.elapsed(),
-                "stdout stayed open after the server exited, so later output wasn't inspected".into(),
-            ));
+            evidence.limit =
+                Some((now, "stdout stayed open after the server exited, so later output wasn't inspected".into()));
+        }
+        // A frame still unfinished when reading ended may hold anything sent
+        // since it began.
+        if !evidence.done
+            && let Some(began) = evidence.partial_since
+        {
+            evidence.lost.push((began, now, "a frame was still unfinished when lspcheck stopped reading".into()));
         }
         let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
         let whole = evidence.done && !evidence.cut;
@@ -1000,6 +1036,8 @@ impl Session {
             not_stopped,
             limit: evidence.limit,
             own_limit: self.own_limit.take(),
+            lost: evidence.lost,
+            stopped: evidence.stopped,
             transcript,
             messages: std::mem::take(&mut self.messages),
             initialized_at: self.initialized_at,
@@ -1029,6 +1067,7 @@ async fn read_stdout(
     let mut reader = FrameReader::new(opts.max_header, opts.max_body);
     let mut buf = vec![0u8; 64 * 1024];
     let (mut total, mut stopped) = (0usize, false);
+    let mut partial_since: Option<Duration> = None;
     let stop = |at: Duration, why: String| {
         record(&t, at, EventKind::Note(why.clone()));
         let mut ev = evidence.lock().expect("evidence lock");
@@ -1038,7 +1077,8 @@ async fn read_stdout(
         drop(ev);
         let _ = tx.send((at, Inbound::Stopped));
     };
-    let deliver = |at: Duration, chunk: Chunk, stopped: &mut bool| {
+    // `began`: when the first byte the chunk may contain arrived.
+    let deliver = |began: Duration, at: Duration, chunk: Chunk, stopped: &mut bool| {
         record(&t, at, parsed_event(&chunk));
         let mut ev = evidence.lock().expect("evidence lock");
         let content_types = |ev: &mut Evidence, headers: &[Header]| {
@@ -1068,7 +1108,7 @@ async fn read_stdout(
                 let why = format!(
                     "a {content_length}-byte frame is over lspcheck's {limit}-byte inspection limit (--max-frame-mib), so it wasn't checked"
                 );
-                ev.skipped.push((at, why.clone()));
+                ev.lost.push((began, at, why.clone()));
                 ev.limit.get_or_insert((at, why));
                 return;
             }
@@ -1090,6 +1130,9 @@ async fn read_stdout(
                 Problem::Truncated { content_length, received }
             }
         };
+        if !matches!(problem, Problem::Garbage(_)) {
+            ev.lost.push((began, at, UNREAD.into()));
+        }
         ev.problems.push((at, problem.clone()));
         let _ = tx.send((at, Inbound::Problem(problem)));
     };
@@ -1115,18 +1158,39 @@ async fn read_stdout(
             continue;
         }
         record(&t, at, EventKind::Read(buf[..n].to_vec()));
+        // Every chunk this read completes began no earlier than the oldest
+        // unfinished byte (or this read, if there was none).
+        let began = partial_since.unwrap_or(at);
+        let mut completed = false;
         for chunk in reader.feed(&buf[..n]) {
-            deliver(at, chunk, &mut stopped);
+            completed = true;
+            deliver(began, at, chunk, &mut stopped);
             if stopped {
                 break;
             }
         }
+        // What is left unfinished began after the last chunk completed, so
+        // in this read; with nothing completed, it is still what it was.
+        partial_since = if reader.is_idle() {
+            None
+        } else if completed {
+            Some(at)
+        } else {
+            Some(began)
+        };
+        evidence.lock().expect("evidence lock").partial_since = partial_since;
     }
     let at = start.elapsed();
     if !stopped {
+        let began = partial_since.unwrap_or(at);
         for chunk in reader.finish() {
-            deliver(at, chunk, &mut stopped);
+            deliver(began, at, chunk, &mut stopped);
         }
+    } else if let Some(began) = partial_since {
+        // Inspection stopped inside a frame, which may hold anything sent
+        // since it began.
+        let why = "a frame was still unfinished when lspcheck stopped inspecting stdout".to_string();
+        evidence.lock().expect("evidence lock").lost.push((began, at, why));
     }
     record(&t, at, EventKind::StdoutClosed);
     evidence.lock().expect("evidence lock").done = true;
@@ -1233,4 +1297,31 @@ pub fn describe_status(status: ExitStatus) -> String {
         }
     }
     "an unknown status".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missed_evidence_counts_where_its_span_overlaps_the_wait() {
+        let ms = Duration::from_millis;
+        let span = |a, b| (ms(a), ms(b), format!("lost {a}-{b}"));
+        let between = |lost: &[(Duration, Duration, String)], ongoing: Option<(Duration, String)>| {
+            incomplete_between(lost, [ongoing.as_ref(), None], ms(100), ms(200))
+        };
+        // Complete before the request was sent: it can't have held the reply.
+        assert_eq!(between(&[span(10, 90)], None), None);
+        // Begun only after lspcheck stopped waiting.
+        assert_eq!(between(&[span(210, 300)], None), None);
+        // Begun before the request and finished after the wait: it spans it.
+        assert_eq!(between(&[span(50, 900)], None).as_deref(), Some("lost 50-900"));
+        // Inside the wait, or touching either end.
+        assert!(between(&[span(120, 150)], None).is_some());
+        assert!(between(&[span(10, 100)], None).is_some());
+        assert!(between(&[span(200, 300)], None).is_some());
+        // Reading that stopped excuses from any time up to the end of the wait.
+        assert!(between(&[], Some((ms(5), "stopped".into()))).is_some());
+        assert_eq!(between(&[], Some((ms(201), "stopped".into()))), None);
+    }
 }

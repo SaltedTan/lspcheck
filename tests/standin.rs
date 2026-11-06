@@ -264,6 +264,7 @@ fn lawful_variations_fail_nothing() {
         "long-header",
         "answers-reordered",
         "slow-reads",
+        "big-dollar-reply",
         "newline-after-body",
         "defer-until-next",
         "cancelled-other-error",
@@ -363,6 +364,76 @@ fn a_frame_skipped_after_a_missed_reply_doesnt_excuse_it() {
     let r = run(&["--fault", "ignore-dollar-request", "--fault", "big-frame-on-exit"], &["--max-frame-mib", "1"]);
     expect(&r, "J4", "fail");
     expect(&r, "F1", "error");
+}
+
+#[test]
+fn a_frame_skipped_before_a_request_was_sent_doesnt_excuse_its_missing_reply() {
+    // The oversized frame comes before the reply to initialize, long before
+    // J4's and J6's requests are sent, so it can't have held their replies.
+    // The checks judged across the whole stream are still inconclusive.
+    for (f, id) in [("ignore-dollar-request", "J4"), ("drop-concurrent", "J6")] {
+        let r = run(&["--fault", "big-frame", "--fault", f], &["--max-frame-mib", "1"]);
+        expect(&r, id, "fail");
+        expect(&r, "F1", "error");
+    }
+    // Skipped while J4's first request was answered, before the $/ request
+    // that goes unanswered was sent.
+    let r = run(
+        &["--fault", "big-frame-before-unknown-reply", "--fault", "ignore-dollar-request"],
+        &["--max-frame-mib", "1"],
+    );
+    expect(&r, "J4", "fail");
+}
+
+#[test]
+fn a_frame_unfinished_while_lspcheck_waited_makes_its_absence_inconclusive() {
+    // A frame begun just before the shutdown reply swallows it, and is only
+    // found to be cut short when the stream ends, after lspcheck stopped
+    // waiting. The reply may have been in it, so L4 can't fail.
+    let r = fault("inflated-before-shutdown");
+    expect(&r, "F1", "fail");
+    for (id, v) in &r.verdicts {
+        if id != "F1" {
+            assert_ne!(v, "fail", "{id}\n{}", r.stdout);
+        }
+    }
+    expect(&r, "L4", "error");
+    assert!(r.stdout.contains("inconclusive, because some of the server's frames couldn't be read"), "{}", r.stdout);
+}
+
+#[test]
+fn a_frame_unfinished_when_inspection_stops_makes_its_absence_inconclusive() {
+    // J4's $/ reply is swallowed by a frame that never ends; at shutdown,
+    // after J4 was judged, the server writes past the output budget, so
+    // lspcheck stops inspecting inside that frame. It may have held the reply.
+    let r = run(&["--fault", "inflated-on-dollar-request", "--fault", "flood-on-shutdown"], &["--max-output-mib", "1"]);
+    expect(&r, "J4", "error");
+    assert!(r.stdout.contains("a frame was still unfinished when lspcheck stopped inspecting"), "{}", r.stdout);
+    assert!(!r.verdicts.values().any(|v| v == "fail"), "{}", r.stdout);
+}
+
+#[test]
+fn a_cancelled_answer_swallowed_by_an_unfinished_frame_is_inconclusive() {
+    // The answer to the cancelled request goes inside a frame found cut short
+    // only when the stream ends, after C1 was judged.
+    let r = fault("inflated-on-cancel");
+    expect(&r, "C1", "error");
+    expect(&r, "F1", "fail");
+    for (id, v) in &r.verdicts {
+        if id != "F1" {
+            assert_ne!(v, "fail", "{id}\n{}", r.stdout);
+        }
+    }
+}
+
+#[test]
+fn a_reply_skipped_while_lspcheck_waited_makes_its_absence_inconclusive() {
+    // The $/ request's reply is over the inspection limit, so lspcheck never
+    // sees it: J4 can't say it went unanswered. Within the limit it passes.
+    let r = run(&["--fault", "big-dollar-reply"], &["--max-frame-mib", "1"]);
+    expect(&r, "J4", "error");
+    assert!(r.stdout.contains("inconclusive"), "{}", r.stdout);
+    expect(&fault("big-dollar-reply"), "J4", "pass");
 }
 
 #[test]

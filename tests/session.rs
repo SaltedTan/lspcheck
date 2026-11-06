@@ -123,3 +123,31 @@ async fn taking_in_what_was_read_doesnt_wait_on_an_answer_it_cant_write() {
     assert!(s.incomplete_within(Duration::ZERO, s.elapsed()).is_some(), "an unanswered request went unnoticed");
     s.finish(Duration::from_millis(200)).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn finishing_records_what_was_read_but_never_taken_in() {
+    // The server writes 1,000 log messages and one without "jsonrpc", then
+    // exits. Nothing is received before `finish`, so every message is still
+    // queued: the cross-scenario checks judge them only if `finish` records
+    // them all.
+    let script = r#"import sys
+body = b'{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":4,"message":"x"}}'
+bad = b'{"method":"window/logMessage","params":{"type":4,"message":"no jsonrpc"}}'
+frame = lambda b: b'Content-Length: %d\r\n\r\n' % len(b) + b
+sys.stdout.buffer.write(frame(body) * 1000 + frame(bad))
+sys.stdout.buffer.flush()
+"#;
+    let cmd = ServerCommand::new(&[
+        OsString::from("python3"),
+        OsString::from("-I"),
+        OsString::from("-c"),
+        OsString::from(script),
+    ]);
+    let mut s = Session::start(&cmd, Options::default()).await.unwrap();
+    assert!(s.wait_exit(Instant::now() + Duration::from_secs(30)).await.is_some(), "the server didn't exit");
+    assert!(s.messages.is_empty(), "nothing should have been taken in yet");
+    let finish = s.finish(Duration::from_millis(200)).await;
+    assert_eq!(finish.messages.len(), 1001, "messages recorded at the end");
+    let last = &finish.messages.last().unwrap().1.value;
+    assert!(last.get("jsonrpc").is_none(), "the last message should be the one without jsonrpc: {last}");
+}
