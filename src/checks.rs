@@ -143,6 +143,13 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "textDocumentSync"
     ),
     check!("D5", Documents, Must, "Lines are split at \\n, \\r\\n and \\r", "textDocumentSync"),
+    check!(
+        "D6",
+        Documents,
+        Must,
+        "A selectionRange result has one entry per position, each range contains its position, and each parent contains its child",
+        "textDocument_selectionRange"
+    ),
 ];
 
 /// Checks judged from every scenario's observations.
@@ -267,7 +274,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
-    Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5"] },
+    Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5", "D6"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
@@ -1356,19 +1363,30 @@ async fn ask_all(
     requests: Vec<(&'static str, Value)>,
     asked: &mut Vec<Asked>,
     notes: &mut Vec<String>,
+    undelivered: &mut Vec<(&'static str, String)>,
 ) -> Option<String> {
-    for (method, params) in requests {
+    let methods: Vec<&'static str> = requests.iter().map(|(m, _)| *m).collect();
+    for (i, (method, params)) in requests.into_iter().enumerate() {
         match ask(ctx, method, params).await {
             Ok((a, answer)) => {
                 asked.push(a);
                 if let Err(e) = answer {
+                    let closed = matches!(e, WaitError::Closed);
                     let why = describe_call_error(&CallError::Wait(e), ctx.cfg.request_timeout);
                     notes.push(format!("{method} went unanswered ({why}), so no more requests were sent"));
+                    // The server's output closed: neither this request nor the
+                    // rest of the batch could be answered, as if undelivered.
+                    if closed {
+                        undelivered.extend(methods[i..].iter().map(|m| (*m, format!("{m} was cut off ({why})"))));
+                    }
                     return Some(format!("{method} went unanswered ({why})"));
                 }
             }
             Err(e) => {
                 notes.push(format!("lspcheck couldn't send {method} ({e}), so no more requests were sent"));
+                // This request and the rest of the batch never reached the
+                // server: lspcheck couldn't deliver them.
+                undelivered.extend(methods[i..].iter().map(|m| (*m, format!("lspcheck couldn't send {m} ({e})"))));
                 break;
             }
         }
@@ -1425,7 +1443,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let caps = result.get("capabilities").cloned().unwrap_or(Value::Null);
     if !opens_documents(&reply) {
         let detail = "the server doesn't ask for didOpen (textDocumentSync), so lspcheck opens no document";
-        for id in ["D1", "D2", "D3", "D5"] {
+        for id in ["D1", "D2", "D3", "D5", "D6"] {
             ctx.report(id, Verdict::Skip, detail);
         }
         // D4 still runs: doc.txt on disk, never opened.
@@ -1440,7 +1458,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let encoding = match negotiated_encoding(&reply) {
         Ok(e) => e,
         Err(why) => {
-            for id in ["D1", "D2", "D3", "D5"] {
+            for id in ["D1", "D2", "D3", "D5", "D6"] {
                 ctx.report(id, Verdict::Error, why.clone());
             }
             // D4 doesn't need the encoding, and runs with the document
@@ -1469,7 +1487,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let doc = json!({"uri": uri, "languageId": "plaintext", "version": DOC_A_VERSION, "text": text});
     if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await {
         let detail = format!("lspcheck couldn't send didOpen: {e}");
-        for id in ["D1", "D2", "D3", "D5"] {
+        for id in ["D1", "D2", "D3", "D5", "D6"] {
             ctx.report(id, Verdict::Error, detail.clone());
         }
         leave(ctx).await;
@@ -1482,8 +1500,12 @@ async fn documents(ctx: &mut Ctx<'_>) {
 
     let mut asked = Vec::new();
     let mut notes = Vec::new();
+    // The document requests lspcheck couldn't deliver, or sent after the
+    // server's output closed: no answer could come (D6 can't pass then).
+    let mut undelivered: Vec<(&'static str, String)> = Vec::new();
     // Why the server stopped answering before D4, if it did.
-    let mut stalled = ask_all(ctx, document_requests(&caps, &uri, &text, encoding), &mut asked, &mut notes).await;
+    let mut stalled =
+        ask_all(ctx, document_requests(&caps, &uri, &text, encoding), &mut asked, &mut notes, &mut undelivered).await;
     await_diagnostics(ctx, &uri, DOC_A_VERSION, from).await;
 
     // The change to version 42, the advertised way. A sync kind of None
@@ -1536,6 +1558,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
                     document_requests(&caps, &uri, &docs[0].versions[1].text, encoding),
                     &mut asked,
                     &mut notes,
+                    &mut undelivered,
                 )
                 .await;
                 // The latest requests say whether the server is answering
@@ -1585,7 +1608,9 @@ async fn documents(ctx: &mut Ctx<'_>) {
         // B's requests are the latest before D4's, so they say whether the
         // server is answering when D4 starts (when any were asked).
         let asked_before = asked.len();
-        let b_stalled = ask_all(ctx, document_requests(&caps, &b_uri, &b_text, encoding), &mut asked, &mut notes).await;
+        let b_stalled =
+            ask_all(ctx, document_requests(&caps, &b_uri, &b_text, encoding), &mut asked, &mut notes, &mut undelivered)
+                .await;
         if asked.len() > asked_before {
             stalled = b_stalled;
         }
@@ -1725,6 +1750,60 @@ async fn documents(ctx: &mut Ctx<'_>) {
             detail = format!("{detail}; {}", notes.join("; "));
         }
         ctx.report("D5", verdict, detail);
+    }
+    // D6: selectionRange replies about open documents, judged against the
+    // request's own positions, in the text current when the request was
+    // sent. The same windows D1 uses: before A's `didClose`, and for B
+    // before B's. Skipped when the server advertises no
+    // selectionRangeProvider, so no request is sent.
+    if !advertises(&caps, "selectionRangeProvider") {
+        ctx.report(
+            "D6",
+            Verdict::Skip,
+            "the server advertises no selectionRangeProvider, so lspcheck sends no selectionRange request",
+        );
+    } else {
+        let mut selection: Vec<documents::SelectionReply> = Vec::new();
+        // A fresh borrow, so the earlier `msgs` borrow doesn't live across
+        // the mutable borrows above.
+        let d6_msgs = &ctx.s.messages;
+        for a in asked.iter().filter(|a| a.method == "textDocument/selectionRange") {
+            let req_uri = a.params.pointer("/textDocument/uri").and_then(Value::as_str);
+            let Some(doc) = docs.iter().find(|d| req_uri.is_some_and(|u| documents::same_uri(&d.uri, u))) else {
+                continue;
+            };
+            // The same window D1 uses for this document: before its close.
+            let window_end = if b_opened && req_uri.is_some_and(|u| documents::same_uri(u, &b_uri)) {
+                b_closed_at.map_or(end, |at| at.min(end))
+            } else {
+                end
+            };
+            // The version current when the request was sent, used only to
+            // clamp.
+            let Some(version) = doc.versions.iter().rfind(|v| v.at <= a.at) else { continue };
+            let positions = documents::request_positions(&a.params);
+            for (_at, m) in
+                d6_msgs.iter().filter(|(at, m)| *at >= a.at && *at < window_end && m.response_id() == Some(&a.id))
+            {
+                let Kind::Response { outcome: Outcome::Result(result), .. } = &m.kind else { continue };
+                if let Some(r) =
+                    documents::judge_selection_reply(&version.text, encoding, version.number, &positions, result)
+                {
+                    selection.push(r);
+                }
+            }
+        }
+        // A selectionRange request lspcheck couldn't deliver leaves D6
+        // without evidence it should have had: an error, unless a failure
+        // was seen.
+        let undelivered_selection =
+            undelivered.iter().find(|(m, _)| *m == "textDocument/selectionRange").map(|(_, why)| why.clone());
+        let d6_incomplete = incomplete.clone().or(undelivered_selection);
+        let (verdict, mut detail) = documents::judge_d6(&selection, d6_incomplete.as_deref());
+        if !notes.is_empty() {
+            detail = format!("{detail}; {}", notes.join("; "));
+        }
+        ctx.report("D6", verdict, detail);
     }
 }
 

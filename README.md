@@ -52,10 +52,12 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
                      all three answered: the closed document got result (empty); the never-opened document got result (empty); the plain request got error -32601
   PASS  D5  MUST    Lines are split at \n, \r\n and \r
                      3 informative position(s) on character boundaries about the line-ending document, counted in UTF-16 code units; 32 position(s) about it
-31 checks: 28 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 0 skipped, 0 not exercised, 0 errors
+  SKIP  D6  MUST    A selectionRange result has one entry per position, each range contains its position, and each parent contains its child
+                     the server advertises no selectionRangeProvider, so lspcheck sends no selectionRange request
+32 checks: 28 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 1 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 31 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
+lspcheck is early: it has 32 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
 document positions. [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids,
 documents and robustness.
 
@@ -134,6 +136,15 @@ in a lone `\r`, `\r\n` and `\n`, with a word on two lines that a wrong split mov
 about B that falls inside a character fails D5 when no counting of the spec's lines explains it (in any encoding) and
 a split the spec doesn't allow does (`\n` only, `\r\n` counted as two breaks, or no lone `\r`); otherwise D5 is
 `ERROR` and D1 carries the failure.
+
+The same scenario also checks selection ranges (D6): for each `selectionRange` request lspcheck sends about an open
+document, the result must have one entry per position, each entry's `range` must contain its position, and each
+`parent.range` must contain its child's range, all the way up the chain. Comparisons clamp each character to its
+line's length in the negotiated encoding, as a client would; a range on a line the text doesn't have isn't judged,
+and a malformed entry (no `range`, not an object, a `parent` that isn't an object) is a type error for a later check.
+A server that advertises no `selectionRangeProvider` leaves D6 `SKIP`; one that answers with only `null`, errors, or
+no reply, or whose ranges can't be compared, leaves it `N/E`. A `selectionRange` request lspcheck couldn't send, or one
+cut off because the server's output closed, makes D6 `ERROR` unless it already failed.
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of

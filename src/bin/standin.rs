@@ -167,9 +167,14 @@ const FAULTS: &[(&str, &str)] = &[
     ),
     ("drop-first-request", "never answer the first request about a document, then answer normally"),
     ("stop-at-crlf", "stop answering anything from the first request about crlf.txt"),
+    ("exit-at-version-42", "exit, without answering, at the first request about a document at version 42"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
     ("escaped-child", "start a child in a new session, with a non-UTF-8 name, that outlives the server"),
+    ("empty-selection", "lawful: an empty range at each position, parent the whole line"),
+    ("selection-outside", "the range is the word before the position, still on a boundary"),
+    ("selection-short", "one entry fewer than the positions"),
+    ("selection-parent-inside", "the parent is a range strictly inside its child"),
 ];
 
 fn main() {
@@ -561,6 +566,16 @@ fn main() {
         if no_more_answers {
             continue;
         }
+        if fault("exit-at-version-42")
+            && method.starts_with("textDocument/")
+            && msg
+                .pointer("/params/textDocument/uri")
+                .and_then(Value::as_str)
+                .and_then(|u| docs.get(u))
+                .is_some_and(|(_, version)| *version == 42)
+        {
+            std::process::exit(0);
+        }
         if fault("stop-at-crlf")
             && method.starts_with("textDocument/")
             && msg.pointer("/params/textDocument/uri").and_then(Value::as_str).is_some_and(|u| u.ends_with("crlf.txt"))
@@ -863,8 +878,8 @@ fn main() {
                 };
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
                 let result = match (text, disk) {
-                    (Some(t), _) => document_answer(&method, &params, t, units, split),
-                    (None, Some(t)) => document_answer(&method, &params, &t, units, split),
+                    (Some(t), _) => document_answer(&method, &params, t, units, split, &faults),
+                    (None, Some(t)) => document_answer(&method, &params, &t, units, split, &faults),
                     _ => Value::Null,
                 };
                 out.frame(&ok(&id, result));
@@ -1062,7 +1077,15 @@ fn range(sl: usize, sc: usize, el: usize, ec: usize) -> Value {
 }
 
 /// The answer to a request about an open document.
-fn document_answer(method: &str, params: &Value, text: &str, units: Units, split: LineSplit) -> Value {
+fn document_answer(
+    method: &str,
+    params: &Value,
+    text: &str,
+    units: Units,
+    split: LineSplit,
+    faults: &[String],
+) -> Value {
+    let fault = |name: &str| faults.iter().any(|f| f == name);
     let words = words(text, units, split);
     let lines = lines(text, split);
     let at = |p: &Value| (p["line"].as_u64().unwrap_or(0) as usize, p["character"].as_u64().unwrap_or(0) as usize);
@@ -1089,20 +1112,77 @@ fn document_answer(method: &str, params: &Value, text: &str, units: Units, split
                 .collect(),
             None => json!([]),
         },
-        "textDocument/selectionRange" => params["positions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|p| {
-                let (line, ch) = at(p);
-                let Some(text) = lines.get(line) else { return json!({"range": range(line, ch, line, ch)}) };
-                let parent = json!({"range": range(line, 0, line, units.of(text))});
-                match word_at((line, ch)) {
-                    Some((l, s, e, _)) => json!({"range": range(*l, *s, *l, *e), "parent": parent}),
-                    None => json!({"range": range(line, ch, line, ch), "parent": parent}),
+        "textDocument/selectionRange" => {
+            let positions: Vec<Value> = params["positions"].as_array().cloned().unwrap_or_default();
+            let mut out: Vec<Value> = positions
+                .iter()
+                .map(|p| {
+                    let (line, ch) = at(p);
+                    let Some(text) = lines.get(line) else { return json!({"range": range(line, ch, line, ch)}) };
+                    let parent = json!({"range": range(line, 0, line, units.of(text))});
+                    match word_at((line, ch)) {
+                        Some((l, s, e, _)) => json!({"range": range(*l, *s, *l, *e), "parent": parent}),
+                        None => json!({"range": range(line, ch, line, ch), "parent": parent}),
+                    }
+                })
+                .collect();
+            // The selection faults.
+            if fault("selection-outside") {
+                // The range is the word *before* the position, still on a
+                // boundary: it doesn't contain the position.
+                for (i, p) in positions.iter().enumerate() {
+                    let (line, ch) = at(p);
+                    if line >= lines.len() {
+                        continue;
+                    }
+                    let on_line: Vec<(usize, usize)> = words
+                        .iter()
+                        .filter(|(l, _, _, _)| *l == line)
+                        .map(|(_, s, e, _)| (*s, *e))
+                        .collect();
+                    // A word strictly before the position (ends before it),
+                    // the latest such; else a word strictly after it (starts
+                    // after it), the earliest such; else an empty range at a
+                    // boundary that isn't the position.
+                    let before = on_line.iter().filter(|(_, e)| *e < ch).max_by_key(|(_, e)| *e).copied();
+                    let after = on_line.iter().filter(|(s, _)| *s > ch).min_by_key(|(s, _)| *s).copied();
+                    let (s, e) = before.or(after).unwrap_or(if ch > 0 { (0, 0) } else { (1, 1) });
+                    out[i]["range"] = range(line, s, line, e);
                 }
-            })
-            .collect(),
+            }
+            if fault("selection-short") {
+                // One entry fewer than the positions: drop the last.
+                if !out.is_empty() {
+                    out.pop();
+                }
+            }
+            if fault("selection-parent-inside") {
+                // The parent is a range strictly inside its child.
+                for entry in &mut out {
+                    let Some(rng) = entry.get("range") else { continue };
+                    let s = rng["start"]["line"].as_u64().unwrap_or(0) as usize;
+                    let cs = rng["start"]["character"].as_u64().unwrap_or(0) as usize;
+                    let ce = rng["end"]["character"].as_u64().unwrap_or(0) as usize;
+                    // A range strictly inside: [cs+1, ce-1] if the child has
+                    // width, else an empty range at the child's start.
+                    let (ps, pe) = if ce > cs + 1 { (cs + 1, ce - 1) } else { (cs, cs) };
+                    entry["parent"] = json!({"range": range(s, ps, s, pe)});
+                }
+            }
+            if fault("empty-selection") {
+                // Lawful: an empty range at each position, parent the whole
+                // line.
+                for (i, p) in positions.iter().enumerate() {
+                    let (line, ch) = at(p);
+                    let Some(text) = lines.get(line) else { continue };
+                    out[i] = json!({
+                        "range": range(line, ch, line, ch),
+                        "parent": {"range": range(line, 0, line, units.of(text))},
+                    });
+                }
+            }
+            json!(out)
+        }
         _ => Value::Null,
     }
 }

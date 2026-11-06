@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3, D1 to D5 and `replay` are done; J7 and D6 are still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3, D1 to D6 and `replay` are done; J7 is still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -120,7 +120,7 @@ cancelled request until it is cancelled again, for C2 from its first cancel, and
 each until `exit`. A missing response is excused only by something missed while lspcheck was waiting for it.
 
 ### Documents and positions (richer with a profile document)
-D1 to D5 are done; D6 is planned.
+D1 to D6 are done.
 
 | ID | Basis | Check |
 |---|---|---|
@@ -252,6 +252,27 @@ and was read while B was open:
 
 The design's original rule (a), "D1's positions in LF-only document A were informative and all valid", is left out
 for the reason D3 dropped its own: valid positions elsewhere never prove the server splits B's lines correctly.
+
+D6 judges the `selectionRange` replies to the requests lspcheck sent about the open documents (A at 41 or 42, B at
+7), read while each was open (the same windows D1 uses). The text a reply refers to is the version current when its
+request was sent; it is used only to clamp. For each reply with an array result, compared against the request's own
+`positions`:
+
+- **skip:** `selectionRangeProvider` isn't advertised, or no `didOpen` (as D1).
+- **fail:** the array's length isn't the number of positions sent; a `result[i].range` doesn't contain `positions[i]`
+  (start ≤ position ≤ end, comparing (line, character) pairs, after clamping each character to its line's length in
+  the negotiated encoding); or a `parent.range` doesn't contain its child's range, anywhere up the chain. A seen
+  failure stands even when evidence is incomplete. The detail names the first few.
+- **error:** no failure seen, but `incomplete_within` reports missed evidence in the window D1 uses, or a
+  `selectionRange` request couldn't be answered: lspcheck couldn't send it, or the server's output had closed before
+  its reply (the whole rest of a batch is cut off then). D6 doesn't pass on part of its evidence.
+- **not-exercised:** no containment comparison could be made: no reply with an array result (only `null`, errors, or
+  no reply), or only entries that are malformed or on lines the text doesn't have.
+- **pass:** otherwise; the detail says how many replies and entries were judged.
+
+A range on a line the text doesn't have is not judged (counted in the detail); a malformed entry (no `range`, not an
+object, a `parent` that isn't an object) is not judged here — it is a type error for a later check — but is counted.
+The parent chain walk is bounded (1000 levels), and a chain cut short is counted.
 
 Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs
 only one versioned publish for the document, so it is exercised wherever diagnostics are labelled. D4 runs wherever
