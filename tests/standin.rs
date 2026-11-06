@@ -376,6 +376,29 @@ fn a_frame_skipped_before_a_request_was_sent_doesnt_excuse_its_missing_reply() {
         expect(&r, id, "fail");
         expect(&r, "F1", "error");
     }
+    // Skipped while J4's first request was answered, before the $/ request
+    // that goes unanswered was sent.
+    let r = run(
+        &["--fault", "big-frame-before-unknown-reply", "--fault", "ignore-dollar-request"],
+        &["--max-frame-mib", "1"],
+    );
+    expect(&r, "J4", "fail");
+}
+
+#[test]
+fn a_frame_unfinished_while_lspcheck_waited_makes_its_absence_inconclusive() {
+    // A frame begun just before the shutdown reply swallows it, and is only
+    // found to be cut short when the stream ends, after lspcheck stopped
+    // waiting. The reply may have been in it, so L4 can't fail.
+    let r = fault("inflated-before-shutdown");
+    expect(&r, "F1", "fail");
+    for (id, v) in &r.verdicts {
+        if id != "F1" {
+            assert_ne!(v, "fail", "{id}\n{}", r.stdout);
+        }
+    }
+    expect(&r, "L4", "error");
+    assert!(r.stdout.contains("inconclusive, because some of the server's frames couldn't be read"), "{}", r.stdout);
 }
 
 #[test]

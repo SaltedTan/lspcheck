@@ -72,6 +72,14 @@ const FAULTS: &[(&str, &str)] = &[
     ),
     ("ignore-dollar-request", "never answer an unknown $/ request"),
     ("big-dollar-reply", "lawful: answer an unknown $/ request with MethodNotFound carrying 2 MiB of data"),
+    (
+        "big-frame-before-unknown-reply",
+        "send a 2 MiB log message before answering lspcheck/unknownRequest (J4's first request)",
+    ),
+    (
+        "inflated-before-shutdown",
+        "before replying to shutdown, start a frame whose 2 MiB body never comes, so it swallows the reply",
+    ),
     ("shutdown-result", "return {} from shutdown"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
     ("big-frame-on-exit", "on exit, send one 2 MiB log message before exiting"),
@@ -854,6 +862,9 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                     std::process::exit(1);
                 }
+                if fault("inflated-before-shutdown") {
+                    out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
+                }
                 let mut reply = ok(&id, result);
                 if fault("shutdown-no-jsonrpc") {
                     reply.as_object_mut().unwrap().remove("jsonrpc");
@@ -892,6 +903,13 @@ fn main() {
                 }
             }
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
+            "lspcheck/unknownRequest" if fault("big-frame-before-unknown-reply") => {
+                let text = "x".repeat(2 * 1024 * 1024);
+                out.frame(
+                    &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
+                );
+                out.frame(&err(&id, -32601, "method not found"));
+            }
             "$/lspcheck/unknownRequest" if fault("result-and-error") => out.frame(&json!({
                 "jsonrpc": "2.0",
                 "id": id,

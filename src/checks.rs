@@ -534,8 +534,10 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
     let t = ctx.cfg.request_timeout;
     let mut problems = Vec::new();
     let (mut seen_wrong, mut unsent) = (false, false);
-    let since = ctx.s.elapsed();
+    // When the first request that went unanswered was sent.
+    let mut since = None;
     for method in ["lspcheck/unknownRequest", "$/lspcheck/unknownRequest"] {
+        let sent = ctx.s.elapsed();
         match ctx.s.call(method, Some(json!({})), t).await {
             Ok(m) => match &m.kind {
                 Kind::Response { outcome: Outcome::Error { code: Some(codes::METHOD_NOT_FOUND), .. }, .. } => {}
@@ -547,6 +549,7 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
             },
             Err(e) => {
                 unsent |= matches!(e, CallError::Write(_));
+                since.get_or_insert(sent);
                 problems.push(format!("{method}: {}", describe_call_error(&e, t)))
             }
         }
@@ -558,6 +561,7 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
     } else if unsent {
         ctx.report("J4", Verdict::Error, problems.join("; "));
     } else {
+        let since = since.expect("a request went unanswered");
         ctx.fail_absent("J4", since, problems.join("; "));
     }
 
@@ -922,6 +926,7 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
                         "whether it keeps serving wasn't checked: it didn't answer a plain request before either",
                     );
                 } else {
+                    let since = ctx.s.elapsed();
                     match ctx.s.call(PROBE, Some(json!({})), t).await {
                         Ok(_) => ctx.pass("L3"),
                         Err(e) => {
