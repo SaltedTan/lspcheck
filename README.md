@@ -24,6 +24,8 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   PASS  J4  MUST    An unknown request gets MethodNotFound (-32601), including a $/ request
   PASS  J5  MUST    Envelopes are well formed: jsonrpc 2.0, one of result/error, an integer code
   PASS  J6  MUST    Concurrent requests are each answered with the right id
+  PASS  J7  MUST    The server's own requests don't reuse an unanswered id, and it keeps serving after they are answered
+                     24 server request(s), no unanswered id reused; the server answered lspcheck's later requests after 20 of lspcheck's answers
   FAIL  L1  SHOULD  Before initialize, a request gets ServerNotInitialized (-32002) and a notification no reply
                      got result "[]" instead of ServerNotInitialized
   PASS  L2  MUST    initialize returns capabilities and an offered position encoding
@@ -87,12 +89,19 @@ lspcheck list                            # every check, with its specification s
 lspcheck runs the server several times, once per scenario, each time with an empty temporary workspace as its working
 directory. A server path with a directory part, such as `./my-server`, is resolved before that; a bare name is looked up
 on `PATH`. The checks on the server's output (F1, F2, F8) and on leftover processes (L9) are judged across every
-scenario, as are the JSON-RPC correlation checks J1, J2 and J5.
+scenario, as are the JSON-RPC correlation checks J1, J2, J5 and J7.
 
 The JSON-RPC scenario writes four requests, with numeric and string ids, before reading any reply (J6), and then sends
 unknown notifications followed by probes to show that a notification gets no response (J3). A reply whose id only
 loosely matches the request's (a number spelled as a string, or one that lost precision as a double) fails J1, and a
 duplicate, unasked or premature reply fails J2.
+
+lspcheck answers the server's own requests as it reads them: `workspace/configuration` with a `null` per item,
+`workspace/workspaceFolders` with the workspace, `workspace/applyEdit` and `window/showDocument` as not done, the
+registration, progress and refresh requests with `null`, and anything else with MethodNotFound. A server request that
+reuses the id of an earlier one lspcheck hadn't begun to answer fails J7, since the two answers couldn't be told apart;
+reusing an id once its answer has been written is lawful. J7 passes when the server is also seen answering a request
+lspcheck sent after one of its answers.
 
 The checks on how the server reads its input (F3 to F7) send small requests the server doesn't know, which every server
 must answer, written in different ways: split across many writes, several frames in one write, with a `Content-Type`

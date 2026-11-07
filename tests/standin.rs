@@ -214,7 +214,7 @@ fn passes_except(run: &Run, expected: &[(&str, &str)]) {
 
 /// Like [`only_fails`], for a server that sends frames lspcheck can't read
 /// (F1): such a frame might have been a response or message the correlation
-/// and envelope checks judge, so J1, J2 and J5 are inconclusive.
+/// and envelope checks judge, so J1, J2, J5 and J7 are inconclusive.
 fn only_fails_unread(run: &Run, failing: &[&str]) {
     for (id, verdict) in &run.verdicts {
         if id == "L9" && !cfg!(unix) {
@@ -222,7 +222,7 @@ fn only_fails_unread(run: &Run, failing: &[&str]) {
         }
         let want = if failing.contains(&id.as_str()) {
             "fail"
-        } else if ["J1", "J2", "J5"].contains(&id.as_str()) {
+        } else if ["J1", "J2", "J5", "J7"].contains(&id.as_str()) {
             "error"
         } else {
             "pass"
@@ -285,6 +285,7 @@ fn lawful_variations_fail_nothing() {
         "disk-diagnostics-after-close",
         "drop-first-request",
         "empty-selection",
+        "reuse-answered-request-id",
     ] {
         let r = fault(name);
         // With no versioned publish for the opened document, D2 has nothing
@@ -767,6 +768,20 @@ fn replies_to_exit_and_out_of_range_ids_are_judged() {
     let r = fault("out-of-range-id");
     only_fails(&r, &["J5"]);
     assert!(r.stdout.contains("2147483648"), "{}", r.stdout);
+}
+
+#[test]
+fn a_server_request_reusing_an_unanswered_id_fails_j7() {
+    // Both requests arrive in one write, before lspcheck has begun answering
+    // the first, so the server can't have had its answer.
+    let r = fault("reused-request-id");
+    only_fails(&r, &["J7"]);
+    assert!(r.stdout.contains("reused id 1 of its window/workDoneProgress/create request"), "{}", r.stdout);
+    // Reusing it once the answer has come is lawful, and the clean stand-in
+    // is seen to keep serving after lspcheck answers it.
+    let r = fault("reuse-answered-request-id");
+    expect(&r, "J7", "pass");
+    assert!(r.stdout.contains("the server answered lspcheck's later requests after"), "{}", r.stdout);
 }
 
 /// The concurrent requests can't all be written by their deadline, because

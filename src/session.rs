@@ -228,6 +228,20 @@ struct Evidence {
     done: bool,
 }
 
+/// A request the server sent lspcheck, and how lspcheck answered it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerRequest {
+    /// When it was read.
+    pub at: Duration,
+    pub id: Id,
+    pub method: String,
+    /// When lspcheck began writing its answer, if it did. Until then the
+    /// server can't have had the answer.
+    pub answer_began: Option<Duration>,
+    /// When lspcheck finished writing the whole answer, if it did.
+    pub answered_at: Option<Duration>,
+}
+
 /// A response that matched no outstanding request, with what explains it.
 #[derive(Debug, Clone)]
 pub struct Unmatched {
@@ -294,6 +308,11 @@ pub struct Finish {
     pub unmatched: Vec<Unmatched>,
     /// Requests that were answered, with when their response was read.
     pub answered: Vec<(Duration, Id)>,
+    /// Requests lspcheck sent whole, with when each was registered (just
+    /// before it was written).
+    pub sent: Vec<(Duration, Id)>,
+    /// The server's requests, in the order they were read.
+    pub server_requests: Vec<ServerRequest>,
     /// `Content-Type` values the server sent.
     pub content_types: Vec<(Duration, String)>,
     /// When the first readable frame with non-ASCII text in its body arrived.
@@ -370,6 +389,8 @@ pub struct Session {
     /// Requests that were answered, with when the response was read.
     answered: Vec<(Duration, Id)>,
     unmatched: Vec<(Duration, Id)>,
+    /// The server's requests, in the order they were read.
+    server_requests: Vec<ServerRequest>,
     group: Group,
     exit: Option<ExitStatus>,
     opts: Options,
@@ -453,6 +474,7 @@ impl Session {
             aborted: HashSet::new(),
             answered: Vec::new(),
             unmatched: Vec::new(),
+            server_requests: Vec::new(),
             group,
             exit: None,
             opts,
@@ -788,6 +810,15 @@ impl Session {
     /// Records a message and matches a response to its outstanding request.
     fn accept(&mut self, at: Duration, m: &Message) {
         self.messages.push((at, m.clone()));
+        if let Kind::Request { id, method } = &m.kind {
+            self.server_requests.push(ServerRequest {
+                at,
+                id: id.clone(),
+                method: method.clone(),
+                answer_began: None,
+                answered_at: None,
+            });
+        }
         let Some(id) = m.response_id() else { return };
         match self.pending.get(id) {
             Some(&sent) if at >= sent => {
@@ -820,7 +851,14 @@ impl Session {
             | "workspace/semanticTokens/refresh" => message::response(id, Value::Null),
             _ => message::error_response(id, codes::METHOD_NOT_FOUND, "lspcheck does not handle this request"),
         };
-        if let Err(e) = self.send_until(&reply, deadline).await
+        // `accept` has just recorded this request.
+        let i = self.server_requests.len() - 1;
+        self.server_requests[i].answer_began = Some(self.start.elapsed());
+        let written = self.send_until(&reply, deadline).await;
+        if written.is_ok() {
+            self.server_requests[i].answered_at = Some(self.start.elapsed());
+        }
+        if let Err(e) = written
             && e != WriteError::Closed
         {
             // The server may be waiting for this answer, so what follows can't
@@ -1047,6 +1085,17 @@ impl Session {
             problems: evidence.problems,
             unmatched,
             answered: std::mem::take(&mut self.answered),
+            sent: {
+                let mut sent: Vec<(Duration, Id)> = self
+                    .used_ids
+                    .iter()
+                    .filter(|(id, _)| !self.aborted.contains(*id))
+                    .map(|(id, at)| (*at, id.clone()))
+                    .collect();
+                sent.sort_by_key(|(at, _)| *at);
+                sent
+            },
+            server_requests: std::mem::take(&mut self.server_requests),
             content_types: evidence.content_types,
             non_ascii: evidence.non_ascii,
             miscounted,

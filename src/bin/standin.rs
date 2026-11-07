@@ -57,6 +57,8 @@ const FAULTS: &[(&str, &str)] = &[
     ("reply-to-notification", "answer an unknown notification with an error whose id is null"),
     ("reply-to-exit", "answer exit with an error whose id is null before exiting"),
     ("out-of-range-id", "after initialize, send a request whose id 2147483648 is outside LSP's integer range"),
+    ("reused-request-id", "on initialized, send two progress requests with the same id in one write"),
+    ("reuse-answered-request-id", "lawful: once the progress request is answered, send another with the same id"),
     (
         "fill-stdin-on-initialized",
         "with the initialize result, ask for a configuration whose answer fills a 64 KiB pipe; stop reading for 3 s",
@@ -265,6 +267,8 @@ fn main() {
     let mut answered_one = false;
     // For inflated-on-first-probe.
     let mut probed = false;
+    // For reuse-answered-request-id: whether the id was used again.
+    let mut reused_id = false;
     let mut children: Vec<Child> = Vec::new();
     // The text of each open document, with the version it was last sent at,
     // and how positions are counted.
@@ -312,6 +316,11 @@ fn main() {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
         // An answer to one of this server's own requests: nothing to do.
         if msg.get("method").is_none() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+            // Once the first progress request is answered, its id is free again.
+            if fault("reuse-answered-request-id") && !reused_id && msg.get("id") == Some(&json!(1)) {
+                reused_id = true;
+                out.frame(&json!({"jsonrpc": "2.0", "id": 1, "method": "window/workDoneProgress/create", "params": {"token": "second"}}));
+            }
             if fault("replay-gate")
                 && msg.get("id").is_some_and(|id| id == "cfg")
                 && let Some(id) = replay_gate_id.take()
@@ -536,6 +545,19 @@ fn main() {
                     "method": "client/registerCapability",
                     "params": {"registrations": [{"id": "1", "method": "textDocument/didChange", "registerOptions": {"documentSelector": null, "syncKind": 2}}]}
                 }));
+            }
+            if method == "initialized" {
+                // Like many servers, ask for a progress token. reused-request-id
+                // asks again with the same id in the same write, before the
+                // answer to the first can have arrived.
+                let create = |token: &str| json!({"jsonrpc": "2.0", "id": 1, "method": "window/workDoneProgress/create", "params": {"token": token}});
+                if fault("reused-request-id") {
+                    let mut both = out.encode(&create("first"));
+                    both.extend(out.encode(&create("second")));
+                    out.raw(&both);
+                } else {
+                    out.frame(&create("first"));
+                }
             }
             if method == "initialized" && fault("register-other") {
                 // A dynamic registration of a method D3 doesn't depend on;
