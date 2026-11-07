@@ -57,6 +57,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("reply-to-notification", "answer an unknown notification with an error whose id is null"),
     ("reply-to-exit", "answer exit with an error whose id is null before exiting"),
     ("out-of-range-id", "after initialize, send a request whose id 2147483648 is outside LSP's integer range"),
+    (
+        "await-progress-answer",
+        "lawful: after initialized, handle nothing else until the progress request is answered (as gopls does)",
+    ),
     ("reused-request-id", "on initialized, send two progress requests with the same id in one write"),
     ("reuse-answered-request-id", "lawful: once the progress request is answered, send another with the same id"),
     (
@@ -267,6 +271,8 @@ fn main() {
     let mut answered_one = false;
     // For inflated-on-first-probe.
     let mut probed = false;
+    // Messages read by await-progress-answer while it waited, to handle next.
+    let mut queued: std::collections::VecDeque<Frame> = std::collections::VecDeque::new();
     // For reuse-answered-request-id: whether the id was used again.
     let mut reused_id = false;
     let mut children: Vec<Child> = Vec::new();
@@ -282,11 +288,11 @@ fn main() {
     // For diagnostics-own-version: the stand-in's own diagnostics counter.
     let mut own_version = 0i64;
     loop {
-        if !input.ready() {
+        if queued.is_empty() && !input.ready() {
             // About to wait for input: send what was held back, newest first.
             out.release();
         }
-        let Some((mut headers, mut body)) = input.next() else { break };
+        let Some((mut headers, mut body)) = queued.pop_front().or_else(|| input.next()) else { break };
         // A server that answers only the latest of several concurrent requests:
         // J6's batch is the only one with an all-digit string id, and lspcheck
         // writes all four requests before reading, so waiting for the next
@@ -557,6 +563,17 @@ fn main() {
                     out.raw(&both);
                 } else {
                     out.frame(&create("first"));
+                }
+                if fault("await-progress-answer") {
+                    // Like gopls: handle nothing else until the answer comes.
+                    while let Some(frame) = input.next() {
+                        let answer = serde_json::from_slice::<Value>(&frame.1)
+                            .is_ok_and(|v| v.get("method").is_none() && v.get("id") == Some(&json!(1)));
+                        if answer {
+                            break;
+                        }
+                        queued.push_back(frame);
+                    }
                 }
             }
             if method == "initialized" && fault("register-other") {

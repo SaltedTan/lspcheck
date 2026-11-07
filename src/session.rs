@@ -25,7 +25,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 
 /// Session settings.
 #[derive(Debug, Clone)]
@@ -499,6 +499,18 @@ impl Session {
         record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files });
     }
 
+    /// Why lspcheck may have missed something the server sent so far: an
+    /// inspection limit, or frames that couldn't be read. Unlike
+    /// [`Session::incomplete`], lspcheck's own failures to write aren't counted.
+    pub fn missed_output(&self) -> Option<String> {
+        let ev = self.evidence.lock().expect("evidence lock");
+        let unread = ev.problems.iter().any(|(_, p)| !matches!(p, Problem::Garbage(_)));
+        ev.limit
+            .as_ref()
+            .map(|(_, why)| why.clone())
+            .or_else(|| unread.then(|| "some of the server's frames couldn't be read (see F1)".to_string()))
+    }
+
     /// Why evidence is incomplete so far, if it is: an inspection limit,
     /// frames that couldn't be read, or lspcheck's own side of the
     /// conversation. Any of these could explain a response that didn't come.
@@ -921,6 +933,41 @@ impl Session {
     }
 
     /// Waits for the server to exit on its own.
+    /// Waits for the server to exit by `deadline`, reading what it sends
+    /// meanwhile and answering its requests. A server may be blocked on a
+    /// request it sent just before reading `exit` (gopls waits for its
+    /// progress token after `initialized`), so waiting without answering
+    /// could keep it running through lspcheck's own doing.
+    pub async fn serve_until_exit(&mut self, deadline: Instant) -> Option<ExitStatus> {
+        loop {
+            if let Some(status) = self.exit {
+                return Some(status);
+            }
+            if self.stdout_closed {
+                return self.wait_exit(deadline).await;
+            }
+            // Both futures are cancel safe: whichever loses is dropped
+            // without losing a message or the exit status.
+            let event = tokio::select! {
+                biased;
+                status = self.child.wait() => Err(status),
+                inbound = self.rx.recv() => Ok(inbound),
+                _ = sleep_until(deadline) => return None,
+            };
+            match event {
+                Err(Ok(status)) => {
+                    self.exited(status);
+                    return Some(status);
+                }
+                Err(Err(_)) => return None,
+                Ok(None) => self.stdout_closed = true,
+                Ok(Some((at, inbound))) => {
+                    self.handle(at, inbound, deadline).await;
+                }
+            }
+        }
+    }
+
     pub async fn wait_exit(&mut self, deadline: Instant) -> Option<ExitStatus> {
         if let Some(status) = self.exit {
             return Some(status);

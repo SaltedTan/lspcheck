@@ -286,6 +286,7 @@ fn lawful_variations_fail_nothing() {
         "drop-first-request",
         "empty-selection",
         "reuse-answered-request-id",
+        "await-progress-answer",
     ] {
         let r = fault(name);
         // With no versioned publish for the opened document, D2 has nothing
@@ -768,6 +769,29 @@ fn replies_to_exit_and_out_of_range_ids_are_judged() {
     let r = fault("out-of-range-id");
     only_fails(&r, &["J5"]);
     assert!(r.stdout.contains("2147483648"), "{}", r.stdout);
+}
+
+#[test]
+fn a_server_waiting_on_its_own_request_after_exit_is_answered() {
+    // The stand-in reads `exit` but handles it only once its progress request
+    // is answered, as gopls does. lspcheck sends `exit` right after
+    // `initialized`, so it must answer while waiting for the exit.
+    let r = fault("await-progress-answer");
+    expect(&r, "L6", "pass");
+    expect(&r, "L7", "pass");
+}
+
+#[test]
+fn a_server_still_running_after_exit_is_inconclusive_when_frames_were_missed() {
+    // A frame lspcheck couldn't read may have been a request the server is
+    // still waiting on, so its not exiting can't be blamed on it.
+    let r = run(&["--fault", "ignore-exit", "--fault", "bad-bodies"], &[]);
+    expect(&r, "L6", "error");
+    expect(&r, "L7", "error");
+    assert!(r.stdout.contains("so it may be waiting on lspcheck"), "{}", r.stdout);
+    let r = fault("ignore-exit");
+    expect(&r, "L6", "fail");
+    expect(&r, "L7", "fail");
 }
 
 #[test]

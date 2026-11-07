@@ -681,10 +681,10 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
     if let Err(e) = ctx.s.notify("exit", None).await {
         return ctx.report("L6", Verdict::Error, format!("could not send exit: {e}"));
     }
-    match ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await {
+    match ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await {
         Some(status) if status.code() == Some(0) => ctx.pass("L6"),
         Some(status) => ctx.fail("L6", format!("exited with {}", session::describe_status(status))),
-        None => ctx.fail("L6", format!("still running {} s after exit", ctx.cfg.exit_timeout.as_secs())),
+        None => still_running(ctx, "L6"),
     }
 }
 
@@ -706,7 +706,7 @@ async fn json_rpc(ctx: &mut Ctx<'_>) {
     // Leave politely so the server isn't killed mid-thought.
     if ctx.s.call("shutdown", None, t).await.is_ok() {
         let _ = ctx.s.notify("exit", None).await;
-        let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+        let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
     }
 }
 
@@ -980,7 +980,7 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
     if init.is_ok() {
         let _ = ctx.s.call("shutdown", None, t).await;
         let _ = ctx.s.notify("exit", None).await;
-        let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+        let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
     }
 }
 
@@ -1069,7 +1069,7 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
         ),
     }
     if ctx.s.notify("exit", None).await.is_ok() {
-        let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+        let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
     }
 }
 
@@ -1382,7 +1382,7 @@ async fn leave(ctx: &mut Ctx<'_>) -> Duration {
     let shut = ctx.s.call("shutdown", None, ctx.cfg.request_timeout).await.is_ok();
     let end = ctx.s.elapsed();
     if shut && ctx.s.notify("exit", None).await.is_ok() {
-        let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+        let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
     }
     ctx.s.take_in();
     end
@@ -2121,6 +2121,23 @@ async fn end_of_input(ctx: &mut Ctx<'_>) {
     }
 }
 
+/// A server still running after `exit`, though lspcheck answered its requests
+/// while it waited. If lspcheck missed something the server sent, that may
+/// have been a request the server is still waiting on. An answer lspcheck
+/// couldn't write doesn't excuse it: a server waiting for an answer would be
+/// reading its input.
+fn still_running(ctx: &mut Ctx<'_>, id: &'static str) {
+    let waited = ctx.cfg.exit_timeout.as_secs();
+    match ctx.s.missed_output() {
+        Some(why) => ctx.report(
+            id,
+            Verdict::Error,
+            format!("inconclusive: still running {waited} s after exit, but {why}, so it may be waiting on lspcheck"),
+        ),
+        None => ctx.fail(id, format!("still running {waited} s after exit")),
+    }
+}
+
 /// exit without shutdown.
 async fn exit_without_shutdown(ctx: &mut Ctx<'_>) {
     match ctx.initialize().await {
@@ -2132,10 +2149,10 @@ async fn exit_without_shutdown(ctx: &mut Ctx<'_>) {
     if let Err(e) = ctx.s.notify("exit", None).await {
         return ctx.report("L7", Verdict::Error, format!("could not send exit: {e}"));
     }
-    match ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await {
+    match ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await {
         Some(status) if status.code() == Some(1) => ctx.pass("L7"),
         Some(status) => ctx.fail("L7", format!("exited with {}", session::describe_status(status))),
-        None => ctx.fail("L7", format!("still running {} s after exit", ctx.cfg.exit_timeout.as_secs())),
+        None => still_running(ctx, "L7"),
     }
 }
 
@@ -2414,7 +2431,7 @@ async fn framing(ctx: &mut Ctx<'_>) {
     // Leave politely so the server isn't killed mid-thought.
     if broken.is_none() && ctx.s.call("shutdown", None, t).await.is_ok() {
         let _ = ctx.s.notify("exit", None).await;
-        let _ = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+        let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
     }
 }
 

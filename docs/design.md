@@ -105,6 +105,13 @@ the server sent no requests or lspcheck sent none after completing an answer.
 | L8 | POLICY | End of stdin without `exit`, after `initialize`, ends the process within the exit deadline, with any status (prevents orphaned servers). |
 | L9 | POLICY | After exit no descendant remains. Profiles can allow named long-lived daemons. Where lspcheck can't see an escape through `setsid`/double fork (macOS), a pass says so in its detail. |
 
+While it waits for the process to exit after `exit`, lspcheck keeps reading and answers the server's requests: a
+server may read `exit` but handle it only once a request it sent just before is answered (gopls does this with the
+progress token it asks for after `initialized`), and lspcheck sends `exit` without pausing. A server still running at
+the deadline fails L6 or L7, unless lspcheck missed some of its output (a frame it skipped or couldn't read, or reading
+that stopped), which may have held a request the server is waiting on; then the check is `error`. An answer
+lspcheck couldn't write doesn't excuse it: a server waiting for an answer would be reading its input.
+
 ### Cancellation
 | ID | Basis | Check |
 |---|---|---|
