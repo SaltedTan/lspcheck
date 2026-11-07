@@ -91,8 +91,9 @@ distribution. On Linux or macOS:
 On Windows, download the `x86_64-pc-windows-msvc` ZIP archive, verify its SHA-256 digest against `SHA256SUMS`,
 then extract it and put `lspcheck.exe` on your `PATH`.
 
-Each archive also carries build provenance from the release workflow, which the GitHub CLI can check:
-`gh attestation verify lspcheck-$v-$target.tar.gz --repo SaltedTan/lspcheck`.
+Each archive also carries build provenance from the release workflow, which the GitHub CLI can check. Run this where
+you downloaded the archive, substituting your platform's archive name:
+`gh attestation verify lspcheck-0.1.0-x86_64-unknown-linux-musl.tar.gz --repo SaltedTan/lspcheck`.
 
 To build from source instead, with Rust 1.99 or later:
 
