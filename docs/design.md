@@ -17,8 +17,7 @@ lspcheck --json report.json --junit junit.xml --transcripts out/ -- ./my-server 
 lspcheck list                              # the check catalogue with spec references
 lspcheck replay out/L5.jsonl -- ./my-server   # re-run one failing session
 ```
-Exit status: 0 when no MUST check failed; 1 when one did; 2 for a usage or checker error. `--strict` also fails on
-SHOULD checks.
+See the [README](../README.md#exit-status) for exit statuses and `--strict`.
 
 ## Non-goals
 - Not a certification or "LSP compliant" badge. Each check states its basis, and the report lists what wasn't exercised.
@@ -391,7 +390,7 @@ Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, to
   passes the clean stand-in.** That guards against false greens.
 - Self-tests for the harness: partial frames, stderr floods, a server that stops reading stdin, a hung server, signals
   during spawn, cleanup after a crash.
-- Real servers in CI (pinned versions; results recorded as expected-results files, not required to all pass):
+- Planned real-server CI coverage (pinned versions; results recorded as expected-results files, not required to all pass):
   lua-language-server, gopls, basedpyright, rust-analyzer, and the virgil-lsp release archive.
 - Platforms: Linux and macOS required in CI; Windows built and tested, descendant checks there best effort at first.
 
