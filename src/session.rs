@@ -25,7 +25,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 
 /// Session settings.
 #[derive(Debug, Clone)]
@@ -330,6 +330,10 @@ impl Finish {
     /// and `to`, judged over the whole session (see [`Session::incomplete_within`]).
     pub fn incomplete_within(&self, from: Duration, to: Duration) -> Option<String> {
         incomplete_between(&self.lost, [self.stopped.as_ref(), self.own_limit.as_ref()], from, to)
+    }
+
+    pub fn missed_output_within(&self, from: Duration, to: Duration) -> Option<String> {
+        incomplete_between(&self.lost, [self.stopped.as_ref(), None], from, to)
     }
 }
 
@@ -920,7 +924,44 @@ impl Session {
         record(&self.transcript, self.start.elapsed(), EventKind::Exited(describe_status(status)));
     }
 
-    /// Waits for the server to exit on its own.
+    /// Waits for the server to exit by `deadline`, reading what it sends
+    /// meanwhile and answering its requests. A server may be blocked on a
+    /// request it sent just before reading `exit` (gopls waits for its
+    /// progress token after `initialized`), so waiting without answering
+    /// could keep it running through lspcheck's own doing.
+    pub async fn serve_until_exit(&mut self, deadline: Instant) -> Option<ExitStatus> {
+        loop {
+            if let Some(status) = self.exit {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            if self.stdout_closed {
+                return self.wait_exit(deadline).await;
+            }
+            // Both futures are cancel safe: whichever loses is dropped
+            // without losing a message or the exit status.
+            let event = tokio::select! {
+                biased;
+                status = self.child.wait() => Err(status),
+                _ = sleep_until(deadline) => return None,
+                inbound = self.rx.recv() => Ok(inbound),
+            };
+            match event {
+                Err(Ok(status)) => {
+                    self.exited(status);
+                    return Some(status);
+                }
+                Err(Err(_)) => return None,
+                Ok(None) => self.stdout_closed = true,
+                Ok(Some((at, inbound))) => {
+                    self.handle(at, inbound, deadline).await;
+                }
+            }
+        }
+    }
+
     pub async fn wait_exit(&mut self, deadline: Instant) -> Option<ExitStatus> {
         if let Some(status) = self.exit {
             return Some(status);
@@ -1352,6 +1393,21 @@ pub fn describe_status(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn exit_wait_does_not_consume_queued_input_after_its_deadline() {
+        let cmd = ServerCommand::new(&["sleep".into(), "30".into()]);
+        let mut s = Session::start(&cmd, Options::default()).await.unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        s.rx = rx;
+        let message = Message::classify(json!({"jsonrpc": "2.0", "method": "window/logMessage"}));
+        assert!(tx.send((s.elapsed(), Inbound::Message(message))).is_ok());
+        let got = s.serve_until_exit(Instant::now() - Duration::from_secs(1)).await;
+        assert!(got.is_none());
+        assert!(s.messages.is_empty());
+        s.finish(Duration::from_millis(200)).await;
+    }
 
     #[test]
     fn missed_evidence_counts_where_its_span_overlaps_the_wait() {

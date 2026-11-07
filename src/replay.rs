@@ -655,7 +655,7 @@ pub async fn replay(
         let _ = session.wait_response(&id, Instant::now() + timeout).await;
     }
     if plan.exit.is_some() {
-        let _ = session.wait_exit(Instant::now() + exit_timeout).await;
+        let _ = session.serve_until_exit(Instant::now() + exit_timeout).await;
     }
     let finish = session.finish(Duration::from_secs(1)).await;
 

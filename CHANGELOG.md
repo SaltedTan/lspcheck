@@ -62,3 +62,6 @@
   still arriving is checked again once the scenario's output has been read to the end, and becomes `ERROR` if that
   frame turned out to be cut short inside the window the check relied on.
 - `lspcheck-standin`, a test server with switchable faults.
+- Fixed false exit failures for servers waiting on a client answer, such as gopls, and for unreadable output
+  discovered during cleanup. Exit waits now respect their deadline even with queued output; see the
+  [lifecycle judging rules](docs/design.md#lifecycle).

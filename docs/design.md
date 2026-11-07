@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. Exit waits now follow the [lifecycle rules](#lifecycle).
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -104,6 +104,15 @@ the server sent no requests or lspcheck sent none after completing an answer.
 | L7 | SHOULD | `exit` without `shutdown` ends it with status 1. |
 | L8 | POLICY | End of stdin without `exit`, after `initialize`, ends the process within the exit deadline, with any status (prevents orphaned servers). |
 | L9 | POLICY | After exit no descendant remains. Profiles can allow named long-lived daemons. Where lspcheck can't see an escape through `setsid`/double fork (macOS), a pass says so in its detail. |
+
+While it waits for the process to exit after `exit`, lspcheck keeps reading and answers the server's requests: a
+server may read `exit` but handle it only once a request it sent just before is answered (gopls does this with the
+progress token it asks for after `initialized`), and lspcheck sends `exit` without pausing. A server still running at
+the deadline fails L6 or L7, unless lspcheck missed some of its output (a frame it skipped or couldn't read, or reading
+that stopped), which may have held a request the server is waiting on; then the check is `error`. An answer
+lspcheck couldn't write doesn't excuse it: a server waiting for an answer would be reading its input.
+The exit deadline takes priority over queued output. Timeout verdicts are checked again after cleanup, so a frame
+that began before the deadline but was only found truncated at the end of stdout also makes L6 or L7 `error`.
 
 ### Cancellation
 | ID | Basis | Check |

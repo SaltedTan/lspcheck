@@ -95,7 +95,8 @@ unknown notifications followed by probes to show that a notification gets no res
 loosely matches the request's (a number spelled as a string, or one that lost precision as a double) fails J1, and a
 duplicate, unasked or premature reply fails J2.
 
-lspcheck answers the server's own requests as it reads them. J7 checks for unanswered id reuse and continued service
+lspcheck answers the server's own requests as it reads them, including during
+[exit waits](docs/design.md#lifecycle). J7 checks for unanswered id reuse and continued service
 after those answers; the [design reference](docs/design.md#json-rpc-correlation) defines the judging rules and fixed
 answers. Configurable answers are planned for M3 profiles.
 
