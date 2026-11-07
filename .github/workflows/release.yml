@@ -1,6 +1,6 @@
 name: Release
 
-# A tag vX.Y.Z builds lspcheck for every supported platform, checks each
+# Pushing a tag vX.Y.Z builds lspcheck for every supported platform, checks each
 # binary against the stand-in on its own platform, and publishes the archives
 # with SHA-256 checksums and build provenance. Pull requests that change this
 # file, and manual runs, do everything except attest and publish.
@@ -34,12 +34,13 @@ jobs:
       - name: Read the version, and check a tag matches it
         id: version
         env:
+          EVENT: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
           TAG: ${{ github.ref_name }}
         run: |
           version=$(cargo metadata --locked --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "lspcheck") | .version')
-          if [ "$REF_TYPE" = tag ] && [ "$TAG" != "v$version" ]; then
+          if [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && [ "$TAG" != "v$version" ]; then
             echo "::error::tag $TAG doesn't match Cargo.toml's version $version"
             exit 1
           fi
@@ -145,11 +146,15 @@ jobs:
           test "$(wc -l < SHA256SUMS)" -eq 5
       - name: Take the release notes from the changelog
         env:
+          EVENT: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
         run: |
           # The section under "## X.Y.Z", up to the next "## " heading. A run
-          # that isn't for a tag tries the Unreleased section instead.
-          section="$VERSION"; [ "$REF_TYPE" = tag ] || section=Unreleased
+          # that isn't a tag push tries the Unreleased section instead.
+          section=Unreleased
+          if [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ]; then
+            section="$VERSION"
+          fi
           awk -v v="$section" '
             /^## / { if (found) exit; if ($2 == v) { found = 1; next } }
             found { print }
@@ -168,9 +173,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Only this job can write, and only for a tag.
+  # Only this job can write, and only for a tag push.
   publish:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [version, assemble]
     runs-on: ubuntu-24.04
     timeout-minutes: 15

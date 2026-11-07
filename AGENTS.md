@@ -74,8 +74,9 @@ Server authors will act on what lspcheck reports, so a wrong verdict is the wors
 
 `.github/workflows/release.yml` builds `lspcheck` for Linux (x86_64 and aarch64, static musl), macOS (x86_64 and
 arm64) and Windows (x86_64), each on a runner of its own platform, runs each binary against the stand-in, and on a
-tag publishes the archives with a `SHA256SUMS` file and build provenance. A pull request that changes the workflow, and
-a manual run, do everything but attest and publish. To release version X.Y.Z:
+tag push publishes the archives with a `SHA256SUMS` file and build provenance. A pull request that changes the workflow,
+and a manual run (including one targeting a tag), use *Unreleased* notes and do everything but attest and publish.
+To release version X.Y.Z:
 
 1. In a pull request, set `version` in `Cargo.toml` (and `Cargo.lock`), and rename the changelog's *Unreleased*
    heading to `## X.Y.Z (YYYY-MM-DD)`, with a fresh empty *Unreleased* above it. The release notes are that section.
