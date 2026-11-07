@@ -53,5 +53,9 @@
   now, and how many server-to-client requests were answered; it judges no check. Replay preserves stdin-close events,
   only skips complete server responses, and refuses to overwrite output files or workspace contents it does not own.
 - Inspection limits (`--max-output-mib`, `--max-frame-mib`) that make results inconclusive rather than failed, when the
-  missing output could explain them. Requests lspcheck couldn't deliver give errors, not failures.
+  missing output could explain them. Requests lspcheck couldn't deliver give errors, not failures. What lspcheck
+  missed is timed as a span, and excuses a missing reply only when it overlaps the time lspcheck spent waiting for it;
+  a frame complete before the request was sent excuses nothing. A `PASS` or `NOT EXERCISED` reached while a frame was
+  still arriving is checked again once the scenario's output has been read to the end, and becomes `ERROR` if that
+  frame turned out to be cut short inside the window the check relied on.
 - `lspcheck-standin`, a test server with switchable faults.

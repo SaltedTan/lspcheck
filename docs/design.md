@@ -119,6 +119,14 @@ server request it couldn't answer (the server may be waiting for it), or reading
 cancelled request until it is cancelled again, for C2 from its first cancel, and for C3 from the cancelled request,
 each until `exit`. A missing response is excused only by something missed while lspcheck was waiting for it.
 
+lspcheck times what it missed as spans, from the arrival of the first byte it couldn't inspect to the moment it knew
+it had missed them, so a frame that began before a wait and ended after it still counts for that wait. Some losses are
+found only later: a frame still arriving when a verdict is reached may turn out to be cut short when the stream ends.
+So every `PASS` and `NOT EXERCISED` that relied on nothing being missed in a window is checked again at the end of its
+scenario, once the server's output has been read to the end, and becomes `ERROR` if something missed falls in that
+window. A missing response is checked the same way and becomes `ERROR` rather than `FAIL`. A failure lspcheck saw
+directly is never replaced.
+
 ### Documents and positions (richer with a profile document)
 D1 to D6 are done.
 

@@ -451,6 +451,10 @@ fn verdicts_reached_before_a_frame_was_found_cut_short_are_inconclusive() {
             "{f}\n{}",
             r.stdout
         );
+        if f == "inflated-before-shutdown" {
+            // C1's window ended at the cancel, before the frame began.
+            expect(&r, "C1", "pass");
+        }
         expect(&r, "F1", "fail");
         for (id, v) in &r.verdicts {
             if id != "F1" {
