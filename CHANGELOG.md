@@ -62,7 +62,6 @@
   still arriving is checked again once the scenario's output has been read to the end, and becomes `ERROR` if that
   frame turned out to be cut short inside the window the check relied on.
 - `lspcheck-standin`, a test server with switchable faults.
-- lspcheck answers the server's requests while it waits for the process to exit, so a server that handles `exit` only
-  after a request it sent is answered (as gopls does) no longer fails L7 through lspcheck's doing. L6 and L7 are
-  errors, not failures, when lspcheck missed some of the server's output before the deadline, including frames only
-  found unfinished during cleanup. Queued output cannot extend an exit wait beyond its deadline.
+- Fixed false exit failures for servers waiting on a client answer, such as gopls, and for unreadable output
+  discovered during cleanup. Exit waits now respect their deadline even with queued output; see the
+  [lifecycle judging rules](docs/design.md#lifecycle).
