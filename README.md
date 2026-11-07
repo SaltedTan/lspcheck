@@ -75,14 +75,17 @@ against `SHA256SUMS`, and put `lspcheck` on your `PATH`. The Linux binaries are 
 distribution. On Linux or macOS:
 
 ```sh
-set -eu
-v=0.1.0 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, x86_64-apple-darwin,
-                                       # aarch64-apple-darwin
-base=https://github.com/SaltedTan/lspcheck/releases/download/v$v
-curl -fsSLO "$base/lspcheck-$v-$target.tar.gz" -O "$base/SHA256SUMS"
-sha256sum --check --ignore-missing SHA256SUMS   # on macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
-tar -xzf "lspcheck-$v-$target.tar.gz"
-"./lspcheck-$v-$target/lspcheck" --version
+# The subshell stops at the first failure, such as a checksum mismatch, without closing your shell.
+(
+  set -eu
+  v=0.1.0 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, x86_64-apple-darwin,
+                                             # aarch64-apple-darwin
+  base=https://github.com/SaltedTan/lspcheck/releases/download/v$v
+  curl -fsSLO "$base/lspcheck-$v-$target.tar.gz" -O "$base/SHA256SUMS"
+  sha256sum --check --ignore-missing SHA256SUMS   # on macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
+  tar -xzf "lspcheck-$v-$target.tar.gz"
+  "./lspcheck-$v-$target/lspcheck" --version
+)
 ```
 
 On Windows, download the `x86_64-pc-windows-msvc` ZIP archive, verify its SHA-256 digest against `SHA256SUMS`,
