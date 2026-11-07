@@ -75,6 +75,7 @@ against `SHA256SUMS`, and put `lspcheck` on your `PATH`. The Linux binaries are 
 distribution.
 
 ```sh
+set -eu
 v=0.1.0 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, x86_64-apple-darwin,
                                            # aarch64-apple-darwin, x86_64-pc-windows-msvc (.zip)
 base=https://github.com/SaltedTan/lspcheck/releases/download/v$v
@@ -103,7 +104,7 @@ versions, and the [changelog](CHANGELOG.md) says which. The exit status fails th
 - name: Check the language server with lspcheck
   env:
     LSPCHECK_VERSION: 0.1.0
-    LSPCHECK_SHA256: <the archive's line in SHA256SUMS>
+    LSPCHECK_SHA256: <the archive's 64-character SHA-256 digest from SHA256SUMS>
   run: |
     name=lspcheck-$LSPCHECK_VERSION-x86_64-unknown-linux-musl
     curl -fsSLO "https://github.com/SaltedTan/lspcheck/releases/download/v$LSPCHECK_VERSION/$name.tar.gz"
