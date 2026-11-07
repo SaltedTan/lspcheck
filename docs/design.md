@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: the release workflow is done (tagged builds for five platforms, each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance); the v0.1.0 release, profiles, K1, R*, JUnit/Markdown output and the stock-server CI matrix are still planned.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; profiles, K1, R*, JUnit/Markdown output and the stock-server CI matrix are still planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -17,8 +17,7 @@ lspcheck --json report.json --junit junit.xml --transcripts out/ -- ./my-server 
 lspcheck list                              # the check catalogue with spec references
 lspcheck replay out/L5.jsonl -- ./my-server   # re-run one failing session
 ```
-Exit status: 0 when no MUST check failed; 1 when one did; 2 for a usage or checker error. `--strict` also fails on
-SHOULD checks.
+See the [README](../README.md#exit-status) for exit statuses and `--strict`.
 
 ## Non-goals
 - Not a certification or "LSP compliant" badge. Each check states its basis, and the report lists what wasn't exercised.
@@ -391,7 +390,7 @@ Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, to
   passes the clean stand-in.** That guards against false greens.
 - Self-tests for the harness: partial frames, stderr floods, a server that stops reading stdin, a hung server, signals
   during spawn, cleanup after a crash.
-- Real servers in CI (pinned versions; results recorded as expected-results files, not required to all pass):
+- Planned real-server CI coverage (pinned versions; results recorded as expected-results files, not required to all pass):
   lua-language-server, gopls, basedpyright, rust-analyzer, and the virgil-lsp release archive.
 - Platforms: Linux and macOS required in CI; Windows built and tested, descendant checks there best effort at first.
 

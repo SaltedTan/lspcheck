@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-- First checks:
+## 0.1.0 (2026-11-08)
+
+The first release: 33 checks of framing, JSON-RPC correlation, the lifecycle, cancellation and document positions,
+for any language server that talks over stdio. Prebuilt binaries are attached for Linux (x86_64 and aarch64, static),
+macOS (x86_64 and arm64) and Windows (x86_64), with SHA-256 checksums and build provenance.
+
+- Checks:
   - F1, stdout framing, F2, Content-Length counted in bytes, and F8, the declared charset;
   - F3 to F7, how the server reads its input: split writes, coalesced frames, multibyte text, and the client's
     `Content-Type` header in both charset spellings;
@@ -46,7 +52,7 @@
     character to its line's length in the negotiated encoding. A range on a line the text doesn't have isn't judged,
     and a malformed entry is a type error for a later check. A server that advertises no `selectionRangeProvider`
     leaves D6 skipped; one that answers with only `null`, errors, or no reply leaves it not exercised.
-- The text model behind the upcoming document checks (`src/text.rs`): the spec's line split, the UTF-8/UTF-16/UTF-32
+- The text model behind the document checks (`src/text.rs`): the spec's line split, the UTF-8/UTF-16/UTF-32
   position encodings, the character-boundary test, applying content changes, and the table of the positions a reply
   refers to.
 - Terminal, JSON (`lspcheck-report-v1`) and JSON Lines transcript output. Each transcript opens with a meta line
@@ -65,6 +71,8 @@
 - A release workflow: a `vX.Y.Z` tag publishes `lspcheck` for Linux (x86_64 and aarch64, static), macOS (x86_64 and
   arm64) and Windows (x86_64), each checked against the stand-in on its own platform, with SHA-256 checksums
   (`SHA256SUMS`) and build provenance that `gh attestation verify` can check.
-- Fixed false exit failures for servers waiting on a client answer, such as gopls, and for unreadable output
-  discovered during cleanup. Exit waits now respect their deadline even with queued output; see the
-  [lifecycle judging rules](docs/design.md#lifecycle).
+- lspcheck answers the server's requests while it waits for the server to exit, since a server may handle `exit` only
+  once a request it sent is answered (gopls does). L6 and L7 are errors, not failures, when output lspcheck missed
+  before the deadline could have held such a request; see the [lifecycle judging rules](docs/design.md#lifecycle).
+- Checked against gopls, rust-analyzer, lua-language-server and basedpyright before release: every failure lspcheck
+  reports for them was confirmed in the server's own behaviour.

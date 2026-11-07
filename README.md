@@ -70,10 +70,54 @@ and doesn't test editors or clients. Every result says which rule it checks and 
 
 ## Install
 
-Until the first release, build it from source with Rust 1.99 or later:
+Download the archive for your platform from the [releases](https://github.com/SaltedTan/lspcheck/releases), check it
+against `SHA256SUMS`, and put `lspcheck` on your `PATH`. The Linux binaries are static, so they run on any
+distribution. On Linux or macOS:
 
 ```sh
-cargo install --locked --git https://github.com/SaltedTan/lspcheck
+# The subshell stops at the first failure, such as a checksum mismatch, without closing your shell.
+(
+  set -eu
+  v=0.1.0 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, x86_64-apple-darwin,
+                                             # aarch64-apple-darwin
+  base=https://github.com/SaltedTan/lspcheck/releases/download/v$v
+  curl -fsSLO "$base/lspcheck-$v-$target.tar.gz" -O "$base/SHA256SUMS"
+  sha256sum --check --ignore-missing SHA256SUMS   # on macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
+  tar -xzf "lspcheck-$v-$target.tar.gz"
+  "./lspcheck-$v-$target/lspcheck" --version
+)
+```
+
+On Windows, download the `x86_64-pc-windows-msvc` ZIP archive, verify its SHA-256 digest against `SHA256SUMS`,
+then extract it and put `lspcheck.exe` on your `PATH`.
+
+Each archive also carries build provenance from the release workflow, which the GitHub CLI can check. Run this where
+you downloaded the archive, substituting your platform's archive name:
+`gh attestation verify lspcheck-0.1.0-x86_64-unknown-linux-musl.tar.gz --repo SaltedTan/lspcheck`.
+
+To build from source instead, with Rust 1.99 or later:
+
+```sh
+cargo install --locked --git https://github.com/SaltedTan/lspcheck --tag v0.1.0
+```
+
+### In CI
+
+Pin a version and its checksum, so the check only changes when you upgrade it. Checks are added and refined between
+versions, and the [changelog](CHANGELOG.md) says which. The exit status fails the job when a `MUST` check fails
+(`--strict` also fails it on `SHOULD` and `POLICY` failures), and `--json` and `--transcripts` keep the evidence:
+
+```yaml
+- name: Check the language server with lspcheck
+  env:
+    LSPCHECK_VERSION: 0.1.0
+    LSPCHECK_SHA256: <the archive's 64-character SHA-256 digest from SHA256SUMS>
+  run: |
+    name=lspcheck-$LSPCHECK_VERSION-x86_64-unknown-linux-musl
+    curl -fsSLO "https://github.com/SaltedTan/lspcheck/releases/download/v$LSPCHECK_VERSION/$name.tar.gz"
+    echo "$LSPCHECK_SHA256  $name.tar.gz" | sha256sum --check
+    tar -xzf "$name.tar.gz"
+    "$name/lspcheck" --json lspcheck.json --transcripts lspcheck-transcripts -- ./build/my-server --stdio
 ```
 
 ## Use
