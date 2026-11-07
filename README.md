@@ -99,9 +99,9 @@ duplicate, unasked or premature reply fails J2.
 lspcheck answers the server's own requests as it reads them: `workspace/configuration` with a `null` per item,
 `workspace/workspaceFolders` with the workspace, `workspace/applyEdit` and `window/showDocument` as not done, the
 registration, progress and refresh requests with `null`, and anything else with MethodNotFound. A server request that
-reuses the id of an earlier one lspcheck hadn't begun to answer fails J7, since the two answers couldn't be told apart;
-reusing an id once its answer has been written is lawful. J7 passes when the server is also seen answering a request
-lspcheck sent after one of its answers.
+reuses the id of an earlier one lspcheck hadn't begun to answer, or never answered in full, fails J7, since the two
+answers couldn't be told apart; reusing an id once its answer has been written is lawful. J7 passes when the server
+is also seen answering a request lspcheck sent after one of its answers.
 
 The checks on how the server reads its input (F3 to F7) send small requests the server doesn't know, which every server
 must answer, written in different ways: split across many writes, several frames in one write, with a `Content-Type`

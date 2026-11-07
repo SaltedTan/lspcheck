@@ -21,6 +21,7 @@ use crate::transcript;
 use crate::transport;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -2750,16 +2751,24 @@ fn judge_j5(runs: &[ScenarioRun]) -> CheckResult {
 
 /// The first time the server reused the id of one of its own requests while
 /// that request was still unanswered: before lspcheck began writing its
-/// answer, or when lspcheck never answered it. Only then is the reuse seen:
-/// once an answer has begun, the server may have read it before reusing the
-/// id, which JSON-RPC allows.
+/// answer, or when lspcheck never answered it in full. For a completed answer,
+/// the server may have read it any time after writing began, before reusing
+/// the id, which JSON-RPC allows.
 fn reused_server_id(requests: &[ServerRequest]) -> Option<(&ServerRequest, &ServerRequest)> {
-    requests.iter().enumerate().find_map(|(i, later)| {
-        requests[..i]
-            .iter()
-            .find(|earlier| earlier.id == later.id && earlier.answer_began.is_none_or(|began| later.at < began))
-            .map(|earlier| (earlier, later))
-    })
+    let mut by_id: HashMap<&Id, (Option<&ServerRequest>, Option<&ServerRequest>)> = HashMap::new();
+    for later in requests {
+        let (unanswered, latest) = by_id.entry(&later.id).or_default();
+        if let Some(earlier) = unanswered.or(latest.filter(|r| r.answer_began.is_none_or(|began| later.at < began))) {
+            return Some((earlier, later));
+        }
+        if later.answered_at.is_none() {
+            *unanswered = Some(later);
+        }
+        if latest.is_none_or(|r| r.answer_began < later.answer_began) {
+            *latest = Some(later);
+        }
+    }
+    None
 }
 
 /// How the server went on after lspcheck answered one of its requests:
@@ -2776,9 +2785,9 @@ fn judge_j7(runs: &[ScenarioRun]) -> CheckResult {
     let failures = observed(runs)
         .filter_map(|(name, o)| {
             let (earlier, later) = reused_server_id(&o.server_requests)?;
-            let when = match earlier.answer_began {
+            let when = match earlier.answered_at {
                 Some(_) => "before lspcheck had begun answering it",
-                None => "which lspcheck never answered",
+                None => "which lspcheck never answered in full",
             };
             Some(format!(
                 "in {name} at {} ms: the server's {} request reused id {} of its {} request read at {} ms, {when}",
@@ -3094,7 +3103,7 @@ mod tests {
     }
 
     #[test]
-    fn j7_fails_only_on_an_id_reused_before_its_answer_began() {
+    fn j7_fails_on_reuse_before_an_answer_begins_or_after_an_incomplete_answer() {
         // Read before the first answer began: the server couldn't have had it.
         let r = judge_j7(&j7_run(vec![server_request(10, "1", Some(20)), server_request(15, "1", Some(25))], true));
         assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
@@ -3102,12 +3111,50 @@ mod tests {
         let r = judge_j7(&j7_run(vec![server_request(10, "1", None), server_request(30, "1", None)], true));
         assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
         assert!(r.detail.contains("never answered"), "{}", r.detail);
+        let mut incomplete = server_request(10, "1", Some(20));
+        incomplete.answered_at = None;
+        let r = judge_j7(&j7_run(vec![incomplete, server_request(30, "1", Some(35))], true));
+        assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
+        assert!(r.detail.contains("never answered in full"), "{}", r.detail);
         // Read after the answer began: the server may have read it first.
         let r = judge_j7(&j7_run(vec![server_request(10, "1", Some(20)), server_request(20, "1", Some(25))], true));
         assert_eq!(r.verdict, Verdict::Pass, "{}", r.detail);
         // Different ids at the same time are fine.
         let r = judge_j7(&j7_run(vec![server_request(10, "1", Some(20)), server_request(10, "2", Some(25))], true));
         assert_eq!(r.verdict, Verdict::Pass, "{}", r.detail);
+    }
+
+    #[test]
+    fn j7_reuse_matches_exact_id_values_in_read_order() {
+        let mut requests = vec![
+            server_request(10, "1", Some(20)),
+            server_request(30, "1", Some(40)),
+            server_request(35, "2", None),
+            server_request(36, "1", Some(50)),
+            server_request(37, "2", None),
+        ];
+        let (earlier, later) = reused_server_id(&requests).unwrap();
+        assert!(std::ptr::eq(earlier, &requests[1]));
+        assert!(std::ptr::eq(later, &requests[3]));
+
+        requests[0].id = Id::int(1);
+        requests[1].id = Id::Str("1".into());
+        assert!(reused_server_id(&requests[..2]).is_none());
+        requests[0].answered_at = None;
+        requests[1].id = Id::from_value(&serde_json::from_str::<Value>("1.0").unwrap());
+        let (earlier, later) = reused_server_id(&requests[..2]).unwrap();
+        assert!(std::ptr::eq(earlier, &requests[0]));
+        assert!(std::ptr::eq(later, &requests[1]));
+    }
+
+    #[test]
+    fn j7_handles_a_large_burst_of_distinct_request_ids() {
+        let mut requests: Vec<_> = (0..100_000).map(|i| server_request(i, &i.to_string(), None)).collect();
+        assert!(reused_server_id(&requests).is_none());
+        requests.push(server_request(100_000, "99999", None));
+        let (earlier, later) = reused_server_id(&requests).unwrap();
+        assert!(std::ptr::eq(earlier, &requests[99_999]));
+        assert!(std::ptr::eq(later, &requests[100_000]));
     }
 
     #[test]

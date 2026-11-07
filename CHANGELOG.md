@@ -9,8 +9,9 @@
   - J4, MethodNotFound for unknown requests;
   - J1 to J3, J5 and J6, JSON-RPC correlation: ids preserved, one response per request, none to a notification,
     well-formed envelopes, and concurrent requests with numeric and string ids;
-  - J7, the server's own requests: one that reuses the id of an earlier request lspcheck hadn't begun to answer fails,
-    and the server must be seen answering lspcheck's requests after lspcheck answers one of its own. The stand-in now
+  - J7, the server's own requests: one that reuses the id of an earlier request lspcheck hadn't begun to answer, or
+    never answered in full, fails, and the server must be seen answering lspcheck's requests after lspcheck answers one
+    of its own. The stand-in now
     asks for a progress token after `initialized`, as many servers do;
   - L1 to L8, the initialize, shutdown and exit lifecycle, including a second initialize, requests after shutdown,
     and the end of input without exit;
