@@ -96,7 +96,8 @@ loosely matches the request's (a number spelled as a string, or one that lost pr
 duplicate, unasked or premature reply fails J2.
 
 lspcheck answers the server's own requests as it reads them, including while it waits for the server to exit, since a
-server may handle `exit` only once a request it sent just before is answered. J7 checks for unanswered id reuse and continued service
+server may handle `exit` only once a request it sent just before is answered. Exit timeouts account for unreadable
+output found during cleanup, including unfinished frames that may hide requests. J7 checks for unanswered id reuse and continued service
 after those answers; the [design reference](docs/design.md#json-rpc-correlation) defines the judging rules and fixed
 answers. Configurable answers are planned for M3 profiles.
 

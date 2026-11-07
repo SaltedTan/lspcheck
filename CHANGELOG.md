@@ -64,4 +64,5 @@
 - `lspcheck-standin`, a test server with switchable faults.
 - lspcheck answers the server's requests while it waits for the process to exit, so a server that handles `exit` only
   after a request it sent is answered (as gopls does) no longer fails L7 through lspcheck's doing. L6 and L7 are
-  errors, not failures, when lspcheck missed some of the server's output before the deadline.
+  errors, not failures, when lspcheck missed some of the server's output before the deadline, including frames only
+  found unfinished during cleanup. Queued output cannot extend an exit wait beyond its deadline.

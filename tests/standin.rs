@@ -795,6 +795,14 @@ fn a_server_still_running_after_exit_is_inconclusive_when_frames_were_missed() {
 }
 
 #[test]
+fn unfinished_output_makes_exit_timeouts_inconclusive_after_cleanup() {
+    let r = run(&["--fault", "inflated-on-exit"], &["--only", "L6,L7"]);
+    expect(&r, "L6", "error");
+    expect(&r, "L7", "error");
+    assert!(r.stdout.contains("so it may be waiting on lspcheck"), "{}", r.stdout);
+}
+
+#[test]
 fn a_server_request_reusing_an_unanswered_id_fails_j7() {
     // Both requests arrive in one write, before lspcheck has begun answering
     // the first, so the server can't have had its answer.

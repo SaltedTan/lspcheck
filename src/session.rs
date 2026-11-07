@@ -331,6 +331,10 @@ impl Finish {
     pub fn incomplete_within(&self, from: Duration, to: Duration) -> Option<String> {
         incomplete_between(&self.lost, [self.stopped.as_ref(), self.own_limit.as_ref()], from, to)
     }
+
+    pub fn missed_output_within(&self, from: Duration, to: Duration) -> Option<String> {
+        incomplete_between(&self.lost, [self.stopped.as_ref(), None], from, to)
+    }
 }
 
 type Transcript = Arc<Mutex<Vec<Event>>>;
@@ -497,18 +501,6 @@ impl Session {
     /// Records the workspace and the files in it, for [`crate::replay`].
     pub fn record_workspace(&self, path: PathBuf, files: Vec<(String, String)>) {
         record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files });
-    }
-
-    /// Why lspcheck may have missed something the server sent so far: an
-    /// inspection limit, or frames that couldn't be read. Unlike
-    /// [`Session::incomplete`], lspcheck's own failures to write aren't counted.
-    pub fn missed_output(&self) -> Option<String> {
-        let ev = self.evidence.lock().expect("evidence lock");
-        let unread = ev.problems.iter().any(|(_, p)| !matches!(p, Problem::Garbage(_)));
-        ev.limit
-            .as_ref()
-            .map(|(_, why)| why.clone())
-            .or_else(|| unread.then(|| "some of the server's frames couldn't be read (see F1)".to_string()))
     }
 
     /// Why evidence is incomplete so far, if it is: an inspection limit,
@@ -932,7 +924,6 @@ impl Session {
         record(&self.transcript, self.start.elapsed(), EventKind::Exited(describe_status(status)));
     }
 
-    /// Waits for the server to exit on its own.
     /// Waits for the server to exit by `deadline`, reading what it sends
     /// meanwhile and answering its requests. A server may be blocked on a
     /// request it sent just before reading `exit` (gopls waits for its
@@ -943,6 +934,9 @@ impl Session {
             if let Some(status) = self.exit {
                 return Some(status);
             }
+            if Instant::now() >= deadline {
+                return None;
+            }
             if self.stdout_closed {
                 return self.wait_exit(deadline).await;
             }
@@ -951,8 +945,8 @@ impl Session {
             let event = tokio::select! {
                 biased;
                 status = self.child.wait() => Err(status),
-                inbound = self.rx.recv() => Ok(inbound),
                 _ = sleep_until(deadline) => return None,
+                inbound = self.rx.recv() => Ok(inbound),
             };
             match event {
                 Err(Ok(status)) => {
@@ -1399,6 +1393,21 @@ pub fn describe_status(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn exit_wait_does_not_consume_queued_input_after_its_deadline() {
+        let cmd = ServerCommand::new(&["sleep".into(), "30".into()]);
+        let mut s = Session::start(&cmd, Options::default()).await.unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        s.rx = rx;
+        let message = Message::classify(json!({"jsonrpc": "2.0", "method": "window/logMessage"}));
+        assert!(tx.send((s.elapsed(), Inbound::Message(message))).is_ok());
+        let got = s.serve_until_exit(Instant::now() - Duration::from_secs(1)).await;
+        assert!(got.is_none());
+        assert!(s.messages.is_empty());
+        s.finish(Duration::from_millis(200)).await;
+    }
 
     #[test]
     fn missed_evidence_counts_where_its_span_overlaps_the_wait() {

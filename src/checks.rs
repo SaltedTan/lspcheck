@@ -227,6 +227,7 @@ pub struct CheckResult {
 pub struct Recheck {
     pub from: Duration,
     pub to: Duration,
+    pub output_only: bool,
     pub verdict: Verdict,
     pub detail: String,
 }
@@ -421,7 +422,12 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
     // in its window, judged again now that everything read is known.
     for r in &mut results {
         let Some(again) = r.unless_missed.take() else { continue };
-        if let Some(why) = finish.incomplete_within(again.from, again.to) {
+        let missed = if again.output_only {
+            finish.missed_output_within(again.from, again.to)
+        } else {
+            finish.incomplete_within(again.from, again.to)
+        };
+        if let Some(why) = missed {
             r.verdict = again.verdict;
             r.detail = again.detail.replace(MISSED, &why);
         }
@@ -524,7 +530,7 @@ impl Ctx<'_> {
     fn unless_missed(&mut self, from: Duration, to: Duration, verdict: Verdict, detail: impl Into<String>) {
         let r = self.results.last_mut().expect("just reported");
         if r.verdict != verdict {
-            r.unless_missed = Some(Recheck { from, to, verdict, detail: detail.into() });
+            r.unless_missed = Some(Recheck { from, to, output_only: false, verdict, detail: detail.into() });
         }
     }
 
@@ -2128,14 +2134,18 @@ async fn end_of_input(ctx: &mut Ctx<'_>) {
 /// reading its input.
 fn still_running(ctx: &mut Ctx<'_>, id: &'static str) {
     let waited = ctx.cfg.exit_timeout.as_secs();
-    match ctx.s.missed_output() {
-        Some(why) => ctx.report(
-            id,
-            Verdict::Error,
-            format!("inconclusive: still running {waited} s after exit, but {why}, so it may be waiting on lspcheck"),
+    let to = ctx.s.elapsed();
+    ctx.fail(id, format!("still running {waited} s after exit"));
+    let r = ctx.results.last_mut().expect("just reported");
+    r.unless_missed = Some(Recheck {
+        from: Duration::ZERO,
+        to,
+        output_only: true,
+        verdict: Verdict::Error,
+        detail: format!(
+            "inconclusive: still running {waited} s after exit, but {MISSED}, so it may be waiting on lspcheck"
         ),
-        None => ctx.fail(id, format!("still running {waited} s after exit")),
-    }
+    });
 }
 
 /// exit without shutdown.

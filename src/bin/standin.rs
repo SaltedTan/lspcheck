@@ -107,6 +107,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("exit-flood-bad-envelope", "on exit, write 200,000 log messages and then one without \"jsonrpc\""),
     ("exit-status", "exit with status 3 on exit"),
     ("ignore-exit", "ignore exit and stay running"),
+    ("inflated-on-exit", "on exit, start an inflated frame containing a progress request and stay running"),
     ("split-header", "drop input when a read ends inside a header section, as if each header came in one read"),
     ("split-utf8", "decode each read as UTF-8 on its own, mangling characters split across reads"),
     ("first-frame-per-read", "keep only the first frame of a read that holds $/setTrace and two more"),
@@ -595,6 +596,17 @@ fn main() {
                 out.frame(
                     &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32002, "message": "not initialized"}}),
                 );
+            }
+            if method == "exit" && fault("inflated-on-exit") {
+                out.raw(b"Content-Length: 2097152\r\n\r\n");
+                out.raw(
+                    &serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0", "id": "exit-progress", "method": "window/workDoneProgress/create",
+                        "params": {"token": "exit"}
+                    }))
+                    .unwrap(),
+                );
+                continue;
             }
             if method == "exit" && !fault("ignore-exit") {
                 if fault("replay-gate") && replay_gate_id.is_some() {
