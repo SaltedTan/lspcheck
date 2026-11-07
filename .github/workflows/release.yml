@@ -155,13 +155,20 @@ jobs:
           if [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ]; then
             section="$VERSION"
           fi
-          awk -v v="$section" '
+          if ! awk -v v="$section" '
             /^## / { if (found) exit; if ($2 == v) { found = 1; next } }
             found { print }
-          ' CHANGELOG.md > notes.md
-          if ! grep -q '[^[:space:]]' notes.md; then
+            END { exit !found }
+          ' CHANGELOG.md > notes.md; then
             echo "::error::CHANGELOG.md has no section for $section"
             exit 1
+          fi
+          if ! grep -q '[^[:space:]]' notes.md; then
+            if [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ]; then
+              echo "::error::CHANGELOG.md has an empty section for $section"
+              exit 1
+            fi
+            echo "No unreleased changes." > notes.md
           fi
           cat notes.md
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
