@@ -13,12 +13,15 @@
 use crate::documents::{self, Change, OpenDoc, Published, Source, SyncKind, Version};
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
-use crate::session::{self, CallError, Finish, Options, Problem, Recv, Session, Unmatched, WaitError, WriteError};
+use crate::session::{
+    self, CallError, Finish, Options, Problem, Recv, ServerRequest, Session, Unmatched, WaitError, WriteError,
+};
 use crate::text::{self, ContentChange, Encoding, Position};
 use crate::transcript;
 use crate::transport;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -103,6 +106,13 @@ pub const CATALOGUE: &[CheckInfo] = &[
     ),
     check!("J6", JsonRpc, Must, "Concurrent requests are each answered with the right id", "requestMessage"),
     check!(
+        "J7",
+        JsonRpc,
+        Must,
+        "The server's own requests don't reuse an unanswered id, and it keeps serving after they are answered",
+        "requestMessage"
+    ),
+    check!(
         "L1",
         Lifecycle,
         Should,
@@ -153,7 +163,7 @@ pub const CATALOGUE: &[CheckInfo] = &[
 ];
 
 /// Checks judged from every scenario's observations.
-pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "J1", "J2", "J3", "J5", "L9"];
+pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "J1", "J2", "J3", "J5", "J7", "L9"];
 
 pub fn info(id: &str) -> &'static CheckInfo {
     CATALOGUE.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("unknown check {id}"))
@@ -268,6 +278,10 @@ pub struct Observations {
     pub unmatched: Vec<Unmatched>,
     /// Requests that were answered, with when their response was read.
     pub answered: Vec<(Duration, Id)>,
+    /// Requests lspcheck sent whole, with when each was registered.
+    pub sent: Vec<(Duration, Id)>,
+    /// The server's requests, in the order they were read.
+    pub server_requests: Vec<ServerRequest>,
 }
 
 /// One scenario's verdicts and observations.
@@ -318,6 +332,7 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
         unless_unreadable(&runs, judge_j2(&runs)),
         judge_j3(&runs),
         unless_unreadable(&runs, judge_j5(&runs)),
+        unless_unreadable(&runs, judge_j7(&runs)),
         judge_l9(&runs),
     ]
     .into_iter()
@@ -443,6 +458,8 @@ fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observatio
         j3_exercise,
         unmatched: f.unmatched,
         answered: f.answered,
+        sent: f.sent,
+        server_requests: f.server_requests,
     }
 }
 
@@ -2732,6 +2749,113 @@ fn judge_j5(runs: &[ScenarioRun]) -> CheckResult {
     r
 }
 
+/// The first time the server reused the id of one of its own requests while
+/// that request was still unanswered: before lspcheck began writing its
+/// answer, or when lspcheck never answered it in full. For a completed answer,
+/// the server may have read it any time after writing began, before reusing
+/// the id, which JSON-RPC allows.
+fn reused_server_id(requests: &[ServerRequest]) -> Option<(&ServerRequest, &ServerRequest)> {
+    let mut by_id: HashMap<&Id, (Option<&ServerRequest>, Option<&ServerRequest>)> = HashMap::new();
+    for later in requests {
+        let (unanswered, latest) = by_id.entry(&later.id).or_default();
+        if let Some(earlier) = unanswered.or(latest.filter(|r| r.answer_began.is_none_or(|began| later.at < began))) {
+            return Some((earlier, later));
+        }
+        if later.answered_at.is_none() {
+            *unanswered = Some(later);
+        }
+        if latest.is_none_or(|r| r.answer_began < later.answer_began) {
+            *latest = Some(later);
+        }
+    }
+    None
+}
+
+/// How the server went on after lspcheck answered one of its requests:
+/// `Some(true)` when it answered a request lspcheck sent after the answer,
+/// `Some(false)` when lspcheck sent requests after it and none was answered,
+/// `None` when lspcheck sent none.
+fn served_after(o: &Observations, answered_at: Duration) -> Option<bool> {
+    let mut later = o.sent.iter().filter(|(sent, _)| *sent >= answered_at).peekable();
+    later.peek()?;
+    Some(later.any(|(_, id)| o.answered.iter().any(|(_, a)| a == id)))
+}
+
+fn judge_j7(runs: &[ScenarioRun]) -> CheckResult {
+    let failures = observed(runs)
+        .filter_map(|(name, o)| {
+            let (earlier, later) = reused_server_id(&o.server_requests)?;
+            let when = match earlier.answered_at {
+                Some(_) => "before lspcheck had begun answering it",
+                None => "which lspcheck never answered in full",
+            };
+            Some(format!(
+                "in {name} at {} ms: the server's {} request reused id {} of its {} request read at {} ms, {when}",
+                later.at.as_millis(),
+                later.method,
+                later.id,
+                earlier.method,
+                earlier.at.as_millis(),
+            ))
+        })
+        .collect();
+    let r = cross("J7", runs, failures, "", true);
+    if r.verdict != Verdict::Pass {
+        return r;
+    }
+    let total: usize = observed(runs).map(|(_, o)| o.server_requests.len()).sum();
+    if total == 0 {
+        return result("all", "J7", Verdict::NotExercised, "the server sent lspcheck no requests");
+    }
+    // The server going quiet after an answer can't be pinned on the answer:
+    // something else lspcheck sent may have stopped it. Only an answer the
+    // server is seen to have gone on from counts, as a pass.
+    let (mut served, mut silent) = (0, None);
+    for (name, o) in observed(runs) {
+        for r in &o.server_requests {
+            match r.answered_at.and_then(|at| served_after(o, at)) {
+                Some(true) => served += 1,
+                Some(false) => {
+                    silent.get_or_insert((name, r));
+                }
+                None => {}
+            }
+        }
+    }
+    match (served, silent) {
+        (0, Some((name, r))) => result(
+            "all",
+            "J7",
+            Verdict::Error,
+            format!(
+                "inconclusive: in {name}, after lspcheck answered the server's {} request (read at {} ms), the \
+                 server answered none of lspcheck's later requests (see the checks that sent them), and no other \
+                 answer was followed by one it answered",
+                r.method,
+                r.at.as_millis()
+            ),
+        ),
+        (0, None) => result(
+            "all",
+            "J7",
+            Verdict::NotExercised,
+            format!(
+                "the server sent {total} request(s), but lspcheck sent no request of its own after answering one, \
+                 so whether the server keeps serving after an answer wasn't seen"
+            ),
+        ),
+        (served, _) => result(
+            "all",
+            "J7",
+            Verdict::Pass,
+            format!(
+                "{total} server request(s), no unanswered id reused; the server answered lspcheck's later requests \
+                 after {served} of lspcheck's answers"
+            ),
+        ),
+    }
+}
+
 fn judge_l9(runs: &[ScenarioRun]) -> CheckResult {
     let all = observed(runs).collect::<Vec<_>>();
     if all.iter().any(|(_, o)| o.coverage == Coverage::None) {
@@ -2948,9 +3072,104 @@ mod tests {
                 j3_exercise: None,
                 unmatched: Vec::new(),
                 answered: Vec::new(),
+                sent: Vec::new(),
+                server_requests: Vec::new(),
             }),
             transcript: None,
         }
+    }
+
+    fn server_request(at: u64, id: &str, began: Option<u64>) -> ServerRequest {
+        ServerRequest {
+            at: Duration::from_millis(at),
+            id: Id::Str(id.into()),
+            method: "window/workDoneProgress/create".into(),
+            answer_began: began.map(Duration::from_millis),
+            answered_at: began.map(|b| Duration::from_millis(b + 1)),
+        }
+    }
+
+    /// A run in which the server sent `requests`, and lspcheck sent request
+    /// "a" at 50 ms, answered when `answered`.
+    fn j7_run(requests: Vec<ServerRequest>, answered: bool) -> [ScenarioRun; 1] {
+        let mut run = observed_run("lifecycle", vec![], None);
+        let o = run.observed.as_mut().unwrap();
+        o.server_requests = requests;
+        o.sent = vec![(Duration::from_millis(50), Id::Str("a".into()))];
+        if answered {
+            o.answered = vec![(Duration::from_millis(60), Id::Str("a".into()))];
+        }
+        [run]
+    }
+
+    #[test]
+    fn j7_fails_on_reuse_before_an_answer_begins_or_after_an_incomplete_answer() {
+        // Read before the first answer began: the server couldn't have had it.
+        let r = judge_j7(&j7_run(vec![server_request(10, "1", Some(20)), server_request(15, "1", Some(25))], true));
+        assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
+        // Never answered: still outstanding.
+        let r = judge_j7(&j7_run(vec![server_request(10, "1", None), server_request(30, "1", None)], true));
+        assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
+        assert!(r.detail.contains("never answered"), "{}", r.detail);
+        let mut incomplete = server_request(10, "1", Some(20));
+        incomplete.answered_at = None;
+        let r = judge_j7(&j7_run(vec![incomplete, server_request(30, "1", Some(35))], true));
+        assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
+        assert!(r.detail.contains("never answered in full"), "{}", r.detail);
+        // Read after the answer began: the server may have read it first.
+        let r = judge_j7(&j7_run(vec![server_request(10, "1", Some(20)), server_request(20, "1", Some(25))], true));
+        assert_eq!(r.verdict, Verdict::Pass, "{}", r.detail);
+        // Different ids at the same time are fine.
+        let r = judge_j7(&j7_run(vec![server_request(10, "1", Some(20)), server_request(10, "2", Some(25))], true));
+        assert_eq!(r.verdict, Verdict::Pass, "{}", r.detail);
+    }
+
+    #[test]
+    fn j7_reuse_matches_exact_id_values_in_read_order() {
+        let mut requests = vec![
+            server_request(10, "1", Some(20)),
+            server_request(30, "1", Some(40)),
+            server_request(35, "2", None),
+            server_request(36, "1", Some(50)),
+            server_request(37, "2", None),
+        ];
+        let (earlier, later) = reused_server_id(&requests).unwrap();
+        assert!(std::ptr::eq(earlier, &requests[1]));
+        assert!(std::ptr::eq(later, &requests[3]));
+
+        requests[0].id = Id::int(1);
+        requests[1].id = Id::Str("1".into());
+        assert!(reused_server_id(&requests[..2]).is_none());
+        requests[0].answered_at = None;
+        requests[1].id = Id::from_value(&serde_json::from_str::<Value>("1.0").unwrap());
+        let (earlier, later) = reused_server_id(&requests[..2]).unwrap();
+        assert!(std::ptr::eq(earlier, &requests[0]));
+        assert!(std::ptr::eq(later, &requests[1]));
+    }
+
+    #[test]
+    fn j7_handles_a_large_burst_of_distinct_request_ids() {
+        let mut requests: Vec<_> = (0..100_000).map(|i| server_request(i, &i.to_string(), None)).collect();
+        assert!(reused_server_id(&requests).is_none());
+        requests.push(server_request(100_000, "99999", None));
+        let (earlier, later) = reused_server_id(&requests).unwrap();
+        assert!(std::ptr::eq(earlier, &requests[99_999]));
+        assert!(std::ptr::eq(later, &requests[100_000]));
+    }
+
+    #[test]
+    fn j7_passes_only_on_service_seen_after_an_answer() {
+        assert_eq!(judge_j7(&j7_run(vec![], true)).verdict, Verdict::NotExercised);
+        // Answered after lspcheck's request was sent: nothing seen since.
+        let r = judge_j7(&j7_run(vec![server_request(55, "1", Some(56))], true));
+        assert_eq!(r.verdict, Verdict::NotExercised, "{}", r.detail);
+        // lspcheck's later request went unanswered: that may not be the answer's doing.
+        let r = judge_j7(&j7_run(vec![server_request(10, "1", Some(20))], false));
+        assert_eq!(r.verdict, Verdict::Error, "{}", r.detail);
+        // Missed output may have held a reused id.
+        let mut runs = j7_run(vec![server_request(10, "1", Some(20))], true);
+        runs[0].observed.as_mut().unwrap().limit = Some((Duration::from_millis(5), "skipped a frame".into()));
+        assert_eq!(judge_j7(&runs).verdict, Verdict::Error);
     }
 
     #[test]

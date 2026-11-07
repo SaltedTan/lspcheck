@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is under way: J1 to J3, J5, J6, C1 to C3, D1 to D6 and `replay` are done; J7 is still planned. F1, F2, F8, J1, J2, J5 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -67,9 +67,9 @@ whole, because a missing reply to it can't be told apart from a slow start.
 | J4 | MUST | An unknown request method gets error `-32601` MethodNotFound; an unknown `$/` request too. |
 | J5 | MUST | Envelopes: `"jsonrpc": "2.0"`, exactly one of `result`/`error`, error `code` an integer and `message` a string; request ids integers or strings, response ids integers, strings or `null`, integers (ids and error codes) within LSP's signed 32-bit range; `params`, when present, an object or an array. |
 | J6 | MUST | Concurrent requests (sent before any reply) are each answered with the right id; order may differ. |
-| J7 | MUST | Server-to-client requests have well-formed unique ids; the checker answers them (configurable) and checks the server tolerates the answers. |
+| J7 | MUST | Server-to-client requests don't reuse an unanswered id, and the server keeps serving after lspcheck answers them (judging rules below). The id's type and range are J5's. |
 
-J1, J2 and J5 are judged across every scenario from the responses and messages seen. The `json-rpc` scenario exercises J6
+J1, J2, J5 and J7 are judged across every scenario from the responses and messages seen. The `json-rpc` scenario exercises J6
 and J3: after `initialize`, four requests are written before any reply is read (two numeric ids, one numeric string and
 one non-numeric string), and each must be answered with its exact id in any order; then two unknown notifications are
 followed by two probes; this guarantees J3 is exercised. Across the other scenarios with well-formed input, any response
@@ -77,7 +77,20 @@ without an id read after `initialized` fails J3 too, since it can only answer a 
 it can't attribute to a cancel), until a write of lspcheck's stops partway through a frame: the server may answer
 that malformed input with a null-id ParseError. A frame lspcheck skipped or couldn't read since `initialized`, or such a
 write, makes a pass an error. A frame
-lspcheck couldn't read anywhere (F1) also makes a J1, J2 or J5 pass an error: it might have held what they judge.
+lspcheck couldn't read anywhere (F1) also makes a J1, J2, J5 or J7 pass an error: it might have held what they judge.
+
+J7 treats an earlier request as unanswered when lspcheck never wrote its whole answer. For a completed answer,
+J7 times a reuse against when lspcheck began writing it: only a request read before then was certainly sent before
+the server could have had the answer. Reusing an id at or after that time is treated as lawful if the earlier answer
+was written in full. lspcheck's answers are fixed: `null` for each
+`workspace/configuration` item, the workspace for `workspace/workspaceFolders`, `applied: false` and
+`success: false` for `workspace/applyEdit` and `window/showDocument`, `null` for registrations, progress tokens,
+`window/showMessageRequest` and the refresh requests, and MethodNotFound otherwise; a profile will make them
+configurable (`[client]` below). A server that stops answering after an answer may have stopped for another reason,
+so that alone is never J7's failure. When the evidence is complete and no unanswered id was reused, J7 passes when
+the server answers at least one request lspcheck sent after completing an answer to a server request. It is an error
+when no answer was followed by service but at least one was followed by unanswered requests, and not exercised when
+the server sent no requests or lspcheck sent none after completing an answer.
 
 ### Lifecycle
 | ID | Basis | Check |
