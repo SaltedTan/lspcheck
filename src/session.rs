@@ -988,10 +988,6 @@ impl Session {
         // and the work is bounded by --max-output-mib.
         self.take_queued(false);
         self.group.close();
-        // A response without an id read after `initialized` could be a reply
-        // to a notification (`exit` included); anything lspcheck missed since
-        // makes judging J3 inconclusive.
-        let j3_incomplete = self.initialized_at.and_then(|from| self.incomplete_within(from, self.start.elapsed()));
         let mut evidence = std::mem::take(&mut *self.evidence.lock().expect("evidence lock"));
         let now = self.start.elapsed();
         if !evidence.done && evidence.limit.is_none() {
@@ -1005,6 +1001,11 @@ impl Session {
         {
             evidence.lost.push((began, now, "a frame was still unfinished when lspcheck stopped reading".into()));
         }
+        // A response without an id read after `initialized` could be a reply
+        // to a notification (`exit` included); anything lspcheck missed since,
+        // the unfinished frame above included, makes judging J3 inconclusive.
+        let ongoing = [evidence.stopped.as_ref(), self.own_limit.as_ref()];
+        let j3_incomplete = self.initialized_at.and_then(|from| incomplete_between(&evidence.lost, ongoing, from, now));
         let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
         let whole = evidence.done && !evidence.cut;
         let (miscounted, unchecked) = miscounted_frames(&evidence.unparsed, &transcript, whole);
