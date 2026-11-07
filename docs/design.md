@@ -67,7 +67,7 @@ whole, because a missing reply to it can't be told apart from a slow start.
 | J4 | MUST | An unknown request method gets error `-32601` MethodNotFound; an unknown `$/` request too. |
 | J5 | MUST | Envelopes: `"jsonrpc": "2.0"`, exactly one of `result`/`error`, error `code` an integer and `message` a string; request ids integers or strings, response ids integers, strings or `null`, integers (ids and error codes) within LSP's signed 32-bit range; `params`, when present, an object or an array. |
 | J6 | MUST | Concurrent requests (sent before any reply) are each answered with the right id; order may differ. |
-| J7 | MUST | A server-to-client request doesn't reuse the id of an earlier one the client hasn't begun to answer (or never answered in full), since their answers couldn't be told apart; reusing an id after its answer is lawful. lspcheck answers each request as it reads it, and the server must be seen answering a request lspcheck sent after one of those answers. The id's type and range are J5's. |
+| J7 | MUST | Server-to-client requests don't reuse an unanswered id, and the server keeps serving after lspcheck answers them (judging rules below). The id's type and range are J5's. |
 
 J1, J2, J5 and J7 are judged across every scenario from the responses and messages seen. The `json-rpc` scenario exercises J6
 and J3: after `initialize`, four requests are written before any reply is read (two numeric ids, one numeric string and
@@ -81,13 +81,16 @@ lspcheck couldn't read anywhere (F1) also makes a J1, J2, J5 or J7 pass an error
 
 J7 treats an earlier request as unanswered when lspcheck never wrote its whole answer. For a completed answer,
 J7 times a reuse against when lspcheck began writing it: only a request read before then was certainly sent before
-the server could have had the answer. lspcheck's answers are fixed: `null` for each
+the server could have had the answer. Reusing an id at or after that time is treated as lawful if the earlier answer
+was written in full. lspcheck's answers are fixed: `null` for each
 `workspace/configuration` item, the workspace for `workspace/workspaceFolders`, `applied: false` and
 `success: false` for `workspace/applyEdit` and `window/showDocument`, `null` for registrations, progress tokens,
 `window/showMessageRequest` and the refresh requests, and MethodNotFound otherwise; a profile will make them
 configurable (`[client]` below). A server that stops answering after an answer may have stopped for another reason,
-so that alone is never J7's failure: J7 is an error when no answer was followed by service, and not exercised when the
-server sent no requests or lspcheck sent none after answering.
+so that alone is never J7's failure. When the evidence is complete and no unanswered id was reused, J7 passes when
+the server answers at least one request lspcheck sent after completing an answer to a server request. It is an error
+when no answer was followed by service but at least one was followed by unanswered requests, and not exercised when
+the server sent no requests or lspcheck sent none after completing an answer.
 
 ### Lifecycle
 | ID | Basis | Check |

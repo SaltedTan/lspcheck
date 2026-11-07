@@ -56,12 +56,11 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
                      3 informative position(s) on character boundaries about the line-ending document, counted in UTF-16 code units; 32 position(s) about it
   SKIP  D6  MUST    A selectionRange result has one entry per position, each range contains its position, and each parent contains its child
                      the server advertises no selectionRangeProvider, so lspcheck sends no selectionRange request
-32 checks: 28 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 1 skipped, 0 not exercised, 0 errors
+33 checks: 29 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 1 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: it has 32 checks so far, covering framing, JSON-RPC correlation, the lifecycle, cancellation and
-document positions. [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids,
-documents and robustness.
+lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation and document positions.
+[The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
 
@@ -96,12 +95,9 @@ unknown notifications followed by probes to show that a notification gets no res
 loosely matches the request's (a number spelled as a string, or one that lost precision as a double) fails J1, and a
 duplicate, unasked or premature reply fails J2.
 
-lspcheck answers the server's own requests as it reads them: `workspace/configuration` with a `null` per item,
-`workspace/workspaceFolders` with the workspace, `workspace/applyEdit` and `window/showDocument` as not done, the
-registration, progress and refresh requests with `null`, and anything else with MethodNotFound. A server request that
-reuses the id of an earlier one lspcheck hadn't begun to answer, or never answered in full, fails J7, since the two
-answers couldn't be told apart; reusing an id once its answer has been written is lawful. J7 passes when the server
-is also seen answering a request lspcheck sent after one of its answers.
+lspcheck answers the server's own requests as it reads them. J7 checks for unanswered id reuse and continued service
+after those answers; the [design reference](docs/design.md#json-rpc-correlation) defines the judging rules and fixed
+answers. Configurable answers are planned for M3 profiles.
 
 The checks on how the server reads its input (F3 to F7) send small requests the server doesn't know, which every server
 must answer, written in different ways: split across many writes, several frames in one write, with a `Content-Type`
