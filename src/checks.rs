@@ -625,7 +625,11 @@ enum InitFailure {
 impl Ctx<'_> {
     /// Records the workspace and the files in it, for a replay.
     fn record_workspace(&self) {
-        self.s.record_workspace(self.root.clone(), workspace_files(&self.root, &self.cfg.workspace.names));
+        self.s.record_workspace(
+            self.root.clone(),
+            workspace_files(&self.root, &self.cfg.workspace.names),
+            self.cfg.workspace.directories.clone(),
+        );
     }
 
     /// `initialize` params with the profile's `initializationOptions`, if any.
@@ -3635,17 +3639,16 @@ pub fn initialize_params(root: &Path) -> Value {
     })
 }
 
-/// The files in a workspace, as (relative name, text) pairs, for the
+/// The files in a workspace, as (relative name, bytes) pairs, for the
 /// workspace line of a transcript: those at its top, and the profile's
-/// `names` (relative, with `/` separators) wherever they are. A file that
-/// isn't UTF-8 text is left out.
-fn workspace_files(root: &Path, names: &[String]) -> Vec<(String, String)> {
+/// `names` (relative, with `/` separators) wherever they are.
+fn workspace_files(root: &Path, names: &[String]) -> Vec<(String, Vec<u8>)> {
     let mut files = std::collections::BTreeMap::new();
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file()
-                && let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(text) = std::fs::read(&path)
             {
                 files.insert(entry.file_name().to_string_lossy().into_owned(), text);
             }
@@ -3654,7 +3657,7 @@ fn workspace_files(root: &Path, names: &[String]) -> Vec<(String, String)> {
     for name in names {
         let path: PathBuf =
             std::iter::once(root.as_os_str()).chain(name.split('/').map(std::ffi::OsStr::new)).collect();
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(text) = std::fs::read(&path) {
             files.insert(name.clone(), text);
         }
     }

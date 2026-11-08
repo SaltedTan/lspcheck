@@ -51,6 +51,7 @@ pub struct Workspace {
     /// Every file the profile puts in the workspace, fixture and inline,
     /// named as in `files`, so transcripts record them.
     pub names: Vec<String>,
+    pub directories: Vec<String>,
 }
 
 /// A check the profile skips, and why.
@@ -247,11 +248,8 @@ fn workspace(raw: RawWorkspace, dir: &Path) -> Result<Workspace, String> {
         Some(path) => {
             let full = dir.join(&path);
             let full = std::path::absolute(&full).unwrap_or(full);
-            match std::fs::metadata(&full) {
-                Ok(meta) if meta.is_dir() => {}
-                Ok(_) => return Err(format!("workspace.path: {} is not a directory", full.display())),
-                Err(e) => return Err(format!("workspace.path: can't use {}: {e}", full.display())),
-            }
+            let full: PathBuf = full.components().collect();
+            real_directory(&full).map_err(|e| format!("workspace.path: can't use {}: {e}", full.display()))?;
             walk(&full, "", &mut fixture_files, &mut fixture_dirs)?;
             Some(full)
         }
@@ -259,7 +257,7 @@ fn workspace(raw: RawWorkspace, dir: &Path) -> Result<Workspace, String> {
     };
     let mut files = Vec::new();
     for (name, text) in raw.files.unwrap_or_default() {
-        let parts = safe_name(&name)?;
+        let parts = safe_name(&name).map_err(|e| format!("workspace.files: {e}"))?;
         if fixture_dirs.contains(&name) {
             return Err(format!("workspace.files: {name:?} is a directory in workspace.path"));
         }
@@ -298,29 +296,46 @@ fn workspace(raw: RawWorkspace, dir: &Path) -> Result<Workspace, String> {
     }
     let mut names = fixture_files;
     names.extend(files.iter().map(|(name, _)| name.clone()));
-    Ok(Workspace { fixture, files, names: names.into_iter().collect() })
+    Ok(Workspace {
+        fixture,
+        files,
+        names: names.into_iter().collect(),
+        directories: fixture_dirs.into_iter().collect(),
+    })
 }
 
-/// The parts of a `[workspace].files` name: a relative path with `/`
+/// The parts of a workspace name: a relative path with `/`
 /// separators, without empty, `.` or `..` parts.
-fn safe_name(name: &str) -> Result<Vec<&str>, String> {
-    let bad = |why: &str| Err(format!("workspace.files: {name:?} {why}"));
+pub(crate) fn safe_name(name: &str) -> Result<Vec<&str>, String> {
+    let bad = |why: &str| Err(format!("{name:?} {why}"));
     if name.is_empty() {
         return bad("is empty");
     }
     if name.contains('\\') {
         return bad("contains a backslash; separate directories with /");
     }
-    if name.starts_with('/') || (name.as_bytes().get(1) == Some(&b':') && name.as_bytes()[0].is_ascii_alphabetic()) {
+    if name.starts_with('/') {
         return bad("is absolute; names are relative to the workspace");
     }
     let parts: Vec<&str> = name.split('/').collect();
     if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
         return bad("has an empty, . or .. part");
     }
-    let path: PathBuf = parts.iter().collect();
-    if path.is_absolute() || path.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
-        return bad("isn't a plain relative path");
+    for part in &parts {
+        if part.chars().any(|c| c.is_control() || ":<>\"|?*".contains(c)) {
+            return bad("contains a character forbidden in portable file names");
+        }
+        if part.ends_with(['.', ' ']) {
+            return bad("has a part ending with a dot or space");
+        }
+        let stem = part.split('.').next().unwrap_or_default().to_ascii_uppercase();
+        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        {
+            return bad("contains a Windows reserved device name");
+        }
     }
     Ok(parts)
 }
@@ -337,6 +352,7 @@ fn walk(dir: &Path, prefix: &str, files: &mut BTreeSet<String>, dirs: &mut BTree
             return Err(format!("workspace.path: {} has a name that isn't UTF-8", path.display()));
         };
         let name = format!("{prefix}{file_name}");
+        safe_name(&name).map_err(|e| format!("workspace.path: {e}"))?;
         let kind = entry.file_type().map_err(|e| format!("workspace.path: can't inspect {}: {e}", path.display()))?;
         if kind.is_symlink() {
             return Err(format!(
@@ -372,7 +388,20 @@ pub fn populate(root: &Path, w: &Workspace) -> std::io::Result<()> {
     Ok(())
 }
 
+fn real_directory(path: &Path) -> std::io::Result<()> {
+    let normalized: PathBuf = path.components().collect();
+    let meta = std::fs::symlink_metadata(&normalized)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!("{} is a symbolic link", path.display())));
+    }
+    if !meta.is_dir() {
+        return Err(std::io::Error::other(format!("{} is not a directory", path.display())));
+    }
+    Ok(())
+}
+
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    real_directory(from)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let (source, target) = (entry.path(), to.join(entry.file_name()));
@@ -484,6 +513,61 @@ mod tests {
         }
         let p = parse_here("[workspace]\nfiles = { \"go.mod\" = \"module x\\n\", \"src/a b/c.go\" = \"\" }\n").unwrap();
         assert_eq!(p.workspace.names, ["go.mod", "src/a b/c.go"]);
+    }
+
+    #[test]
+    fn profile_regression_names_are_portable_in_every_component() {
+        let mut forbidden: Vec<String> = ":<>\"|?*\\".chars().map(|c| format!("file{c}name")).collect();
+        forbidden.extend((0..=31).chain(127..=159).map(|c| format!("file{}name", char::from_u32(c).unwrap())));
+        forbidden.extend(["file.", "file ", "CON", "prn", "Aux.txt", "nUl.tar.gz"].map(str::to_string));
+        for prefix in ["COM", "LPT"] {
+            for n in 1..=9 {
+                forbidden.push(format!("{prefix}{n}"));
+                forbidden.push(format!("{}{n}.txt", prefix.to_lowercase()));
+            }
+        }
+        for name in forbidden {
+            for path in [name.clone(), format!("src/{name}"), format!("{name}/file.txt")] {
+                assert!(safe_name(&path).is_err(), "{path:?}");
+            }
+        }
+        for name in ["src/a b/c.go", "COM0", "LPT10.txt", "CONSOLE", "src/lib.rs"] {
+            assert!(safe_name(name).is_ok(), "{name:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_regression_fixture_names_are_also_portable() {
+        for name in ["missing.txt:payload", "NUL.txt", "file."] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(name), "x").unwrap();
+            let error = parse("[workspace]\npath = \".\"\n", dir.path()).unwrap_err();
+            assert!(error.starts_with("workspace.path") && error.contains(name), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_regression_fixture_roots_are_rechecked_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        let target = dir.path().join("target");
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&fixture).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(fixture.join("payload.txt"), "keep").unwrap();
+        for spelling in ["fixture", "fixture/", "fixture/."] {
+            let profile = parse(&format!("[workspace]\npath = {spelling:?}\n"), dir.path()).unwrap();
+            std::fs::rename(&fixture, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &fixture).unwrap();
+            let error = populate(&root, &profile.workspace).unwrap_err().to_string();
+            assert!(error.contains("fixture") && error.contains("symbolic link"), "{error}");
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            assert_eq!(std::fs::read_to_string(target.join("payload.txt")).unwrap(), "keep");
+            std::fs::remove_file(&fixture).unwrap();
+            std::fs::rename(&target, &fixture).unwrap();
+        }
     }
 
     #[test]

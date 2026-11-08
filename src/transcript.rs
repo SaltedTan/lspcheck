@@ -46,11 +46,22 @@ fn write_events(file: std::fs::File, events: &[Event]) -> std::io::Result<()> {
                 json!({"t_ms": t, "dir": "meta", "event": "exited", "how": how})
             }
             EventKind::Note(text) => json!({"t_ms": t, "dir": "meta", "note": text}),
-            EventKind::Workspace { path, files } => {
+            EventKind::Workspace { path, files, directories } => {
                 let mut v = json!({"t_ms": t, "dir": "meta", "workspace": path.to_string_lossy()});
-                let files: serde_json::Map<String, Value> =
-                    files.iter().map(|(name, text)| (name.clone(), Value::String(text.clone()))).collect();
+                let files: serde_json::Map<String, Value> = files
+                    .iter()
+                    .map(|(name, bytes)| {
+                        let value = match std::str::from_utf8(bytes) {
+                            Ok(text) => Value::String(text.into()),
+                            Err(_) => json!({"encoding": "base64", "data": base64(bytes)}),
+                        };
+                        (name.clone(), value)
+                    })
+                    .collect();
                 v["files"] = Value::Object(files);
+                if !directories.is_empty() {
+                    v["directories"] = json!(directories);
+                }
                 v
             }
             EventKind::Configuration(settings) => {

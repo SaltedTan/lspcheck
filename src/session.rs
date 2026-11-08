@@ -95,7 +95,8 @@ pub enum EventKind {
     /// can be replayed in a recreated workspace.
     Workspace {
         path: PathBuf,
-        files: Vec<(String, String)>,
+        files: Vec<(String, Vec<u8>)>,
+        directories: Vec<String>,
     },
     /// The settings `workspace/configuration` is answered from, so a replay
     /// answers the same way.
@@ -519,8 +520,8 @@ impl Session {
     }
 
     /// Records the workspace and the files in it, for [`crate::replay`].
-    pub fn record_workspace(&self, path: PathBuf, files: Vec<(String, String)>) {
-        record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files });
+    pub fn record_workspace(&self, path: PathBuf, files: Vec<(String, Vec<u8>)>, directories: Vec<String>) {
+        record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files, directories });
     }
 
     /// Records the settings `workspace/configuration` is answered from, for [`crate::replay`].

@@ -273,8 +273,10 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   `--transcripts` and the size limits are command-line only.
 - **Paths** are relative to the profile file's directory: `[workspace].path`, and a `[server].command` program with a
   directory part (`bin/server`; a bare name is looked up on `PATH`). The fixture directory may hold only regular files
-  and directories: a symbolic link is refused, not followed. `[workspace].files` names are relative paths with `/`
-  between directories; empty, absolute, `.` and `..` parts are refused, and missing directories are created.
+  and directories: symbolic links, including the fixture root itself, are refused. Workspace file and directory
+  names must be portable relative paths with `/` between directories: empty, absolute, `.` and `..` parts,
+  backslashes, control characters, `: < > " | ? *`, trailing dots or spaces, and Windows device names (`CON`, `PRN`,
+  `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, also with extensions) are refused. Missing directories are created.
 - **lspcheck's own files.** lspcheck writes `doc.txt`, `crlf.txt` and `lspcheck-utf8.txt` at the top of the workspace,
   and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names.
 - **`[client]`.** `initialization_options` is any TOML value; it is sent as JSON in every `initialize`, including
@@ -291,9 +293,9 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   error (exit status 2) naming the file and the key, with TOML's line and column where it has them.
 
 The report names the profile: in the terminal's first line, and as `"profile"` in the JSON report (`null` without
-one). Transcripts record the profile's files (those that are UTF-8 text) and its settings, so `lspcheck replay`
-recreates the workspace and answers `workspace/configuration` the same way. A fixture file that isn't UTF-8 text isn't
-recorded, so a replay can't recreate it.
+one). Transcripts record the profile's files, including binary contents, directories (including empty ones), and
+settings, so `lspcheck replay` recreates the workspace and answers `workspace/configuration` the same way. File
+permissions are not preserved during replay.
 
 ### Reproducing a failure
 

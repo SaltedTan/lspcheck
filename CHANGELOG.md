@@ -35,8 +35,9 @@
   `workspace/configuration` (also sent in `workspace/didChangeConfiguration` after `initialized`); `[allow]` lets
   named descendants outlive the server (L9) and skips checks with a reason. A bad profile is a usage error (exit
   status 2) naming the key, before any server starts. The terminal header and the JSON report's new `"profile"` field
-  name the profile; transcripts record its files and settings, so `replay` recreates them. The `[document]` section,
-  `[client].capabilities` and K1 are still planned.
+  name the profile; transcripts record its files (including binary contents), empty directories and settings,
+  so `replay` recreates them. Fixture roots must not be symbolic links, and workspace names must be portable.
+  The `[document]` section, `[client].capabilities` and K1 are still planned.
 - Stand-in faults `needs-init-option`, `needs-workspace-file` and `needs-configuration`, which a profile satisfies.
 
 ### Changed

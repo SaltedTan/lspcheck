@@ -1559,6 +1559,11 @@ fn workspace_ready(initialize: &Value) -> Result<(), String> {
         {
             return Err(format!("the stand-in needs {path} in its workspace, as standin.toml says"));
         }
+        if let Some(path) = line.trim().strip_prefix("require_directory = \"").and_then(|rest| rest.strip_suffix('"'))
+            && !root.join(path).is_dir()
+        {
+            return Err(format!("the stand-in needs directory {path} in its workspace, as standin.toml says"));
+        }
     }
     Ok(())
 }

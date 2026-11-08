@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. Profiles part 1 is done (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[allow]`); unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies; part 2 (`[document]`, `[client].capabilities`, K1) and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. Profiles part 1 is done (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[allow]`), including portable workspace names and replay of binary files and empty directories; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies; part 2 (`[document]`, `[client].capabilities`, K1) and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -413,10 +413,12 @@ it was before profiles (the JSON report has `"profile": null`). Generic checks s
 - **Paths** are relative to the profile file's directory: `[workspace].path`, and a `[server].command` program with a
   directory part (a bare name is looked up on `PATH`; arguments are passed as written). `[workspace].path` must be an
   existing directory; it is copied recursively into each scenario's workspace, regular files and directories only: a
-  symbolic link anywhere in it is a usage error naming it, never followed, so nothing outside the fixture is copied
-  (the copy checks again without following links). `[workspace].files` keys are relative paths with `/` separators;
-  empty, absolute (`/x`, `C:/x`), backslashed, and `.`, `..` or empty parts are refused. Parent directories are
-  created, and an inline file overwrites a copied file of the same path. An inline file that needs a directory where
+  symbolic link at its root or anywhere in it is a usage error naming it, never followed, so nothing outside the
+  fixture is copied (the copy checks again without following links). Workspace file and directory names, including
+  `[workspace].files` keys, must be portable relative paths with `/` separators: empty, absolute (`/x`, `C:/x`),
+  backslashed, and `.`, `..` or empty parts are refused, as are control characters, `: < > " | ? *`, trailing dots or
+  spaces, and Windows device names (case-insensitive, with or without extensions). Parent directories are created,
+  and an inline file overwrites a copied file of the same path. An inline file that needs a directory where
   the fixture or another inline file has a file, or that names a fixture directory, is refused.
 - **lspcheck's own files.** lspcheck writes `doc.txt` and `crlf.txt` (documents scenario) and `lspcheck-utf8.txt`
   (framing, F5) at the top of the workspace, and D4 asks about `missing.txt` there, which must not exist. These names
@@ -446,8 +448,11 @@ it was before profiles (the JSON report has `"profile": null`). Generic checks s
 - **Reports.** The JSON report gains a top-level `"profile"` (the path as given, or `null`); the schema id is
   unchanged. The terminal header line ends with `— profile PATH` when one is used.
 - **Replay.** A transcript's workspace line records the files at the workspace's top (as before) and every file the
-  profile put there, nested ones named with `/`, so replay recreates them; a file that isn't UTF-8 text isn't
-  recorded (an existing limit) and so can't be recreated. There is no size limit. A `{"dir":"meta","configuration":…}`
+  profile put there, nested ones named with `/`. Text files remain JSON strings; binary files are objects with
+  `"encoding":"base64"` and a `"data"` string in the standard base64 alphabet. An optional `"directories"` array
+  preserves fixture directories, including empty ones. Old transcripts without these additions still replay.
+  Replay validates portable names for both files and directories before writing. File permissions are not
+  preserved during replay. There is no size limit. A `{"dir":"meta","configuration":…}`
   line records the settings, and replay answers `workspace/configuration` from it. `initializationOptions` and the
   `didChangeConfiguration` are in the recorded bytes. Replay's own timeouts are still its flags; it doesn't read
   profiles.

@@ -2273,3 +2273,79 @@ fn a_bad_profile_is_a_usage_error_before_any_server_starts() {
     assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
     assert!(!transcripts.exists(), "nothing was set up for a run");
 }
+
+#[cfg(unix)]
+#[test]
+fn profile_regression_symlink_roots_are_usage_errors_before_startup() {
+    let (path, keep) = profile("");
+    let target = keep.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, keep.path().join("fixture")).unwrap();
+    for spelling in ["fixture", "fixture/", "fixture/."] {
+        std::fs::write(&path, format!("[workspace]\npath = {spelling:?}\n")).unwrap();
+        let transcripts = keep.path().join("t");
+        let out = Command::new(LSPCHECK)
+            .arg("--profile")
+            .arg(&path)
+            .arg("--transcripts")
+            .arg(&transcripts)
+            .args(["--only", "L2", "--", STANDIN])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{spelling}");
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains("fixture") && error.contains("symbolic link"), "{error}");
+        assert!(!transcripts.exists());
+    }
+}
+
+#[test]
+fn profile_regression_stream_names_are_usage_errors_before_startup() {
+    for name in ["missing.txt:payload", "dir:stream/file.txt", "a/NUL.txt", "a/file.", "a/file "] {
+        let (path, keep) = profile(&format!("[workspace]\nfiles = {{ {name:?} = \"x\" }}\n"));
+        let transcripts = keep.path().join("t");
+        let out = Command::new(LSPCHECK)
+            .arg("--profile")
+            .arg(&path)
+            .arg("--transcripts")
+            .arg(&transcripts)
+            .args(["--only", "L2", "--", STANDIN])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{name}");
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains("workspace.files") && error.contains(name), "{error}");
+        assert!(!transcripts.exists());
+    }
+}
+
+#[test]
+fn profile_regression_binary_fixtures_and_empty_directories_replay() {
+    let (path, keep) = profile("[workspace]\npath = \"fixture\"\n");
+    let fixture = keep.path().join("fixture");
+    std::fs::create_dir_all(fixture.join("assets")).unwrap();
+    std::fs::create_dir_all(fixture.join("cache/empty")).unwrap();
+    std::fs::write(fixture.join("assets/payload.bin"), [255]).unwrap();
+    std::fs::write(
+        fixture.join("standin.toml"),
+        "require = \"assets/payload.bin\"\nrequire_directory = \"cache/empty\"\n",
+    )
+    .unwrap();
+    let transcripts = keep.path().join("t");
+    let server = [STANDIN, "--fault", "needs-workspace-file"];
+    let r =
+        run_command_in(&["--profile", path.to_str().unwrap(), "--only", "L2,L6"], &server, None, transcripts.clone());
+    only_fails(&r, &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let transcript = transcripts.join("lifecycle.jsonl");
+    let stdout = replays_alike(&transcript, "needs-workspace-file");
+    assert!(stdout.contains("result -> result"), "{stdout}");
+    let recording = std::fs::read_to_string(&transcript).unwrap();
+    let workspace: Value = recording
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["workspace"].is_string())
+        .unwrap();
+    assert_eq!(workspace["files"]["assets/payload.bin"], serde_json::json!({"encoding": "base64", "data": "/w=="}));
+    assert!(workspace["directories"].as_array().unwrap().contains(&Value::String("cache/empty".into())));
+}
