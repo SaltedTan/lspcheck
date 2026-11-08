@@ -242,11 +242,12 @@ lspcheck inspects at most `--max-output-mib` (256) of stdout per scenario and fr
 These are lspcheck's own limits, not protocol rules: past them it keeps reading so the server isn't blocked, but stops
 inspecting. A reply that never arrived is then reported as `ERROR` (inconclusive), not `FAIL`, if a frame lspcheck
 skipped was arriving at any time between sending the request and giving up on the reply, or lspcheck stopped inspecting
-before it gave up, since the reply might have been in what it didn't inspect. R4 keeps each request's wait separate:
-any unanswered id whose wait was fully inspected keeps the check at `FAIL`. A frame that was complete before the
-request was sent can't have held its reply, so it excuses nothing. Likewise, a `PASS` or `NOT EXERCISED` that relied on
-lspcheck seeing everything in a window becomes `ERROR` if it finds, once the server's output has been read to the end,
-that it missed something there (a frame still arriving at the time may turn out to be cut short). A failure lspcheck saw
+before it gave up, since the reply might have been in what it didn't inspect. See the
+[robustness reference](docs/design.md#capabilities-and-robustness) for R4's treatment of multiple unanswered ids.
+A frame that was complete before the request was sent can't have held its reply, so it excuses nothing.
+Likewise, a `PASS` or `NOT EXERCISED` that relied on lspcheck seeing everything in a window becomes `ERROR` if it finds,
+once the server's output has been read to the end, that it missed something there (a frame still arriving at the time
+may turn out to be cut short). A failure lspcheck saw
 directly, such as a wrong result, stays `FAIL`. The same happens when some of the server's frames can't be read at all,
 and when lspcheck couldn't finish writing to a server that stopped reading its input: a request lspcheck couldn't
 deliver gives `ERROR`, never `FAIL`. A header section longer than 1 MiB also stops inspection.

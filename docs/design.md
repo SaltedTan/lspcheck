@@ -34,7 +34,7 @@ no evidence, e.g. no non-ASCII output was ever seen), or `error` (the checker or
 Lessons from virgil-lsp: an unexercised check must never render as a pass, and a checker failure must keep the first
 useful evidence rather than be replaced by a cleanup error.
 
-## Check catalogue (v0.1)
+## Check catalogue
 Each session starts a fresh server process unless noted, so one failure can't contaminate the next. Spec references
 are to LSP 3.17 and JSON-RPC 2.0.
 
@@ -319,16 +319,23 @@ a document request is advertised.
 
 R4 runs in the separate `odd-ids` scenario after initialization. It sends `lspcheck/probe` with each of these ids,
 one at a time: `0`, `-1`, `2147483647`, `-2147483648`, `""`, a 1000-character ASCII string, `"é中😀𝄞"` and
-`"7"`. It waits for each response before sending the next, and passes only when every response has the exact id
-(either a result or an error is acceptable). Unanswered ids are named in the detail; long strings are truncated.
-Each unanswered request retains its own wait window for the evidence recheck after cleanup; any fully inspected
-window establishes a failure. J3 also judges `odd-ids` and `wrong-params`, whose JSON-RPC input is well formed.
+`"7"`. Each request waits for a response or its deadline before the next is sent; a closed output stream or a failed
+write stops the sequence. It passes only when every request gets a response with its exact id (a result or an error is
+acceptable). Only delivered requests with no exact-id response can fail R4. The detail names unanswered ids and any
+unmatched response ids seen; long strings are truncated. Each unanswered request retains its own wait window for
+the evidence recheck after cleanup; any fully inspected window establishes a failure. If every such window has
+incomplete evidence, the verdict is `ERROR`. Initialization or delivery failure is also `ERROR` unless an earlier
+delivered request establishes a failure. J1 and J2 independently judge mismatched ids under their `MUST` rules.
+Numeric ids stay within LSP 3.17's signed 32-bit range, so `2^53` is deliberately excluded.
 
 R2 runs in its own `wrong-params` scenario so a server crash cannot contaminate other checks. From the initialize
 capabilities it selects the first advertised method among hover, definition, document symbols and workspace symbols.
-It sends the corresponding method with a number where an object or string is required, then sends a plain probe.
-An error response followed by a response to the probe passes; `InvalidParams` is preferred but any error code passes.
-If none of those capabilities is advertised, R2 is not exercised.
+It sends the corresponding method with a number where an object or string is required. After an error response,
+it sends a plain probe; a response to that probe passes. `InvalidParams` is preferred but any error code passes.
+A result or malformed response, no response to a delivered request, or a server that stops serving fails R2;
+missing replies become `ERROR` when lspcheck's inspection was incomplete. Initialization or delivery failure is
+`ERROR`. If none of those capabilities is advertised, R2 is not exercised. Both robustness scenarios have
+well-formed JSON-RPC input, so the [J3 judging rules](#json-rpc-correlation) apply to them too.
 
 ## Profiles (optional TOML)
 ```toml
@@ -398,11 +405,12 @@ Single crate, `src/` modules:
   group first so the PGID can't be recycled while we scan for descendants (the reuse bug virgil-lsp hit). Kill escalation:
   SIGTERM, grace, SIGKILL. Descendant scan: Linux `/proc`, macOS `proc_listpids`, Windows job process list.
 - `session`: tokio tasks for stdout (parsed there, so framing evidence is complete even if replies aren't consumed)
-  and stderr (always drained); stdin writes bounded by a deadline. Request ids are random 31-bit integers, so a server
-  can't prepare a reply before it sees the request (output already read when a request is sent can't answer it, but
-  bytes still in the pipe can, so the randomness is what matters); ids match by **JSON value** (`1` and `1.0` are the
-  same number). Each call has one absolute deadline covering its write and its reply; each scenario has its own
-  timeouts and a bounded cleanup. After a write stops partway through a frame, lspcheck sends nothing more.
+  and stderr (always drained); stdin writes bounded by a deadline. Generated request ids are random positive 31-bit
+  integers, so a server can't prepare a reply before it sees the request (output already read when a request is sent
+  can't answer it, but bytes still in the pipe can, so the randomness is what matters); ids match by **JSON value** (`1` and `1.0` are the
+  same number). Scenarios can also choose explicit ids; R4 reserves its test ids before initialization so generated
+  ids cannot collide with them. Each call has one absolute deadline covering its write and its reply; each scenario
+  has its own timeouts and a bounded cleanup. After a write stops partway through a frame, lspcheck sends nothing more.
 - `checks`: one module per area; each check declares id, basis, spec link, and a function over a `Session`.
 - `profile`, `report`, `cli` (clap).
 Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, toml, thiserror; `nix` on Unix,

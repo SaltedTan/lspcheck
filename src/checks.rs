@@ -234,10 +234,10 @@ pub struct CheckResult {
     pub detail: String,
     /// The scenario the evidence came from, or "all" for cross-cutting checks.
     pub scenario: &'static str,
-    /// For a failure because something expected never arrived: when lspcheck
-    /// sent what should have been answered, and when it stopped waiting.
-    /// Evidence lspcheck didn't see in between could explain it. A failure
-    /// seen directly has none.
+    /// For a failure because expected replies never arrived: each request's
+    /// send time and the end of its wait. The failure is inconclusive only
+    /// if every window could hide a reply in evidence lspcheck missed.
+    /// A failure seen directly has no windows.
     #[serde(skip)]
     pub absent_at: Vec<(Duration, Duration)>,
     /// For a verdict reached during the session on the assumption that
@@ -506,7 +506,14 @@ fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observatio
 }
 
 fn result(scenario: &'static str, id: &str, verdict: Verdict, detail: impl Into<String>) -> CheckResult {
-    CheckResult { id: info(id).id, verdict, detail: detail.into(), scenario, absent_at: Vec::new(), unless_missed: None }
+    CheckResult {
+        id: info(id).id,
+        verdict,
+        detail: detail.into(),
+        scenario,
+        absent_at: Vec::new(),
+        unless_missed: None,
+    }
 }
 
 struct Ctx<'a> {
