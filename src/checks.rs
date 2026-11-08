@@ -1814,11 +1814,24 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Judgement {
         K1Pending::Judged(judgement) => judgement,
         K1Pending::Sent { mut asked, notes } => {
             for a in &mut asked {
+                let Some(id) = &a.id else { continue };
                 if a.outcome == capabilities::Outcome::Unanswered
-                    && let Some(id) = &a.id
                     && let Some(m) = finish.answer_to(id)
                 {
                     a.outcome = k1_outcome(m);
+                }
+                // MethodNotFound for the request is seen evidence even when
+                // it isn't the first response with its id (J2 judges the
+                // duplicate); only responses read after the request was sent
+                // count.
+                if let Some(&(sent, _)) = finish.sent.iter().find(|(_, s)| s == id)
+                    && finish.messages.iter().any(|(at, m)| {
+                        *at >= sent
+                            && m.response_id() == Some(id)
+                            && k1_outcome(m) == capabilities::Outcome::Error(codes::METHOD_NOT_FOUND)
+                    })
+                {
+                    a.outcome = capabilities::Outcome::Error(codes::METHOD_NOT_FOUND);
                 }
             }
             let asked: Vec<(String, capabilities::Outcome)> = asked.into_iter().map(|a| (a.label, a.outcome)).collect();

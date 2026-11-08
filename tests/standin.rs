@@ -486,6 +486,19 @@ fn an_advertised_request_answered_with_method_not_found_fails_k1() {
 }
 
 #[test]
+fn method_not_found_after_a_result_still_fails_k1() {
+    // MethodNotFound seen for a K1 request is evidence even when a result for
+    // the same id came first; the duplicate itself is J2's.
+    let r = fault("method-not-found-after-result");
+    only_fails(&r, &["K1", "J2"]);
+    assert!(
+        r.stdout.contains("MethodNotFound (-32601) for 1 advertised request(s): textDocument/documentColor"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
 fn an_advertised_request_left_unanswered_leaves_k1_inconclusive() {
     // LSP sets no deadline for a response, so a request answered neither with
     // MethodNotFound nor anything else by the end of the session is ERROR.

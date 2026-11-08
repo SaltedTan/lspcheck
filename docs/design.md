@@ -382,13 +382,15 @@ the server: after sending the requests, the scenario shuts the server down grace
 answering the server's requests on the way. Once session cleanup has drained the final stdout, K1 judges every
 request by its matched response, including replies read during shutdown or the final drain.
 
-- **fail:** a request was answered with an error whose code is -32601, whenever its reply was read. The detail names
-  each such request (method and position) and any request that was still unanswered. This is seen evidence and stands
-  whatever happened to the other requests.
+- **fail:** a request was answered with an error whose code is -32601, whenever its reply was read, even after another
+  response with the same id (that duplicate is J2's). The detail names each such request (method and position), any
+  request that was still unanswered and any that couldn't be sent. This is seen evidence and stands whatever happened
+  to the other requests.
 - **error:** initialize didn't succeed, the server chose an encoding lspcheck didn't offer (see L2), the document
   couldn't be written, read or opened (`didOpen` not delivered), or a request couldn't be delivered. A delivered
   request with no response by the end of the session is also `ERROR` (`no response to <method> at <position> by the
-  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1.
+  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1. The detail names
+  every request that went unanswered and every one that couldn't be sent.
 - **not-exercised:** the initialize result has no capabilities object, or the server advertises none of the requests
   above, or none could be sent (the detail says why).
 - **pass:** every request sent was answered with a result or another error by the end of the session. The detail

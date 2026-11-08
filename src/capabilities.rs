@@ -377,28 +377,30 @@ pub fn judge(asked: &[(String, Outcome)], notes: &[String]) -> Judgement {
         .collect();
     let unanswered: Vec<&str> =
         asked.iter().filter(|(_, o)| *o == Outcome::Unanswered).map(|(label, _)| label.as_str()).collect();
-    let undelivered = asked.iter().find_map(|(label, o)| match o {
-        Outcome::Undelivered(why) => Some((label, why)),
-        _ => None,
-    });
-    if !not_found.is_empty() {
-        let mut detail =
-            format!("MethodNotFound (-32601) for {} advertised request(s): {}", not_found.len(), not_found.join(", "));
-        if !unanswered.is_empty() {
-            detail.push_str(&format!("; no response to {} by the end of the session", unanswered.join(", ")));
-        } else if let Some((label, why)) = undelivered {
-            detail.push_str(&format!("; lspcheck couldn't send {label} ({why})"));
-        }
-        return Judgement::Fail(with_notes(detail));
-    }
-    if !unanswered.is_empty() {
+    let undelivered: Vec<String> = asked
+        .iter()
+        .filter_map(|(label, o)| match o {
+            Outcome::Undelivered(why) => Some(format!("lspcheck couldn't send {label} ({why})")),
+            _ => None,
+        })
+        .collect();
+    let unanswered_detail = (!unanswered.is_empty()).then(|| {
         let each = if unanswered.len() == 1 { "it" } else { "them" };
-        let detail =
-            format!("no response to {} by the end of the session, so K1 couldn't judge {each}", unanswered.join(", "));
-        return Judgement::Error(with_notes(detail));
+        format!("no response to {} by the end of the session, so K1 couldn't judge {each}", unanswered.join(", "))
+    });
+    // Everything K1 couldn't judge: unanswered requests, then undelivered ones.
+    let unjudged: Vec<String> = unanswered_detail.into_iter().chain(undelivered).collect();
+    if !not_found.is_empty() {
+        let mut parts = vec![format!(
+            "MethodNotFound (-32601) for {} advertised request(s): {}",
+            not_found.len(),
+            not_found.join(", ")
+        )];
+        parts.extend(unjudged);
+        return Judgement::Fail(with_notes(parts.join("; ")));
     }
-    if let Some((label, why)) = undelivered {
-        return Judgement::Error(with_notes(format!("lspcheck couldn't send {label} ({why})")));
+    if !unjudged.is_empty() {
+        return Judgement::Error(with_notes(unjudged.join("; ")));
     }
     if asked.is_empty() {
         let mut detail = String::from("the server advertises none of the requests K1 sends");
@@ -588,6 +590,31 @@ mod tests {
         ];
         let Judgement::Error(detail) = judge(&asked, &[]) else { panic!() };
         assert_eq!(detail, "lspcheck couldn't send workspace/symbol (the server's stdin is closed)");
+    }
+
+    #[test]
+    fn an_unanswered_request_doesnt_hide_one_that_couldnt_be_sent() {
+        let asked = [
+            answered("textDocument/hover at 1:1", Outcome::Unanswered),
+            answered("textDocument/hover at 2:1", Outcome::Undelivered("the server exited with status 17".into())),
+        ];
+        let Judgement::Error(detail) = judge(&asked, &[]) else { panic!() };
+        assert_eq!(
+            detail,
+            "no response to textDocument/hover at 1:1 by the end of the session, so K1 couldn't judge it; \
+             lspcheck couldn't send textDocument/hover at 2:1 (the server exited with status 17)"
+        );
+        let asked = [
+            answered("textDocument/documentColor", Outcome::Error(-32601)),
+            answered("textDocument/hover at 1:1", Outcome::Unanswered),
+            answered("textDocument/hover at 2:1", Outcome::Undelivered("the server exited with status 17".into())),
+        ];
+        let Judgement::Fail(detail) = judge(&asked, &[]) else { panic!() };
+        assert!(detail.contains("no response to textDocument/hover at 1:1"), "{detail}");
+        assert!(
+            detail.contains("couldn't send textDocument/hover at 2:1 (the server exited with status 17)"),
+            "{detail}"
+        );
     }
 
     #[test]

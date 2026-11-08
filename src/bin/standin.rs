@@ -243,6 +243,11 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: advertise colorProvider, and answer textDocument/documentColor with RequestFailed (-32803)",
     ),
     ("ignores-advertised", "advertise colorProvider, and never answer textDocument/documentColor"),
+    (
+        "method-not-found-after-result",
+        "advertise colorProvider, answer textDocument/documentColor with a result, then again with MethodNotFound when \
+         shutdown arrives",
+    ),
     ("defer-hover-until-shutdown", "lawful: answer hover requests only when shutdown arrives"),
     (
         "advertised-error-after-shutdown",
@@ -347,6 +352,8 @@ fn main() {
     // The rest of a notification begun after the checks were done, written
     // only once `shutdown` arrives.
     let mut unfinished: Option<Vec<u8>> = None;
+    // A documentColor request answered once, to answer again at shutdown.
+    let mut answered_color: Option<Value> = None;
     // For inflated-on-first-probe.
     let mut probed = false;
     // Messages read by await-progress-answer while it waited, to handle next.
@@ -964,7 +971,15 @@ fn main() {
             if fault("no-change-sync") {
                 result["capabilities"]["textDocumentSync"] = json!({"openClose": true, "change": 0});
             }
-            if ["advertises-unimplemented", "capability-other-error", "ignores-advertised"].iter().any(|f| fault(f)) {
+            if [
+                "advertises-unimplemented",
+                "capability-other-error",
+                "ignores-advertised",
+                "method-not-found-after-result",
+            ]
+            .iter()
+            .any(|f| fault(f))
+            {
                 result["capabilities"]["colorProvider"] = json!(true);
             }
             if fault("no-capabilities") {
@@ -1094,6 +1109,11 @@ fn main() {
             && let Some(rest) = unfinished.take()
         {
             out.raw(&rest);
+        }
+        if method == "shutdown"
+            && let Some(color) = answered_color.take()
+        {
+            out.frame(&err(&color, -32601, "method not found"));
         }
         if method == "textDocument/hover" && fault("echo-positions") {
             let uri = msg.pointer("/params/textDocument/uri").and_then(Value::as_str).unwrap_or("");
@@ -1251,6 +1271,10 @@ fn main() {
                 out.frame(&err(&id, -32803, "no colors today"));
             }
             "textDocument/documentColor" if fault("ignores-advertised") => {}
+            "textDocument/documentColor" if fault("method-not-found-after-result") => {
+                out.frame(&ok(&id, json!([])));
+                answered_color = Some(id);
+            }
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
             "lspcheck/unknownRequest" if fault("big-frame-before-unknown-reply") => {
                 let text = "x".repeat(2 * 1024 * 1024);
