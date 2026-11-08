@@ -788,7 +788,7 @@ fn describe_odd_id(id: &Id) -> String {
     match id {
         Id::Str(value) if value.chars().count() > 40 => {
             let prefix: String = value.chars().take(20).collect();
-            format!("\"{prefix}…\" ({} characters)", value.chars().count())
+            format!("{} ({} characters)", Id::Str(prefix + "…"), value.chars().count())
         }
         _ => id.to_string(),
     }
@@ -3378,6 +3378,13 @@ mod tests {
     fn odd_id_details_truncate_long_strings() {
         let detail = describe_odd_id(&Id::Str("x".repeat(1000)));
         assert_eq!(detail, format!("\"{}…\" (1000 characters)", "x".repeat(20)));
+    }
+
+    #[test]
+    fn odd_id_details_escape_control_characters() {
+        let detail = describe_odd_id(&Id::Str(format!("\n\u{1b}\"\\é{}", "x".repeat(40))));
+        assert_eq!(detail, r#""\n\u{1b}\"\\éxxxxxxxxxxxxxxx…" (45 characters)"#);
+        assert_eq!(describe_odd_id(&Id::Str("\n\u{1b}\"\\é".into())), r#""\n\u{1b}\"\\é""#);
     }
 
     fn observed_run(name: &'static str, leftovers: Vec<ProcInfo>, scan_error: Option<&str>) -> ScenarioRun {
