@@ -82,9 +82,8 @@ lspcheck couldn't read anywhere (F1) also makes a J1, J2, J5 or J7 pass an error
 J7 treats an earlier request as unanswered when lspcheck never wrote its whole answer. For a completed answer,
 J7 times a reuse against when lspcheck began writing it: only a request read before then was certainly sent before
 the server could have had the answer. Reusing an id at or after that time is treated as lawful if the earlier answer
-was written in full. lspcheck's answers are fixed: `null` for each
-`workspace/configuration` item (or, with a profile's `[client].configuration`, the item's section looked up in it;
-see below), the workspace for `workspace/workspaceFolders`, `applied: false` and
+was written in full. lspcheck answers `workspace/configuration` using the [profile rules](#profiles-optional-toml),
+and returns the workspace for `workspace/workspaceFolders`, `applied: false` and
 `success: false` for `workspace/applyEdit` and `window/showDocument`, `null` for registrations, progress tokens,
 `window/showMessageRequest` and the refresh requests, and MethodNotFound otherwise. A server that stops answering after an answer may have stopped for another reason,
 so that alone is never J7's failure. When the evidence is complete and no unanswered id was reused, J7 passes when
@@ -150,7 +149,7 @@ scenario, once the server's output has been read to the end, and becomes `ERROR`
 window. A missing response is checked the same way and becomes `ERROR` rather than `FAIL`. A failure lspcheck saw
 directly is never replaced.
 
-### Documents and positions (richer with a profile document)
+### Documents and positions
 D1 to D6 are done.
 
 | ID | Basis | Check |
@@ -305,7 +304,7 @@ A range on a line the text doesn't have is not judged (counted in the detail); a
 object, a `parent` that isn't an object) is not judged here — it is a type error for a later check — but is counted.
 The parent chain walk is bounded (1000 levels), and a chain cut short is counted.
 
-Without a profile, most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs
+Most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs
 only one versioned publish for the document, so it is exercised wherever diagnostics are labelled. D4 runs wherever
 a document request is advertised.
 
@@ -370,69 +369,40 @@ After successful initialization, all four robustness scenarios attempt a bounded
 cleanup. This lets lawful output still in flight finish and lets L9 observe descendants that outlive the server.
 
 ## Profiles (optional TOML)
-`lspcheck --profile PATH [-- SERVER…]` reads a TOML file (`src/profile.rs`). Part 1 is implemented; the sections
-marked *planned* are part 2.
+Part 1 is implemented in `src/profile.rs`; the [README](../README.md#profiles) owns the supported profile example,
+command and timeout precedence, path rules, and common usage. This section records implementation details and
+planned extensions. Profiles still use the [plain-text probe documents](#documents-and-positions).
+
+K1 and the following fields are planned for part 2; these fields are refused for now:
+
 ```toml
-[server]
-command = ["gopls", "serve"]   # used when no command follows `--`
-startup_timeout = "30s"        # like --startup-timeout
-request_timeout = "10s"        # like --timeout
-exit_timeout = "5s"            # like --exit-timeout
-
-[workspace]                    # each scenario gets a fresh temp dir; rootUri and workspaceFolders point there
-path = "fixtures/go"           # a directory copied into it, relative to the profile file's directory
-files = { "go.mod" = "module example\n\ngo 1.22\n" }   # inline files written after copying `path`
-
 [document]                     # planned (part 2)
 path = "main.go"
 language_id = "go"
 positions = ["main.go:3:6"]    # where K1 probes; otherwise identifier-looking tokens are used
 
 [client]
-initialization_options = { hints = true }            # sent as initializeParams.initializationOptions
-configuration = { gopls = { staticcheck = false } }  # answers to workspace/configuration
 capabilities = "default"       # planned (part 2): or a path to a capabilities JSON
-
-[allow]
-descendants = ["gopls-helper"]       # process names allowed to outlive exit (L9)
-skip = [{ id = "L7", reason = "exits 0 by design, see issue 12" }]
 ```
-Without a profile: an empty temp workspace and a `plaintext` document, and nothing below applies; the output is what
-it was before profiles (the JSON report has `"profile": null`). Generic checks still run; position checks report
-`not-exercised` where the server produced no positions.
 
-- **Parsing.** Every section and key is optional. Unknown sections or keys (serde's `deny_unknown_fields`, so part 2's
-  `[document]` and `capabilities` are refused for now) and wrong types are usage errors (exit status 2) whose message
-  names the file and shows `toml`'s error with its line, column and the offending line. Durations are strings
-  `"<n>ms"`, `"<n>s"` or `"<n>m"` with a non-negative integer n; anything else, a bare number included, is an error
-  naming the key. Everything is validated once, before any scenario starts.
-- **Precedence.** A command after `--` overrides `[server].command`; neither is a usage error. A timeout flag given on
-  the command line overrides the profile's value, which overrides the built-in default (the flags are optional in clap,
-  and the defaults are applied after merging). `--only`, `--strict`, `--json`, `--transcripts` and the size limits are
-  command-line only.
-- **Paths** are relative to the profile file's directory: `[workspace].path`, and a `[server].command` program with a
-  directory part (a bare name is looked up on `PATH`; arguments are passed as written). `[workspace].path` must be an
-  existing directory; it is copied recursively into each scenario's workspace, regular files and directories only: a
-  symbolic link at its root or anywhere in it is a usage error naming it, never followed, so nothing outside the
-  fixture is copied (the copy checks again without following links). Workspace file and directory names, including
-  `[workspace].files` keys, must be portable relative paths with `/` separators: empty, absolute (`/x`, `C:/x`),
-  backslashed, and `.`, `..` or empty parts are refused, as are control characters, `: < > " | ? *`, trailing dots or
-  spaces, and Windows device names (case-insensitive, with or without extensions). Parent directories are created,
-  and an inline file overwrites a copied file with the exact same spelling. Across fixture files, directories and
-  inline files, paths differing only by ASCII case in any shared component are usage errors naming both paths.
+- **Parsing.** Serde's `deny_unknown_fields` enforces the accepted keys. TOML parsing errors include a line, column
+  and the offending line; validation errors name the relevant key. Duration quantities must be non-negative whole
+  numbers. The profile is validated before any scenario starts. The timeout flags are optional in clap, so defaults
+  can be applied after merging with the profile.
+- **Workspace validation.** Each scenario's `rootUri` and `workspaceFolders` point to its populated temporary
+  workspace. The copy rechecks the fixture root and each entry without following symbolic links, because the
+  fixture may have changed since validation. Command arguments are passed as written.
   An inline file that needs a directory where the fixture or another inline file has a file, or that names a fixture
   directory, is refused.
-- **lspcheck's own files.** lspcheck writes `doc.txt` and `crlf.txt` (documents scenario) and `lspcheck-utf8.txt`
-  (framing, F5) at the top of the workspace, and D4 asks about `missing.txt` there, which must not exist. These names
-  (`checks::OWN_FILES`, compared ignoring ASCII case) are reserved: a profile file or directory at one is a usage error
-  naming it. Deeper paths such as `src/doc.txt` are the profile's.
+- **lspcheck's own files.** `checks::OWN_FILES` enforces the reserved top-level names listed in the README.
+  Deeper paths such as `src/doc.txt` are the profile's.
 - **`initialization_options`** is any TOML value, converted to JSON (a date or time becomes its TOML spelling; NaN or
   an infinite float is an error), and sent as `initializationOptions` in every initialize lspcheck sends: each
   scenario's, L3's second one and the pre-initialize scenario's. Absent, the field is omitted as before.
 - **`configuration`** (a table). Each `workspace/configuration` item is answered by looking up its `section` as a
   dot-separated path into the table (`"gopls"` gives the `gopls` table, `"gopls.staticcheck"` gives `false`); an item
-  without a section, or with an empty one, gets the whole table; a path that leads nowhere, or a section that isn't a
-  string, gets `null`. Without it, each item gets `null` as before. When it is given, lspcheck also sends
+  without a section, or with a null or empty one, gets the whole table; a path that leads nowhere, or another
+  non-string section, gets `null`. Without it, each item gets `null` as before. When it is given, lspcheck also sends
   `workspace/didChangeConfiguration` with `{"settings": <configuration>}` right after `initialized`, before the
   scenario's first request (some servers read settings only that way). That is one more notification after
   `initialized`: J3 already counts any id-less response after `initialized` as answering a notification, and C3's

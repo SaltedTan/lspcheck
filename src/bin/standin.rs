@@ -1565,7 +1565,8 @@ fn workspace_ready(initialize: &Value) -> Result<(), String> {
             return Err(format!("the stand-in needs directory {path} in its workspace, as standin.toml says"));
         }
         #[cfg(unix)]
-        if let Some(path) = line.trim().strip_prefix("require_executable = \"").and_then(|rest| rest.strip_suffix('"')) {
+        if let Some(path) = line.trim().strip_prefix("require_executable = \"").and_then(|rest| rest.strip_suffix('"'))
+        {
             use std::os::unix::fs::PermissionsExt;
             let metadata = std::fs::metadata(root.join(path)).map_err(|e| format!("can't inspect {path}: {e}"))?;
             if metadata.permissions().mode() & 0o111 == 0 {

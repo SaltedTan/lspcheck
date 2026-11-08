@@ -158,9 +158,9 @@ See the [report format reference](docs/design.md#report) for verdict mappings, `
 transcript references.
 
 lspcheck runs the server several times, once per scenario, each time with a fresh temporary workspace as its working
-directory: empty, or holding a [profile](#profiles)'s files. A server path with a directory part, such as `./my-server`, is resolved before that; a bare name is looked up
-on `PATH`. The checks on the server's output (F1, F2, F8) and on leftover processes (L9) are judged across every
-scenario, as are the JSON-RPC correlation checks J1, J2, J5 and J7.
+directory: empty, or holding a [profile](#profiles)'s files. A server path with a directory part, such as `./my-server`,
+is resolved before that; a bare name is looked up on `PATH`. The checks on the server's output (F1, F2, F8) and on
+leftover processes (L9) are judged across every scenario, as are the JSON-RPC correlation checks J1, J2, J5 and J7.
 
 The JSON-RPC scenario writes four requests, with numeric and string ids, before reading any reply (J6), and then sends
 unknown notifications followed by probes to show that a notification gets no response (J3). A reply whose id only
@@ -188,7 +188,7 @@ publishes. Every position the server sends about the document must fall between 
 the two sides agreed (UTF-16 unless the server chose another): never between the halves of a UTF-16 surrogate pair or
 inside a UTF-8 multibyte sequence. The document is built so that counting in the wrong units lands inside a
 character, and a failure says which counting would have fit. A position past the end of a line isn't judged, because
-the client clamps it. Most language servers ignore a plain-text document without a profile, and then D1 is `N/E`.
+the client clamps it. Most language servers ignore a plain-text document, and then D1 is `N/E`.
 
 The same scenario also checks diagnostics versions (D2): when the server labels a `publishDiagnostics` for the opened
 document with a `version`, it must be one lspcheck sent for it before the notification was read — so a server that
@@ -239,7 +239,9 @@ lspcheck closed the server's input. Events are ordered by timestamp, including r
 ### Profiles
 
 Many servers refuse to initialize, or check little, without a project or settings. A profile is a TOML file that
-gives lspcheck what a server needs, and says what its maintainers accept. Every section and key is optional:
+gives lspcheck what a server needs, and says what its maintainers accept. Every section and key is optional.
+The example below uses supported fields; [planned profile fields](docs/design.md#profiles-optional-toml) are not
+accepted yet.
 
 ```toml
 [server]
@@ -281,7 +283,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   is a usage error naming both paths. An inline file may overwrite a fixture file with the exact same spelling.
   Missing directories are created.
 - **lspcheck's own files.** lspcheck writes `doc.txt`, `crlf.txt` and `lspcheck-utf8.txt` at the top of the workspace,
-  and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names.
+  and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names,
+  compared ignoring ASCII case.
 - **`[client]`.** `initialization_options` is any TOML value; it is sent as JSON in every `initialize`, including
   L3's second one. When `configuration` is given, lspcheck answers each `workspace/configuration` item by looking up
   its `section` as a dot-separated path in it (`"gopls.staticcheck"` gives `false`; a missing path gives `null`; an item
@@ -289,8 +292,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   `initialized`, for servers that read settings only that way.
 - **`[allow]`.** L9 doesn't fail for a leftover process whose name, as lspcheck reports it, is in `descendants`; the
   `PASS` detail names what was allowed. (On Linux that name is the kernel's command name, at most 15 bytes.) A check in
-  `skip` reports `SKIP` with the reason given, and doesn't affect the exit status; a scenario whose checks are all
-  skipped doesn't run, and no other check's verdict changes.
+  `skip` reports `SKIP` with the reason given, and doesn't affect the exit status. The
+  [design reference](docs/design.md#profiles-optional-toml) explains when skipped checks let a scenario be omitted.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
   type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name or an unknown check id is a usage
   error (exit status 2) naming the file and the key, with TOML's line and column where it has them.

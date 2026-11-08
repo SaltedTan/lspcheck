@@ -359,7 +359,9 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
                     };
                     let file_modes = match v.get("file_modes") {
                         Some(value) => serde_json::from_value::<std::collections::BTreeMap<String, u32>>(value.clone())
-                            .map_err(|e| format!("{}: line {line}: invalid workspace file modes: {e}", path.display()))?,
+                            .map_err(|e| {
+                                format!("{}: line {line}: invalid workspace file modes: {e}", path.display())
+                            })?,
                         None => std::collections::BTreeMap::new(),
                     };
                     plan.workspace = Some(Workspace { path: PathBuf::from(dir), files, directories, file_modes });
