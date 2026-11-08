@@ -15,11 +15,14 @@ use std::io::Write;
 use std::path::Path;
 
 /// Writes `events` to `path` as JSON Lines.
+///
+/// Preserves the supplied order; pass the transcript returned by
+/// [`crate::session::Session::finish`] for replay ordering.
 pub fn write(path: &Path, events: &[Event]) -> std::io::Result<()> {
     write_events(std::fs::File::create(path)?, events)
 }
 
-/// Writes `events` to a new path as JSON Lines, refusing to replace anything.
+/// Like [`write`], but refuses to replace an existing path.
 pub fn write_new(path: &Path, events: &[Event]) -> std::io::Result<()> {
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     write_events(file, events)
@@ -27,10 +30,7 @@ pub fn write_new(path: &Path, events: &[Event]) -> std::io::Result<()> {
 
 fn write_events(file: std::fs::File, events: &[Event]) -> std::io::Result<()> {
     let mut out = std::io::BufWriter::new(file);
-    // Reads can be appended while a write is flushing. Its timestamp marks
-    // when it began, so restore event order before replay consumes the lines.
-    let mut events: Vec<_> = events.iter().collect();
-    events.sort_by_key(|event| event.at);
+    // Events arrive in the order they began (`Session::finish` sorts them).
     for e in events {
         let t = e.at.as_secs_f64() * 1000.0;
         let line = match &e.kind {
@@ -136,56 +136,6 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::message::{Id, request};
-    use crate::transport;
-    use std::time::Duration;
-
-    #[test]
-    fn replies_read_during_a_flush_follow_their_request_in_both_transcript_writers() {
-        let request = transport::encode(&serde_json::to_vec(&request(&Id::int(7), "unknown", None)).unwrap());
-        let reply = transport::encode(
-            &serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32601}})).unwrap(),
-        );
-        let split = request.len() / 2;
-        // The public JSONL contract is event-time order. A write is timestamped
-        // when it begins but appended only after flushing; the reader can
-        // append its reply first. Split writes must retain their byte order.
-        let events = [
-            Event { at: Duration::ZERO, kind: EventKind::Sent(request[..split].to_vec()) },
-            Event { at: Duration::from_millis(20), kind: EventKind::Read(reply) },
-            Event { at: Duration::from_millis(10), kind: EventKind::Sent(request[split..].to_vec()) },
-            Event { at: Duration::from_millis(30), kind: EventKind::StdinClosed },
-            Event { at: Duration::from_millis(30), kind: EventKind::Note("after stdin closed".into()) },
-        ];
-        let dir = tempfile::tempdir().unwrap();
-        for writer in [write, write_new] {
-            let path = dir.path().join("transcript.jsonl");
-            writer(&path, &events).unwrap();
-            // Replay is the real consumer: JSON-RPC's matching-id reply must
-            // count, and must gate stdin closure rather than be lost.
-            let plan = crate::replay::parse(&path).unwrap();
-            assert_eq!(plan.requests.len(), 1);
-            assert_eq!(plan.requests[0].id, Id::int(7));
-            assert_eq!(plan.requests[0].recorded.as_deref(), Some("error -32601"));
-            let close = plan.stdin_close.unwrap();
-            assert_eq!(close.after_steps, 2);
-            assert_eq!(close.gates, [Id::int(7)]);
-            let lines: Vec<Value> = std::fs::read_to_string(&path)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-            assert_eq!(
-                lines.iter().map(|line| line["t_ms"].as_f64().unwrap()).collect::<Vec<_>>(),
-                [0.0, 10.0, 20.0, 30.0, 30.0],
-            );
-            assert_eq!(lines[3]["event"], "stdin closed", "equal timestamps retain insertion order");
-            assert_eq!(lines[4]["note"], "after stdin closed");
-            std::fs::remove_file(path).unwrap();
-        }
-    }
-
     #[test]
     fn base64_round_trips() {
         for input in [b"".as_slice(), b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar", &[0, 1, 2, 127, 128, 255]] {

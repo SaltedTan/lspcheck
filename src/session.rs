@@ -72,7 +72,18 @@ impl Default for Options {
 pub struct Event {
     /// Time since the session started.
     pub at: Duration,
+    /// When the event began relative to every other, so that a transcript
+    /// can be put back in the order things happened: a write is appended only
+    /// once it has flushed, by which time the reader may have appended the
+    /// reply, possibly with the same timestamp. Taken from [`next_seq`].
+    pub seq: u64,
     pub kind: EventKind,
+}
+
+/// The next event sequence number. Process-wide, so it only ever grows.
+pub fn next_seq() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone)]
@@ -362,7 +373,12 @@ impl Finish {
 type Transcript = Arc<Mutex<Vec<Event>>>;
 
 fn record(t: &Transcript, at: Duration, kind: EventKind) {
-    t.lock().expect("transcript lock").push(Event { at, kind });
+    record_began(t, at, next_seq(), kind);
+}
+
+/// Records an event that began at `at` and was given `seq` then.
+fn record_began(t: &Transcript, at: Duration, seq: u64, kind: EventKind) {
+    t.lock().expect("transcript lock").push(Event { at, seq, kind });
 }
 
 enum Inbound {
@@ -632,7 +648,7 @@ impl Session {
         let ends: Vec<usize> =
             cuts.iter().copied().filter(|&c| c > 0 && c < bytes.len()).chain([bytes.len()]).collect();
         // The piece being written: where it starts and when it began.
-        let (mut written, mut piece, mut piece_at) = (0usize, 0usize, start.elapsed());
+        let (mut written, mut piece, mut piece_at, mut piece_seq) = (0usize, 0usize, start.elapsed(), next_seq());
         let result = timeout_at(deadline, async {
             for (i, &end) in ends.iter().enumerate() {
                 if end <= written {
@@ -641,7 +657,7 @@ impl Session {
                 if i > 0 && !pause.is_zero() {
                     sleep(pause).await;
                 }
-                piece_at = start.elapsed();
+                (piece_at, piece_seq) = (start.elapsed(), next_seq());
                 while written < end {
                     let n = stdin.write(&bytes[written..end]).await?;
                     if n == 0 {
@@ -650,14 +666,14 @@ impl Session {
                     written += n;
                 }
                 stdin.flush().await?;
-                record(t, piece_at, EventKind::Sent(bytes[piece..written].to_vec()));
+                record_began(t, piece_at, piece_seq, EventKind::Sent(bytes[piece..written].to_vec()));
                 piece = written;
             }
             Ok(())
         })
         .await;
         if written > piece {
-            record(&self.transcript, piece_at, EventKind::Sent(bytes[piece..written].to_vec()));
+            record_began(&self.transcript, piece_at, piece_seq, EventKind::Sent(bytes[piece..written].to_vec()));
         }
         let outcome = match result {
             Ok(Ok(())) => Ok(()),
@@ -1159,9 +1175,10 @@ impl Session {
         let j3_incomplete = self.initialized_at.and_then(|from| incomplete_between(&evidence.lost, ongoing, from, now));
         let mut transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
         // Writes are recorded after flushing, so the reader may append a
-        // later reply first. Restore occurrence order, retaining append order
-        // for equal timestamps (including pieces of a split write).
-        transcript.sort_by_key(|event| event.at);
+        // later reply first. Put events back in the order they began; this is
+        // the one place transcripts are ordered, and every consumer reads them
+        // from here.
+        transcript.sort_by_key(|event| event.seq);
         let whole = evidence.done && !evidence.cut;
         let (miscounted, unchecked) = miscounted_frames(&evidence.unparsed, &transcript, whole);
         // Whether an unmatched reply is a duplicate, early, aborted or only
@@ -1498,25 +1515,27 @@ mod tests {
         let request = transport::encode(&serde_json::to_vec(&message::request(&id, "probe", None)).unwrap());
         let reply = transport::encode(&serde_json::to_vec(&message::response(&id, Value::Null)).unwrap());
         let exit = transport::encode(&serde_json::to_vec(&message::notification("exit", None)).unwrap());
-        // Force the Windows pipe schedule: the reader records the reply
-        // before the writer's flush completes and records the earlier send.
-        record(&s.transcript, Duration::from_nanos(2), EventKind::Read(reply));
-        // Equal timestamps must preserve split-write byte order too.
+        // Force the schedule seen on Windows: a write in two pieces begins,
+        // and the reader records the reply before the writer records its
+        // pieces, all with the same coarse timestamp.
+        let at = Duration::from_millis(10);
         let cut = request.len() / 2;
-        record(&s.transcript, Duration::from_nanos(1), EventKind::Sent(request[..cut].to_vec()));
-        record(&s.transcript, Duration::from_nanos(1), EventKind::Sent(request[cut..].to_vec()));
-        record(&s.transcript, Duration::from_nanos(3), EventKind::Sent(exit));
+        let (first, second) = (next_seq(), next_seq());
+        record(&s.transcript, at, EventKind::Read(reply));
+        record_began(&s.transcript, at, second, EventKind::Sent(request[cut..].to_vec()));
+        record_began(&s.transcript, at, first, EventKind::Sent(request[..cut].to_vec()));
+        record(&s.transcript, at, EventKind::Sent(exit));
         let finish = s.finish(Duration::from_millis(200)).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recording.jsonl");
         crate::transcript::write(&path, &finish.transcript).unwrap();
         let plan = crate::replay::parse(&path).unwrap();
-        // The JSON Lines transcript contract orders the request before its
-        // reply, so replay must retain the result and gate the next write.
+        // The request comes before its reply, in byte order, so replay keeps
+        // the recorded result and waits for it before the next write.
         assert_eq!(plan.requests.len(), 1);
         assert_eq!(plan.requests[0].recorded.as_deref(), Some("result"));
         assert_eq!(plan.steps[2].gates, vec![id]);
-        assert!(finish.transcript.windows(2).all(|pair| pair[0].at <= pair[1].at));
+        assert!(finish.transcript.windows(2).all(|pair| pair[0].seq < pair[1].seq));
     }
 
     #[cfg(unix)]

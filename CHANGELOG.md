@@ -6,14 +6,12 @@
 
 - R1 and R3 wait for an unprompted exit after a failed probe, so a pipe closing before the process finishes exiting
   does not turn a server crash into an inconclusive result on Windows.
-- Transcripts keep fast replies after their requests even when read during a write's flush, avoiding false missing
-  replies in replay summaries on Windows.
+- Transcripts keep each request before its reply, even when the reply is read while the request's write is still
+  flushing and both have the same timestamp, so replay no longer reports a recorded reply as missing (seen on Windows).
 - R1 includes queued responses in its frozen read window and keeps earlier ParseErrors from hiding wrong-code replies.
 - Robustness checks avoid false framing failures and missed leftover processes during cleanup; R2 stays inconclusive
   when skipped output could contain the follow-up reply, even if the server exits.
 - R2 rejects malformed error responses, including invalid codes and missing or non-string messages.
-- Transcripts keep requests before fast replies even when a pipe flush finishes after the reply is read, fixing
-  intermittent missing recorded replies during replay on Windows.
 - Inline profile files can replace read-only fixture files, using default file creation permissions.
 - Terminal, JUnit and Markdown reports reference the transcripts directory for cross-cutting failures and errors.
 - Markdown keeps character references and tildes literal in table cells and makes CR/LF visible in commands and
