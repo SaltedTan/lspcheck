@@ -15,11 +15,14 @@ use std::io::Write;
 use std::path::Path;
 
 /// Writes `events` to `path` as JSON Lines.
+///
+/// Preserves the supplied order; pass the transcript returned by
+/// [`crate::session::Session::finish`] for replay ordering.
 pub fn write(path: &Path, events: &[Event]) -> std::io::Result<()> {
     write_events(std::fs::File::create(path)?, events)
 }
 
-/// Writes `events` to a new path as JSON Lines, refusing to replace anything.
+/// Like [`write`], but refuses to replace an existing path.
 pub fn write_new(path: &Path, events: &[Event]) -> std::io::Result<()> {
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     write_events(file, events)
