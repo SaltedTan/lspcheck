@@ -55,8 +55,17 @@ pub fn counts_line(results: &[&CheckResult]) -> String {
     )
 }
 
-pub fn print_terminal(out: &mut impl Write, server: &str, runs: &[ScenarioRun]) -> std::io::Result<()> {
-    writeln!(out, "lspcheck {} — {server}", env!("CARGO_PKG_VERSION"))?;
+/// The terminal summary. Its header names the profile, when one was used.
+pub fn print_terminal(
+    out: &mut impl Write,
+    server: &str,
+    profile: Option<&Path>,
+    runs: &[ScenarioRun],
+) -> std::io::Result<()> {
+    match profile {
+        Some(path) => writeln!(out, "lspcheck {} — {server} — profile {}", env!("CARGO_PKG_VERSION"), path.display())?,
+        None => writeln!(out, "lspcheck {} — {server}", env!("CARGO_PKG_VERSION"))?,
+    }
     let results = ordered(runs);
     for r in &results {
         let c = checks::info(r.id);
@@ -73,7 +82,8 @@ pub fn print_terminal(out: &mut impl Write, server: &str, runs: &[ScenarioRun]) 
     writeln!(out, "{}", counts_line(&results))
 }
 
-pub fn json_report(server: &[String], runs: &[ScenarioRun]) -> Value {
+/// The JSON report. `profile` is the profile's path as given, if one was used.
+pub fn json_report(server: &[String], profile: Option<&Path>, runs: &[ScenarioRun]) -> Value {
     let results: Vec<Value> = ordered(runs)
         .into_iter()
         .map(|r| {
@@ -94,6 +104,7 @@ pub fn json_report(server: &[String], runs: &[ScenarioRun]) -> Value {
         "schema": SCHEMA,
         "lspcheck": env!("CARGO_PKG_VERSION"),
         "server": server,
+        "profile": profile.map(|p| p.to_string_lossy()),
         "host": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH},
         "results": results,
     })
@@ -541,7 +552,7 @@ mod tests {
                 ];
                 let expected = recorded && matches!(verdict, Verdict::Fail | Verdict::Error);
                 let mut terminal = Vec::new();
-                print_terminal(&mut terminal, "gopls serve", &runs).unwrap();
+                print_terminal(&mut terminal, "gopls serve", None, &runs).unwrap();
                 let terminal = String::from_utf8(terminal).unwrap();
                 let xml = junit_report(&server(), &runs);
                 let markdown = markdown_report(&server(), &runs);

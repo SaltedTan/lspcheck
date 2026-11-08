@@ -46,6 +46,9 @@ pub struct Options {
     pub auto_respond: bool,
     /// The answer to `workspace/workspaceFolders`.
     pub workspace_folders: Value,
+    /// The settings `workspace/configuration` is answered from (a profile's
+    /// `[client].configuration`); without them, each item gets `null`.
+    pub configuration: Option<Value>,
 }
 
 impl Default for Options {
@@ -59,6 +62,7 @@ impl Default for Options {
             stderr_limit: 1024 * 1024,
             auto_respond: true,
             workspace_folders: Value::Null,
+            configuration: None,
         }
     }
 }
@@ -93,6 +97,9 @@ pub enum EventKind {
         path: PathBuf,
         files: Vec<(String, String)>,
     },
+    /// The settings `workspace/configuration` is answered from, so a replay
+    /// answers the same way.
+    Configuration(Value),
 }
 
 /// Something wrong with the server's output stream.
@@ -127,6 +134,19 @@ impl std::fmt::Display for Problem {
             }
         }
     }
+}
+
+/// The answer to one `workspace/configuration` item: its `section` looked up
+/// as a dot-separated path into `settings`, `null` where the path leads
+/// nowhere. An item without a section (or with an empty one) gets all of it.
+pub fn configuration_item(settings: &Value, item: &Value) -> Value {
+    let section = match item.get("section") {
+        None | Some(Value::Null) => return settings.clone(),
+        Some(Value::String(s)) if s.is_empty() => return settings.clone(),
+        Some(Value::String(s)) => s,
+        Some(_) => return Value::Null,
+    };
+    section.split('.').try_fold(settings, |v, key| v.get(key)).cloned().unwrap_or(Value::Null)
 }
 
 /// A short, escaped rendering of some bytes.
@@ -503,6 +523,11 @@ impl Session {
         record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files });
     }
 
+    /// Records the settings `workspace/configuration` is answered from, for [`crate::replay`].
+    pub fn record_configuration(&self, settings: Value) {
+        record(&self.transcript, self.start.elapsed(), EventKind::Configuration(settings));
+    }
+
     /// Why evidence is incomplete so far, if it is: an inspection limit,
     /// frames that couldn't be read, or lspcheck's own side of the
     /// conversation. Any of these could explain a response that didn't come.
@@ -850,8 +875,12 @@ impl Session {
     async fn answer(&mut self, id: &Id, method: &str, request: &Value, deadline: Instant) {
         let reply = match method {
             "workspace/configuration" => {
-                let n = request.pointer("/params/items").and_then(Value::as_array).map_or(0, Vec::len);
-                message::response(id, Value::Array(vec![Value::Null; n]))
+                let items = request.pointer("/params/items").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+                let answers = match &self.opts.configuration {
+                    Some(settings) => items.iter().map(|item| configuration_item(settings, item)).collect(),
+                    None => vec![Value::Null; items.len()],
+                };
+                message::response(id, Value::Array(answers))
             }
             "workspace/workspaceFolders" => message::response(id, self.opts.workspace_folders.clone()),
             "workspace/applyEdit" => message::response(id, json!({"applied": false})),
@@ -1422,6 +1451,23 @@ pub fn describe_status(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_items_are_looked_up_by_dotted_section() {
+        let settings = json!({"gopls": {"staticcheck": false, "ui": {"hints": [1]}}, "x.y": 1});
+        let item = |v: Value| configuration_item(&settings, &v);
+        assert_eq!(item(json!({"section": "gopls"})), settings["gopls"]);
+        assert_eq!(item(json!({"section": "gopls.staticcheck"})), json!(false));
+        assert_eq!(item(json!({"section": "gopls.ui.hints"})), json!([1]));
+        // A whole table without a section; null where the path leads nowhere.
+        assert_eq!(item(json!({"scopeUri": "file:///x"})), settings);
+        assert_eq!(item(json!({"section": ""})), settings);
+        assert_eq!(item(json!({"section": "gopls.missing"})), Value::Null);
+        assert_eq!(item(json!({"section": "gopls.staticcheck.deeper"})), Value::Null);
+        // A dot always separates: a key spelled with one isn't found.
+        assert_eq!(item(json!({"section": "x.y"})), Value::Null);
+        assert_eq!(item(json!({"section": 3})), Value::Null);
+    }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]

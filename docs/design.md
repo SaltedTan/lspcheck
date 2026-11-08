@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies, while profiles, K1 and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. Profiles part 1 is done (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[allow]`); unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies; part 2 (`[document]`, `[client].capabilities`, K1) and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -12,7 +12,7 @@ transcript that reproduces each failure.
 
 ```
 lspcheck -- gopls                          # default checks, temp workspace, no profile
-lspcheck --profile go.toml -- gopls serve  # with a sample workspace and document
+lspcheck --profile go.toml -- gopls serve  # with a sample workspace and settings
 lspcheck --json report.json --junit junit.xml --transcripts out/ -- ./my-server --stdio
 lspcheck list                              # the check catalogue with spec references
 lspcheck replay out/L5.jsonl -- ./my-server   # re-run one failing session
@@ -83,10 +83,10 @@ J7 treats an earlier request as unanswered when lspcheck never wrote its whole a
 J7 times a reuse against when lspcheck began writing it: only a request read before then was certainly sent before
 the server could have had the answer. Reusing an id at or after that time is treated as lawful if the earlier answer
 was written in full. lspcheck's answers are fixed: `null` for each
-`workspace/configuration` item, the workspace for `workspace/workspaceFolders`, `applied: false` and
+`workspace/configuration` item (or, with a profile's `[client].configuration`, the item's section looked up in it;
+see below), the workspace for `workspace/workspaceFolders`, `applied: false` and
 `success: false` for `workspace/applyEdit` and `window/showDocument`, `null` for registrations, progress tokens,
-`window/showMessageRequest` and the refresh requests, and MethodNotFound otherwise; a profile will make them
-configurable (`[client]` below). A server that stops answering after an answer may have stopped for another reason,
+`window/showMessageRequest` and the refresh requests, and MethodNotFound otherwise. A server that stops answering after an answer may have stopped for another reason,
 so that alone is never J7's failure. When the evidence is complete and no unanswered id was reused, J7 passes when
 the server answers at least one request lspcheck sent after completing an answer to a server request. It is an error
 when no answer was followed by service but at least one was followed by unanswered requests, and not exercised when
@@ -131,9 +131,10 @@ cancel can come at any time, so the verdicts are given at the end, over everythi
   and C2 when after; a response carrying the never-sent id fails C2, and so does a plain request that goes unanswered
   after the cancels;
 - a response without an id (`id` missing or `null`) can't be matched to the notification it answers, and until `exit`
-  lspcheck sends only `initialized` and the cancels. C3 fails on one read after the first cancel was written whose
+  lspcheck sends only `initialized` (and, with a profile's settings, `workspace/didChangeConfiguration`) and the
+  cancels. C3 fails on one read after the first cancel was written whose
   text names `$/cancelRequest` (as a MethodNotFound message usually does); any other is `error` for C3, since it may
-  answer `initialized` (answering any notification is J3's failure).
+  answer `initialized` or the settings (answering any notification is J3's failure).
 
 If the server stopped answering, what it didn't send can't be judged, so those checks are `error`. A pass is also
 `error` when lspcheck missed something where that check's evidence would be: a frame it skipped or couldn't read, a
@@ -369,32 +370,87 @@ After successful initialization, all four robustness scenarios attempt a bounded
 cleanup. This lets lawful output still in flight finish and lets L9 observe descendants that outlive the server.
 
 ## Profiles (optional TOML)
+`lspcheck --profile PATH [-- SERVER…]` reads a TOML file (`src/profile.rs`). Part 1 is implemented; the sections
+marked *planned* are part 2.
 ```toml
 [server]
-command = ["gopls"]          # or given after `--`
-startup_timeout = "30s"
-request_timeout = "10s"
+command = ["gopls", "serve"]   # used when no command follows `--`
+startup_timeout = "30s"        # like --startup-timeout
+request_timeout = "10s"        # like --timeout
+exit_timeout = "5s"            # like --exit-timeout
 
-[workspace]                 # copied into a fresh temp dir per session; rootUri and workspaceFolders point there
-path = "fixtures/go"        # or inline:
-files = { "go.mod" = "module example\n" }
+[workspace]                    # each scenario gets a fresh temp dir; rootUri and workspaceFolders point there
+path = "fixtures/go"           # a directory copied into it, relative to the profile file's directory
+files = { "go.mod" = "module example\n\ngo 1.22\n" }   # inline files written after copying `path`
 
-[document]
+[document]                     # planned (part 2)
 path = "main.go"
 language_id = "go"
-positions = ["main.go:3:6"] # where K1 probes; otherwise identifier-looking tokens are used
+positions = ["main.go:3:6"]    # where K1 probes; otherwise identifier-looking tokens are used
 
 [client]
-initialization_options = {}
-configuration = {}          # answers to workspace/configuration
-capabilities = "default"    # or a path to a capabilities JSON
+initialization_options = { hints = true }            # sent as initializeParams.initializationOptions
+configuration = { gopls = { staticcheck = false } }  # answers to workspace/configuration
+capabilities = "default"       # planned (part 2): or a path to a capabilities JSON
 
 [allow]
-descendants = []            # process names allowed to outlive exit
-skip = []                   # check ids, with a reason each
+descendants = ["gopls-helper"]       # process names allowed to outlive exit (L9)
+skip = [{ id = "L7", reason = "exits 0 by design, see issue 12" }]
 ```
-Without a profile: an empty temp workspace and a `plaintext` document. Generic checks still run; position checks report
+Without a profile: an empty temp workspace and a `plaintext` document, and nothing below applies; the output is what
+it was before profiles (the JSON report has `"profile": null`). Generic checks still run; position checks report
 `not-exercised` where the server produced no positions.
+
+- **Parsing.** Every section and key is optional. Unknown sections or keys (serde's `deny_unknown_fields`, so part 2's
+  `[document]` and `capabilities` are refused for now) and wrong types are usage errors (exit status 2) whose message
+  names the file and shows `toml`'s error with its line, column and the offending line. Durations are strings
+  `"<n>ms"`, `"<n>s"` or `"<n>m"` with a non-negative integer n; anything else, a bare number included, is an error
+  naming the key. Everything is validated once, before any scenario starts.
+- **Precedence.** A command after `--` overrides `[server].command`; neither is a usage error. A timeout flag given on
+  the command line overrides the profile's value, which overrides the built-in default (the flags are optional in clap,
+  and the defaults are applied after merging). `--only`, `--strict`, `--json`, `--transcripts` and the size limits are
+  command-line only.
+- **Paths** are relative to the profile file's directory: `[workspace].path`, and a `[server].command` program with a
+  directory part (a bare name is looked up on `PATH`; arguments are passed as written). `[workspace].path` must be an
+  existing directory; it is copied recursively into each scenario's workspace, regular files and directories only: a
+  symbolic link anywhere in it is a usage error naming it, never followed, so nothing outside the fixture is copied
+  (the copy checks again without following links). `[workspace].files` keys are relative paths with `/` separators;
+  empty, absolute (`/x`, `C:/x`), backslashed, and `.`, `..` or empty parts are refused. Parent directories are
+  created, and an inline file overwrites a copied file of the same path. An inline file that needs a directory where
+  the fixture or another inline file has a file, or that names a fixture directory, is refused.
+- **lspcheck's own files.** lspcheck writes `doc.txt` and `crlf.txt` (documents scenario) and `lspcheck-utf8.txt`
+  (framing, F5) at the top of the workspace, and D4 asks about `missing.txt` there, which must not exist. These names
+  (`checks::OWN_FILES`, compared ignoring ASCII case) are reserved: a profile file or directory at one is a usage error
+  naming it. Deeper paths such as `src/doc.txt` are the profile's.
+- **`initialization_options`** is any TOML value, converted to JSON (a date or time becomes its TOML spelling; NaN or
+  an infinite float is an error), and sent as `initializationOptions` in every initialize lspcheck sends: each
+  scenario's, L3's second one and the pre-initialize scenario's. Absent, the field is omitted as before.
+- **`configuration`** (a table). Each `workspace/configuration` item is answered by looking up its `section` as a
+  dot-separated path into the table (`"gopls"` gives the `gopls` table, `"gopls.staticcheck"` gives `false`); an item
+  without a section, or with an empty one, gets the whole table; a path that leads nowhere, or a section that isn't a
+  string, gets `null`. Without it, each item gets `null` as before. When it is given, lspcheck also sends
+  `workspace/didChangeConfiguration` with `{"settings": <configuration>}` right after `initialized`, before the
+  scenario's first request (some servers read settings only that way). That is one more notification after
+  `initialized`: J3 already counts any id-less response after `initialized` as answering a notification, and C3's
+  attribution reads it as one of the notifications it can't tell apart from `initialized` (`error`, not `fail`). The
+  pre-initialize scenario's own `didChangeConfiguration` before initialize is unchanged.
+- **`allow.descendants`.** L9 doesn't fail for a leftover process whose name (as lspcheck reports it: on Linux the
+  kernel's command name, at most 15 bytes) is in the list. A `PASS` detail names what was allowed, per scenario; a
+  leftover not on the list fails as before, and the detail of that failure names the allowed ones too.
+- **`allow.skip`.** Each entry needs an `id` in the catalogue and a non-empty `reason`; an id listed twice is an
+  error. A skipped check reports `SKIP` with `skipped by the profile: <reason>` and doesn't affect the exit status. A
+  scenario runs when one of its checks, or a cross-cutting check, is wanted (by `--only`) and not skipped, and then
+  runs whole, as without the skips, so no other verdict changes; a skipped check's verdict is replaced at the end. A
+  scenario whose checks are all skipped or unselected doesn't run (when no cross-cutting check needs it), and its
+  skipped checks are still reported.
+- **Reports.** The JSON report gains a top-level `"profile"` (the path as given, or `null`); the schema id is
+  unchanged. The terminal header line ends with `— profile PATH` when one is used.
+- **Replay.** A transcript's workspace line records the files at the workspace's top (as before) and every file the
+  profile put there, nested ones named with `/`, so replay recreates them; a file that isn't UTF-8 text isn't
+  recorded (an existing limit) and so can't be recreated. There is no size limit. A `{"dir":"meta","configuration":…}`
+  line records the settings, and replay answers `workspace/configuration` from it. `initializationOptions` and the
+  `didChangeConfiguration` are in the recorded bytes. Replay's own timeouts are still its flags; it doesn't read
+  profiles.
 
 ## Report
 - Terminal summary in catalogue order, with counts and a line per check.
@@ -421,7 +477,7 @@ Without a profile: an empty temp workspace and a `plaintext` document. Generic c
 - `lspcheck replay TRANSCRIPT -- SERVER`: re-runs one recorded session against a server. It recreates the recorded
   workspace (refusing a non-empty or symlink path; preserving an existing empty directory), re-sends every client write
   in order (gaps under 200 ms kept as pauses), and answers server-to-client requests with the same auto-answers a live run
-  uses. It reports each request's outcome against the recorded one (result / error code / no reply), the exit status
+  uses, with a profile's recorded settings for `workspace/configuration`. It reports each request's outcome against the recorded one (result / error code / no reply), the exit status
   recorded versus now, and how many server-to-client requests were answered. An outcome is the first response with
   the request's id read after the write holding the request's last byte began, before the id was next sent and before
   lspcheck began stopping the server; both runs are matched the same way. It judges no check: the summary says to
@@ -445,9 +501,11 @@ Single crate, `src/` modules:
   ids cannot collide with them. Each call has one absolute deadline covering its write and its reply; each scenario
   has its own timeouts and a bounded cleanup. After a write stops partway through a frame, lspcheck sends nothing more.
 - `checks`: one module per area; each check declares id, basis, spec link, and a function over a `Session`.
-- `profile`, `report`, `cli` (clap).
-Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, toml, thiserror; `nix` on Unix,
-`windows-sys` on Windows. No network access at runtime.
+- `profile`: reads and validates a profile (`toml` with `serde`'s `deny_unknown_fields`), copies its files into each
+  scenario's workspace, and merges its command and timeouts with the command line's.
+- `report`, `cli` (clap).
+Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, toml (`parse` and `serde` features
+only), thiserror; `nix` on Unix, `windows-sys` on Windows. No network access at runtime.
 
 ## How we know it works
 - `standin`: a test-only server binary (in the workspace) with fault flags, one per check:

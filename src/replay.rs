@@ -77,6 +77,9 @@ pub struct StdinClose {
 pub struct Plan {
     /// The workspace to recreate, when the recording has one.
     pub workspace: Option<Workspace>,
+    /// The settings the recording answered `workspace/configuration` from,
+    /// when a profile gave some.
+    pub configuration: Option<Value>,
     pub steps: Vec<Step>,
     /// The request frame occurrences in send order.
     pub requests: Vec<RequestOccurrence>,
@@ -220,6 +223,7 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
     let mut plan = Plan {
         workspace: None,
+        configuration: None,
         steps: Vec::new(),
         requests: Vec::new(),
         stdin_close: None,
@@ -335,6 +339,9 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
                         }
                     }
                     plan.workspace = Some(Workspace { path: PathBuf::from(dir), files });
+                }
+                if let Some(settings) = v.get("configuration") {
+                    plan.configuration = Some(settings.clone());
                 }
                 if v.get("event").and_then(Value::as_str) == Some("stdin closed") {
                     plan.stdin_close =
@@ -568,6 +575,7 @@ pub async fn replay(
             .as_ref()
             .map(|root| json!([{"uri": file_uri(root), "name": "workspace"}]))
             .unwrap_or(Value::Null),
+        configuration: plan.configuration.clone(),
         ..Options::default()
     };
     let mut session = match Session::start(&cmd, opts).await {
@@ -577,6 +585,9 @@ pub async fn replay(
 
     if let Some(recorded) = &plan.workspace {
         session.record_workspace(recorded.path.clone(), recorded.files.clone());
+    }
+    if let Some(settings) = &plan.configuration {
+        session.record_configuration(settings.clone());
     }
     // Each recorded event, in order, waits for the replies the original run
     // had already read, including events replaced by the session's auto-answer.
@@ -798,6 +809,17 @@ mod tests {
         let w = p.workspace.expect("a workspace");
         assert_eq!(w.path, PathBuf::from("/tmp/ws"));
         assert_eq!(w.files, vec![("doc.txt".to_string(), "hello\n".to_string())]);
+        assert!(p.configuration.is_none());
+    }
+
+    #[test]
+    fn recorded_settings_are_kept_for_the_answers() {
+        let jsonl = [
+            r#"{"t_ms": 0.0, "dir": "meta", "configuration": {"gopls": {"staticcheck": false}}}"#.to_string(),
+            line("out", 1.0, b""),
+        ]
+        .join("\n");
+        assert_eq!(plan(&jsonl).configuration, Some(json!({"gopls": {"staticcheck": false}})));
     }
 
     #[test]

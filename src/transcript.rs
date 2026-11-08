@@ -53,6 +53,9 @@ fn write_events(file: std::fs::File, events: &[Event]) -> std::io::Result<()> {
                 v["files"] = Value::Object(files);
                 v
             }
+            EventKind::Configuration(settings) => {
+                json!({"t_ms": t, "dir": "meta", "configuration": settings})
+            }
         };
         serde_json::to_writer(&mut out, &line)?;
         out.write_all(b"\n")?;

@@ -68,6 +68,8 @@ struct Run {
     status: i32,
     verdicts: BTreeMap<String, String>,
     stdout: String,
+    /// The JSON report.
+    report: Value,
     /// What the server wrote to stderr, from every transcript.
     server_stderr: String,
     took: Duration,
@@ -127,7 +129,7 @@ fn run_command_in(
             }
         }
     }
-    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, server_stderr, took }
+    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, report: json, server_stderr, took }
 }
 
 fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
@@ -261,6 +263,9 @@ fn the_clean_standin_passes_every_check() {
     expect(&r, "R4", "pass");
     assert_eq!(r.status, 0, "{}", r.stdout);
     assert_eq!(r.verdicts.len(), lspcheck::checks::CATALOGUE.len());
+    // Without a profile, the report says so and the header doesn't mention one.
+    assert_eq!(r.report["profile"], Value::Null);
+    assert!(!r.stdout.lines().next().unwrap_or("").contains("profile"), "{}", r.stdout);
     // D1, D2 and D3 passed on evidence, not for lack of it.
     assert!(r.stdout.contains("informative position(s) on character boundaries"), "{}", r.stdout);
     assert!(
@@ -2060,4 +2065,211 @@ fn replay_of_a_transcript_without_a_workspace_notes_it() {
     assert_eq!(out.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("none recorded"), "{stdout}");
+}
+
+// --- profiles ---------------------------------------------------------------
+
+/// A profile file holding `text`, in a directory kept alive by the returned guard.
+fn profile(text: &str) -> (std::path::PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("profile.toml");
+    std::fs::write(&path, text).unwrap();
+    (path, dir)
+}
+
+/// A TOML literal string holding `s` (no escapes, so Windows paths survive).
+fn literal(s: &str) -> String {
+    assert!(!s.contains('\''), "{s}");
+    format!("'{s}'")
+}
+
+/// The stand-in with `faults`, checked with the profile at `path`.
+fn with_profile(faults: &[&str], path: &std::path::Path) -> Run {
+    let args: Vec<&str> = faults.iter().flat_map(|f| ["--fault", f]).collect();
+    run(&args, &["--profile", path.to_str().unwrap()])
+}
+
+/// Replays `transcript` against the stand-in with `fault`, and asserts every
+/// request's outcome is the one recorded.
+fn replays_alike(transcript: &std::path::Path, fault: &str) -> String {
+    let out = replay(transcript, &[], &[STANDIN, "--fault", fault]);
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let outcomes: Vec<&str> = stdout.lines().filter(|l| l.starts_with("    ") && l.contains(" -> ")).collect();
+    assert!(!outcomes.is_empty(), "{stdout}");
+    for line in outcomes {
+        let (_, outcome) = line.split_once(": ").unwrap();
+        let (recorded, replayed) = outcome.split_once(" -> ").unwrap();
+        assert_eq!(recorded, replayed, "{stdout}");
+    }
+    stdout
+}
+
+#[test]
+fn a_server_that_needs_initialization_options_is_an_error_without_them_and_passes_with_them() {
+    let r = fault("needs-init-option");
+    expect(&r, "L2", "error");
+    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+    assert_eq!(r.status, 2);
+    assert!(r.stdout.contains("refused to initialize"), "{}", r.stdout);
+
+    // Every initialize carries them, the second one (L3) and the one after a
+    // request before initialize (L1) included.
+    let (path, _keep) = profile("[client]\ninitialization_options = { standin = \"ready\", depth = 2 }\n");
+    let r = with_profile(&["needs-init-option"], &path);
+    only_fails(&r, &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    assert_eq!(r.report["profile"], path.to_str().unwrap());
+    assert!(r.stdout.lines().next().unwrap().ends_with(&format!("— profile {}", path.display())), "{}", r.stdout);
+}
+
+#[test]
+fn a_server_that_needs_a_workspace_file_passes_with_inline_files() {
+    let r = fault("needs-workspace-file");
+    expect(&r, "L2", "error");
+    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+    assert!(r.stdout.contains("needs standin.toml"), "{}", r.stdout);
+
+    let (path, _keep) = profile(
+        "[workspace]\nfiles = { \"standin.toml\" = \"require = \\\"src/lib.txt\\\"\\n\", \"src/lib.txt\" = \"x\" }\n",
+    );
+    let r = with_profile(&["needs-workspace-file"], &path);
+    only_fails(&r, &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn a_server_that_needs_a_workspace_file_passes_with_a_fixture_and_replays() {
+    // The fixture is found relative to the profile, and its nested file is
+    // copied too (the stand-in requires it).
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/standin-workspace.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let t = dir.path().join("t");
+    let server = [STANDIN, "--fault", "needs-workspace-file"];
+    let r = run_command_in(&["--profile", path.to_str().unwrap()], &server, None, t.clone());
+    only_fails(&r, &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    // The transcript records the fixture's files, so a replay recreates them
+    // and the server initializes there as it did.
+    let transcript = t.join("lifecycle.jsonl");
+    let first = std::fs::read_to_string(&transcript).unwrap();
+    let workspace: Value = first
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["workspace"].is_string())
+        .unwrap();
+    assert!(workspace["files"]["src/nested/lib.txt"].is_string(), "{workspace}");
+    let stdout = replays_alike(&transcript, "needs-workspace-file");
+    assert!(stdout.contains("result -> result"), "{stdout}");
+}
+
+#[test]
+fn a_server_that_needs_settings_fails_without_them_and_passes_and_replays_with_them() {
+    let r = fault("needs-configuration");
+    expect(&r, "J4", "fail");
+    assert_eq!(r.status, 1, "{}", r.stdout);
+    assert!(r.stdout.contains("isn't configured"), "{}", r.stdout);
+
+    let (path, _keep) = profile("[client.configuration.standin]\nmode = \"ready\"\n");
+    let dir = tempfile::tempdir().unwrap();
+    let t = dir.path().join("t");
+    let server = [STANDIN, "--fault", "needs-configuration"];
+    let r = run_command_in(&["--profile", path.to_str().unwrap()], &server, None, t.clone());
+    only_fails(&r, &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    // The answer was looked up by section, and the settings were also sent
+    // after `initialized`.
+    assert!(r.server_stderr.contains("configuration answered with [\"ready\"]"), "{}", r.server_stderr);
+    let transcript = t.join("lifecycle.jsonl");
+    let text = std::fs::read_to_string(&transcript).unwrap();
+    assert!(text.contains("workspace/didChangeConfiguration"), "{text}");
+    // A replay answers the server's question from the recorded settings, so
+    // it is served as it was.
+    let stdout = replays_alike(&transcript, "needs-configuration");
+    assert!(stdout.contains("error -32601 -> error -32601"), "{stdout}");
+}
+
+#[test]
+fn the_profiles_command_is_used_when_none_follows_the_dashes() {
+    let (path, _keep) =
+        profile(&format!("[server]\ncommand = [{}, \"--fault\", \"wrong-unknown-error\"]\n", literal(STANDIN)));
+    let r = run_command(&["--profile", path.to_str().unwrap()], &[], None);
+    only_fails(&r, &["J4"]);
+    assert_eq!(r.report["server"][2], "wrong-unknown-error");
+    // A command after `--` wins.
+    let r = run_command(&["--profile", path.to_str().unwrap()], &[STANDIN], None);
+    only_fails(&r, &[]);
+}
+
+#[cfg(unix)]
+#[test]
+fn allowed_descendants_dont_fail_l9_but_are_named() {
+    // A name not on the list still fails, as without a profile.
+    let (path, _keep) = profile("[allow]\ndescendants = [\"some-other-daemon\"]\n");
+    let r = with_profile(&["orphan-child"], &path);
+    only_fails(&r, &["L9"]);
+    // The name lspcheck reports for the leftover (on Linux, the kernel's
+    // 15-byte command name).
+    let detail = r.report["results"].as_array().unwrap().iter().find(|c| c["id"] == "L9").unwrap()["detail"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let name = detail.split_once(" (").and_then(|(_, rest)| rest.split_once(')')).map(|(n, _)| n).unwrap();
+    assert!(name.starts_with("lspcheck-stand"), "{detail}");
+
+    let (path, _keep) = profile(&format!("[allow]\ndescendants = [{name:?}]\n"));
+    let r = with_profile(&["orphan-child"], &path);
+    only_fails(&r, &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    assert!(r.stdout.contains("allowed by the profile to outlive the server"), "{}", r.stdout);
+    assert!(r.stdout.contains(&format!("({name})")), "{}", r.stdout);
+}
+
+#[test]
+fn a_skipped_check_is_reported_as_skip_and_hides_nothing_else() {
+    // J4 fails on this fault and L9 is cross-cutting; both are skipped.
+    let (path, _keep) = profile(
+        "[[allow.skip]]\nid = \"J4\"\nreason = \"answers unknown requests its own way, see issue 7\"\n\
+         [[allow.skip]]\nid = \"L9\"\nreason = \"helpers are cleaned up by the editor\"\n",
+    );
+    let r = with_profile(&["wrong-unknown-error", "exit-status"], &path);
+    passes_except(&r, &[("J4", "skip"), ("L9", "skip"), ("L6", "fail"), ("L7", "fail")]);
+    assert!(
+        r.stdout.contains("skipped by the profile: answers unknown requests its own way, see issue 7"),
+        "{}",
+        r.stdout
+    );
+    assert!(r.stdout.contains("skipped by the profile: helpers are cleaned up by the editor"), "{}", r.stdout);
+    // The skipped MUST failure doesn't count; L6 and L7 are SHOULD checks.
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    assert_eq!(r.verdicts.len(), lspcheck::checks::CATALOGUE.len());
+}
+
+#[test]
+fn a_scenario_whose_checks_are_all_skipped_or_unselected_doesnt_run() {
+    let (path, _keep) = profile("[allow]\nskip = [{ id = \"L7\", reason = \"exits 0 by design\" }]\n");
+    let dir = tempfile::tempdir().unwrap();
+    let t = dir.path().join("t");
+    let r = run_command_in(&["--profile", path.to_str().unwrap(), "--only", "L6,L7"], &[STANDIN], None, t.clone());
+    assert_eq!(r.verdicts.len(), 2, "{}", r.stdout);
+    expect(&r, "L6", "pass");
+    expect(&r, "L7", "skip");
+    assert!(t.join("lifecycle.jsonl").exists());
+    assert!(!t.join("exit-without-shutdown.jsonl").exists(), "L7's scenario ran");
+}
+
+#[test]
+fn a_bad_profile_is_a_usage_error_before_any_server_starts() {
+    let (path, keep) = profile("[server]\nrequest_timeout = 30\n");
+    let transcripts = keep.path().join("t");
+    let out = Command::new(LSPCHECK)
+        .args(["--profile", path.to_str().unwrap(), "--transcripts", transcripts.to_str().unwrap(), "--", STANDIN])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("server.request_timeout") && stderr.contains("line 2"), "{stderr}");
+    assert!(stderr.contains(&path.display().to_string()), "{stderr}");
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(!transcripts.exists(), "nothing was set up for a run");
 }

@@ -234,6 +234,15 @@ const FAULTS: &[(&str, &str)] = &[
     ("selection-outside", "the range is the word before the position, still on a boundary"),
     ("selection-short", "one entry fewer than the positions"),
     ("selection-parent-inside", "the parent is a range strictly inside its child"),
+    ("needs-init-option", "refuse to initialize unless initializationOptions has standin = \"ready\""),
+    (
+        "needs-workspace-file",
+        "refuse to initialize unless the root holds standin.toml and every file its require lines name",
+    ),
+    (
+        "needs-configuration",
+        "after initialized, ask for setting standin.mode and wait for it; unless it is \"ready\", answer every request with an error",
+    ),
 ];
 
 fn main() {
@@ -319,6 +328,8 @@ fn main() {
     let mut queued: std::collections::VecDeque<Frame> = std::collections::VecDeque::new();
     // For reuse-answered-request-id: whether the id was used again.
     let mut reused_id = false;
+    // For needs-configuration: whether the client gave the setting it needs.
+    let mut configured = !fault("needs-configuration");
     let mut children: Vec<Child> = Vec::new();
     // The text of each open document, with the version it was last sent at,
     // and how positions are counted.
@@ -646,6 +657,22 @@ fn main() {
                     }
                 }
             }
+            if method == "initialized" && fault("needs-configuration") {
+                // Like a server that reads its settings before doing
+                // anything else: handle nothing until the answer comes.
+                let id = json!("standin-config");
+                let items = json!([{"section": "standin.mode"}]);
+                out.frame(&json!({"jsonrpc": "2.0", "id": id, "method": "workspace/configuration", "params": {"items": items}}));
+                while let Some(frame) = input.next() {
+                    let Ok(v) = serde_json::from_slice::<Value>(&frame.1) else { continue };
+                    if v.get("method").is_none() && v.get("id") == Some(&id) {
+                        configured = v.get("result") == Some(&json!(["ready"]));
+                        eprintln!("standin: configuration answered with {}", v.get("result").unwrap_or(&Value::Null));
+                        break;
+                    }
+                    queued.push_back(frame);
+                }
+            }
             if method == "initialized" && fault("register-other") {
                 // A dynamic registration of a method D3 doesn't depend on;
                 // it must not make D3 an error.
@@ -851,6 +878,18 @@ fn main() {
                 out.frame(&json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32001, "message": "Required SDK is unavailable", "data": {"retry": false}}}));
                 continue;
             }
+            if fault("needs-init-option")
+                && msg.pointer("/params/initializationOptions/standin") != Some(&json!("ready"))
+            {
+                out.frame(&err(&id, -32001, "the stand-in needs initializationOptions {\"standin\": \"ready\"}"));
+                continue;
+            }
+            if fault("needs-workspace-file")
+                && let Err(why) = workspace_ready(&msg)
+            {
+                out.frame(&err(&id, -32001, &why));
+                continue;
+            }
             initialized = true;
             let offered = |name: &str| {
                 msg.pointer("/params/capabilities/general/positionEncodings")
@@ -962,6 +1001,10 @@ fn main() {
                 bytes.extend(out.encode(&reply));
             }
             out.raw(&bytes);
+            continue;
+        }
+        if !configured {
+            out.frame(&err(&id, -32603, "the stand-in isn't configured: setting standin.mode isn't \"ready\""));
             continue;
         }
         if shut_down && !fault("post-shutdown-results") {
@@ -1500,6 +1543,48 @@ fn publish_diagnostics<W: Write>(
 
 /// The file a `file:` URI names, read from disk (closed-from-disk); `None`
 /// when the URI isn't a `file:` URI, the path isn't UTF-8, or the read fails.
+/// For needs-workspace-file: whether the workspace root given in `initialize`
+/// holds `standin.toml` and each file named by a `require = "PATH"` line in it.
+fn workspace_ready(initialize: &Value) -> Result<(), String> {
+    let root = initialize
+        .pointer("/params/rootUri")
+        .and_then(Value::as_str)
+        .and_then(uri_path)
+        .ok_or("the stand-in needs a rootUri")?;
+    let manifest = std::fs::read_to_string(root.join("standin.toml"))
+        .map_err(|e| format!("the stand-in needs standin.toml in its workspace: {e}"))?;
+    for line in manifest.lines() {
+        if let Some(path) = line.trim().strip_prefix("require = \"").and_then(|rest| rest.strip_suffix('"'))
+            && !root.join(path).is_file()
+        {
+            return Err(format!("the stand-in needs {path} in its workspace, as standin.toml says"));
+        }
+    }
+    Ok(())
+}
+
+/// The path a `file:` URI names, percent-decoded. On Windows the `/` before
+/// the drive letter is dropped.
+fn uri_path(uri: &str) -> Option<std::path::PathBuf> {
+    let bytes = uri.strip_prefix("file://")?.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h = (bytes[i + 1] as char).to_digit(16)?;
+            let l = (bytes[i + 2] as char).to_digit(16)?;
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let path = String::from_utf8(out).ok()?;
+    let windows_drive = cfg!(windows) && path.as_bytes().get(2) == Some(&b':');
+    Some(std::path::PathBuf::from(if windows_drive { &path[1..] } else { &path[..] }))
+}
+
 fn disk_text(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("file://")?;
     let bytes = rest.as_bytes();
