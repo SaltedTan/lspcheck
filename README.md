@@ -59,7 +59,7 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
   SKIP  D6  MUST    A selectionRange result has one entry per position, each range contains its position, and each parent contains its child
                      the server advertises no selectionRangeProvider, so lspcheck sends no selectionRange request
   PASS  R1  POLICY  A well-framed body that isn't JSON gets ParseError (-32700) with id null or is ignored, and the server keeps serving
-                     the server returned ParseError (-32700) with id null and answered a later plain request
+                     the server returned 1 ParseError (-32700) response(s) with id null and answered a later plain request
   FAIL  R2  POLICY  A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving
                      textDocument/hover returned a result for parameters of the wrong types: "null"
   PASS  R3  POLICY  A large document (default 4 MiB, configurable) is accepted or refused without the server failing
@@ -222,21 +222,10 @@ A server that advertises no `selectionRangeProvider` leaves D6 `SKIP`; one that 
 no reply, or whose ranges can't be compared, leaves it `N/E`. A `selectionRange` request lspcheck couldn't send, or one
 cut off because the server's output closed, makes D6 `ERROR` unless it already failed.
 
-R1 sends a complete, correctly framed body that isn't JSON. The server may
-ignore it, or reply with JSON-RPC `ParseError` (`-32700`) and `id: null`; it
-must then answer a plain request. A wrong response or a delivered request that
-goes unanswered fails R1. Responses are judged by when they were read, from
-sending the malformed body until the probe wait ends, including queued replies;
-earlier replies and shutdown output are excluded. The intentionally malformed
-body is not included in J3's no-response-to-notifications check; J2 treats null-id responses as
-unassigned, and J5 still validates their envelopes.
-
-R3 opens `lspcheck-large.txt` as `plaintext` with 4 MiB of text by default.
-`--large-document-mib N` changes the size and must be greater than zero. After
-the complete `didOpen`, lspcheck waits up to `--startup-timeout` for a plain
-request to be answered. The server may accept or refuse the document, but must
-remain serving. A `didOpen` or probe that lspcheck can't deliver is `ERROR`;
-an unanswered delivered probe fails only when lspcheck's evidence is complete.
+R1 checks continued service after malformed JSON; R3 checks it after opening a large document.
+`--large-document-mib N` sets R3's document size (4 MiB by default, greater than zero required), and
+`--startup-timeout` gives its follow-up request time to be answered. See the
+[robustness reference](docs/design.md#capabilities-and-robustness) for response windows, verdicts and evidence rules.
 
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of

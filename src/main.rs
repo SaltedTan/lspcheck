@@ -40,11 +40,11 @@ struct Cli {
     #[arg(long)]
     strict: bool,
 
-    /// Seconds to wait for each response.
+    /// Seconds to wait for responses other than initialize and R3's probe.
     #[arg(long, default_value_t = 10, value_name = "SECS")]
     timeout: u64,
 
-    /// Seconds to wait for the reply to initialize.
+    /// Seconds to wait for initialize and R3's probe after opening the large document.
     #[arg(long, default_value_t = 30, value_name = "SECS")]
     startup_timeout: u64,
 

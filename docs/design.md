@@ -319,20 +319,24 @@ a document request is advertised.
 | R4 | POLICY | Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string. |
 
 R1 runs in `not-json` after initialization. It writes one complete frame whose body is not JSON, then sends a plain
-request. An ignored body is lawful, as is one well-formed ParseError response with `id: null` and code `-32700`.
-Another response, including a null-id error with another code, fails R1. Both the response verdict and ParseError
-count use unmatched response occurrences read from the start of the malformed-body write through the end of the
-probe wait. Judging follows graceful shutdown so queued messages are included, with earlier and later reads excluded.
-The plain request must be answered; an unanswered delivered request or an observed server exit fails, unless lspcheck's evidence was incomplete. A body or
-probe lspcheck couldn't deliver is `ERROR`. J2 doesn't attribute null-id errors to a request, J5 validates their
-envelope, and this deliberately malformed-input scenario is excluded from J3.
+request. An ignored body is lawful; any unmatched responses must have `id: null` and error code `-32700`
+(ParseError). An unmatched response with another id or code, or a result, fails R1. Both the response verdict and
+ParseError count use unmatched response occurrences read from the start of the malformed-body write through the
+end of the probe wait. Judging follows graceful shutdown so queued messages are included, with earlier and later
+reads excluded. The plain request must be answered. An exit before the answer or an unanswered delivered request
+fails; missing answers become `ERROR` when evidence in the applicable window is incomplete. An exit while a
+delivered probe is pending preserves that probe's wait window, ending before shutdown or cleanup. Once the probe
+is answered, a later exit does not fail R1. Incomplete delivery of the malformed body is `ERROR`; an undeliverable
+probe is also `ERROR` unless an observed exit establishes a failure. J2 doesn't attribute null-id errors to a
+request, J5 validates their envelope, and this deliberately malformed-input scenario is excluded from J3.
 
 R3 runs in `large-document` after initialization. It writes `lspcheck-large.txt` into the scenario workspace and
-opens it as `plaintext`, with 4 MiB of text by default. `--large-document-mib N` configures the size; zero is a usage
-error. Once the full `didOpen` is delivered, lspcheck sends a plain request and waits up to `--startup-timeout`.
-The server may accept or refuse the document; it must stay alive and answer the probe. An incomplete `didOpen` or a
-probe lspcheck couldn't deliver is `ERROR`. A delivered probe that goes unanswered fails only when lspcheck saw
-complete evidence; an observed server exit is a failure.
+opens it as `plaintext`; [usage](../README.md#use) documents the size option and default. Once the full `didOpen` is
+delivered, lspcheck sends a plain request and waits up to `--startup-timeout`. The server may accept or refuse the
+document; it must answer the probe. An incomplete `didOpen` is `ERROR`. A probe lspcheck couldn't deliver is also
+`ERROR` unless an observed exit establishes a failure. A delivered probe that goes unanswered fails only when
+lspcheck saw complete evidence during its wait, even if the server exits. Once the probe is answered, a later exit
+does not fail R3.
 
 R4 runs in the separate `odd-ids` scenario after initialization. It sends `lspcheck/probe` with each of these ids,
 one at a time: `0`, `-1`, `2147483647`, `-2147483648`, `""`, a 1000-character ASCII string, `"é中😀𝄞"` and
@@ -357,7 +361,7 @@ before waiting for process exit or cleanup. Initialization or delivery failure i
 `ERROR`. If none of those capabilities is advertised, R2 is not exercised. The well-formed `wrong-params`,
 `large-document` and `odd-ids` scenarios are included in [J3 judging](#json-rpc-correlation); `not-json` is not.
 
-After successful initialization, both robustness scenarios attempt a bounded `shutdown`/`exit` exchange before
+After successful initialization, all four robustness scenarios attempt a bounded `shutdown`/`exit` exchange before
 cleanup. This lets lawful output still in flight finish and lets L9 observe descendants that outlive the server.
 
 ## Profiles (optional TOML)
