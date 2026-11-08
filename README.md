@@ -225,8 +225,10 @@ cut off because the server's output closed, makes D6 `ERROR` unless it already f
 R1 sends a complete, correctly framed body that isn't JSON. The server may
 ignore it, or reply with JSON-RPC `ParseError` (`-32700`) and `id: null`; it
 must then answer a plain request. A wrong response or a delivered request that
-goes unanswered fails R1. The intentionally malformed body is not included in
-J3's no-response-to-notifications check; J2 treats null-id responses as
+goes unanswered fails R1. Responses are judged by when they were read, from
+sending the malformed body until the probe wait ends, including queued replies;
+earlier replies and shutdown output are excluded. The intentionally malformed
+body is not included in J3's no-response-to-notifications check; J2 treats null-id responses as
 unassigned, and J5 still validates their envelopes.
 
 R3 opens `lspcheck-large.txt` as `plaintext` with 4 MiB of text by default.

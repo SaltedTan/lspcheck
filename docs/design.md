@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, while profiles, K1 and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, while profiles, K1 and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -320,8 +320,10 @@ a document request is advertised.
 
 R1 runs in `not-json` after initialization. It writes one complete frame whose body is not JSON, then sends a plain
 request. An ignored body is lawful, as is one well-formed ParseError response with `id: null` and code `-32700`.
-Another response, including a null-id error with another code, fails R1. The plain request must be answered; an
-unanswered delivered request or an observed server exit fails, unless lspcheck's evidence was incomplete. A body or
+Another response, including a null-id error with another code, fails R1. Both the response verdict and ParseError
+count use unmatched response occurrences read from the start of the malformed-body write through the end of the
+probe wait. Judging follows graceful shutdown so queued messages are included, with earlier and later reads excluded.
+The plain request must be answered; an unanswered delivered request or an observed server exit fails, unless lspcheck's evidence was incomplete. A body or
 probe lspcheck couldn't deliver is `ERROR`. J2 doesn't attribute null-id errors to a request, J5 validates their
 envelope, and this deliberately malformed-input scenario is excluded from J3.
 

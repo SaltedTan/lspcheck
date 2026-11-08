@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- R1 includes queued responses in its frozen read window and keeps earlier ParseErrors from hiding wrong-code replies.
 - Robustness checks avoid false framing failures and missed leftover processes during cleanup; R2 stays inconclusive
   when skipped output could contain the follow-up reply, even if the server exits.
 - R2 rejects malformed error responses, including invalid codes and missing or non-string messages.

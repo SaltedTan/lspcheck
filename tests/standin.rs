@@ -1012,6 +1012,72 @@ fn non_json_bodies_are_rejected_or_ignored_without_losing_service() {
 }
 
 #[test]
+fn r1_response_window_includes_queued_wrong_code_responses() {
+    for faults in [
+        vec!["--fault", "bad-json-reply-after-probe"],
+        vec!["--fault", "parse-error-with-initialize", "--fault", "bad-json-reply-after-probe"],
+    ] {
+        let r = run(&faults, &["--only", "R1", "--strict"]);
+        expect(&r, "R1", "fail");
+        assert_eq!(r.status, 1, "{faults:?}\n{}", r.stdout);
+        assert!(
+            r.stdout.contains("unmatched response with id null wasn't ParseError (-32700): error -32600"),
+            "{faults:?}\n{}",
+            r.stdout
+        );
+    }
+}
+
+#[test]
+fn r1_response_window_keeps_response_occurrences_separate() {
+    let r = run(
+        &["--fault", "parse-error-with-initialize", "--fault", "parse-error-wrong-code"],
+        &["--only", "R1", "--strict"],
+    );
+    expect(&r, "R1", "fail");
+    assert_eq!(r.status, 1, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("unmatched response with id null wasn't ParseError (-32700): error -32600"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn r1_response_window_excludes_earlier_parse_errors() {
+    let r = run(&["--fault", "parse-error-with-initialize", "--fault", "silent-on-bad-json"], &["--only", "R1"]);
+    expect(&r, "R1", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    assert!(r.stdout.contains("ignored the non-JSON body"), "{}", r.stdout);
+}
+
+#[test]
+fn r1_response_window_preserves_lawful_replies_and_service() {
+    for faults in [
+        vec![],
+        vec!["--fault", "silent-on-bad-json"],
+        vec!["--fault", "reply-to-exit"],
+        vec!["--fault", "await-progress-answer"],
+        vec!["--fault", "trailing-fragment"],
+        vec!["--fault", "big-reply-then-exit"],
+        vec!["--fault", "parse-error-with-initialize"],
+    ] {
+        let r = run(&faults, &["--only", "R1,R2,R4,J1,J2,J6"]);
+        expect(&r, "R1", "pass");
+        expect(&r, "R2", "pass");
+        expect(&r, "R4", "pass");
+        expect(&r, "J1", "pass");
+        expect(&r, "J6", "pass");
+        if !faults.contains(&"parse-error-with-initialize") {
+            expect(&r, "J2", "pass");
+        }
+        if !faults.contains(&"silent-on-bad-json") {
+            assert!(r.stdout.contains("returned 1 ParseError (-32700) response(s)"), "{faults:?}\n{}", r.stdout);
+        }
+    }
+}
+
+#[test]
 fn large_document_failure_and_transcript_replay() {
     let r = fault("dies-on-large-document");
     only_fails(&r, &["R3"]);

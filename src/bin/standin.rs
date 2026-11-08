@@ -28,6 +28,8 @@ const FAULTS: &[(&str, &str)] = &[
     ("newline-after-body", "lawful: end every outgoing body with a newline, counted in its Content-Length"),
     ("bad-bodies", "on initialize, send 70 frames whose body isn't JSON"),
     ("parse-error-wrong-code", "answer a non-JSON body with InvalidRequest (-32600), not ParseError"),
+    ("bad-json-reply-after-probe", "in one write, answer the probe after a non-JSON body then send InvalidRequest"),
+    ("parse-error-with-initialize", "in one write, answer initialize then send a null-id ParseError"),
     ("silent-on-bad-json", "lawful: ignore a non-JSON body without answering it"),
     ("dies-on-bad-json", "exit when a non-JSON body arrives"),
     ("json-into-next-header", "send a correctly counted body that the next frame's first header line would complete"),
@@ -362,7 +364,7 @@ fn main() {
                 if fault("dies-on-bad-json") {
                     std::process::exit(2);
                 }
-                if !fault("silent-on-bad-json") {
+                if !fault("silent-on-bad-json") && !fault("bad-json-reply-after-probe") {
                     let code = if fault("parse-error-wrong-code") { -32600 } else { -32700 };
                     out.frame(&err(&Value::Null, code, "parse error"));
                 }
@@ -917,7 +919,13 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 continue;
             }
-            out.frame(&ok(&id, result));
+            if fault("parse-error-with-initialize") {
+                let mut bytes = out.encode(&ok(&id, result));
+                bytes.extend(out.encode(&err(&Value::Null, -32700, "early parse error")));
+                out.raw(&bytes);
+            } else {
+                out.frame(&ok(&id, result));
+            }
             if fault("reply-unsent-id") {
                 out.frame(&err(&json!(format!("lspcheck-unsent-{}", std::process::id())), -32601, "no such request"));
             }
@@ -1129,6 +1137,11 @@ fn main() {
                 let mut reply = err(&id, -32601, "method not found");
                 reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
                 out.frame(&reply);
+            }
+            "lspcheck/probe" if fault("bad-json-reply-after-probe") && follows_odd_input => {
+                let mut bytes = out.encode(&err(&id, -32601, "method not found"));
+                bytes.extend(out.encode(&err(&Value::Null, -32600, "invalid request")));
+                out.raw(&bytes);
             }
             "lspcheck/probe" if fault("trailing-fragment") && (follows_odd_input || id == json!("7")) => {
                 let mut reply = out.encode(&err(&id, -32601, "method not found"));

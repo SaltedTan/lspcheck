@@ -439,11 +439,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         "json-rpc" => json_rpc(&mut ctx).await,
         // These end with a graceful shutdown, not cleanup's kill, so output
         // still in flight is read whole and leftovers are seen by L9.
-        "not-json" => {
-            if not_json(&mut ctx).await {
-                leave(&mut ctx).await;
-            }
-        }
+        "not-json" => not_json(&mut ctx).await,
         "odd-ids" => {
             if odd_ids(&mut ctx).await {
                 leave(&mut ctx).await;
@@ -802,10 +798,8 @@ fn is_parse_error(m: &Message) -> bool {
     matches!(&m.kind, Kind::Response { id: Id::Null, outcome: Outcome::Error { code: Some(codes::PARSE_ERROR), .. } })
 }
 
-fn unexpected_after_non_json(m: &Message, unmatched: &mut Vec<Id>) -> Option<String> {
+fn unexpected_after_non_json(m: &Message) -> Option<String> {
     let Kind::Response { id, outcome } = &m.kind else { return None };
-    let index = unmatched.iter().position(|unmatched_id| unmatched_id == id)?;
-    unmatched.remove(index);
     if *id == Id::Null && is_parse_error(m) {
         None
     } else if *id == Id::Null {
@@ -823,21 +817,20 @@ fn unexpected_after_non_json(m: &Message, unmatched: &mut Vec<Id>) -> Option<Str
 
 /// Sends a non-JSON body as a complete frame, then checks a fresh request to
 /// show the server kept serving.
-/// Returns whether initialize succeeded, so the scenario can end gracefully.
-async fn not_json(ctx: &mut Ctx<'_>) -> bool {
+async fn not_json(ctx: &mut Ctx<'_>) {
     if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
         ctx.initialize().await
     {
         ctx.report("R1", Verdict::Error, format!("initialize didn't succeed: {why}"));
-        return false;
+        return;
     }
 
     let since = ctx.s.elapsed();
-    let before = ctx.s.messages.len();
     let body = b"lspcheck: this body is not JSON {";
     if let Err(error) = ctx.s.write_raw(&transport::encode(body)).await {
         ctx.report("R1", Verdict::Error, format!("couldn't send a complete non-JSON frame: {error}"));
-        return true;
+        leave(ctx).await;
+        return;
     }
 
     let id = ctx.s.fresh_id();
@@ -846,18 +839,17 @@ async fn not_json(ctx: &mut Ctx<'_>) -> bool {
     let reply = ctx.s.call_with_id(&id, PROBE, Some(json!({})), t).await;
     let to = ctx.s.elapsed();
     let alive = ctx.s.is_alive();
-    let messages = ctx.s.messages[before..].to_vec();
-    let parse_errors = messages.iter().filter(|(_, message)| is_parse_error(message)).count();
-    let mut unmatched = ctx.s.unmatched_ids(since);
-    let unexpected: Vec<String> =
-        messages.iter().filter_map(|(_, message)| unexpected_after_non_json(message, &mut unmatched)).collect();
+    leave(ctx).await;
+    let messages: Vec<_> = ctx.s.unmatched_responses(since, to).collect();
+    let parse_errors = messages.iter().filter(|message| is_parse_error(message)).count();
+    let unexpected: Vec<String> = messages.iter().filter_map(|message| unexpected_after_non_json(message)).collect();
 
     if !unexpected.is_empty() {
         let detail = unexpected.join("; ");
         ctx.report_judged("R1", since, to, |missed| {
             (Verdict::Fail, format!("{detail}{}", missed.map_or(String::new(), |why| format!("; {why}"))))
         });
-        return true;
+        return;
     }
 
     match reply {
@@ -893,14 +885,17 @@ async fn not_json(ctx: &mut Ctx<'_>) -> bool {
                 CallError::Write(_) => ctx.fail("R1", detail),
             }
         }
-        Err(error) => ctx.fail_call(
-            "R1",
-            since,
-            format!("the server didn't answer a plain request after the non-JSON body ({})", describe_call_error(&error, t)),
-            &error,
-        ),
+        Err(error) => {
+            let detail = format!(
+                "the server didn't answer a plain request after the non-JSON body ({})",
+                describe_call_error(&error, t)
+            );
+            match error {
+                CallError::Wait(_) => ctx.fail_absent_between("R1", since, to, detail),
+                CallError::Write(_) => ctx.report("R1", Verdict::Error, detail),
+            }
+        }
     }
-    true
 }
 
 /// Requests whose ids cover the less common values allowed by LSP 3.17.
