@@ -198,13 +198,18 @@ fn fault(name: &str) -> Run {
 /// descheduled for the whole of a split write reads it in one piece, so the
 /// fault can't act; that run says nothing either way and is repeated.
 fn fault_taking_effect(name: &str, marker: &str) -> Run {
+    run_taking_effect(&["--fault", name], marker)
+}
+
+/// Like [`fault_taking_effect`], for a stand-in started with `standin_args`.
+fn run_taking_effect(standin_args: &[&str], marker: &str) -> Run {
     for _ in 0..5 {
-        let r = fault(name);
+        let r = run(standin_args, &[]);
         if r.server_stderr.contains(marker) {
             return r;
         }
     }
-    panic!("the {name} fault never took effect in 5 runs");
+    panic!("the stand-in given {standin_args:?} never said {marker:?} in 5 runs");
 }
 
 fn expect(run: &Run, id: &str, verdict: &str) {
@@ -727,7 +732,11 @@ fn frames_coalesced_in_one_write_must_all_be_read() {
     // Even when slow reads make the server read each frame separately, the
     // fault must act on F4's shape only: `initialized` coalescing with J6's
     // requests isn't a read of three frames with $/setTrace in it.
-    only_fails(&run(&["--fault", "first-frame-per-read", "--fault", "slow-reads"], &[]), &["F4"]);
+    let r = run_taking_effect(
+        &["--fault", "first-frame-per-read", "--fault", "slow-reads"],
+        "first-frame-per-read dropped",
+    );
+    only_fails(&r, &["F4"]);
 }
 
 #[test]
