@@ -283,6 +283,13 @@ fn the_clean_standin_passes_every_check() {
     assert!(r.stdout.contains("all 8 requests got responses with their exact ids"), "{}", r.stdout);
     assert!(r.stdout.contains("ParseError (-32700) response(s) with id null"), "{}", r.stdout);
     assert!(r.stdout.contains("following didOpen of a 4 MiB document"), "{}", r.stdout);
+    // K1 passed on evidence: three positions for hover and highlights, one
+    // selectionRange with all three, symbols, folding ranges and workspace symbols.
+    assert!(
+        r.stdout.contains("10 request(s) for 6 advertised method(s) were answered, none with MethodNotFound"),
+        "{}",
+        r.stdout
+    );
     // D4 passed on evidence: the closed, the never-opened and the plain
     // request were all answered.
     assert!(r.stdout.contains("all three answered"), "{}", r.stdout);
@@ -422,7 +429,6 @@ fn lawful_variations_fail_nothing() {
         "unopened-error",
         "closed-from-disk",
         "disk-diagnostics-after-close",
-        "drop-first-request",
         "empty-selection",
         "reuse-answered-request-id",
         "await-progress-answer",
@@ -430,6 +436,8 @@ fn lawful_variations_fail_nothing() {
         "trailing-fragment",
         "silent-on-bad-json",
         "slow-large-document",
+        "capability-other-error",
+        "echo-positions",
     ] {
         let r = if name == "slow-large-document" {
             run(&["--fault", name], &["--timeout", "1", "--startup-timeout", "10", "--large-document-mib", "2"])
@@ -439,6 +447,9 @@ fn lawful_variations_fail_nothing() {
         if name == "wrong-params-other-code" {
             expect(&r, "R2", "pass");
             assert!(r.stdout.contains("not InvalidParams (which is preferred)"), "{}", r.stdout);
+        }
+        if name == "capability-other-error" {
+            assert!(r.stdout.contains("-32803 (RequestFailed) for textDocument/documentColor"), "{}", r.stdout);
         }
         if name == "slow-large-document" {
             expect(&r, "R3", "pass");
@@ -460,6 +471,195 @@ fn lawful_variations_fail_nothing() {
         }
         passes_except(&r, &expected);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
+    }
+}
+
+#[test]
+fn an_advertised_request_answered_with_method_not_found_fails_k1() {
+    let r = fault("advertises-unimplemented");
+    only_fails(&r, &["K1"]);
+    assert!(
+        r.stdout.contains("MethodNotFound (-32601) for 1 advertised request(s): textDocument/documentColor"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn method_not_found_after_a_result_still_fails_k1() {
+    // MethodNotFound seen for a K1 request is evidence even when a result for
+    // the same id came first; the duplicate itself is J2's.
+    let r = fault("method-not-found-after-result");
+    only_fails(&r, &["K1", "J2"]);
+    assert!(
+        r.stdout.contains("MethodNotFound (-32601) for 1 advertised request(s): textDocument/documentColor"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn an_advertised_request_left_unanswered_leaves_k1_inconclusive() {
+    // LSP sets no deadline for a response, so a request answered neither with
+    // MethodNotFound nor anything else by the end of the session is ERROR.
+    let r = fault("ignores-advertised");
+    passes_except(&r, &[("K1", "error")]);
+    assert!(
+        r.stdout
+            .contains("no response to textDocument/documentColor by the end of the session, so K1 couldn't judge it"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn a_configuration_request_that_comes_with_k1s_last_reply_is_answered() {
+    // A lawful server may hold what follows a request until its answer, and
+    // this one asks for configuration with the reply to K1's last request.
+    // lspcheck must answer it while it shuts the server down, or the half
+    // written log notification is a false F1.
+    let r = run(&["--fault", "config-before-log-finish"], &["--only", "K1,F1"]);
+    passes_except(&r, &[]);
+    expect(&r, "K1", "pass");
+    expect(&r, "F1", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn a_held_reply_that_arrives_at_shutdown_still_answers_k1() {
+    // A server that holds its workspace/symbol reply until the next input
+    // answers it when `shutdown` arrives. With no document open, that is
+    // K1's only request, and the reply read during `leave` still counts.
+    let r = run(&["--fault", "no-open-close", "--fault", "defer-until-next"], &["--only", "K1"]);
+    expect(&r, "K1", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn k1_counts_replies_read_only_after_shutdown_finishes() {
+    for (fault, verdict, status) in
+        [("advertised-error-after-shutdown", "fail", 1), ("advertised-result-after-shutdown", "pass", 0)]
+    {
+        let (r, transcripts, _dir) = run_with_transcripts(&["--fault", fault], &["--only", "K1"]);
+        expect(&r, "K1", verdict);
+        assert_eq!(r.status, status, "{}", r.stdout);
+        let events: Vec<Value> = std::fs::read_to_string(transcripts.join("capabilities.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let exited = events.iter().position(|e| e["event"] == "exited").unwrap();
+        assert!(events[exited + 1..].iter().any(|e| e["dir"] == "in"), "{events:?}");
+    }
+}
+
+#[test]
+fn k1_sends_remaining_advertised_requests_after_a_timeout() {
+    let r = run(
+        &["--fault", "defer-hover-until-shutdown", "--fault", "advertises-unimplemented", "--fault", "echo-positions"],
+        &["--only", "K1"],
+    );
+    expect(&r, "K1", "fail");
+    assert_eq!(r.status, 1, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("MethodNotFound (-32601) for 1 advertised request(s): textDocument/documentColor"),
+        "{}",
+        r.stdout
+    );
+    assert_eq!(hovers(&r, "lspcheck-k1.txt"), ["0:1", "1:5", "2:1"], "{}", r.server_stderr);
+}
+
+#[test]
+fn k1_covers_all_requests_when_hover_waits_for_shutdown() {
+    let r = run(&["--fault", "defer-hover-until-shutdown"], &["--only", "K1"]);
+    expect(&r, "K1", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    assert!(r.stdout.contains("10 request(s) for 6 advertised method(s) were answered"), "{}", r.stdout);
+}
+
+#[test]
+fn k1_names_every_unsent_request_after_an_unanswered_request_and_exit() {
+    let r = run(&["--fault", "exit-on-first-hover", "--fault", "advertises-unimplemented"], &["--only", "K1"]);
+    expect(&r, "K1", "error");
+    assert_eq!(r.status, 2, "{}", r.stdout);
+    let detail = r.stdout.replace("\n", " ").split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(detail.contains("no response to textDocument/hover at 1:2"), "{detail}");
+    assert!(detail.contains("couldn't send textDocument/hover at 2:6 ("), "{detail}");
+    assert!(detail.contains("the server exited with status 17"), "{detail}");
+    let unsent = "not sent after that: textDocument/hover at 3:2, textDocument/documentHighlight at 1:2, \
+                  textDocument/documentHighlight at 2:6, textDocument/documentHighlight at 3:2, \
+                  textDocument/selectionRange";
+    assert!(detail.contains(unsent), "{detail}");
+    for label in
+        ["textDocument/documentSymbol", "textDocument/foldingRange", "textDocument/documentColor", "workspace/symbol"]
+    {
+        assert!(detail.contains(&format!(", {label}")), "{label}: {detail}");
+    }
+    // The cause is given once, not repeated for each request left unsent.
+    assert_eq!(detail.matches("exited with status 17").count(), 1, "{detail}");
+}
+
+/// The hover positions the stand-in reported for `file`, in order.
+fn hovers(r: &Run, file: &str) -> Vec<String> {
+    let prefix = format!("standin: hover at {file} ");
+    r.server_stderr.lines().filter_map(|l| l.strip_prefix(&prefix)).map(str::to_string).collect()
+}
+
+#[test]
+fn a_request_about_a_document_left_unanswered_leaves_k1_inconclusive() {
+    // The documents scenario takes an unanswered request as no evidence, and
+    // K1 can't judge a request with no response by the end of the session
+    // either: it is an error, not a failure.
+    let r = fault("drop-first-request");
+    passes_except(&r, &[("K1", "error")]);
+    assert!(r.stdout.contains("no response to textDocument/hover at 1:2 by the end of the session"), "{}", r.stdout);
+}
+
+#[test]
+fn k1_asks_one_character_into_the_first_identifier_tokens_of_its_own_document() {
+    let r = run(&["--fault", "echo-positions"], &["--only", "K1"]);
+    expect(&r, "K1", "pass");
+    assert_eq!(hovers(&r, "lspcheck-k1.txt"), ["0:1", "1:5", "2:1"], "{}", r.server_stderr);
+}
+
+#[test]
+fn k1_asks_at_the_profiles_positions_in_the_negotiated_encoding() {
+    // Column 3 of line 2 follows an emoji and a space: 3 UTF-16 code units in,
+    // and 5 bytes.
+    let (path, _keep) = profile(
+        "[workspace]\nfiles = { \"src/main.txt\" = \"x\\n\u{1F600} target here\\n\" }\n\
+         [document]\npath = \"src/main.txt\"\nlanguage_id = \"plaintext\"\npositions = [\"2:3\", \"1:2\"]\n",
+    );
+    for (faults, want) in
+        [(&["echo-positions"][..], ["1:3", "0:1"]), (&["echo-positions", "utf8-encoding"], ["1:5", "0:1"])]
+    {
+        let args: Vec<&str> = faults.iter().flat_map(|f| ["--fault", f]).collect();
+        let r = run(&args, &["--profile", path.to_str().unwrap(), "--only", "K1"]);
+        expect(&r, "K1", "pass");
+        assert_eq!(hovers(&r, "main.txt"), want, "{faults:?}\n{}", r.server_stderr);
+        assert!(hovers(&r, "lspcheck-k1.txt").is_empty(), "{}", r.server_stderr);
+    }
+}
+
+#[test]
+fn a_bad_document_section_is_a_usage_error_before_any_server_starts() {
+    let files = "[workspace]\nfiles = { \"main.go\" = \"package main\\n\" }\n";
+    for (document, want) in [
+        ("path = \"other.go\"\nlanguage_id = \"go\"\n", "document.path: \"other.go\" isn't a file"),
+        ("path = \"main.go\"\nlanguage_id = \"go\"\npositions = [\"one:two\"]\n", "document.positions: \"one:two\""),
+        ("path = \"main.go\"\nlanguage_id = \"go\"\npositions = [\"1:14\"]\n", "1:14 is past the end of line 1"),
+        ("path = \"main.go\"\n", "document.language_id is required"),
+    ] {
+        let (path, keep) = profile(&format!("{files}[document]\n{document}"));
+        let transcripts = keep.path().join("t");
+        let out = Command::new(LSPCHECK)
+            .args(["--profile", path.to_str().unwrap(), "--transcripts", transcripts.to_str().unwrap(), "--", STANDIN])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{document}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(want), "{document}: {stderr}");
+        assert!(!transcripts.exists(), "nothing was set up for a run");
     }
 }
 
@@ -840,10 +1040,19 @@ fn bad_initialize_results_fail_l2() {
     // and D3 can't judge without it either; without capabilities the server
     // doesn't ask for didOpen, so all three are skipped, and it advertises no
     // document request, so D4 skips too. D6 can't clamp in the bad encoding,
-    // and skips with no capabilities.
+    // and skips with no capabilities. K1 can't count its positions in the
+    // bad encoding either, and has no capabilities to read without them.
     passes_except(
         &fault("bad-encoding"),
-        &[("L2", "fail"), ("D1", "error"), ("D2", "error"), ("D3", "error"), ("D5", "error"), ("D6", "error")],
+        &[
+            ("L2", "fail"),
+            ("D1", "error"),
+            ("D2", "error"),
+            ("D3", "error"),
+            ("D5", "error"),
+            ("D6", "error"),
+            ("K1", "error"),
+        ],
     );
     passes_except(
         &fault("no-capabilities"),
@@ -856,6 +1065,7 @@ fn bad_initialize_results_fail_l2() {
             ("D5", "skip"),
             ("D6", "skip"),
             ("R2", "not-exercised"),
+            ("K1", "not-exercised"),
         ],
     );
 }
@@ -1536,9 +1746,10 @@ fn a_server_that_recovered_from_an_earlier_timeout_still_fails_d4() {
     // The first document request goes unanswered, then the server answers
     // the rest at both versions, then stops at the closed document. It had
     // recovered, so D4 fails rather than calling it a server that had
-    // already stopped answering.
+    // already stopped answering. K1's first request gets no response by the
+    // end of the session either, which it can't judge.
     let r = run(&["--fault", "drop-first-request", "--fault", "stop-after-unopened"], &[]);
-    only_fails(&r, &["D4"]);
+    passes_except(&r, &[("D4", "fail"), ("K1", "error")]);
     assert!(r.stdout.contains("the closed document went unanswered"), "{}", r.stdout);
 }
 

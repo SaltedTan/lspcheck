@@ -20,6 +20,14 @@
 
 ### Added
 
+- K1 checks advertised requests in a new `capabilities` scenario; MethodNotFound (-32601) fails the check.
+  See the [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage, late-response handling
+  and inconclusive results.
+- Profiles accept `[document]`: the file K1 opens (`path`, from the profile's workspace), its `language_id`, and up to
+  five `positions` as `LINE:COLUMN` (from 1, the column in characters), converted to the negotiated position encoding.
+  A missing file, a file that isn't UTF-8, a missing language id or a position outside the document is a usage error.
+  Without `[document]`, K1 asks about `lspcheck-k1.txt`, a new reserved workspace name.
+- [Example profiles](examples/profiles/) for gopls, rust-analyzer, lua-language-server and basedpyright.
 - `--junit PATH` and `--markdown PATH` add CI reports alongside JSON. See [usage](README.md#use) and the
   [report format reference](docs/design.md#report).
 - R1 sends a correctly framed body that isn't JSON and checks for a null-id ParseError (or the body being ignored)
@@ -42,7 +50,7 @@
   Profiles and replay refuse paths with inconsistent ASCII case in any shared component; inline fixture overrides
   with the exact same spelling remain supported.
   R3 preserves the profile workspace in its transcript and reserves its own `lspcheck-large.txt` from profile files.
-  The `[document]` section, `[client].capabilities` and K1 are still planned.
+  See the [profile reference](docs/design.md#profiles-optional-toml) for planned fields.
 - Stand-in faults `needs-init-option`, `needs-workspace-file` and `needs-configuration`, which a profile satisfies.
 
 ### Changed

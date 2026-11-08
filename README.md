@@ -59,6 +59,8 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
                      3 informative position(s) on character boundaries about the line-ending document, counted in UTF-16 code units; 32 position(s) about it
   SKIP  D6  MUST    A selectionRange result has one entry per position, each range contains its position, and each parent contains its child
                      the server advertises no selectionRangeProvider, so lspcheck sends no selectionRange request
+  PASS  K1  MUST    An advertised request, sent with valid parameters about an open document, isn't answered with MethodNotFound (-32601)
+                     34 request(s) for 16 advertised method(s) were answered, none with MethodNotFound
   PASS  R1  POLICY  A well-framed body that isn't JSON gets ParseError (-32700) with id null or is ignored, and the server keeps serving
                      the server returned 1 ParseError (-32700) response(s) with id null and answered a later plain request
   FAIL  R2  POLICY  A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving
@@ -67,12 +69,13 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
                      answered a plain request after 0.012 s following didOpen of a 4 MiB document
   PASS  R4  POLICY  Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string
                      all 8 requests got responses with their exact ids
-37 checks: 32 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 1 skipped, 0 not exercised, 0 errors
+38 checks: 33 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 1 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions and
-parameter, malformed-body, large-document and request-id robustness.
-The [robustness reference](docs/design.md#capabilities-and-robustness) explains the R checks' verdict rules.
+lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions,
+advertised capabilities, and parameter, malformed-body, large-document and request-id robustness.
+The [capabilities and robustness reference](docs/design.md#capabilities-and-robustness) explains the K1 and R checks'
+verdict rules.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
@@ -224,6 +227,11 @@ A server that advertises no `selectionRangeProvider` leaves D6 `SKIP`; one that 
 no reply, or whose ranges can't be compared, leaves it `N/E`. A `selectionRange` request lspcheck couldn't send, or one
 cut off because the server's output closed, makes D6 `ERROR` unless it already failed.
 
+K1 checks that the server handles what it advertises: it opens a document (a profile's
+[`[document]`](#profiles), or a plain-text one of lspcheck's own) and probes advertised methods without judging the
+content of their results. See the [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage,
+MethodNotFound failures, late and duplicate replies, and details naming unanswered and undeliverable requests.
+
 R1 checks continued service after malformed JSON; R3 checks it after opening a large document.
 If a follow-up request fails, both checks wait up to `--exit-timeout` for an unprompted server exit before judging it.
 `--large-document-mib N` sets R3's document size (4 MiB by default, greater than zero required), and
@@ -242,8 +250,9 @@ answers even when the client's pipe flush finishes later.
 `--profile` is available from the next release (currently [Unreleased](CHANGELOG.md#unreleased)).
 
 Many servers refuse to initialize, or check little, without a project or settings. A profile is a TOML file that
-gives lspcheck what a server needs, and says what its maintainers accept. The four sections and their top-level keys
-are optional; each `allow.skip` entry requires both `id` and `reason`.
+gives lspcheck what a server needs, and says what its maintainers accept. The five sections and their top-level keys
+are optional, except that `[document]` needs `path` and `language_id`; each `allow.skip` entry requires both `id`
+and `reason`.
 The example below uses supported fields; [planned profile fields](docs/design.md#profiles-optional-toml) are not
 accepted yet.
 
@@ -265,6 +274,11 @@ configuration = { gopls = { staticcheck = false } }    # answers to workspace/co
 [allow]
 descendants = ["gopls-helper"]                         # process names allowed to outlive exit (L9)
 skip = [{ id = "L7", reason = "exits 0 by design, see issue 12" }]
+
+[document]                     # what K1 opens and asks about
+path = "main.go"               # a file the workspace above provides, `/`-separated
+language_id = "go"             # its didOpen languageId
+positions = ["3:6", "10:2"]    # optional, at most 5: LINE:COLUMN from 1, COLUMN in characters (code points)
 ```
 
 ```sh
@@ -286,8 +300,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   in every component across fixture and inline entries; `src/A.json` with `SRC/b.json`, or `A.json` with `a.json`,
   is a usage error naming both paths. An inline file may replace a fixture file with the exact same spelling,
   including a read-only file; the replacement uses default file creation permissions. Missing directories are created.
-- **lspcheck's own files.** lspcheck writes `doc.txt`, `crlf.txt`, `lspcheck-utf8.txt` and `lspcheck-large.txt` at the
-  top of the workspace, and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names,
+- **lspcheck's own files.** lspcheck writes `doc.txt`, `crlf.txt`, `lspcheck-utf8.txt`, `lspcheck-large.txt` and
+  `lspcheck-k1.txt` at the top of the workspace, and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names,
   compared ignoring ASCII case.
 - **`[client]`.** `initialization_options` is converted using the [TOML-to-JSON rules](docs/design.md#profiles-optional-toml)
   and sent in every `initialize`, including L3's second one. When the `configuration` table is given, lspcheck answers
@@ -299,9 +313,23 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   `PASS` detail names what was allowed. (On Linux that name is the kernel's command name, at most 15 bytes.) A check in
   `skip` reports `SKIP` with the reason given, and doesn't affect the exit status. The
   [design reference](docs/design.md#profiles-optional-toml) explains when skipped checks let a scenario be omitted.
+- **`[document]`.** K1 opens this file (at version 1, with the `language_id` given) instead of a plain-text document of
+  lspcheck's own, and asks position requests at `positions`, each converted to the position encoding the server
+  chose. `path` must name a file of `[workspace]` (from `path` or `files`) holding UTF-8 text; each position must be
+  on a line the file has, at most one column past the line's last character. Without `positions`, K1
+  [chooses positions from the document's text](docs/design.md#capabilities-and-robustness).
+  Other checks still use their own documents.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
-  type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name or an unknown check id is a usage
-  error (exit status 2) naming the file and the key, with TOML's line and column where it has them.
+  type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name, an unknown check id, or a
+  `[document]` whose file, language id or positions don't fit is a usage error (exit status 2) naming the file and
+  the key, with TOML's line and column where it has them.
+
+[`examples/profiles/`](examples/profiles/) has small self-contained profiles for gopls, rust-analyzer,
+lua-language-server and basedpyright, each with a tiny project and a `[document]`:
+
+```sh
+lspcheck --profile examples/profiles/gopls.toml --only K1
+```
 
 The report names the profile: in the terminal's first line, and as `"profile"` in the JSON report (`null` without
 one). Transcripts record the profile's files, including binary contents, directories (including empty ones), and

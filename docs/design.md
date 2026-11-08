@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. Profiles part 1 is done (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[allow]`), including portable workspace names with consistent ASCII case, inline overrides of read-only fixtures, and replay of binary files, empty directories and Unix file permissions; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies; part 2 (`[document]`, `[client].capabilities`, K1) and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. Profiles part 1 is done (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[allow]`), including portable workspace names with consistent ASCII case, inline overrides of read-only fixtures, and replay of binary files, empty directories and Unix file permissions; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies; profiles part 2 has `[document]` and [K1](#capabilities-and-robustness), including late and duplicate response handling and consolidated delivery details, and example profiles for gopls, rust-analyzer, lua-language-server and basedpyright that pass K1; `[client].capabilities` and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -311,12 +311,97 @@ a document request is advertised.
 ### Capabilities and robustness
 | ID | Basis | Check |
 |---|---|---|
-| K1 | MUST | Every advertised request capability with a position or document parameter answers (not MethodNotFound) at profile positions or generic ones. |
+| K1 | MUST | A request the server advertises, sent with valid parameters about an open document, isn't answered with MethodNotFound (-32601). |
 | K2 | MUST | Replies validate against the LSP 3.17 metaModel (vendored, CC BY 4.0 attribution). **v0.2.** |
 | R1 | POLICY | A well-framed body that isn't JSON gets ParseError `-32700` with id `null` or is ignored, and the server keeps serving. |
 | R2 | POLICY | A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving. |
 | R3 | POLICY | A large document (default 4 MiB, configurable) is accepted or refused without the server failing, and it keeps serving. |
 | R4 | POLICY | Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string. |
+
+K1 runs in its own `capabilities` scenario. Advertising a capability declares that the server handles its request,
+so answering that request with MethodNotFound contradicts the server's own initialize result. Any other error
+(RequestFailed, ContentModified, InvalidParams for a position the server dislikes, or a code of its own) is lawful and
+only noted in the detail. lspcheck initializes with client capabilities for every request below, then takes the
+document from the profile's [`[document]`](#profiles-optional-toml), or else writes its own, `lspcheck-k1.txt`, as
+`plaintext`: identifier-like words on four lines. It reads the document's text from the workspace (a profile's
+positions are checked again against it, in case the fixture changed since the profile was read; a mismatch is
+`ERROR`) and opens it with `didOpen` at version 1, when the server asks for `didOpen` and at least one request is
+about a document. A capability is advertised when its value is `true` or an object;
+`semanticTokensProvider` (always an object) advertises `full` and `range` separately, and `renameProvider` advertises
+`prepareRename` only with `prepareProvider: true`. For each advertised capability, in this order, K1 sends:
+
+| Capability | Method | Params beyond `textDocument` |
+|---|---|---|
+| hoverProvider | textDocument/hover | position |
+| definitionProvider | textDocument/definition | position |
+| declarationProvider | textDocument/declaration | position |
+| typeDefinitionProvider | textDocument/typeDefinition | position |
+| implementationProvider | textDocument/implementation | position |
+| referencesProvider | textDocument/references | position, `context: {includeDeclaration: true}` |
+| documentHighlightProvider | textDocument/documentHighlight | position |
+| signatureHelpProvider | textDocument/signatureHelp | position |
+| completionProvider | textDocument/completion | position |
+| renameProvider.prepareProvider | textDocument/prepareRename | position |
+| renameProvider | textDocument/rename | position, `newName: "lspcheckRenamed"` |
+| linkedEditingRangeProvider | textDocument/linkedEditingRange | position |
+| callHierarchyProvider | textDocument/prepareCallHierarchy | position |
+| typeHierarchyProvider | textDocument/prepareTypeHierarchy | position |
+| monikerProvider | textDocument/moniker | position |
+| selectionRangeProvider | textDocument/selectionRange | `positions`: all of them |
+| documentSymbolProvider | textDocument/documentSymbol | — |
+| foldingRangeProvider | textDocument/foldingRange | — |
+| codeLensProvider | textDocument/codeLens | — |
+| documentLinkProvider | textDocument/documentLink | — |
+| colorProvider | textDocument/documentColor | — |
+| diagnosticProvider | textDocument/diagnostic | — |
+| documentFormattingProvider | textDocument/formatting | `options: {tabSize: 4, insertSpaces: true}` |
+| documentRangeFormattingProvider | textDocument/rangeFormatting | the whole document's range, options |
+| codeActionProvider | textDocument/codeAction | the whole document's range, `context: {diagnostics: []}` |
+| inlayHintProvider | textDocument/inlayHint | the whole document's range |
+| semanticTokensProvider.full | textDocument/semanticTokens/full | — |
+| semanticTokensProvider.range | textDocument/semanticTokens/range | the whole document's range |
+| workspaceSymbolProvider | workspace/symbol | `{query: ""}` (no `textDocument`) |
+
+A position request is sent once at each position: the profile's (at most five), or else one character into each of
+the first three identifier-like tokens (`[A-Za-z_][A-Za-z0-9_]*`, matched leftmost first) of the document, or its
+start when it has none. Positions are counted in the negotiated encoding (the server's `positionEncoding`, or
+UTF-16), and the whole document's range ends at the end of its last line (the empty line after a final newline).
+K1 doesn't send `workspace/executeCommand`, `willSaveWaitUntil`, `onTypeFormatting` or `inlineValue`: they need a
+command, a save, a trigger character or a stopped debugger, which K1 can't set up faithfully.
+
+Two things keep a request about the document from being sent, and the detail names them: a server that doesn't ask
+for `didOpen` has no open document to be asked about (only `workspace/symbol` is sent), and a static registration's
+`documentSelector` that doesn't select the document. A filter selects it when its `language` (if any) is the
+document's language id and its `scheme` (if any) is `file`; a filter with a glob `pattern`, or for notebooks, isn't
+evaluated and doesn't select it.
+
+The requests are sent one at a time, each waiting up to `--timeout` for its reply. After one goes unanswered, the
+remaining requests are sent without waiting for each reply. Only a delivery failure stops sending (the detail
+lists the requests left unsent). LSP sets no deadline for a response, so a wait that ends is not evidence against
+the server: after sending the requests, the scenario shuts the server down gracefully (`shutdown`, then `exit`),
+answering the server's requests on the way. Once session cleanup has drained the final stdout, K1 judges every
+request by its matched response, including replies read during shutdown or the final drain. A MethodNotFound reply
+counts when its id equals the request's exactly and it was read at or after the request was sent, even after another
+response with that id (the duplicate is J2's).
+
+For either a failure or an error, the detail names every unanswered request. It gives the delivery failure's cause
+(including the server's exit status when observed) once, on the request lspcheck couldn't send, then lists the
+remaining requests in a single `not sent after that` note.
+
+- **fail:** a request was answered with an error whose code is -32601. The detail names each such request (method
+  and position). This is seen evidence and stands whatever happened to the other requests.
+- **error:** initialize didn't succeed, the server chose an encoding lspcheck didn't offer (see L2), the document
+  couldn't be written, read or opened (`didOpen` not delivered), or a request couldn't be delivered. A delivered
+  request with no response by the end of the session is also `ERROR` (`no response to <method> at <position> by the
+  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1.
+- **not-exercised:** the initialize result has no capabilities object, or the server advertises none of the requests
+  above, or all advertised requests were excluded by the `didOpen` or selector rules (the detail says why).
+- **pass:** every request selected for delivery was answered with a result or another error by the end of the
+  session. The detail counts the requests and methods, and lists the other errors by code with the requests that
+  got them.
+
+Responses to K1's requests are judged by J1, J2 and J5 like any other, and the scenario's input is all well formed,
+so it is included in J3. K1 judges only the error code, never a result's content.
 
 R1 runs in `not-json` after initialization. It writes one complete frame whose body is not JSON, then sends a plain
 request. An ignored body is lawful. The body has no id, so only a response with `id: null` can answer it: one
@@ -365,24 +450,21 @@ before waiting for process exit or cleanup. Initialization or delivery failure i
 `ERROR`. If none of those capabilities is advertised, R2 is not exercised. The well-formed `wrong-params`,
 `large-document` and `odd-ids` scenarios are included in [J3 judging](#json-rpc-correlation); `not-json` is not.
 
-After successful initialization, all four robustness scenarios attempt a bounded `shutdown`/`exit` exchange before
-cleanup. This lets lawful output still in flight finish and lets L9 observe descendants that outlive the server.
+After successful initialization, all four robustness scenarios and `capabilities` attempt a bounded
+`shutdown`/`exit` exchange before cleanup. This lets lawful output still in flight finish and lets L9 observe descendants that outlive the server.
 
 ## Profiles (optional TOML)
-Part 1 is implemented in `src/profile.rs`; the [README](../README.md#profiles) owns the supported profile example,
+Profiles are implemented in `src/profile.rs`; the [README](../README.md#profiles) owns the supported profile example,
 command and timeout precedence, path rules, and common usage. This section records implementation details and
-planned extensions. Profiles still use the [plain-text probe documents](#documents-and-positions).
+planned extensions. The documents scenario still uses its [plain-text probe documents](#documents-and-positions);
+only K1 uses `[document]`. [`examples/profiles/`](../examples/profiles/) has a profile for each of gopls,
+rust-analyzer, lua-language-server and basedpyright.
 
-K1 and the following fields are planned for part 2; these fields are refused for now:
+This field is planned, and refused for now:
 
 ```toml
-[document]                     # planned (part 2)
-path = "main.go"
-language_id = "go"
-positions = ["main.go:3:6"]    # where K1 probes; otherwise identifier-looking tokens are used
-
 [client]
-capabilities = "default"       # planned (part 2): or a path to a capabilities JSON
+capabilities = "default"       # planned: or a path to a capabilities JSON
 ```
 
 - **Parsing.** Serde's `deny_unknown_fields` enforces the accepted keys. TOML parsing errors include a line, column
@@ -397,7 +479,7 @@ capabilities = "default"       # planned (part 2): or a path to a capabilities J
   An inline file that needs a directory where the fixture or another inline file has a file, or that names a fixture
   directory, is refused.
 - **lspcheck's own files.** `checks::OWN_FILES` enforces the reserved top-level names listed in the README.
-  These include R3's `lspcheck-large.txt`. Deeper paths such as `src/doc.txt` are the profile's.
+  These include R3's `lspcheck-large.txt` and K1's `lspcheck-k1.txt`. Deeper paths such as `src/doc.txt` are the profile's.
 - **`initialization_options`** is any TOML value, converted to JSON (a date or time becomes its TOML spelling; NaN or
   an infinite float is an error), and sent as `initializationOptions` in every initialize lspcheck sends: each
   scenario's, L3's second one and the pre-initialize scenario's. Absent, the field is omitted as before.
@@ -410,6 +492,14 @@ capabilities = "default"       # planned (part 2): or a path to a capabilities J
   `initialized`: J3 already counts any id-less response after `initialized` as answering a notification, and C3's
   attribution reads it as one of the notifications it can't tell apart from `initialized` (`error`, not `fail`). The
   pre-initialize scenario's own `didChangeConfiguration` before initialize is unchanged.
+- **`[document]`** names the document [K1](#capabilities-and-robustness) asks about: `path` (required) is a file the
+  profile's workspace provides, from the fixture or inline (`/`-separated, the same name rules), whose content must
+  be UTF-8 (an inline file's text replaces a fixture file's); `language_id` (required, not blank) is its `didOpen`
+  language id; `positions` (optional, one to five) are `"LINE:COLUMN"` strings, both from 1, the column counted in
+  Unicode code points, each on a line the document has (the spec's line split, so the empty line after a final
+  newline counts) and at most one past the line's last character. Each is converted to the negotiated encoding when
+  sent. Without `positions`, K1 uses identifier-like tokens of the document; without `[document]`, its own
+  `lspcheck-k1.txt`.
 - **`allow.descendants`.** L9 doesn't fail for a leftover process whose name (as lspcheck reports it: on Linux the
   kernel's command name, at most 15 bytes) is in the list. A `PASS` detail names what was allowed, per scenario; a
   leftover not on the list fails as before, and the detail of that failure names the allowed ones too.
@@ -485,6 +575,7 @@ Single crate, `src/` modules:
   ids cannot collide with them. Each call has one absolute deadline covering its write and its reply; each scenario
   has its own timeouts and a bounded cleanup. After a write stops partway through a frame, lspcheck sends nothing more.
 - `checks`: one module per area; each check declares id, basis, spec link, and a function over a `Session`.
+- `capabilities`: K1's request table, positions and verdict, as pure functions.
 - `profile`: reads and validates a profile (`toml` with `serde`'s `deny_unknown_fields`), copies its files into each
   scenario's workspace, and merges its command and timeouts with the command line's.
 - `report`, `cli` (clap).

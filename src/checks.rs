@@ -10,6 +10,7 @@
 //! lspcheck hit one of its own inspection limits is reported as an error,
 //! because the missing evidence might explain it.
 
+use crate::capabilities::{self, Judgement, Spot};
 use crate::documents::{self, Change, OpenDoc, Published, Source, SyncKind, Version};
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
@@ -177,6 +178,13 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "textDocument_selectionRange"
     ),
     check!(
+        "K1",
+        CapabilitiesAndRobustness,
+        Must,
+        "An advertised request, sent with valid parameters about an open document, isn't answered with MethodNotFound (-32601)",
+        "serverCapabilities"
+    ),
+    check!(
         "R1",
         CapabilitiesAndRobustness,
         Policy,
@@ -306,11 +314,13 @@ pub struct Config {
     pub allowed_descendants: Vec<String>,
     /// Checks reported as skipped, and why.
     pub skip: Vec<Skip>,
+    /// The profile's document for K1, instead of lspcheck's own.
+    pub document: Option<profile::Document>,
 }
 
 /// The files lspcheck writes into a scenario's workspace, and the one it
 /// names there as never existing. A profile can't put files at these paths.
-pub const OWN_FILES: &[&str] = &[DOC_A_FILE, DOC_B_FILE, UTF8_FILE, MISSING_FILE, LARGE_FILE];
+pub const OWN_FILES: &[&str] = &[DOC_A_FILE, DOC_B_FILE, UTF8_FILE, MISSING_FILE, LARGE_FILE, K1_FILE];
 /// Document A, in the documents scenario.
 const DOC_A_FILE: &str = "doc.txt";
 /// Document B, in the documents scenario.
@@ -321,6 +331,8 @@ const UTF8_FILE: &str = "lspcheck-utf8.txt";
 const LARGE_FILE: &str = "lspcheck-large.txt";
 /// The never-opened document D4 asks about, which must not exist.
 const MISSING_FILE: &str = "missing.txt";
+/// The capabilities scenario's document (K1), when the profile names none.
+const K1_FILE: &str = "lspcheck-k1.txt";
 
 /// What a scenario observed that cross-cutting checks use.
 #[derive(Debug)]
@@ -386,6 +398,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5", "D6"] },
     Scenario { name: "wrong-params", checks: &["R2"] },
     Scenario { name: "large-document", checks: &["R3"] },
+    Scenario { name: "capabilities", checks: &["K1"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
@@ -479,7 +492,8 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
             return Ok(unstarted(format!("could not start {}: {e}", cfg.server.display())));
         }
     };
-    let mut ctx = Ctx { s: session, cfg, root, results: Vec::new(), scenario: name, j3_exercise: None };
+    let mut ctx =
+        Ctx { s: session, cfg, root, results: Vec::new(), scenario: name, j3_exercise: None, k1_pending: None };
     // The workspace, so a transcript of this scenario can be replayed in a
     // recreated one (files written later are recorded when they are written),
     // and the settings, so a replay answers the server's questions alike.
@@ -514,11 +528,21 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
                 leave(&mut ctx).await;
             }
         }
+        "capabilities" => capabilities_scenario(&mut ctx).await,
         "end-of-input" => end_of_input(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
-    let Ctx { s, mut results, j3_exercise, .. } = ctx;
+    let Ctx { s, mut results, j3_exercise, k1_pending, .. } = ctx;
     let finish = s.finish(cfg.leftover_grace).await;
+    if let Some(pending) = k1_pending {
+        let (verdict, detail) = match judge_k1(pending, &finish) {
+            Judgement::Fail(detail) => (Verdict::Fail, detail),
+            Judgement::Error(detail) => (Verdict::Error, detail),
+            Judgement::NotExercised(detail) => (Verdict::NotExercised, detail),
+            Judgement::Pass(detail) => (Verdict::Pass, detail),
+        };
+        results.push(result(name, "K1", verdict, detail));
+    }
     for id in scenario.checks {
         if !results.iter().any(|r| r.id == *id) {
             results.push(result(name, id, Verdict::Error, "the scenario ended before reaching this check"));
@@ -612,6 +636,7 @@ struct Ctx<'a> {
     scenario: &'static str,
     /// How the json-rpc scenario's dedicated J3 exercise went.
     j3_exercise: Option<(Verdict, String)>,
+    k1_pending: Option<K1Pending>,
 }
 
 /// Why initialization didn't succeed.
@@ -1689,6 +1714,216 @@ async fn large_document_scenario(ctx: &mut Ctx<'_>) -> bool {
         }
     }
     true
+}
+
+/// K1's own document: identifier-like words on several lines, so the
+/// generic positions fall on three different lines.
+const K1_TEXT: &str = "alpha\n    beta = 1\ngamma(beta)\nlast line\n";
+
+/// Initialize params for the capabilities scenario: the documents scenario's,
+/// plus client capabilities for every request K1 may send, so a server that
+/// advertises only what its client supports advertises them.
+fn capabilities_initialize_params(root: &Path) -> Value {
+    let mut params = documents_initialize_params(root);
+    let doc = &mut params["capabilities"]["textDocument"];
+    for (name, caps) in [
+        ("declaration", json!({"linkSupport": false})),
+        ("typeDefinition", json!({"linkSupport": false})),
+        ("implementation", json!({"linkSupport": false})),
+        ("signatureHelp", json!({})),
+        ("rename", json!({"prepareSupport": true})),
+        ("linkedEditingRange", json!({})),
+        ("callHierarchy", json!({})),
+        ("typeHierarchy", json!({})),
+        ("moniker", json!({})),
+        ("colorProvider", json!({})),
+        ("rangeFormatting", json!({})),
+        ("codeAction", json!({})),
+        (
+            "semanticTokens",
+            json!({
+                "requests": {"range": true, "full": true},
+                "tokenTypes": [
+                    "namespace", "type", "class", "enum", "interface", "struct", "typeParameter", "parameter",
+                    "variable", "property", "enumMember", "event", "function", "method", "macro", "keyword",
+                    "modifier", "comment", "string", "number", "regexp", "operator", "decorator"
+                ],
+                "tokenModifiers": [
+                    "declaration", "definition", "readonly", "static", "deprecated", "abstract", "async",
+                    "modification", "documentation", "defaultLibrary"
+                ],
+                "formats": ["relative"]
+            }),
+        ),
+    ] {
+        doc[name] = caps;
+    }
+    params
+}
+
+/// A response's outcome, as K1 counts it.
+fn k1_outcome(m: &Message) -> capabilities::Outcome {
+    match &m.kind {
+        Kind::Response { outcome: Outcome::Error { code: Some(code), .. }, .. } => capabilities::Outcome::Error(*code),
+        _ => capabilities::Outcome::Answered,
+    }
+}
+
+/// Adds the server's exit status to `why`, after waiting a bounded time for
+/// it: a closed pipe can come before the exit is reported.
+async fn with_exit(ctx: &mut Ctx<'_>, why: String) -> String {
+    match ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await {
+        Some(status) => format!("{why}; the server exited with {}", session::describe_status(status)),
+        None => why,
+    }
+}
+
+/// A request K1 sent, and the id whose response may still arrive during
+/// shutdown or the final stdout drain.
+struct K1Asked {
+    label: String,
+    /// The request's id, unless lspcheck couldn't send it.
+    id: Option<Id>,
+    outcome: capabilities::Outcome,
+}
+
+/// Evidence held until session cleanup drains the final stdout, so replies
+/// read after `leave` returns still count toward K1's verdict.
+enum K1Pending {
+    Judged(Judgement),
+    Sent { asked: Vec<K1Asked>, notes: Vec<String> },
+}
+
+/// K1: opens the profile's document (or lspcheck's own) and sends advertised
+/// requests. Ends with a graceful shutdown when initialize succeeded;
+/// judging waits for the final stdout drain (see [`K1Pending`]).
+async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
+    let params = capabilities_initialize_params(&ctx.root);
+    let reply = match ctx.initialize_with(params).await {
+        Ok(reply) => reply,
+        Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
+            return ctx.report("K1", Verdict::Error, format!("initialize didn't succeed: {why}"));
+        }
+    };
+    ctx.k1_pending = Some(k1(ctx, &reply).await);
+    leave(ctx).await;
+}
+
+fn judge_k1(pending: K1Pending, finish: &Finish) -> Judgement {
+    match pending {
+        K1Pending::Judged(judgement) => judgement,
+        K1Pending::Sent { mut asked, notes } => {
+            for a in &mut asked {
+                let Some(id) = &a.id else { continue };
+                if a.outcome == capabilities::Outcome::Unanswered
+                    && let Some(m) = finish.answer_to(id)
+                {
+                    a.outcome = k1_outcome(m);
+                }
+                // MethodNotFound for the request is seen evidence even when
+                // it isn't the first response with its id (J2 judges the
+                // duplicate); only responses read after the request was sent
+                // count.
+                if let Some(&(sent, _)) = finish.sent.iter().find(|(_, s)| s == id)
+                    && finish.messages.iter().any(|(at, m)| {
+                        *at >= sent
+                            && m.response_id() == Some(id)
+                            && k1_outcome(m) == capabilities::Outcome::Error(codes::METHOD_NOT_FOUND)
+                    })
+                {
+                    a.outcome = capabilities::Outcome::Error(codes::METHOD_NOT_FOUND);
+                }
+            }
+            let asked: Vec<(String, capabilities::Outcome)> = asked.into_iter().map(|a| (a.label, a.outcome)).collect();
+            capabilities::judge(&asked, &notes)
+        }
+    }
+}
+
+/// K1's requests, after a successful initialize. The caller leaves.
+async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
+    let Some(caps) = initialize_capabilities(reply).filter(|c| c.is_object()).cloned() else {
+        return K1Pending::Judged(Judgement::NotExercised("initialize had no capabilities object (see L2)".into()));
+    };
+    let encoding = match negotiated_encoding(reply) {
+        Ok(encoding) => encoding,
+        Err(why) => return K1Pending::Judged(Judgement::Error(why)),
+    };
+    let (name, language_id, given) = match &ctx.cfg.document {
+        Some(d) => (d.path.clone(), d.language_id.clone(), d.positions.clone()),
+        None => (K1_FILE.to_string(), "plaintext".to_string(), None),
+    };
+    let path: PathBuf =
+        std::iter::once(ctx.root.as_os_str()).chain(name.split('/').map(std::ffi::OsStr::new)).collect();
+    if ctx.cfg.document.is_none() {
+        if let Err(e) = std::fs::write(&path, K1_TEXT) {
+            return K1Pending::Judged(Judgement::Error(format!("couldn't write {name}: {e}")));
+        }
+        ctx.record_workspace();
+    }
+    // The text as the server finds it on disk. A profile's was checked when
+    // the profile was read, but the fixture may have changed since.
+    let text = match std::fs::read(&path).map(String::from_utf8) {
+        Ok(Ok(text)) => text,
+        Ok(Err(_)) => {
+            return K1Pending::Judged(Judgement::Error(format!("{name} in the workspace isn't UTF-8 text")));
+        }
+        Err(e) => {
+            return K1Pending::Judged(Judgement::Error(format!("couldn't read {name} in the workspace: {e}")));
+        }
+    };
+    let spots = match given {
+        Some(spots) => {
+            if let Some(e) = spots.iter().find_map(|s| s.check(&text).err()) {
+                return K1Pending::Judged(Judgement::Error(format!("{name} changed since the profile was read: {e}")));
+            }
+            spots
+        }
+        None => capabilities::identifier_spots(&text, capabilities::GENERIC_POSITIONS),
+    };
+    // A document without identifier-like tokens is asked about at its start.
+    let spots = if spots.is_empty() { vec![Spot { line: 0, column: 0 }] } else { spots };
+    let uri = file_uri(&path);
+    let opened = opens_documents(reply);
+    let doc = capabilities::Document { uri: &uri, language_id: &language_id, text: &text, opened };
+    let (requests, mut notes) = capabilities::requests(&caps, &doc, &spots, encoding);
+    if requests.iter().any(|r| r.params.get("textDocument").is_some()) {
+        let doc = json!({"uri": uri, "languageId": language_id, "version": 1, "text": text});
+        if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await {
+            return K1Pending::Judged(Judgement::Error(format!("lspcheck couldn't send didOpen for {name}: {e}")));
+        }
+    }
+
+    let mut asked: Vec<K1Asked> = Vec::new();
+    let mut wait = true;
+    for (i, r) in requests.iter().enumerate() {
+        let sent = match if wait {
+            ask(ctx, r.method, r.params.clone()).await.map(|(a, reply)| (a.id, reply.ok()))
+        } else {
+            ctx.s.request(r.method, Some(r.params.clone())).await.map(|id| (id, None))
+        } {
+            Ok((id, Some(m))) => K1Asked { label: r.label.clone(), id: Some(id), outcome: k1_outcome(&m) },
+            Ok((id, None)) => {
+                wait = false;
+                K1Asked { label: r.label.clone(), id: Some(id), outcome: capabilities::Outcome::Unanswered }
+            }
+            Err(e) => {
+                let why = if e == WriteError::Closed { with_exit(ctx, e.to_string()).await } else { e.to_string() };
+                K1Asked { label: r.label.clone(), id: None, outcome: capabilities::Outcome::Undelivered(why) }
+            }
+        };
+        let stop = matches!(sent.outcome, capabilities::Outcome::Undelivered(_));
+        asked.push(sent);
+        if stop {
+            // The cause is in the failed request's entry; name the rest once.
+            let rest: Vec<&str> = requests[i + 1..].iter().map(|remaining| remaining.label.as_str()).collect();
+            if !rest.is_empty() {
+                notes.insert(0, format!("not sent after that: {}", rest.join(", ")));
+            }
+            break;
+        }
+    }
+    K1Pending::Sent { asked, notes }
 }
 
 /// The index in `messages` of the first response to `id` at or after `from`.
@@ -3292,6 +3527,7 @@ const J3_SCENARIOS: &[&str] = &[
     "documents",
     "wrong-params",
     "large-document",
+    "capabilities",
     "end-of-input",
     "exit-without-shutdown",
 ];

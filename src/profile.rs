@@ -8,7 +8,8 @@
 //!
 //! Everything is read and validated once, before any server starts, so a
 //! bad profile is a usage error rather than a run full of errors. Paths in
-//! the profile are relative to the directory of the profile file.
+//! the profile are relative to the directory of the profile file; the
+//! document K1 asks about is named relative to the workspace.
 
 #![cfg_attr(
     windows,
@@ -18,6 +19,7 @@
     )
 )]
 
+use crate::capabilities::{self, Spot};
 use crate::checks;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
@@ -46,6 +48,18 @@ pub struct Profile {
     pub allowed_descendants: Vec<String>,
     /// `[allow].skip`.
     pub skip: Vec<Skip>,
+    /// `[document]`: what K1 asks about instead of a document of lspcheck's own.
+    pub document: Option<Document>,
+}
+
+/// The document K1 opens and asks about: a file the workspace provides.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Document {
+    /// Its name in the workspace, with `/` separators.
+    pub path: String,
+    pub language_id: String,
+    /// Where position requests are asked; identifier-like tokens when absent.
+    pub positions: Option<Vec<Spot>>,
 }
 
 /// What a profile puts in each scenario's workspace.
@@ -80,6 +94,15 @@ struct Raw {
     client: RawClient,
     #[serde(default)]
     allow: RawAllow,
+    document: Option<RawDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDocument {
+    path: Option<String>,
+    language_id: Option<String>,
+    positions: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -220,7 +243,69 @@ pub fn parse(text: &str, dir: &Path) -> Result<Profile, String> {
         }
         profile.skip.push(Skip { id: check.id, reason: skip.reason });
     }
+    if let Some(raw) = raw.document {
+        profile.document = Some(document(raw, &profile.workspace)?);
+    }
     Ok(profile)
+}
+
+/// Validates `[document]`: `path` names a UTF-8 text file the workspace
+/// provides, `language_id` isn't empty, and each position is in the file.
+fn document(raw: RawDocument, workspace: &Workspace) -> Result<Document, String> {
+    let Some(path) = raw.path else {
+        return Err("document.path is required: name a file in the profile's workspace".into());
+    };
+    safe_name(&path).map_err(|e| format!("document.path: {e}"))?;
+    if !workspace.names.contains(&path) {
+        return Err(format!(
+            "document.path: {path:?} isn't a file the profile's workspace provides ([workspace].path or [workspace].files)"
+        ));
+    }
+    let text = workspace_text(workspace, &path)?;
+    let language_id = match raw.language_id {
+        None => return Err("document.language_id is required with document.path, such as \"go\"".into()),
+        Some(id) if id.trim().is_empty() => return Err("document.language_id is empty".into()),
+        Some(id) => id,
+    };
+    let positions = match raw.positions {
+        None => None,
+        Some(given) => {
+            if given.is_empty() {
+                return Err("document.positions is empty; leave it out to use identifier-like tokens".into());
+            }
+            if given.len() > capabilities::MAX_POSITIONS {
+                return Err(format!(
+                    "document.positions has {} positions; at most {} are used",
+                    given.len(),
+                    capabilities::MAX_POSITIONS
+                ));
+            }
+            let mut spots = Vec::new();
+            for s in &given {
+                let Some(spot) = Spot::parse(s) else {
+                    return Err(format!(
+                        "document.positions: {s:?} isn't LINE:COLUMN, two whole numbers from 1, such as \"3:6\""
+                    ));
+                };
+                spot.check(&text).map_err(|e| format!("document.positions: in {path}, {e}"))?;
+                spots.push(spot);
+            }
+            Some(spots)
+        }
+    };
+    Ok(Document { path, language_id, positions })
+}
+
+/// The text of a file the workspace provides: an inline file's, else the
+/// fixture's, which must be UTF-8.
+fn workspace_text(workspace: &Workspace, name: &str) -> Result<String, String> {
+    if let Some((_, text)) = workspace.files.iter().find(|(n, _)| n == name) {
+        return Ok(text.clone());
+    }
+    let fixture = workspace.fixture.as_ref().expect("a file not inline is in the fixture");
+    let path: PathBuf = std::iter::once(fixture.as_os_str()).chain(name.split('/').map(std::ffi::OsStr::new)).collect();
+    let bytes = std::fs::read(&path).map_err(|e| format!("document.path: can't read {}: {e}", path.display()))?;
+    String::from_utf8(bytes).map_err(|_| format!("document.path: {name:?} isn't UTF-8 text"))
 }
 
 /// A TOML value as JSON. A date or time becomes its TOML spelling; a float
@@ -527,8 +612,9 @@ mod tests {
         assert!(e.contains("comand"), "{e}");
         let e = parse_here("[[allow.skip]]\nid = \"L7\"\nreason = \"r\"\nwhy = \"x\"\n").unwrap_err();
         assert!(e.contains("why"), "{e}");
-        // Part 2's sections aren't accepted yet.
-        assert!(parse_here("[document]\npath = \"main.go\"\n").unwrap_err().contains("document"));
+        let e = parse_here("[document]\npath = \"a\"\nlanguage = \"go\"\n").unwrap_err();
+        assert!(e.contains("language") && e.contains("line 3"), "{e}");
+        // Client capabilities aren't accepted yet.
         assert!(parse_here("[client]\ncapabilities = \"default\"\n").unwrap_err().contains("capabilities"));
     }
 
@@ -673,6 +759,7 @@ mod tests {
             "lspcheck-large.txt",
             "LSPCHECK-LARGE.TXT",
             "lspcheck-large.txt/inner",
+            "lspcheck-k1.txt",
         ] {
             let text = format!("[workspace]\nfiles = {{ {name:?} = \"x\" }}\n");
             let e = parse_here(&text).unwrap_err();
@@ -804,6 +891,92 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "original");
         permissions.set_readonly(false);
         std::fs::set_permissions(&source, permissions).unwrap();
+    }
+
+    #[test]
+    fn a_document_names_a_workspace_file_with_its_language_and_positions() {
+        let p = parse_here(
+            "[workspace]\nfiles = { \"src/main.go\" = \"package main\\n\\nfunc main() {}\\n\" }\n\
+             [document]\npath = \"src/main.go\"\nlanguage_id = \"go\"\npositions = [\"1:9\", \"3:6\", \"4:1\"]\n",
+        )
+        .unwrap();
+        let spot = |line, column| Spot { line, column };
+        assert_eq!(
+            p.document,
+            Some(Document {
+                path: "src/main.go".into(),
+                language_id: "go".into(),
+                positions: Some(vec![spot(0, 8), spot(2, 5), spot(3, 0)]),
+            })
+        );
+        // Positions are optional.
+        let p = parse_here(
+            "[workspace]\nfiles = { \"a.go\" = \"x\" }\n[document]\npath = \"a.go\"\nlanguage_id = \"go\"\n",
+        );
+        assert_eq!(p.unwrap().document.unwrap().positions, None);
+        assert_eq!(parse_here("").unwrap().document, None);
+    }
+
+    #[test]
+    fn a_fixture_file_can_be_the_document_and_must_be_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("fixture/pkg")).unwrap();
+        std::fs::write(dir.path().join("fixture/pkg/a.py"), "def f():\n    pass\n").unwrap();
+        std::fs::write(dir.path().join("fixture/blob.bin"), [0xff, 0xfe, 0x00]).unwrap();
+        let text = |path: &str| {
+            format!(
+                "[workspace]\npath = \"fixture\"\n[document]\npath = {path:?}\nlanguage_id = \"python\"\npositions = [\"2:5\"]\n"
+            )
+        };
+        assert!(parse(&text("pkg/a.py"), dir.path()).is_ok());
+        let e = parse(&text("blob.bin"), dir.path()).unwrap_err();
+        assert!(e.starts_with("document.path") && e.contains("isn't UTF-8"), "{e}");
+        // A directory isn't a file.
+        let e = parse(&text("pkg"), dir.path()).unwrap_err();
+        assert!(e.starts_with("document.path") && e.contains("isn't a file"), "{e}");
+        // An inline file replaces the fixture's text, which positions must fit.
+        let inline = "[workspace]\npath = \"fixture\"\nfiles = { \"pkg/a.py\" = \"x\" }\n\
+                      [document]\npath = \"pkg/a.py\"\nlanguage_id = \"python\"\npositions = [\"2:5\"]\n";
+        let e = parse(inline, dir.path()).unwrap_err();
+        assert!(e.contains("in pkg/a.py, 2:5 is past the end"), "{e}");
+    }
+
+    #[test]
+    fn a_bad_document_is_an_error_naming_the_key() {
+        let with = |document: &str| {
+            parse_here(&format!(
+                "[workspace]\nfiles = {{ \"main.go\" = \"package main\\nfunc é() {{}}\\n\" }}\n[document]\n{document}"
+            ))
+            .unwrap_err()
+        };
+        for (document, want) in [
+            ("language_id = \"go\"\n", "document.path is required"),
+            ("path = \"other.go\"\nlanguage_id = \"go\"\n", "isn't a file the profile's workspace provides"),
+            ("path = \"../main.go\"\nlanguage_id = \"go\"\n", "document.path: \"../main.go\""),
+            ("path = \"main.go\"\n", "document.language_id is required"),
+            ("path = \"main.go\"\nlanguage_id = \" \"\n", "document.language_id is empty"),
+            ("path = \"main.go\"\nlanguage_id = \"go\"\npositions = []\n", "document.positions is empty"),
+            ("path = \"main.go\"\nlanguage_id = \"go\"\npositions = [\"3\"]\n", "\"3\" isn't LINE:COLUMN"),
+            ("path = \"main.go\"\nlanguage_id = \"go\"\npositions = [\"0:1\"]\n", "\"0:1\" isn't LINE:COLUMN"),
+            (
+                "path = \"main.go\"\nlanguage_id = \"go\"\npositions = [\"4:1\"]\n",
+                "4:1 is past the end: the document has 3 line(s)",
+            ),
+            // Columns count characters: line 2 has 11, so 12 is its end.
+            (
+                "path = \"main.go\"\nlanguage_id = \"go\"\npositions = [\"2:12\", \"2:13\"]\n",
+                "columns run from 1 to 12",
+            ),
+            (
+                "path = \"main.go\"\nlanguage_id = \"go\"\npositions = [\"1:1\", \"1:1\", \"1:1\", \"1:1\", \"1:1\", \"1:1\"]\n",
+                "at most 5",
+            ),
+            ("path = \"main.go\"\nlanguage_id = \"go\"\nposition = [\"1:1\"]\n", "position"),
+            ("path = \"main.go\"\nlanguage_id = \"go\"\npositions = [1]\n", "positions"),
+        ] {
+            let e = with(document);
+            assert!(e.contains(want), "{document}: {e}");
+        }
     }
 
     #[test]

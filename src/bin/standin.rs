@@ -228,6 +228,7 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: on didClose, publish unversioned diagnostics for the file on disk, which another tool changed to ASCII",
     ),
     ("drop-first-request", "never answer the first request about a document, then answer normally"),
+    ("exit-on-first-hover", "exit with status 17 without answering the first hover request"),
     ("stop-at-crlf", "stop answering anything from the first request about crlf.txt"),
     ("exit-at-version-42", "exit, without answering, at the first request about a document at version 42"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
@@ -237,6 +238,31 @@ const FAULTS: &[(&str, &str)] = &[
     ("selection-outside", "the range is the word before the position, still on a boundary"),
     ("selection-short", "one entry fewer than the positions"),
     ("selection-parent-inside", "the parent is a range strictly inside its child"),
+    ("advertises-unimplemented", "advertise colorProvider, and answer textDocument/documentColor with MethodNotFound"),
+    (
+        "capability-other-error",
+        "lawful: advertise colorProvider, and answer textDocument/documentColor with RequestFailed (-32803)",
+    ),
+    ("ignores-advertised", "advertise colorProvider, and never answer textDocument/documentColor"),
+    (
+        "method-not-found-after-result",
+        "advertise colorProvider, answer textDocument/documentColor with a result, then again with MethodNotFound when \
+         shutdown arrives",
+    ),
+    ("defer-hover-until-shutdown", "lawful: answer hover requests only when shutdown arrives"),
+    (
+        "advertised-error-after-shutdown",
+        "answer shutdown, then have a helper answer held hover requests with MethodNotFound after stdin closes",
+    ),
+    (
+        "advertised-result-after-shutdown",
+        "answer shutdown, then have a helper answer held hover requests with null after stdin closes",
+    ),
+    (
+        "config-before-log-finish",
+        "with the reply to workspace/symbol, ask for configuration and finish a log notification only after the answer",
+    ),
+    ("echo-positions", "lawful: say on stderr where each hover request asks, as FILE LINE:CHARACTER"),
     ("needs-init-option", "refuse to initialize unless initializationOptions has standin = \"ready\""),
     (
         "needs-workspace-file",
@@ -254,6 +280,7 @@ fn main() {
         Some("--child") => return child(false),
         Some("--escaped-child") => return child(true),
         Some("--relay") => return relay(args[1].parse().unwrap()),
+        Some("--reply-after-input") => return reply_after_input(&args[1]),
         _ => {}
     }
     let mut faults = Vec::new();
@@ -306,6 +333,7 @@ fn main() {
     let mut late_reply: Option<Value> = None;
     // A workspace/symbol request whose reply waits for the next message.
     let mut deferred: Option<Value> = None;
+    let mut held_hovers: Vec<Value> = Vec::new();
     // Set by stop-after-unknown-cancel: requests are no longer answered.
     let mut no_more_answers = false;
     // For drop-first-request: whether the first document request was dropped.
@@ -325,6 +353,8 @@ fn main() {
     // The rest of a notification begun after the checks were done, written
     // only once `shutdown` arrives.
     let mut unfinished: Option<Vec<u8>> = None;
+    // A documentColor request answered once, to answer again at shutdown.
+    let mut answered_color: Option<Value> = None;
     // For inflated-on-first-probe.
     let mut probed = false;
     // Messages read by await-progress-answer while it waited, to handle next.
@@ -760,6 +790,9 @@ fn main() {
             no_more_answers = true;
             continue;
         }
+        if method == "textDocument/hover" && fault("exit-on-first-hover") {
+            std::process::exit(17);
+        }
         if fault("drop-first-request")
             && !dropped_first
             && method.starts_with("textDocument/")
@@ -942,6 +975,17 @@ fn main() {
             if fault("no-change-sync") {
                 result["capabilities"]["textDocumentSync"] = json!({"openClose": true, "change": 0});
             }
+            if [
+                "advertises-unimplemented",
+                "capability-other-error",
+                "ignores-advertised",
+                "method-not-found-after-result",
+            ]
+            .iter()
+            .any(|f| fault(f))
+            {
+                result["capabilities"]["colorProvider"] = json!(true);
+            }
             if fault("no-capabilities") {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
             }
@@ -1070,6 +1114,29 @@ fn main() {
         {
             out.raw(&rest);
         }
+        if method == "shutdown"
+            && let Some(color) = answered_color.take()
+        {
+            out.frame(&err(&color, -32601, "method not found"));
+        }
+        if method == "textDocument/hover" && fault("echo-positions") {
+            let uri = msg.pointer("/params/textDocument/uri").and_then(Value::as_str).unwrap_or("");
+            let position = &msg["params"]["position"];
+            eprintln!(
+                "standin: hover at {} {}:{}",
+                uri.rsplit('/').next().unwrap_or(uri),
+                position["line"],
+                position["character"]
+            );
+        }
+        if method == "textDocument/hover"
+            && ["defer-hover-until-shutdown", "advertised-error-after-shutdown", "advertised-result-after-shutdown"]
+                .iter()
+                .any(|name| fault(name))
+        {
+            held_hovers.push(id);
+            continue;
+        }
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
@@ -1115,6 +1182,63 @@ fn main() {
                     reply.as_object_mut().unwrap().remove("jsonrpc");
                 }
                 out.frame(&reply);
+                let replies: Vec<Value> = held_hovers
+                    .drain(..)
+                    .map(|id| {
+                        if fault("advertised-error-after-shutdown") {
+                            err(&id, -32601, "method not found")
+                        } else {
+                            ok(&id, Value::Null)
+                        }
+                    })
+                    .collect();
+                if fault("advertised-error-after-shutdown") || fault("advertised-result-after-shutdown") {
+                    let _helper = Command::new(std::env::current_exe().unwrap())
+                        .arg("--reply-after-input")
+                        .arg(serde_json::to_string(&replies).unwrap())
+                        .stdin(Stdio::inherit())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap();
+                    std::process::exit(0);
+                }
+                for reply in replies {
+                    out.frame(&reply);
+                }
+            }
+            // K1 opens a document before asking, so only its workspace/symbol
+            // is affected (the other scenarios ask with none open). Like a
+            // server that reads settings before going on, this one holds what
+            // follows a request until the answer arrives: if lspcheck records
+            // but doesn't answer the request, the log notification stays half
+            // written and F1 would see a truncated frame, though the server is
+            // behaving lawfully.
+            "workspace/symbol" if fault("config-before-log-finish") && !docs.is_empty() => {
+                let config_id = json!("standin-config");
+                let config = json!({
+                    "jsonrpc": "2.0",
+                    "id": config_id,
+                    "method": "workspace/configuration",
+                    "params": {"items": []}
+                });
+                let log = out.encode(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "window/logMessage",
+                    "params": {"type": 4, "message": "configuration answered"}
+                }));
+                let mut bytes = out.encode(&ok(&id, Value::Null));
+                bytes.extend(out.encode(&config));
+                bytes.push(log[0]);
+                out.raw(&bytes);
+                while let Some(frame) = input.next() {
+                    let Ok(v) = serde_json::from_slice::<Value>(&frame.1) else { continue };
+                    if v.get("method").is_none() && v.get("id") == Some(&config_id) {
+                        out.raw(&log[1..]);
+                        break;
+                    }
+                    queued.push_back(frame);
+                }
             }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
             "textDocument/documentSymbol"
@@ -1146,6 +1270,14 @@ fn main() {
                     let symbol = json!({"name": "x", "kind": 13, "range": inside, "selectionRange": inside});
                     out.frame(&ok(&id, json!([symbol])));
                 }
+            }
+            "textDocument/documentColor" if fault("capability-other-error") => {
+                out.frame(&err(&id, -32803, "no colors today"));
+            }
+            "textDocument/documentColor" if fault("ignores-advertised") => {}
+            "textDocument/documentColor" if fault("method-not-found-after-result") => {
+                out.frame(&ok(&id, json!([])));
+                answered_color = Some(id);
             }
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
             "lspcheck/unknownRequest" if fault("big-frame-before-unknown-reply") => {
@@ -1633,6 +1765,17 @@ fn child(escape: bool) {
     println!("ready");
     let _ = std::io::stdout().flush();
     std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+fn reply_after_input(replies: &str) {
+    let replies: Vec<Value> = serde_json::from_str(replies).unwrap();
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    let stdout = std::io::stdout();
+    let mut out = Writer { out: stdout.lock(), faults: Vec::new(), holding: false, held: Vec::new() };
+    for reply in replies {
+        out.frame(&reply);
+    }
 }
 
 /// Writes its input to stdout once `parent` has exited: its stdin ends when
