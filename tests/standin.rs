@@ -410,6 +410,7 @@ fn lawful_variations_fail_nothing() {
         "reuse-answered-request-id",
         "await-progress-answer",
         "wrong-params-other-code",
+        "trailing-fragment",
     ] {
         let r = fault(name);
         if name == "wrong-params-other-code" {
@@ -895,6 +896,17 @@ fn odd_id_failures_survive_later_unreadable_output() {
     expect(&r, "J3", "error");
     assert!(r.stdout.contains("-1"), "{}", r.stdout);
     assert!(r.stdout.contains("inspection limit"), "{}", r.stdout);
+}
+
+#[test]
+fn a_skipped_frame_before_exit_makes_r2_inconclusive() {
+    // The plain request after the wrongly typed one is answered in a frame
+    // over the limit, then the server exits: the skipped frame may have held
+    // the answer, so R2 can't fail. Read whole, it passes.
+    let r = run(&["--fault", "big-reply-then-exit"], &["--only", "R2", "--max-frame-mib", "1"]);
+    expect(&r, "R2", "error");
+    let r = run(&["--fault", "big-reply-then-exit"], &["--only", "R2"]);
+    expect(&r, "R2", "pass");
 }
 
 #[test]

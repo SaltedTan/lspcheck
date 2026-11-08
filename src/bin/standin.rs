@@ -57,6 +57,12 @@ const FAULTS: &[(&str, &str)] = &[
     ("accepts-wrong-params", "answer a request with wrongly typed params with result null"),
     ("dies-on-wrong-params", "exit when a request arrives with wrongly typed params"),
     ("wrong-params-other-code", "lawful: answer wrongly typed params with InternalError (-32603)"),
+    (
+        "trailing-fragment",
+        "lawful: after the last odd-id probe, and after the probe that follows wrongly typed params, send a \
+         logMessage in two writes a second apart",
+    ),
+    ("big-reply-then-exit", "answer the probe that follows wrongly typed params with a 2 MiB error, then exit"),
     ("reply-twice", "answer every lspcheck/probe twice"),
     ("reply-unsent-id", "after initialize, send a response with an id lspcheck never used"),
     ("reply-to-notification", "answer an unknown notification with an error whose id is null"),
@@ -275,6 +281,8 @@ fn main() {
     let mut initialized_reply = fault("initialized-reply-after-cancel");
     // For null-reply-after-first-probe: whether a request was answered since initialize.
     let mut answered_one = false;
+    // A wrongly typed request was just answered, and the next probe not yet.
+    let mut after_wrong_params = false;
     // For inflated-on-first-probe.
     let mut probed = false;
     // Messages read by await-progress-answer while it waited, to handle next.
@@ -926,6 +934,7 @@ fn main() {
             }
             let code = if fault("wrong-params-other-code") { -32603 } else { -32602 };
             out.frame(&err(&id, code, "invalid params"));
+            after_wrong_params = true;
             continue;
         }
         if std::mem::take(&mut dropped) && fault("big-frame-after-drop") {
@@ -936,6 +945,13 @@ fn main() {
         }
         if fault("reply-twice") && method == "lspcheck/probe" {
             out.frame(&err(&id, -32601, "method not found"));
+        }
+        let follows_wrong_params = method == "lspcheck/probe" && std::mem::take(&mut after_wrong_params);
+        if follows_wrong_params && fault("big-reply-then-exit") {
+            let mut reply = err(&id, -32601, "method not found");
+            reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
+            out.frame(&reply);
+            std::process::exit(0);
         }
         match method.as_str() {
             "shutdown" => {
@@ -1051,6 +1067,18 @@ fn main() {
             _ if fault("ignore-unknown-requests") => {}
             _ if fault("wrong-unknown-error") => out.frame(&err(&id, -32600, "unknown")),
             _ => out.frame(&err(&id, -32601, "method not found")),
+        }
+        if fault("trailing-fragment") && (follows_wrong_params || (method == "lspcheck/probe" && id == json!("7"))) {
+            // A lawful notification still on its way when the checks are done:
+            // lspcheck must read it whole rather than kill the server mid-frame.
+            let bytes = out.encode(&json!({
+                "jsonrpc": "2.0",
+                "method": "window/logMessage",
+                "params": {"type": 4, "message": "still writing"}
+            }));
+            out.raw(&bytes[..1]);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            out.raw(&bytes[1..]);
         }
         if !std::mem::replace(&mut answered_one, true) && fault("null-reply-after-first-probe") {
             // As if `initialized` had been answered late.

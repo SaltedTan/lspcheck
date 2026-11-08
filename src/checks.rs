@@ -419,14 +419,24 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
     match name {
         "lifecycle" => lifecycle(&mut ctx).await,
         "json-rpc" => json_rpc(&mut ctx).await,
-        "odd-ids" => odd_ids(&mut ctx).await,
+        // Both end with a graceful shutdown, not cleanup's kill, so output
+        // still in flight is read whole and leftovers are seen by L9.
+        "odd-ids" => {
+            if odd_ids(&mut ctx).await {
+                leave(&mut ctx).await;
+            }
+        }
         "pre-initialize" => pre_initialize(&mut ctx).await,
         "exit-without-shutdown" => exit_without_shutdown(&mut ctx).await,
         "framing" => framing(&mut ctx).await,
         "after-initialize" => after_initialize(&mut ctx).await,
         "cancellation" => cancellation(&mut ctx).await,
         "documents" => documents(&mut ctx).await,
-        "wrong-params" => wrong_params(&mut ctx).await,
+        "wrong-params" => {
+            if wrong_params(&mut ctx).await {
+                leave(&mut ctx).await;
+            }
+        }
         "end-of-input" => end_of_input(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
@@ -785,7 +795,8 @@ fn describe_odd_id(id: &Id) -> String {
 }
 
 /// One-at-a-time probes for valid request ids outside the usual positive range.
-async fn odd_ids(ctx: &mut Ctx<'_>) {
+/// Returns whether initialize succeeded, so the scenario can end gracefully.
+async fn odd_ids(ctx: &mut Ctx<'_>) -> bool {
     let ids = odd_request_ids();
     for id in &ids {
         // Keep initialize's random id and every later generated id clear of
@@ -795,7 +806,8 @@ async fn odd_ids(ctx: &mut Ctx<'_>) {
     if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
         ctx.initialize().await
     {
-        return ctx.report("R4", Verdict::Error, format!("initialize didn't succeed: {why}"));
+        ctx.report("R4", Verdict::Error, format!("initialize didn't succeed: {why}"));
+        return false;
     }
 
     let t = ctx.cfg.request_timeout;
@@ -839,7 +851,7 @@ async fn odd_ids(ctx: &mut Ctx<'_>) {
                         Verdict::Error,
                         format!("lspcheck couldn't deliver request id {}: {error}", describe_odd_id(id)),
                     );
-                    return;
+                    return true;
                 }
                 break;
             }
@@ -861,16 +873,14 @@ async fn odd_ids(ctx: &mut Ctx<'_>) {
         }
         ctx.fail("R4", detail);
         ctx.results.last_mut().expect("just reported").absent_at = missing_windows;
-        return;
+        return true;
     }
     if !undelivered.is_empty() {
-        return ctx.report(
-            "R4",
-            Verdict::Error,
-            format!("lspcheck couldn't deliver request id(s) {}", undelivered.join(", ")),
-        );
+        ctx.report("R4", Verdict::Error, format!("lspcheck couldn't deliver request id(s) {}", undelivered.join(", ")));
+        return true;
     }
     ctx.pass_with("R4", format!("all {} requests got responses with their exact ids", ids.len()));
+    true
 }
 
 /// Four requests written before any reply is read: each must be answered with
@@ -1249,20 +1259,23 @@ fn advertises_symbol(reply: &Message) -> bool {
 
 /// Tries one deliberately wrongly typed request for the first supported
 /// capability, then checks that the server still answers a plain request.
-async fn wrong_params(ctx: &mut Ctx<'_>) {
+/// Returns whether initialize succeeded, so the scenario can end gracefully.
+async fn wrong_params(ctx: &mut Ctx<'_>) -> bool {
     const LOOKED_FOR: &str = "hoverProvider, definitionProvider, documentSymbolProvider and workspaceSymbolProvider";
     let reply = match ctx.initialize().await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
-            return ctx.report("R2", Verdict::Error, format!("initialize didn't succeed: {why}"));
+            ctx.report("R2", Verdict::Error, format!("initialize didn't succeed: {why}"));
+            return false;
         }
     };
     let Some(caps) = initialize_capabilities(&reply) else {
-        return ctx.report(
+        ctx.report(
             "R2",
             Verdict::NotExercised,
             format!("initialize had no capabilities object; looked for {LOOKED_FOR}"),
         );
+        return true;
     };
     let Some((capability, method)) = [
         ("hoverProvider", "textDocument/hover"),
@@ -1272,7 +1285,8 @@ async fn wrong_params(ctx: &mut Ctx<'_>) {
     ]
     .into_iter()
     .find(|(capability, _)| advertises(caps, capability)) else {
-        return ctx.report("R2", Verdict::NotExercised, format!("none of {LOOKED_FOR} was advertised"));
+        ctx.report("R2", Verdict::NotExercised, format!("none of {LOOKED_FOR} was advertised"));
+        return true;
     };
     let params = match method {
         "textDocument/hover" | "textDocument/definition" => {
@@ -1287,12 +1301,13 @@ async fn wrong_params(ctx: &mut Ctx<'_>) {
     let response = match ctx.s.call(method, Some(params), t).await {
         Ok(response) => response,
         Err(error) => {
-            return ctx.fail_call(
+            ctx.fail_call(
                 "R2",
                 sent,
                 format!("{method} with wrongly typed params: {}", describe_call_error(&error, t)),
                 &error,
             );
+            return true;
         }
     };
     let error = match &response.kind {
@@ -1302,16 +1317,18 @@ async fn wrong_params(ctx: &mut Ctx<'_>) {
             None => "error without an integer code".into(),
         },
         Kind::Response { outcome: Outcome::Result(value), .. } => {
-            return ctx.fail(
+            ctx.fail(
                 "R2",
                 format!(
                     "{method} returned a result for parameters of the wrong types: {}",
                     session::preview(value.to_string().as_bytes())
                 ),
             );
+            return true;
         }
         Kind::Response { outcome: Outcome::Malformed(why), .. } => {
-            return ctx.fail("R2", format!("{method} returned a malformed response instead of an error: {why}"));
+            ctx.fail("R2", format!("{method} returned a malformed response instead of an error: {why}"));
+            return true;
         }
         _ => unreachable!("call waits for a response"),
     };
@@ -1320,12 +1337,16 @@ async fn wrong_params(ctx: &mut Ctx<'_>) {
         Ok(()) => {
             ctx.pass_with("R2", format!("{method} ({capability}) returned {error}; a plain request was answered"))
         }
-        Err(StepFailure::Exited(why)) => ctx.fail("R2", format!("{method} returned {error}; {why}")),
+        Err(StepFailure::Exited { why, window: Some((since, waited)) }) => {
+            ctx.fail_absent_between("R2", since, waited, format!("{method} returned {error}; {why}"))
+        }
+        Err(StepFailure::Exited { why, window: None }) => ctx.fail("R2", format!("{method} returned {error}; {why}")),
         Err(StepFailure::Unanswered { detail, since }) => {
             ctx.fail_absent("R2", since, format!("{method} returned {error}; {detail}"));
         }
         Err(StepFailure::Unsent(why)) => ctx.report("R2", Verdict::Error, format!("{method} returned {error}; {why}")),
     }
+    true
 }
 
 /// The index in `messages` of the first response to `id` at or after `from`.
@@ -2475,8 +2496,17 @@ async fn exchange(ctx: &mut Ctx<'_>, ids: &[Id], bytes: &[u8], cuts: &[usize]) -
 }
 
 enum StepFailure {
-    Exited(String),
-    Unanswered { detail: String, since: Duration },
+    /// The server exited. `window` is when lspcheck waited for the plain
+    /// request it had delivered, if it had: output it couldn't read then may
+    /// have held the answer.
+    Exited {
+        why: String,
+        window: Option<(Duration, Duration)>,
+    },
+    Unanswered {
+        detail: String,
+        since: Duration,
+    },
     Unsent(String),
 }
 
@@ -2484,20 +2514,22 @@ enum StepFailure {
 /// didn't pass; if not, why the rest of the scenario can't be judged.
 async fn back_in_step_result(ctx: &mut Ctx<'_>, after: &str) -> Result<(), StepFailure> {
     if !ctx.s.is_alive() {
-        return Err(StepFailure::Exited(format!("the server exited after {after}")));
+        return Err(StepFailure::Exited { why: format!("the server exited after {after}"), window: None });
     }
     let t = ctx.cfg.request_timeout;
     let since = ctx.s.elapsed();
     let result = ctx.s.call(PROBE, Some(json!({})), t).await;
     // A closed pipe usually means the server is exiting; give that a moment
     // to be seen, so the reason given is the real one.
+    let waited = ctx.s.elapsed();
     if matches!(result, Err(CallError::Write(WriteError::Closed) | CallError::Wait(WaitError::Closed)))
         && let Some(status) = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await
     {
-        return Err(StepFailure::Exited(format!(
-            "the server exited after {after} ({})",
-            session::describe_status(status)
-        )));
+        let delivered = matches!(result, Err(CallError::Wait(_)));
+        return Err(StepFailure::Exited {
+            why: format!("the server exited after {after} ({})", session::describe_status(status)),
+            window: delivered.then_some((since, waited)),
+        });
     }
     match result {
         Ok(_) => Ok(()),
@@ -2515,7 +2547,7 @@ async fn back_in_step_result(ctx: &mut Ctx<'_>, after: &str) -> Result<(), StepF
 async fn back_in_step(ctx: &mut Ctx<'_>, after: &str) -> Option<String> {
     match back_in_step_result(ctx, after).await {
         Ok(()) => None,
-        Err(StepFailure::Exited(why) | StepFailure::Unsent(why)) => Some(why),
+        Err(StepFailure::Exited { why, .. } | StepFailure::Unsent(why)) => Some(why),
         Err(StepFailure::Unanswered { detail, .. }) => Some(detail),
     }
 }
