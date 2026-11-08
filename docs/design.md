@@ -312,7 +312,7 @@ a document request is advertised.
 | ID | Basis | Check |
 |---|---|---|
 | K1 | MUST | A request the server advertises, sent with valid parameters about an open document, isn't answered with MethodNotFound (-32601). |
-| K2 | MUST | Replies validate against the LSP 3.17 metaModel (vendored, CC BY 4.0 attribution). **v0.2.** |
+| K2 | MUST | Replies validate against the LSP 3.17 metaModel (vendored, CC BY 4.0 attribution). Planned; see [milestones](#milestones). |
 | R1 | POLICY | A well-framed body that isn't JSON gets ParseError `-32700` with id `null` or is ignored, and the server keeps serving. |
 | R2 | POLICY | A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving. |
 | R3 | POLICY | A large document (default 4 MiB, configurable) is accepted or refused without the server failing, and it keeps serving. |
