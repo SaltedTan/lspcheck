@@ -20,6 +20,16 @@
 
 ### Added
 
+- K1 checks that a server handles what it advertises: in a new `capabilities` scenario, lspcheck opens a document and
+  sends each request the initialize result advertises (hover, definition, references, rename, symbols, formatting,
+  code actions, semantic tokens, workspace symbols and others) one at a time; MethodNotFound (-32601) for any of them,
+  or no answer within `--timeout`, fails K1, and other errors are listed as lawful. See the
+  [K1 reference](docs/design.md#capabilities-and-robustness).
+- Profiles accept `[document]`: the file K1 opens (`path`, from the profile's workspace), its `language_id`, and up to
+  five `positions` as `LINE:COLUMN` (from 1, the column in characters), converted to the negotiated position encoding.
+  A missing file, a file that isn't UTF-8, a missing language id or a position outside the document is a usage error.
+  Without `[document]`, K1 asks about `lspcheck-k1.txt`, a new reserved workspace name.
+- [Example profiles](examples/profiles/) for gopls, rust-analyzer, lua-language-server and basedpyright.
 - `--junit PATH` and `--markdown PATH` add CI reports alongside JSON. See [usage](README.md#use) and the
   [report format reference](docs/design.md#report).
 - R1 sends a correctly framed body that isn't JSON and checks for a null-id ParseError (or the body being ignored)

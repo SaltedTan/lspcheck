@@ -7,6 +7,7 @@
 //! The binary is the supported interface; this library is public so the
 //! binary and its tests can share it, and its API may change in any release.
 
+pub mod capabilities;
 pub mod checks;
 pub mod documents;
 pub mod message;

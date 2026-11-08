@@ -148,7 +148,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("ignore-unknown-requests", "never answer requests for unknown methods"),
     ("exit-on-string-id", "exit when a request has a string id"),
     ("answers-reordered", "lawful: answer requests that arrive together in reverse order"),
-    ("defer-until-next", "lawful: hold a workspace/symbol reply until the next message, cancelling it if asked"),
+    (
+        "defer-until-next",
+        "lawful: while no document is open, hold a workspace/symbol reply until the next message, cancelling it if asked",
+    ),
     ("cancelled-no-reply", "never answer a deferred request that is cancelled"),
     ("cancelled-reply-twice", "answer a cancelled request with both -32800 and a result"),
     ("cancelled-other-error", "lawful: answer a cancelled request with InternalError (-32603)"),
@@ -237,6 +240,13 @@ const FAULTS: &[(&str, &str)] = &[
     ("selection-outside", "the range is the word before the position, still on a boundary"),
     ("selection-short", "one entry fewer than the positions"),
     ("selection-parent-inside", "the parent is a range strictly inside its child"),
+    ("advertises-unimplemented", "advertise colorProvider, and answer textDocument/documentColor with MethodNotFound"),
+    (
+        "capability-other-error",
+        "lawful: advertise colorProvider, and answer textDocument/documentColor with RequestFailed (-32803)",
+    ),
+    ("ignores-advertised", "advertise colorProvider, and never answer textDocument/documentColor"),
+    ("echo-positions", "lawful: say on stderr where each hover request asks, as FILE LINE:CHARACTER"),
     ("needs-init-option", "refuse to initialize unless initializationOptions has standin = \"ready\""),
     (
         "needs-workspace-file",
@@ -942,6 +952,9 @@ fn main() {
             if fault("no-change-sync") {
                 result["capabilities"]["textDocumentSync"] = json!({"openClose": true, "change": 0});
             }
+            if ["advertises-unimplemented", "capability-other-error", "ignores-advertised"].iter().any(|f| fault(f)) {
+                result["capabilities"]["colorProvider"] = json!(true);
+            }
             if fault("no-capabilities") {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
             }
@@ -1014,7 +1027,10 @@ fn main() {
             out.frame(&err(&id, -32600, "shutting down"));
             continue;
         }
-        if method == "workspace/symbol" && holds {
+        // Only while no document is open: the cancellation scenario opens
+        // none and sends a cancel right after the request, while K1 opens one
+        // and sends nothing until its workspace/symbol is answered.
+        if method == "workspace/symbol" && holds && docs.is_empty() {
             deferred = Some(id.clone());
             continue;
         }
@@ -1069,6 +1085,16 @@ fn main() {
             && let Some(rest) = unfinished.take()
         {
             out.raw(&rest);
+        }
+        if method == "textDocument/hover" && fault("echo-positions") {
+            let uri = msg.pointer("/params/textDocument/uri").and_then(Value::as_str).unwrap_or("");
+            let position = &msg["params"]["position"];
+            eprintln!(
+                "standin: hover at {} {}:{}",
+                uri.rsplit('/').next().unwrap_or(uri),
+                position["line"],
+                position["character"]
+            );
         }
         match method.as_str() {
             "shutdown" => {
@@ -1147,6 +1173,10 @@ fn main() {
                     out.frame(&ok(&id, json!([symbol])));
                 }
             }
+            "textDocument/documentColor" if fault("capability-other-error") => {
+                out.frame(&err(&id, -32803, "no colors today"));
+            }
+            "textDocument/documentColor" if fault("ignores-advertised") => {}
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
             "lspcheck/unknownRequest" if fault("big-frame-before-unknown-reply") => {
                 let text = "x".repeat(2 * 1024 * 1024);

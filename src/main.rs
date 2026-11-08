@@ -44,7 +44,7 @@ struct Cli {
     strict: bool,
 
     /// Read a TOML profile: the server command, timeouts, workspace files,
-    /// client settings, and what to allow.
+    /// client settings, what to allow, and the document K1 asks about.
     #[arg(long, value_name = "PATH")]
     profile: Option<PathBuf>,
 
@@ -216,6 +216,7 @@ fn main() {
         configuration: p.configuration,
         allowed_descendants: p.allowed_descendants,
         skip: p.skip,
+        document: p.document,
     };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     let runs = match rt.block_on(checks::run(&cfg, &cli.only)) {

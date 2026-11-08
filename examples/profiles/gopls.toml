@@ -1,0 +1,30 @@
+# gopls on a one-file Go module. Needs `go` on PATH.
+[server]
+command = ["gopls", "serve"]
+startup_timeout = "60s"
+request_timeout = "30s"
+
+[workspace.files]
+"go.mod" = """
+module example.com/hello
+
+go 1.22
+"""
+"main.go" = """
+package main
+
+import "fmt"
+
+func greet(name string) string {
+\treturn "hello, " + name
+}
+
+func main() {
+\tfmt.Println(greet("world"))
+}
+"""
+
+[document]
+path = "main.go"
+language_id = "go"
+positions = ["5:6", "5:12", "10:14"]   # greet, name, the call to greet

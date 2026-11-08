@@ -1,0 +1,27 @@
+# rust-analyzer on a one-file Cargo project. Needs `cargo` on PATH.
+[server]
+command = ["rust-analyzer"]
+startup_timeout = "60s"
+request_timeout = "30s"
+
+[workspace.files]
+"Cargo.toml" = """
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+"""
+"src/main.rs" = """
+fn greet(name: &str) -> String {
+    format!("hello, {name}")
+}
+
+fn main() {
+    println!("{}", greet("world"));
+}
+"""
+
+[document]
+path = "src/main.rs"
+language_id = "rust"
+positions = ["1:4", "1:10", "6:20"]   # greet, name, the call to greet
