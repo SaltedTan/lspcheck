@@ -52,6 +52,11 @@ const FAULTS: &[(&str, &str)] = &[
     ("early-replies", "answer guessed request ids before they are sent, then answer unknown requests wrongly"),
     ("wrong-unknown-error", "answer unknown requests with InvalidRequest"),
     ("string-id-to-number", "reply to a request whose id is a string of digits with that number as id"),
+    ("mangles-odd-ids", "drop non-ASCII characters from string request ids before replying"),
+    ("drops-negative-ids", "never answer a request with a negative integer id"),
+    ("accepts-wrong-params", "answer a request with wrongly typed params with result null"),
+    ("dies-on-wrong-params", "exit when a request arrives with wrongly typed params"),
+    ("wrong-params-other-code", "lawful: answer wrongly typed params with InternalError (-32603)"),
     ("reply-twice", "answer every lspcheck/probe twice"),
     ("reply-unsent-id", "after initialize, send a response with an id lspcheck never used"),
     ("reply-to-notification", "answer an unknown notification with an error whose id is null"),
@@ -295,7 +300,7 @@ fn main() {
         }
         let Some((mut headers, mut body)) = queued.pop_front().or_else(|| input.next()) else { break };
         // A server that answers only the latest of several concurrent requests:
-        // J6's batch is the only one with an all-digit string id, and lspcheck
+        // J6's batch is the only one with a six-digit string id, and lspcheck
         // writes all four requests before reading, so waiting for the next
         // frame is guaranteed to succeed. This depends on protocol order, not
         // on where the OS happened to end its reads.
@@ -671,7 +676,11 @@ fn main() {
             no_more_answers = true;
             continue;
         }
-        if fault("drop-first-request") && !dropped_first && method.starts_with("textDocument/") {
+        if fault("drop-first-request")
+            && !dropped_first
+            && method.starts_with("textDocument/")
+            && msg.pointer("/params/textDocument/uri").and_then(Value::as_str).is_some()
+        {
             dropped_first = true;
             continue;
         }
@@ -701,6 +710,11 @@ fn main() {
         let id = match id.as_str().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
             Some(s) if fault("string-id-to-number") => s.parse::<i64>().map_or(id, |n| json!(n)),
             _ => id,
+        };
+        let id = if let Some(s) = id.as_str().filter(|s| !s.is_ascii()) {
+            if fault("mangles-odd-ids") { json!(s.chars().filter(|c| c.is_ascii()).collect::<String>()) } else { id }
+        } else {
+            id
         };
         if fault("replay-gate") && method == "m" {
             replay_gate_id = Some(id);
@@ -896,6 +910,21 @@ fn main() {
         }
         if method == "workspace/symbol" && holds {
             deferred = Some(id.clone());
+            continue;
+        }
+        if fault("drops-negative-ids") && id.as_i64().is_some_and(|n| n < 0) {
+            continue;
+        }
+        if wrong_param_types(&method, msg.get("params").unwrap_or(&Value::Null)) {
+            if fault("dies-on-wrong-params") {
+                std::process::exit(2);
+            }
+            if fault("accepts-wrong-params") {
+                out.frame(&ok(&id, Value::Null));
+                continue;
+            }
+            let code = if fault("wrong-params-other-code") { -32603 } else { -32602 };
+            out.frame(&err(&id, code, "invalid params"));
             continue;
         }
         if std::mem::take(&mut dropped) && fault("big-frame-after-drop") {
@@ -1522,6 +1551,18 @@ fn err(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
+fn wrong_param_types(method: &str, params: &Value) -> bool {
+    match method {
+        "textDocument/hover" | "textDocument/definition" => {
+            !params.get("textDocument").is_some_and(Value::is_object)
+                || !params.get("position").is_some_and(Value::is_object)
+        }
+        "textDocument/documentSymbol" => !params.get("textDocument").is_some_and(Value::is_object),
+        "workspace/symbol" => !params.get("query").is_some_and(Value::is_string),
+        _ => false,
+    }
+}
+
 /// Where the cancel faults' messages go: straight out, or held until the
 /// next request has been answered (late-cancel-replies), so a client can't
 /// count on them arriving before that answer.
@@ -1702,13 +1743,13 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Whether `body` is a request whose id is a non-empty all-digit string. Only
-/// J6 sends one, which is what makes drop-concurrent act in protocol order.
+/// Whether `body` is a request whose id is J6's six-digit string. That is what
+/// makes drop-concurrent act in protocol order without catching other probes.
 fn is_digit_string_request(body: &[u8]) -> bool {
     serde_json::from_slice::<Value>(body).is_ok_and(|v| {
         v.get("method").is_some_and(Value::is_string)
             && v.get("id")
                 .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()))
     })
 }

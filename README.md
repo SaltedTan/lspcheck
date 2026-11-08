@@ -2,8 +2,8 @@
 
 lspcheck starts a language server and checks that it speaks the
 [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) correctly. It checks message
-framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, document positions, and whether the server leaves
-processes behind. It
+framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, document positions, request parameter handling and
+unusual request ids, and whether the server leaves processes behind. It
 works with any server that talks over stdio, whatever language it is written in, and needs no configuration.
 
 ```console
@@ -56,10 +56,15 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
                      3 informative position(s) on character boundaries about the line-ending document, counted in UTF-16 code units; 32 position(s) about it
   SKIP  D6  MUST    A selectionRange result has one entry per position, each range contains its position, and each parent contains its child
                      the server advertises no selectionRangeProvider, so lspcheck sends no selectionRange request
-33 checks: 29 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 1 skipped, 0 not exercised, 0 errors
+  FAIL  R2  POLICY  A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving
+                     textDocument/hover returned a result for parameters of the wrong types: "null"
+  PASS  R4  POLICY  Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string
+                     all 8 requests got responses with their exact ids
+35 checks: 30 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 1 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation and document positions.
+lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions and
+parameter and request-id robustness.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
