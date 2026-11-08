@@ -68,6 +68,7 @@ impl Area {
             Area::Lifecycle => "Lifecycle",
             Area::Cancellation => "Cancellation",
             Area::Documents => "Documents",
+            Area::CapabilitiesAndRobustness => "Capabilities and robustness",
         }
     }
 }
