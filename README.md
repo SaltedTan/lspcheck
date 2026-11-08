@@ -280,8 +280,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   backslashes, control characters, `: < > " | ? *`, trailing dots or spaces, and Windows device names (`CON`, `PRN`,
   `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, also with extensions) are refused. Paths must use consistent ASCII case
   in every component across fixture and inline entries; `src/A.json` with `SRC/b.json`, or `A.json` with `a.json`,
-  is a usage error naming both paths. An inline file may overwrite a fixture file with the exact same spelling.
-  Missing directories are created.
+  is a usage error naming both paths. An inline file may replace a fixture file with the exact same spelling,
+  including a read-only file; the replacement uses default file creation permissions. Missing directories are created.
 - **lspcheck's own files.** lspcheck writes `doc.txt`, `crlf.txt` and `lspcheck-utf8.txt` at the top of the workspace,
   and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names,
   compared ignoring ASCII case.

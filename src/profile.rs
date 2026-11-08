@@ -406,6 +406,17 @@ pub fn populate(root: &Path, w: &Workspace) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        #[cfg(windows)]
+        if path.try_exists()? {
+            let mut permissions = std::fs::metadata(&path)?.permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&path, permissions)?;
+        }
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e);
+        }
         std::fs::write(&path, text)?;
     }
     Ok(())
@@ -709,6 +720,68 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("a/b/c.txt")).unwrap(), "deep");
         assert_eq!(std::fs::read_to_string(root.join("top.txt")).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(root.join("x/y.txt")).unwrap(), "made");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_readonly_fixture_overrides_use_default_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        std::fs::create_dir_all(fixture.join("src")).unwrap();
+        for name in ["settings.json", "src/settings.json", "unchanged.txt"] {
+            let path = fixture.join(name);
+            std::fs::write(&path, "original").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let profile = parse(
+            "[workspace]\npath = \"fixture\"\nfiles = { \"settings.json\" = \"new top\", \"src/settings.json\" = \"new nested\", \"added.txt\" = \"fresh\" }\n",
+            dir.path(),
+        ).unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let reference = root.join("reference.txt");
+        std::fs::write(&reference, "ordinary creation").unwrap();
+        let default_mode = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+        populate(&root, &profile.workspace).unwrap();
+        for (name, text) in [("settings.json", "new top"), ("src/settings.json", "new nested"), ("added.txt", "fresh")]
+        {
+            let path = root.join(name);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, default_mode);
+        }
+        assert_eq!(std::fs::read_to_string(root.join("unchanged.txt")).unwrap(), "original");
+        assert_eq!(std::fs::metadata(root.join("unchanged.txt")).unwrap().permissions().mode() & 0o777, 0o444);
+        for name in ["settings.json", "src/settings.json", "unchanged.txt"] {
+            let path = fixture.join(name);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o444);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn profile_readonly_fixture_attributes_allow_inline_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        std::fs::create_dir(&fixture).unwrap();
+        let source = fixture.join("settings.json");
+        std::fs::write(&source, "original").unwrap();
+        let mut permissions = std::fs::metadata(&source).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&source, permissions.clone()).unwrap();
+        let profile =
+            parse("[workspace]\npath = \"fixture\"\nfiles = { \"settings.json\" = \"inline\" }\n", dir.path()).unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        populate(&root, &profile.workspace).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("settings.json")).unwrap(), "inline");
+        assert!(!std::fs::metadata(root.join("settings.json")).unwrap().permissions().readonly());
+        assert!(std::fs::metadata(&source).unwrap().permissions().readonly());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "original");
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&source, permissions).unwrap();
     }
 
     #[test]

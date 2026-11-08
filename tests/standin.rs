@@ -2468,3 +2468,46 @@ fn profile_case_exact_fixture_overrides_record_once_and_replay() {
     assert_eq!(files["src/Settings.json"], "new nested");
     replays_alike(&transcript, "needs-workspace-file");
 }
+
+#[cfg(unix)]
+#[test]
+fn profile_readonly_fixture_override_starts_server_and_replays() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let manifest = "require = \"settings.json\"\nrequire = \"src/settings.json\"\n";
+    let (path, keep) = profile(&format!(
+        "[workspace]\npath = \"fixture\"\nfiles = {{ \"standin.toml\" = {}, \"settings.json\" = \"new top\", \"src/settings.json\" = \"new nested\", \"added.txt\" = \"fresh\" }}\n",
+        serde_json::to_string(manifest).unwrap(),
+    ));
+    let fixture = keep.path().join("fixture");
+    std::fs::create_dir_all(fixture.join("src")).unwrap();
+    for (name, text) in [
+        ("standin.toml", "require = \"missing-payload\"\n"),
+        ("settings.json", "original top"),
+        ("src/settings.json", "original nested"),
+    ] {
+        let source = fixture.join(name);
+        std::fs::write(&source, text).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    let transcripts = keep.path().join("t");
+    let server = [STANDIN, "--fault", "needs-workspace-file"];
+    let r =
+        run_command_in(&["--profile", path.to_str().unwrap(), "--only", "L2,L6"], &server, None, transcripts.clone());
+    expect(&r, "L2", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let transcript = transcripts.join("lifecycle.jsonl");
+    let recording = std::fs::read_to_string(&transcript).unwrap();
+    let workspace: Value = recording
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["workspace"].is_string())
+        .unwrap();
+    for (name, text) in [("standin.toml", manifest), ("settings.json", "new top"), ("src/settings.json", "new nested")]
+    {
+        assert_eq!(workspace["files"][name], text);
+        assert_eq!(workspace["file_modes"][name], workspace["file_modes"]["added.txt"]);
+        assert_eq!(std::fs::metadata(fixture.join(name)).unwrap().permissions().mode() & 0o777, 0o444);
+    }
+    replays_alike(&transcript, "needs-workspace-file");
+}
