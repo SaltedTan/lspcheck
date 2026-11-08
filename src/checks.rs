@@ -310,13 +310,15 @@ pub struct Config {
 
 /// The files lspcheck writes into a scenario's workspace, and the one it
 /// names there as never existing. A profile can't put files at these paths.
-pub const OWN_FILES: &[&str] = &[DOC_A_FILE, DOC_B_FILE, UTF8_FILE, MISSING_FILE];
+pub const OWN_FILES: &[&str] = &[DOC_A_FILE, DOC_B_FILE, UTF8_FILE, MISSING_FILE, LARGE_FILE];
 /// Document A, in the documents scenario.
 const DOC_A_FILE: &str = "doc.txt";
 /// Document B, in the documents scenario.
 const DOC_B_FILE: &str = "crlf.txt";
 /// The framing scenario's document with multibyte text (F5).
 const UTF8_FILE: &str = "lspcheck-utf8.txt";
+/// The large-document robustness scenario's file (R3).
+const LARGE_FILE: &str = "lspcheck-large.txt";
 /// The never-opened document D4 asks about, which must not exist.
 const MISSING_FILE: &str = "missing.txt";
 
@@ -1625,12 +1627,12 @@ async fn large_document_scenario(ctx: &mut Ctx<'_>) -> bool {
             return true;
         }
     };
-    let path = ctx.root.join("lspcheck-large.txt");
+    let path = ctx.root.join(LARGE_FILE);
     if let Err(error) = std::fs::write(&path, text.as_bytes()) {
         ctx.report("R3", Verdict::Error, format!("couldn't write the large document: {error}"));
         return true;
     }
-    ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+    ctx.record_workspace();
     let uri = file_uri(&path);
     if let Err(error) = ctx
         .s

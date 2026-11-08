@@ -663,16 +663,30 @@ mod tests {
 
     #[test]
     fn lspchecks_own_files_are_reserved() {
-        for name in ["doc.txt", "DOC.TXT", "crlf.txt", "lspcheck-utf8.txt", "missing.txt", "doc.txt/inner"] {
+        for name in [
+            "doc.txt",
+            "DOC.TXT",
+            "crlf.txt",
+            "lspcheck-utf8.txt",
+            "missing.txt",
+            "doc.txt/inner",
+            "lspcheck-large.txt",
+            "LSPCHECK-LARGE.TXT",
+            "lspcheck-large.txt/inner",
+        ] {
             let text = format!("[workspace]\nfiles = {{ {name:?} = \"x\" }}\n");
             let e = parse_here(&text).unwrap_err();
             assert!(e.contains("reserved"), "{name:?}: {e}");
         }
         assert!(parse_here("[workspace]\nfiles = { \"sub/doc.txt\" = \"x\" }\n").is_ok());
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("crlf.txt"), "x").unwrap();
-        let e = parse("[workspace]\npath = \".\"\n", dir.path()).unwrap_err();
-        assert!(e.starts_with("workspace.path") && e.contains("reserved"), "{e}");
+        for name in ["crlf.txt", "lspcheck-large.txt", "LSPCHECK-LARGE.TXT", "lspcheck-large.txt/inner"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+            let e = parse("[workspace]\npath = \".\"\n", dir.path()).unwrap_err();
+            assert!(e.starts_with("workspace.path") && e.contains("reserved"), "{e}");
+        }
     }
 
     #[test]

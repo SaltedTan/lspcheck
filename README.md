@@ -285,8 +285,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   in every component across fixture and inline entries; `src/A.json` with `SRC/b.json`, or `A.json` with `a.json`,
   is a usage error naming both paths. An inline file may replace a fixture file with the exact same spelling,
   including a read-only file; the replacement uses default file creation permissions. Missing directories are created.
-- **lspcheck's own files.** lspcheck writes `doc.txt`, `crlf.txt` and `lspcheck-utf8.txt` at the top of the workspace,
-  and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names,
+- **lspcheck's own files.** lspcheck writes `doc.txt`, `crlf.txt`, `lspcheck-utf8.txt` and `lspcheck-large.txt` at the
+  top of the workspace, and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names,
   compared ignoring ASCII case.
 - **`[client]`.** `initialization_options` is any TOML value; it is sent as JSON in every `initialize`, including
   L3's second one. When `configuration` is given, lspcheck answers each `workspace/configuration` item by looking up

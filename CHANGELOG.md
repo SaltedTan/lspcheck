@@ -43,6 +43,7 @@
   so `replay` recreates them. Fixture roots must not be symbolic links, and workspace names must be portable.
   Profiles and replay refuse paths with inconsistent ASCII case in any shared component; inline fixture overrides
   with the exact same spelling remain supported.
+  R3 preserves the profile workspace in its transcript and reserves its own `lspcheck-large.txt` from profile files.
   The `[document]` section, `[client].capabilities` and K1 are still planned.
 - Stand-in faults `needs-init-option`, `needs-workspace-file` and `needs-configuration`, which a profile satisfies.
 

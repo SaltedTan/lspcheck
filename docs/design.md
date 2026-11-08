@@ -397,7 +397,7 @@ capabilities = "default"       # planned (part 2): or a path to a capabilities J
   An inline file that needs a directory where the fixture or another inline file has a file, or that names a fixture
   directory, is refused.
 - **lspcheck's own files.** `checks::OWN_FILES` enforces the reserved top-level names listed in the README.
-  Deeper paths such as `src/doc.txt` are the profile's.
+  These include R3's `lspcheck-large.txt`. Deeper paths such as `src/doc.txt` are the profile's.
 - **`initialization_options`** is any TOML value, converted to JSON (a date or time becomes its TOML spelling; NaN or
   an infinite float is an error), and sent as `initializationOptions` in every initialize lspcheck sends: each
   scenario's, L3's second one and the pre-initialize scenario's. Absent, the field is omitted as before.
