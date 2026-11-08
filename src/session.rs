@@ -1157,7 +1157,11 @@ impl Session {
         // the unfinished frame above included, makes judging J3 inconclusive.
         let ongoing = [evidence.stopped.as_ref(), self.own_limit.as_ref()];
         let j3_incomplete = self.initialized_at.and_then(|from| incomplete_between(&evidence.lost, ongoing, from, now));
-        let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
+        let mut transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
+        // Writes are recorded after flushing, so the reader may append a
+        // later reply first. Restore occurrence order, retaining append order
+        // for equal timestamps (including pieces of a split write).
+        transcript.sort_by_key(|event| event.at);
         let whole = evidence.done && !evidence.cut;
         let (miscounted, unchecked) = miscounted_frames(&evidence.unparsed, &transcript, whole);
         // Whether an unmatched reply is a duplicate, early, aborted or only
@@ -1483,6 +1487,36 @@ mod tests {
         // A dot always separates: a key spelled with one isn't found.
         assert_eq!(item(json!({"section": "x.y"})), Value::Null);
         assert_eq!(item(json!({"section": 3})), Value::Null);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn finished_transcripts_preserve_occurrence_order_when_writes_flush_late() {
+        let cmd = ServerCommand::new(&["sleep".into(), "30".into()]);
+        let s = Session::start(&cmd, Options::default()).await.unwrap();
+        let id = Id::int(7);
+        let request = transport::encode(&serde_json::to_vec(&message::request(&id, "probe", None)).unwrap());
+        let reply = transport::encode(&serde_json::to_vec(&message::response(&id, Value::Null)).unwrap());
+        let exit = transport::encode(&serde_json::to_vec(&message::notification("exit", None)).unwrap());
+        // Force the Windows pipe schedule: the reader records the reply
+        // before the writer's flush completes and records the earlier send.
+        record(&s.transcript, Duration::from_nanos(2), EventKind::Read(reply));
+        // Equal timestamps must preserve split-write byte order too.
+        let cut = request.len() / 2;
+        record(&s.transcript, Duration::from_nanos(1), EventKind::Sent(request[..cut].to_vec()));
+        record(&s.transcript, Duration::from_nanos(1), EventKind::Sent(request[cut..].to_vec()));
+        record(&s.transcript, Duration::from_nanos(3), EventKind::Sent(exit));
+        let finish = s.finish(Duration::from_millis(200)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recording.jsonl");
+        crate::transcript::write(&path, &finish.transcript).unwrap();
+        let plan = crate::replay::parse(&path).unwrap();
+        // The JSON Lines transcript contract orders the request before its
+        // reply, so replay must retain the result and gate the next write.
+        assert_eq!(plan.requests.len(), 1);
+        assert_eq!(plan.requests[0].recorded.as_deref(), Some("result"));
+        assert_eq!(plan.steps[2].gates, vec![id]);
+        assert!(finish.transcript.windows(2).all(|pair| pair[0].at <= pair[1].at));
     }
 
     #[cfg(unix)]

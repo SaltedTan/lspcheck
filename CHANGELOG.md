@@ -12,6 +12,8 @@
 - Robustness checks avoid false framing failures and missed leftover processes during cleanup; R2 stays inconclusive
   when skipped output could contain the follow-up reply, even if the server exits.
 - R2 rejects malformed error responses, including invalid codes and missing or non-string messages.
+- Transcripts keep requests before fast replies even when a pipe flush finishes after the reply is read, fixing
+  intermittent missing recorded replies during replay on Windows.
 - Inline profile files can replace read-only fixture files, using default file creation permissions.
 - Terminal, JUnit and Markdown reports reference the transcripts directory for cross-cutting failures and errors.
 - Markdown keeps character references and tildes literal in table cells and makes CR/LF visible in commands and
