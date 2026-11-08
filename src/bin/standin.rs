@@ -1541,8 +1541,6 @@ fn publish_diagnostics<W: Write>(
     out.frame(&json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}));
 }
 
-/// The file a `file:` URI names, read from disk (closed-from-disk); `None`
-/// when the URI isn't a `file:` URI, the path isn't UTF-8, or the read fails.
 /// For needs-workspace-file: whether the workspace root given in `initialize`
 /// holds `standin.toml` and each file named by a `require = "PATH"` line in it.
 fn workspace_ready(initialize: &Value) -> Result<(), String> {
@@ -1599,6 +1597,8 @@ fn uri_path(uri: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(if windows_drive { &path[1..] } else { &path[..] }))
 }
 
+/// The file a `file:` URI names, read from disk (closed-from-disk); `None`
+/// when the URI isn't a `file:` URI, the path isn't UTF-8, or the read fails.
 fn disk_text(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("file://")?;
     let bytes = rest.as_bytes();

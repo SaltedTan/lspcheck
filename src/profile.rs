@@ -10,6 +10,14 @@
 //! bad profile is a usage error rather than a run full of errors. Paths in
 //! the profile are relative to the directory of the profile file.
 
+#![cfg_attr(
+    windows,
+    allow(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows read-only attributes are not Unix permission bits"
+    )
+)]
+
 use crate::checks;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};

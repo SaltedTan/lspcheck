@@ -29,7 +29,7 @@ See the [README](../README.md#exit-status) for exit statuses and `--strict`.
 ## Verdicts
 Each check has a **basis**: `MUST` (a normative spec rule), `SHOULD` (a spec recommendation), or `POLICY` (hygiene the spec
 doesn't mandate, such as exiting on end of input). Each result is one of:
-`pass`, `fail`, `skip` (not applicable, e.g. capability not advertised), `not-exercised` (applicable but the run produced
+`pass`, `fail`, `skip` (see [SKIP semantics](../README.md#verdicts)), `not-exercised` (applicable but the run produced
 no evidence, e.g. no non-ASCII output was ever seen), or `error` (the checker or environment failed; never a pass).
 Lessons from virgil-lsp: an unexercised check must never render as a pass, and a checker failure must keep the first
 useful evidence rather than be replaced by a cleanup error.
@@ -486,8 +486,8 @@ Single crate, `src/` modules:
 - `profile`: reads and validates a profile (`toml` with `serde`'s `deny_unknown_fields`), copies its files into each
   scenario's workspace, and merges its command and timeouts with the command line's.
 - `report`, `cli` (clap).
-Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, toml (`parse` and `serde` features
-only), thiserror; `nix` on Unix, `windows-sys` on Windows. No network access at runtime.
+Dependency versions, features and platform conditions are defined in [Cargo.toml](../Cargo.toml).
+No network access at runtime.
 
 ## How we know it works
 - `standin`: a test-only server binary (in the workspace) with fault flags, one per check:
