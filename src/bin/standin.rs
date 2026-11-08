@@ -132,7 +132,6 @@ const FAULTS: &[(&str, &str)] = &[
     ("exit-on-shutdown", "exit right after replying to shutdown"),
     ("big-frame-on-exit", "on exit, send one 2 MiB log message before exiting"),
     ("exit-flood", "on exit, write 100,000 small log messages and then a line outside any frame"),
-    ("exit-flood-bad-envelope", "on exit, write 200,000 log messages and then one without \"jsonrpc\""),
     ("exit-status", "exit with status 3 on exit"),
     ("ignore-exit", "ignore exit and stay running"),
     ("inflated-on-exit", "on exit, start an inflated frame containing a progress request and stay running"),
@@ -276,7 +275,15 @@ fn main() {
     ]
     .iter()
     .any(|name| fault(name));
-    let mut out = Writer { out: std::io::stdout().lock(), faults: faults.clone(), holding: false, held: Vec::new() };
+    // Stdout's line buffer can split a coalesced write at the last header's
+    // newline, leaving its body for a second write. Use the pipe directly so
+    // the small batches below really are written together.
+    let stdout = std::io::stdout();
+    #[cfg(unix)]
+    let stdout = std::fs::File::from(std::os::fd::AsFd::as_fd(&stdout).try_clone_to_owned().unwrap());
+    #[cfg(not(unix))]
+    let stdout = std::fs::File::from(std::os::windows::io::AsHandle::as_handle(&stdout).try_clone_to_owned().unwrap());
+    let mut out = Writer { out: stdout, faults: faults.clone(), holding: false, held: Vec::new() };
     if fault("stdout-banner") {
         out.raw(b"standin starting\n");
     }
@@ -690,16 +697,6 @@ fn main() {
                         json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
                     let mut bytes = out.encode(&log).repeat(100_000);
                     bytes.extend_from_slice(b"goodbye\n");
-                    out.raw(&bytes);
-                }
-                if fault("exit-flood-bad-envelope") {
-                    let log =
-                        json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
-                    let mut bytes = out.encode(&log).repeat(200_000);
-                    let mut bad =
-                        json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x"}});
-                    bad.as_object_mut().unwrap().remove("jsonrpc");
-                    bytes.extend(out.encode(&bad));
                     out.raw(&bytes);
                 }
                 let status = if fault("exit-status") {
