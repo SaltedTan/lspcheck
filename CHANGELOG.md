@@ -23,12 +23,9 @@
 
 ### Added
 
-- K1 checks that a server handles what it advertises: in a new `capabilities` scenario, lspcheck opens a document and
-  sends each request the initialize result advertises (hover, definition, references, rename, symbols, formatting,
-  code actions, semantic tokens, workspace symbols and others), waiting one at a time until a reply timeout.
-  MethodNotFound (-32601) for any of them fails K1 whenever its reply is read, including during the graceful shutdown; a request with no response by the end
-  of the session leaves K1 inconclusive (`ERROR`), since LSP sets no deadline for a response, and other errors are
-  listed as lawful. See the [K1 reference](docs/design.md#capabilities-and-robustness).
+- K1 checks advertised requests in a new `capabilities` scenario; MethodNotFound (-32601) fails the check.
+  See the [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage, late-response handling
+  and inconclusive results.
 - Profiles accept `[document]`: the file K1 opens (`path`, from the profile's workspace), its `language_id`, and up to
   five `positions` as `LINE:COLUMN` (from 1, the column in characters), converted to the negotiated position encoding.
   A missing file, a file that isn't UTF-8, a missing language id or a position outside the document is a usage error.

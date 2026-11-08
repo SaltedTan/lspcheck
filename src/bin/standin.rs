@@ -148,10 +148,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("ignore-unknown-requests", "never answer requests for unknown methods"),
     ("exit-on-string-id", "exit when a request has a string id"),
     ("answers-reordered", "lawful: answer requests that arrive together in reverse order"),
-    (
-        "defer-until-next",
-        "lawful: while no document is open, hold a workspace/symbol reply until the next message, cancelling it if asked",
-    ),
+    ("defer-until-next", "lawful: hold a workspace/symbol reply until the next message, cancelling it if asked"),
     ("cancelled-no-reply", "never answer a deferred request that is cancelled"),
     ("cancelled-reply-twice", "answer a cancelled request with both -32800 and a result"),
     ("cancelled-other-error", "lawful: answer a cancelled request with InternalError (-32603)"),
