@@ -242,7 +242,8 @@ it answers even when the client's pipe flush finishes later.
 `--profile` is available from the next release (currently [Unreleased](CHANGELOG.md#unreleased)).
 
 Many servers refuse to initialize, or check little, without a project or settings. A profile is a TOML file that
-gives lspcheck what a server needs, and says what its maintainers accept. Every section and key is optional.
+gives lspcheck what a server needs, and says what its maintainers accept. The four sections and their top-level keys
+are optional; each `allow.skip` entry requires both `id` and `reason`.
 The example below uses supported fields; [planned profile fields](docs/design.md#profiles-optional-toml) are not
 accepted yet.
 
@@ -288,8 +289,9 @@ lspcheck --profile go.toml --timeout 30 -- gopls
 - **lspcheck's own files.** lspcheck writes `doc.txt`, `crlf.txt`, `lspcheck-utf8.txt` and `lspcheck-large.txt` at the
   top of the workspace, and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names,
   compared ignoring ASCII case.
-- **`[client]`.** `initialization_options` is any TOML value; it is sent as JSON in every `initialize`, including
-  L3's second one. When `configuration` is given, lspcheck answers each `workspace/configuration` item by looking up
+- **`[client]`.** `initialization_options` is converted using the [TOML-to-JSON rules](docs/design.md#profiles-optional-toml)
+  and sent in every `initialize`, including L3's second one. When the `configuration` table is given, lspcheck answers
+  each `workspace/configuration` item by looking up
   its `section` as a dot-separated path in it (`"gopls.staticcheck"` gives `false`; a missing path gives `null`; an item
   without a section gets the whole table), and sends it once in `workspace/didChangeConfiguration` right after
   `initialized`, for servers that read settings only that way.
