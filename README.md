@@ -6,6 +6,8 @@ framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, document posi
 unusual request ids, and whether the server leaves processes behind. It
 works with any server that talks over stdio, whatever language it is written in, and needs no configuration.
 
+Example output from the development version (see [Unreleased](CHANGELOG.md#unreleased)):
+
 ```console
 $ lspcheck -- basedpyright-langserver --stdio
 lspcheck 0.1.0 — basedpyright-langserver --stdio
