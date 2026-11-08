@@ -454,8 +454,10 @@ capabilities = "default"       # planned (part 2): or a path to a capabilities J
   `transcripts: DIR` for cross-cutting failures and errors, using the shared parent of the recorded scenario paths.
 - `--transcripts DIR`: one JSONL per session with direction, monotonic timestamp, raw bytes (base64 when not UTF-8),
   how the reader split them into frames, and stderr. Each file includes a meta line naming the workspace and the
-  files it held, so a replay can recreate it. Session finalization stably orders events by timestamp: a reply read
-  before its request's pipe flush completes still follows that write, and equal timestamps retain append order. Transcript writing also stably orders events by timestamp.
+  files it held, so a replay can recreate it. Events are written in the order they began: each takes a sequence
+  number when it starts (a write before its first byte, a read when it completes), and the session sorts by it once
+  when it finishes. A write is recorded only after it flushes, so this keeps a reply read during that flush after the
+  request it answers, even with the same timestamp.
 - `lspcheck replay TRANSCRIPT -- SERVER`: re-runs one recorded session against a server. It recreates the recorded
   workspace (refusing a non-empty or symlink path; preserving an existing empty directory), re-sends every client write
   in order (gaps under 200 ms kept as pauses), and answers server-to-client requests with the same auto-answers a live run
