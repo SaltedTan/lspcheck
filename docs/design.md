@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. Profiles part 1 is done (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[allow]`), including portable workspace names with consistent ASCII case, inline overrides of read-only fixtures, and replay of binary files, empty directories and Unix file permissions; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies; profiles part 2 has `[document]` and [K1](#capabilities-and-robustness), including late and duplicate response handling and consolidated delivery details, and example profiles for gopls, rust-analyzer, lua-language-server and basedpyright that pass K1; `[client].capabilities` and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); `[client].capabilities` and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -312,7 +312,7 @@ a document request is advertised.
 | ID | Basis | Check |
 |---|---|---|
 | K1 | MUST | A request the server advertises, sent with valid parameters about an open document, isn't answered with MethodNotFound (-32601). |
-| K2 | MUST | Replies validate against the LSP 3.17 metaModel (vendored, CC BY 4.0 attribution). **v0.2.** |
+| K2 | MUST | Replies validate against the LSP 3.17 metaModel (vendored, CC BY 4.0 attribution). Planned; see [milestones](#milestones). |
 | R1 | POLICY | A well-framed body that isn't JSON gets ParseError `-32700` with id `null` or is ignored, and the server keeps serving. |
 | R2 | POLICY | A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving. |
 | R3 | POLICY | A large document (default 4 MiB, configurable) is accepted or refused without the server failing, and it keeps serving. |
@@ -598,8 +598,8 @@ No network access at runtime.
 - **M0** repository, CI (fmt, clippy, test on Linux/macOS/Windows), transport + process + session, stand-in skeleton.
 - **M1** framing and lifecycle checks (F*, L*), terminal + JSON report.
 - **M2** correlation, cancellation, documents (J*, C*, D*), transcripts and `replay`.
-- **M3** profiles, K1, JUnit/Markdown; stock-server CI matrix; v0.1.0 release with prebuilt binaries
-  (Linux x86_64/aarch64 static, macOS arm64/x86_64, Windows x86_64) and checksums. crates.io publishing needs the
+- **M3** profiles, K1, JUnit/Markdown (released in v0.2.0); stock-server CI matrix; v0.1.0 release with prebuilt
+  binaries (Linux x86_64/aarch64 static, macOS arm64/x86_64, Windows x86_64) and checksums. crates.io publishing needs the
   maintainer's token.
 - **M4** dogfood in virgil-lsp: a pinned binary download in CI (a dependency + workflow change, so a human merge there).
   Done: virgil-lsp's `lspcheck-linux` job checks its freshly built server with the pinned v0.1.0 release.

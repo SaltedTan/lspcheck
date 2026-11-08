@@ -7,11 +7,11 @@ malformed JSON and large-document robustness, unusual request ids, and whether t
 works with any server that talks over stdio, whatever language it is written in, and needs no configuration; an
 optional [profile](#profiles) gives a server the project files and settings it needs.
 
-Example output from the development version (see [Unreleased](CHANGELOG.md#unreleased)):
+Example output:
 
 ```console
 $ lspcheck -- basedpyright-langserver --stdio
-lspcheck 0.1.0 — basedpyright-langserver --stdio
+lspcheck 0.2.0 — basedpyright-langserver --stdio
   PASS  F1  MUST    Every byte on stdout belongs to a well-formed frame
   PASS  F2  MUST    Content-Length counts the body's bytes, not its characters
   PASS  F3  MUST    Input split across writes, down to single header bytes, is read
@@ -94,7 +94,7 @@ distribution. On Linux or macOS:
 # The subshell stops at the first failure, such as a checksum mismatch, without closing your shell.
 (
   set -eu
-  v=0.1.0 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, x86_64-apple-darwin,
+  v=0.2.0 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, x86_64-apple-darwin,
                                              # aarch64-apple-darwin
   base=https://github.com/SaltedTan/lspcheck/releases/download/v$v
   curl -fsSLO "$base/lspcheck-$v-$target.tar.gz" -O "$base/SHA256SUMS"
@@ -109,37 +109,34 @@ then extract it and put `lspcheck.exe` on your `PATH`.
 
 Each archive also carries build provenance from the release workflow, which the GitHub CLI can check. Run this where
 you downloaded the archive, substituting your platform's archive name:
-`gh attestation verify lspcheck-0.1.0-x86_64-unknown-linux-musl.tar.gz --repo SaltedTan/lspcheck`.
+`gh attestation verify lspcheck-0.2.0-x86_64-unknown-linux-musl.tar.gz --repo SaltedTan/lspcheck`.
 
 To build from source instead, with Rust 1.99 or later:
 
 ```sh
-cargo install --locked --git https://github.com/SaltedTan/lspcheck --tag v0.1.0
+cargo install --locked --git https://github.com/SaltedTan/lspcheck --tag v0.2.0
 ```
 
 ### In CI
 
 Pin a version and its checksum, so the check only changes when you upgrade it. Checks are added and refined between
 versions, and the [changelog](CHANGELOG.md) says which. The exit status fails the job when a `MUST` check fails
-(`--strict` also fails it on `SHOULD` and `POLICY` failures). `--json` and `--transcripts` keep the evidence:
+(`--strict` also fails it on `SHOULD` and `POLICY` failures). `--json` and `--transcripts` keep the evidence, and
+`--junit` and `--markdown` feed CI test tabs and the GitHub step summary:
 
 ```yaml
 - name: Check the language server with lspcheck
   env:
-    LSPCHECK_VERSION: 0.1.0
+    LSPCHECK_VERSION: 0.2.0
     LSPCHECK_SHA256: <the archive's 64-character SHA-256 digest from SHA256SUMS>
   run: |
     name=lspcheck-$LSPCHECK_VERSION-x86_64-unknown-linux-musl
     curl -fsSLO "https://github.com/SaltedTan/lspcheck/releases/download/v$LSPCHECK_VERSION/$name.tar.gz"
     echo "$LSPCHECK_SHA256  $name.tar.gz" | sha256sum --check
     tar -xzf "$name.tar.gz"
-    "$name/lspcheck" --json lspcheck.json \
+    "$name/lspcheck" --json lspcheck.json --junit lspcheck.xml --markdown "$GITHUB_STEP_SUMMARY" \
       --transcripts lspcheck-transcripts -- ./build/my-server --stdio
 ```
-
-`--junit` and `--markdown` are available from the next release (currently
-[Unreleased](CHANGELOG.md#unreleased)). With that release, add
-`--junit lspcheck.xml --markdown "$GITHUB_STEP_SUMMARY"` to the command above for CI test tabs and a GitHub step summary.
 
 ## Use
 
@@ -246,8 +243,6 @@ lspcheck closed the server's input. Events are in the order they began, keeping 
 answers even when the client's pipe flush finishes later.
 
 ### Profiles
-
-`--profile` is available from the next release (currently [Unreleased](CHANGELOG.md#unreleased)).
 
 Many servers refuse to initialize, or check little, without a project or settings. A profile is a TOML file that
 gives lspcheck what a server needs, and says what its maintainers accept. The five sections and their top-level keys

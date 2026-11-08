@@ -2,61 +2,43 @@
 
 ## Unreleased
 
-### Fixed
-
-- R1 and R3 wait for an unprompted exit after a failed probe, so a pipe closing before the process finishes exiting
-  does not turn a server crash into an inconclusive result on Windows.
-- Transcripts keep each request before its reply, even when the reply is read while the request's write is still
-  flushing and both have the same timestamp, so replay no longer reports a recorded reply as missing (seen on Windows).
-- R1 includes queued responses in its frozen read window and keeps earlier ParseErrors from hiding wrong-code replies.
-- Robustness checks avoid false framing failures and missed leftover processes during cleanup; R2 stays inconclusive
-  when skipped output could contain the follow-up reply, even if the server exits.
-- R2 rejects malformed error responses, including invalid codes and missing or non-string messages.
-- Inline profile files can replace read-only fixture files, using default file creation permissions.
-- Terminal, JUnit and Markdown reports reference the transcripts directory for cross-cutting failures and errors.
-- Markdown keeps character references and tildes literal in table cells and makes CR/LF visible in commands and
-  transcript paths.
-- The pinned v0.1.0 CI example uses supported flags; instructions for the unreleased report flags appear separately.
+## 0.2.0 (2026-11-09)
 
 ### Added
 
-- K1 checks advertised requests in a new `capabilities` scenario; MethodNotFound (-32601) fails the check.
-  See the [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage, late-response handling
-  and inconclusive results.
-- Profiles accept `[document]`: the file K1 opens (`path`, from the profile's workspace), its `language_id`, and up to
-  five `positions` as `LINE:COLUMN` (from 1, the column in characters), converted to the negotiated position encoding.
-  A missing file, a file that isn't UTF-8, a missing language id or a position outside the document is a usage error.
-  Without `[document]`, K1 asks about `lspcheck-k1.txt`, a new reserved workspace name.
-- [Example profiles](examples/profiles/) for gopls, rust-analyzer, lua-language-server and basedpyright.
-- `--junit PATH` and `--markdown PATH` add CI reports alongside JSON. See [usage](README.md#use) and the
-  [report format reference](docs/design.md#report).
-- R1 sends a correctly framed body that isn't JSON and checks for a null-id ParseError (or the body being ignored)
-  and that the server keeps serving; R3 opens a large document (`--large-document-mib`, 4 MiB by default) and
-  checks that the server keeps serving.
-- Added R2, which sends wrongly typed parameters to an advertised request and checks for an error response and continued
-  service, and R4, which checks exact round-trips for valid unusual request ids.
-- Keep each unanswered R4 request's evidence window. J3 includes the well-formed R2, R3 and R4 scenarios, but not R1's
-  deliberately malformed-input scenario.
 - Profiles: `lspcheck --profile PATH` reads a TOML file that gives a server what it needs and says what its
-  maintainers accept ([README](README.md#profiles)). `[server]` sets the command (used when none follows `--`) and the
-  timeouts (a flag on the command line still wins); `[workspace]` copies a fixture directory and writes inline files
-  into each scenario's workspace; `[client]` sets `initializationOptions` and the settings that answer
-  `workspace/configuration` (also sent in `workspace/didChangeConfiguration` after `initialized`); `[allow]` lets
-  named descendants outlive the server (L9) and skips checks with a reason. A bad profile is a usage error (exit
-  status 2) naming the key, before any server starts. The terminal header and the JSON report's new `"profile"` field
-  name the profile; transcripts record its files (including binary contents and Unix read, write and execute
-  permissions), empty directories and settings,
-  so `replay` recreates them. Fixture roots must not be symbolic links, and workspace names must be portable.
-  Profiles and replay refuse paths with inconsistent ASCII case in any shared component; inline fixture overrides
-  with the exact same spelling remain supported.
-  R3 preserves the profile workspace in its transcript and reserves its own `lspcheck-large.txt` from profile files.
-  See the [profile reference](docs/design.md#profiles-optional-toml) for planned fields.
-- Stand-in faults `needs-init-option`, `needs-workspace-file` and `needs-configuration`, which a profile satisfies.
+  maintainers accept ([README](https://github.com/SaltedTan/lspcheck/blob/v0.2.0/README.md#profiles), [reference](https://github.com/SaltedTan/lspcheck/blob/v0.2.0/docs/design.md#profiles-optional-toml)).
+  - `[server]` sets the command (used when none follows `--`) and the timeouts; a flag on the command line still wins.
+  - `[workspace]` copies a fixture directory and writes inline files into each scenario's workspace.
+  - `[client]` sets `initializationOptions` and the settings that answer `workspace/configuration` (also sent in
+    `workspace/didChangeConfiguration` after `initialized`).
+  - `[document]` names the file K1 opens, its `language_id`, and up to five `LINE:COLUMN` positions.
+  - `[allow]` lets named descendants outlive the server (L9) and skips checks with a reason.
+  - A bad profile is a usage error (exit status 2) naming the key, before any server starts. Transcripts record the
+    profile's files and settings, so `replay` recreates them.
+- [Example profiles](https://github.com/SaltedTan/lspcheck/tree/v0.2.0/examples/profiles/) for gopls, rust-analyzer, lua-language-server and basedpyright.
+- K1 (`MUST`) sends each request the server advertises about an open document and fails if one is answered with
+  MethodNotFound (-32601). A request still unanswered at the end of the session makes K1 inconclusive.
+- Robustness checks (`POLICY`), each in its own scenario:
+  - R1 sends a well-framed body that isn't JSON and expects a null-id ParseError, or nothing, and continued service.
+  - R2 sends wrongly typed parameters to an advertised request and expects an error response and continued service.
+  - R3 opens a large document (`--large-document-mib`, 4 MiB by default) and expects continued service.
+  - R4 checks that unusual but valid request ids (0, negative, the 32-bit extremes, empty, long and non-ASCII
+    strings) come back exactly.
+- `--junit PATH` and `--markdown PATH` write CI reports alongside JSON: a JUnit XML report for CI test tabs and a
+  summary table for a CI step summary ([usage](https://github.com/SaltedTan/lspcheck/blob/v0.2.0/README.md#use), [format](https://github.com/SaltedTan/lspcheck/blob/v0.2.0/docs/design.md#report)).
 
 ### Changed
 
 - The JSON report has a top-level `"profile"` field (`null` without a profile); the schema id is unchanged.
+- With `--transcripts`, the terminal report also points to the transcripts directory for failures and errors of
+  cross-cutting checks.
 - Dependency: `toml` 1.2 (features `parse` and `serde`), to read profiles.
+
+### Fixed
+
+- Transcripts keep each request before its reply, even when the reply is read while the request's write is still
+  flushing, so `replay` no longer reports a recorded reply as missing (seen on Windows).
 
 ## 0.1.0 (2026-11-08)
 
