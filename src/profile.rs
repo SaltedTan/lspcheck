@@ -255,8 +255,11 @@ fn workspace(raw: RawWorkspace, dir: &Path) -> Result<Workspace, String> {
         }
         None => None,
     };
+    let inline = raw.files.unwrap_or_default();
+    validate_name_case(fixture_files.iter().chain(&fixture_dirs).chain(inline.keys()).map(String::as_str))
+        .map_err(|e| format!("workspace: {e}"))?;
     let mut files = Vec::new();
-    for (name, text) in raw.files.unwrap_or_default() {
+    for (name, text) in inline {
         let parts = safe_name(&name).map_err(|e| format!("workspace.files: {e}"))?;
         if fixture_dirs.contains(&name) {
             return Err(format!("workspace.files: {name:?} is a directory in workspace.path"));
@@ -302,6 +305,26 @@ fn workspace(raw: RawWorkspace, dir: &Path) -> Result<Workspace, String> {
         names: names.into_iter().collect(),
         directories: fixture_dirs.into_iter().collect(),
     })
+}
+
+pub(crate) fn validate_name_case<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let mut spellings: BTreeMap<String, (&str, &str)> = BTreeMap::new();
+    for name in names {
+        for end in name.match_indices('/').map(|(index, _)| index).chain(std::iter::once(name.len())) {
+            let prefix = &name[..end];
+            let key = prefix.to_ascii_lowercase();
+            if let Some((previous, other)) = spellings.get(&key) {
+                if *previous != prefix {
+                    return Err(format!(
+                        "{other:?} and {name:?} use inconsistent ASCII case for {previous:?} and {prefix:?}"
+                    ));
+                }
+            } else {
+                spellings.insert(key, (prefix, name));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The parts of a workspace name: a relative path with `/`
@@ -567,6 +590,55 @@ mod tests {
             assert_eq!(std::fs::read_to_string(target.join("payload.txt")).unwrap(), "keep");
             std::fs::remove_file(&fixture).unwrap();
             std::fs::rename(&target, &fixture).unwrap();
+        }
+    }
+
+    #[test]
+    fn profile_case_collisions_in_inline_paths_are_rejected() {
+        for (left, right) in [
+            ("Settings.json", "settings.json"),
+            ("src/Settings.json", "src/settings.json"),
+            ("src/one.txt", "SRC/two.txt"),
+            ("a/x.txt", "A"),
+            ("A", "a/x.txt"),
+            ("src/Nested/one.txt", "src/nested/two.txt"),
+        ] {
+            let error = parse_here(&format!("[workspace]\nfiles = {{ {left:?} = \"one\", {right:?} = \"two\" }}\n"))
+                .unwrap_err();
+            assert!(error.contains(left) && error.contains(right) && error.contains("ASCII case"), "{error}");
+        }
+        assert!(
+            parse_here("[workspace]\nfiles = { \"left/Config.txt\" = \"one\", \"right/config.txt\" = \"two\" }\n")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn profile_case_collisions_between_fixture_and_inline_paths_are_rejected() {
+        for (fixture_name, inline_name, directory) in [
+            ("src/Settings.json", "src/settings.json", false),
+            ("src/Settings.json", "SRC/other.json", false),
+            ("src", "SRC/child.txt", false),
+            ("src", "SRC", true),
+            ("src/empty", "src/EMPTY", true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fixture").join(fixture_name);
+            if directory {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "original").unwrap();
+            }
+            let error = parse(
+                &format!("[workspace]\npath = \"fixture\"\nfiles = {{ {inline_name:?} = \"override\" }}\n"),
+                dir.path(),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains(fixture_name) && error.contains(inline_name) && error.contains("ASCII case"),
+                "{error}"
+            );
         }
     }
 

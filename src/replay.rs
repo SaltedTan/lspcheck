@@ -410,6 +410,10 @@ fn workspace_key(name: &str) -> Result<PathBuf, String> {
 }
 
 fn validate_workspace(w: &Workspace) -> Result<Vec<PathBuf>, String> {
+    crate::profile::validate_name_case(
+        w.files.iter().map(|(name, _)| name.as_str()).chain(w.directories.iter().map(String::as_str)),
+    )
+    .map_err(|e| format!("invalid workspace names: {e}"))?;
     let mut paths: Vec<PathBuf> = Vec::with_capacity(w.files.len());
     for (name, _) in &w.files {
         let path = workspace_key(name)?;
@@ -1212,5 +1216,35 @@ mod tests {
         w.directories.push("cache/empty".into());
         assert!(WorkspaceGuard::new(Some(&w)).is_err());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn profile_case_collisions_in_replay_are_rejected_before_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        for (left, left_directory, right, right_directory) in [
+            ("Settings.json", false, "settings.json", false),
+            ("src/one.txt", false, "SRC/two.txt", false),
+            ("src", true, "SRC", true),
+            ("src/empty", true, "SRC/other", true),
+            ("src/empty", true, "SRC/one.txt", false),
+            ("src", false, "SRC/empty", true),
+            ("src/one.txt", false, "SRC", true),
+        ] {
+            let mut w = workspace(root.clone(), &[]);
+            for (name, directory) in [(left, left_directory), (right, right_directory)] {
+                if directory {
+                    w.directories.push(name.into());
+                } else {
+                    w.files.push((name.into(), b"text".to_vec()));
+                }
+            }
+            let error = match WorkspaceGuard::new(Some(&w)) {
+                Ok(_) => panic!("accepted {left:?} and {right:?}"),
+                Err(error) => error,
+            };
+            assert!(error.contains(left) && error.contains(right) && error.contains("ASCII case"), "{error}");
+            assert!(!root.exists());
+        }
     }
 }

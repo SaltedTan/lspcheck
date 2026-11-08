@@ -37,6 +37,8 @@
   status 2) naming the key, before any server starts. The terminal header and the JSON report's new `"profile"` field
   name the profile; transcripts record its files (including binary contents), empty directories and settings,
   so `replay` recreates them. Fixture roots must not be symbolic links, and workspace names must be portable.
+  Profiles and replay refuse paths with inconsistent ASCII case in any shared component; inline fixture overrides
+  with the exact same spelling remain supported.
   The `[document]` section, `[client].capabilities` and K1 are still planned.
 - Stand-in faults `needs-init-option`, `needs-workspace-file` and `needs-configuration`, which a profile satisfies.
 

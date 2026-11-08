@@ -2349,3 +2349,88 @@ fn profile_regression_binary_fixtures_and_empty_directories_replay() {
     assert_eq!(workspace["files"]["assets/payload.bin"], serde_json::json!({"encoding": "base64", "data": "/w=="}));
     assert!(workspace["directories"].as_array().unwrap().contains(&Value::String("cache/empty".into())));
 }
+
+#[test]
+fn profile_case_collisions_are_usage_errors_before_startup() {
+    let (path, keep) = profile("");
+    let fixture = keep.path().join("fixture");
+    std::fs::create_dir_all(fixture.join("src")).unwrap();
+    std::fs::write(fixture.join("src/Settings.json"), "original").unwrap();
+    for name in ["src/settings.json", "SRC/other.json", "SRC", "src/SETTINGS.JSON/child.txt"] {
+        std::fs::write(&path, format!("[workspace]\npath = \"fixture\"\nfiles = {{ {name:?} = \"override\" }}\n"))
+            .unwrap();
+        let transcripts = keep.path().join("t");
+        let out = Command::new(LSPCHECK)
+            .arg("--profile")
+            .arg(&path)
+            .arg("--transcripts")
+            .arg(&transcripts)
+            .args(["--only", "L2", "--", STANDIN])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{name}");
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains("src/Settings.json") && error.contains(name) && error.contains("ASCII case"), "{error}");
+        assert!(!transcripts.exists());
+    }
+}
+
+#[test]
+fn profile_case_collisions_in_recordings_are_usage_errors() {
+    for (files, directories, left, right) in [
+        (
+            serde_json::json!({"Settings.json": "one", "settings.json": "two"}),
+            serde_json::json!([]),
+            "Settings.json",
+            "settings.json",
+        ),
+        (serde_json::json!({"src/file.txt": "one"}), serde_json::json!(["SRC/empty"]), "src/file.txt", "SRC/empty"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let transcript = dir.path().join("recording.jsonl");
+        std::fs::write(
+            &transcript,
+            serde_json::json!({"dir": "meta", "workspace": root, "files": files, "directories": directories})
+                .to_string(),
+        )
+        .unwrap();
+        let out = replay(&transcript, &[], &[STANDIN]);
+        assert_eq!(out.status.code(), Some(2));
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains(left) && error.contains(right) && error.contains("ASCII case"), "{error}");
+        assert!(!root.exists());
+    }
+}
+
+#[test]
+fn profile_case_exact_fixture_overrides_record_once_and_replay() {
+    let (path, keep) = profile(
+        "[workspace]\npath = \"fixture\"\nfiles = { \"Settings.json\" = \"new top\", \"src/Settings.json\" = \"new nested\" }\n",
+    );
+    let fixture = keep.path().join("fixture");
+    std::fs::create_dir_all(fixture.join("src")).unwrap();
+    for name in ["Settings.json", "src/Settings.json"] {
+        std::fs::write(fixture.join(name), "old").unwrap();
+    }
+    std::fs::write(fixture.join("standin.toml"), "require = \"Settings.json\"\nrequire = \"src/Settings.json\"\n")
+        .unwrap();
+    let transcripts = keep.path().join("t");
+    let server = [STANDIN, "--fault", "needs-workspace-file"];
+    let r =
+        run_command_in(&["--profile", path.to_str().unwrap(), "--only", "L2,L6"], &server, None, transcripts.clone());
+    only_fails(&r, &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let transcript = transcripts.join("lifecycle.jsonl");
+    let recording = std::fs::read_to_string(&transcript).unwrap();
+    let workspace: Value = recording
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["workspace"].is_string())
+        .unwrap();
+    let files = workspace["files"].as_object().unwrap();
+    assert_eq!(files.len(), 3);
+    assert_eq!(files["Settings.json"], "new top");
+    assert_eq!(files["src/Settings.json"], "new nested");
+    replays_alike(&transcript, "needs-workspace-file");
+}

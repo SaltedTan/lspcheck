@@ -276,7 +276,10 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   and directories: symbolic links, including the fixture root itself, are refused. Workspace file and directory
   names must be portable relative paths with `/` between directories: empty, absolute, `.` and `..` parts,
   backslashes, control characters, `: < > " | ? *`, trailing dots or spaces, and Windows device names (`CON`, `PRN`,
-  `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, also with extensions) are refused. Missing directories are created.
+  `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, also with extensions) are refused. Paths must use consistent ASCII case
+  in every component across fixture and inline entries; `src/A.json` with `SRC/b.json`, or `A.json` with `a.json`,
+  is a usage error naming both paths. An inline file may overwrite a fixture file with the exact same spelling.
+  Missing directories are created.
 - **lspcheck's own files.** lspcheck writes `doc.txt`, `crlf.txt` and `lspcheck-utf8.txt` at the top of the workspace,
   and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names.
 - **`[client]`.** `initialization_options` is any TOML value; it is sent as JSON in every `initialize`, including
@@ -305,9 +308,10 @@ permissions are not preserved during replay.
 lspcheck replay out/lifecycle.jsonl -- my-server --stdio
 ```
 
-It recreates the recorded workspace (refusing to touch an existing non-empty one), re-sends every client write in the
-transcript in order, and reports what the server did this time: each request's outcome against the recorded one, the
-exit status, and how many server-to-client requests were answered. Responses the server sends once lspcheck has begun
+It recreates the recorded workspace (refusing an existing non-empty one or recorded paths with inconsistent ASCII
+case in any component), re-sends every client write in the transcript in order, and reports what the server did this
+time: each request's outcome against the recorded one, the exit status, and how many server-to-client requests were
+answered. Responses the server sends once lspcheck has begun
 stopping it don't count as replies, in the recording or the replay. Gaps under 200 ms between writes are kept as pauses;
 longer ones are sent back-to-back. Server-to-client requests are answered with the same auto-answers a live run uses,
 including a profile's settings when the transcript recorded them, so they don't stall the replay. The replay's own transcript goes to `--transcript FILE`; it never overwrites an existing
