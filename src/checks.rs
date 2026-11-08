@@ -1778,8 +1778,8 @@ async fn with_exit(ctx: &mut Ctx<'_>, why: String) -> String {
     }
 }
 
-/// A request K1 sent, and the id whose response may still arrive while
-/// lspcheck shuts the server down.
+/// A request K1 sent, and the id whose response may still arrive during
+/// shutdown or the final stdout drain.
 struct K1Asked {
     label: String,
     /// The request's id, unless lspcheck couldn't send it.
@@ -1787,17 +1787,16 @@ struct K1Asked {
     outcome: capabilities::Outcome,
 }
 
-/// What K1 has left for after the graceful shutdown: its verdict, or the
-/// requests whose replies `leave` may still read.
+/// Evidence held until session cleanup drains the final stdout, so replies
+/// read after `leave` returns still count toward K1's verdict.
 enum K1Pending {
     Judged(Judgement),
     Sent { asked: Vec<K1Asked>, notes: Vec<String> },
 }
 
-/// K1: opens the profile's document (or lspcheck's own), sends each request
-/// the server advertises about it one at a time, and checks none is answered
-/// with MethodNotFound. Ends with a graceful shutdown when initialize
-/// succeeded; a reply read during it still answers its request.
+/// K1: opens the profile's document (or lspcheck's own) and sends advertised
+/// requests. Ends with a graceful shutdown when initialize succeeded;
+/// judging waits for the final stdout drain (see [`K1Pending`]).
 async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
     let params = capabilities_initialize_params(&ctx.root);
     let reply = match ctx.initialize_with(params).await {
