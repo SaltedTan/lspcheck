@@ -137,7 +137,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("inflated-on-exit", "on exit, start an inflated frame containing a progress request and stay running"),
     ("split-header", "drop input when a read ends inside a header section, as if each header came in one read"),
     ("split-utf8", "decode each read as UTF-8 on its own, mangling characters split across reads"),
-    ("first-frame-per-read", "keep only the first frame of a read that holds $/setTrace and two more"),
+    (
+        "first-frame-per-read",
+        "drop $/setTrace and the frames after it from a read that holds a request, $/setTrace and another frame",
+    ),
     ("char-length-input", "count the Content-Length of incoming frames in characters, not bytes"),
     ("no-content-type", "ignore incoming frames that have a Content-Type header"),
     ("strict-charset", "ignore incoming frames whose charset isn't spelled utf-8"),
