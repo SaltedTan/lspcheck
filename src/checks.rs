@@ -239,7 +239,7 @@ pub struct CheckResult {
     /// Evidence lspcheck didn't see in between could explain it. A failure
     /// seen directly has none.
     #[serde(skip)]
-    pub absent_at: Option<(Duration, Duration)>,
+    pub absent_at: Vec<(Duration, Duration)>,
     /// For a verdict reached during the session on the assumption that
     /// lspcheck missed nothing in a window: what it would have been
     /// otherwise. Checked again when the session has ended and everything
@@ -444,10 +444,14 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
     // conversation failing. A failure seen directly, such as a wrong result,
     // stands, and so does one whose wait had nothing go unseen.
     for r in results.iter_mut().filter(|r| r.verdict == Verdict::Fail) {
-        let Some((since, waited)) = r.absent_at else { continue };
-        if let Some(why) = finish.incomplete_within(since, waited) {
+        if r.absent_at.is_empty() {
+            continue;
+        }
+        let missed: Option<Vec<_>> =
+            r.absent_at.iter().map(|&(since, waited)| finish.incomplete_within(since, waited)).collect();
+        if let Some(reasons) = missed {
             r.verdict = Verdict::Error;
-            r.detail = format!("inconclusive, because {why}: {}", r.detail);
+            r.detail = format!("inconclusive, because {}: {}", reasons[0], r.detail);
         }
     }
     // A verdict reached during the session that assumed nothing was missed
@@ -502,7 +506,7 @@ fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observatio
 }
 
 fn result(scenario: &'static str, id: &str, verdict: Verdict, detail: impl Into<String>) -> CheckResult {
-    CheckResult { id: info(id).id, verdict, detail: detail.into(), scenario, absent_at: None, unless_missed: None }
+    CheckResult { id: info(id).id, verdict, detail: detail.into(), scenario, absent_at: Vec::new(), unless_missed: None }
 }
 
 struct Ctx<'a> {
@@ -579,7 +583,7 @@ impl Ctx<'_> {
     fn fail_absent(&mut self, id: &str, since: Duration, detail: impl Into<String>) {
         let waited = self.s.elapsed();
         self.fail(id, detail);
-        self.results.last_mut().expect("just reported").absent_at = Some((since, waited));
+        self.results.last_mut().expect("just reported").absent_at.push((since, waited));
     }
 
     /// A failure because a reply lspcheck waited for from `since` to `waited`
@@ -587,7 +591,7 @@ impl Ctx<'_> {
     /// later finds it missed in that time still makes it inconclusive.
     fn fail_absent_between(&mut self, id: &str, since: Duration, waited: Duration, detail: impl Into<String>) {
         self.fail(id, detail);
-        self.results.last_mut().expect("just reported").absent_at = Some((since, waited));
+        self.results.last_mut().expect("just reported").absent_at.push((since, waited));
     }
 
     /// The verdict for a call sent from `since` on that got no response: a
@@ -790,7 +794,7 @@ async fn odd_ids(ctx: &mut Ctx<'_>) {
     let started = ctx.s.elapsed();
     let mut missing = Vec::new();
     let mut undelivered = Vec::new();
-    let mut first_missing = None;
+    let mut missing_windows = Vec::new();
     let mut stopped = None;
     for (index, id) in ids.iter().enumerate() {
         let sent = ctx.s.elapsed();
@@ -798,7 +802,7 @@ async fn odd_ids(ctx: &mut Ctx<'_>) {
             Ok(_) => {}
             Err(CallError::Wait(error)) => {
                 missing.push(describe_odd_id(id));
-                first_missing.get_or_insert(sent);
+                missing_windows.push((sent, ctx.s.elapsed()));
                 if error == WaitError::Closed {
                     stopped = match ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await {
                         Some(status) => Some(format!("the server exited with {}", session::describe_status(status))),
@@ -847,7 +851,9 @@ async fn odd_ids(ctx: &mut Ctx<'_>) {
         if !undelivered.is_empty() {
             detail.push_str(&format!("; couldn't send the remaining id(s) {}", undelivered.join(", ")));
         }
-        return ctx.fail_absent("R4", first_missing.expect("a request went unanswered"), detail);
+        ctx.fail("R4", detail);
+        ctx.results.last_mut().expect("just reported").absent_at = missing_windows;
+        return;
     }
     if !undelivered.is_empty() {
         return ctx.report(
@@ -1119,8 +1125,8 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
             Some(replied) => ctx.fail("L1", format!("{replied}; the request got {}", describe_call_error(e, t))),
             None => {
                 ctx.fail_call("L1", since, describe_call_error(e, t), e);
-                if let Some(r) = ctx.results.last_mut().filter(|r| r.absent_at.is_some()) {
-                    r.absent_at = Some((since, waited));
+                if let Some(r) = ctx.results.last_mut().filter(|r| !r.absent_at.is_empty()) {
+                    r.absent_at = vec![(since, waited)];
                 }
             }
         },
@@ -2898,9 +2904,11 @@ fn judge_j2(runs: &[ScenarioRun]) -> CheckResult {
 const J3_SCENARIOS: &[&str] = &[
     "lifecycle",
     "json-rpc",
+    "odd-ids",
     "after-initialize",
     "cancellation",
     "documents",
+    "wrong-params",
     "end-of-input",
     "exit-without-shutdown",
 ];
@@ -3465,6 +3473,29 @@ mod tests {
         // Without the leak, the failed search makes the result unknown.
         let runs = [observed_run("lifecycle", vec![], None), observed_run("pre-initialize", vec![], Some("no /proc"))];
         assert_eq!(judge_l9(&runs).verdict, Verdict::Error);
+    }
+
+    #[test]
+    fn j3_judges_robustness_scenarios() {
+        for name in ["odd-ids", "wrong-params"] {
+            let mut run = observed_run(name, vec![], None);
+            let o = run.observed.as_mut().unwrap();
+            o.initialized_at = Some(Duration::from_millis(10));
+            let mut exercise = observed_run("json-rpc", vec![], None);
+            exercise.observed.as_mut().unwrap().j3_exercise = Some((Verdict::Pass, String::new()));
+            let mut runs = [run, exercise];
+            assert_eq!(judge_j3(&runs).verdict, Verdict::Pass, "{name}");
+            runs[0].observed.as_mut().unwrap().j3_incomplete = Some("an unreadable frame".into());
+            assert_eq!(judge_j3(&runs).verdict, Verdict::Error, "{name}");
+            for response in [
+                br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid request"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","result":null}"#.as_slice(),
+            ] {
+                runs[0].observed.as_mut().unwrap().messages =
+                    vec![(Duration::from_millis(20), Message::parse(response).unwrap())];
+                assert_eq!(judge_j3(&runs).verdict, Verdict::Fail, "{name}");
+            }
+        }
     }
 
     #[test]

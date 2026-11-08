@@ -626,7 +626,7 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
 fn a_content_length_counted_in_characters_fails_f2() {
     let r = fault("char-length");
     // The frame can't be read either, so F1 fails too.
-    only_fails_unread_with(&r, &["F1", "F2"], &["J1", "J2", "J5", "J7", "R4"]);
+    only_fails_unread_with(&r, &["F1", "F2"], &["J1", "J2", "J3", "J5", "J7", "R4"]);
     assert!(r.stdout.contains("counts characters, but"), "{}", r.stdout);
     // Also with whitespace after the JSON, or an extension header before the next frame's Content-Length.
     for other in ["newline-after-body", "extension-header", "long-header"] {
@@ -883,6 +883,18 @@ fn negative_integer_ids_must_get_a_response() {
     only_fails(&r, &["R4"]);
     expect(&r, "R4", "fail");
     assert!(r.stdout.contains("-1"), "{}", r.stdout);
+}
+
+#[test]
+fn odd_id_failures_survive_later_unreadable_output() {
+    let r = run(
+        &["--fault", "drops-negative-ids", "--fault", "big-frame-after-drop", "--fault", "char-length"],
+        &["--max-frame-mib", "1"],
+    );
+    expect(&r, "R4", "fail");
+    expect(&r, "J3", "error");
+    assert!(r.stdout.contains("-1"), "{}", r.stdout);
+    assert!(r.stdout.contains("inspection limit"), "{}", r.stdout);
 }
 
 #[test]

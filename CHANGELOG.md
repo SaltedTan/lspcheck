@@ -15,6 +15,7 @@
   [report format reference](docs/design.md#report).
 - Added R2, which sends wrongly typed parameters to an advertised request and checks for an error response and continued
   service, and R4, which checks exact round-trips for valid unusual request ids.
+- Preserve each unanswered R4 request's evidence window and include both robustness scenarios in J3's verdict.
 
 ## 0.1.0 (2026-11-08)
 

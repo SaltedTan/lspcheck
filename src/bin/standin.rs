@@ -143,7 +143,7 @@ const FAULTS: &[(&str, &str)] = &[
         "initialized-reply-after-cancel",
         "answer initialized twice with an error whose id is null, once a cancel arrives",
     ),
-    ("big-frame-after-drop", "after cancelled-no-reply drops a request, send a 2 MiB log message with the next answer"),
+    ("big-frame-after-drop", "after dropping a request, send a 2 MiB log message with the next answer"),
     ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
     ("utf8-positions-as-utf16", "count positions in UTF-8 bytes while UTF-16 is negotiated"),
     ("codepoint-positions", "count positions in code points while UTF-16 is negotiated"),
@@ -913,6 +913,7 @@ fn main() {
             continue;
         }
         if fault("drops-negative-ids") && id.as_i64().is_some_and(|n| n < 0) {
+            dropped = true;
             continue;
         }
         if wrong_param_types(&method, msg.get("params").unwrap_or(&Value::Null)) {

@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report), R2 and R4 are done, while profiles, K1, R1, R3 and the stock-server CI matrix are still planned.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report), R2 and R4 are done with per-request evidence windows and J3 coverage, while profiles, K1, R1, R3 and the stock-server CI matrix are still planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -321,6 +321,8 @@ R4 runs in the separate `odd-ids` scenario after initialization. It sends `lspch
 one at a time: `0`, `-1`, `2147483647`, `-2147483648`, `""`, a 1000-character ASCII string, `"é中😀𝄞"` and
 `"7"`. It waits for each response before sending the next, and passes only when every response has the exact id
 (either a result or an error is acceptable). Unanswered ids are named in the detail; long strings are truncated.
+Each unanswered request retains its own wait window for the evidence recheck after cleanup; any fully inspected
+window establishes a failure. J3 also judges `odd-ids` and `wrong-params`, whose JSON-RPC input is well formed.
 
 R2 runs in its own `wrong-params` scenario so a server crash cannot contaminate other checks. From the initialize
 capabilities it selects the first advertised method among hover, definition, document symbols and workspace symbols.
