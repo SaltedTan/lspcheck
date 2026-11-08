@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Terminal, JUnit and Markdown reports reference the transcripts directory for cross-cutting failures and errors.
+- Markdown keeps character references literal in table cells and makes CR/LF visible in commands and transcript paths.
+
 ### Added
 
 - `--junit PATH` writes a JUnit XML report for CI test tabs: one testsuite per check area with counts and a testcase

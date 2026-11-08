@@ -65,9 +65,9 @@ pub fn print_terminal(out: &mut impl Write, server: &str, runs: &[ScenarioRun]) 
             writeln!(out, "                     {}", r.detail)?;
         }
         if matches!(r.verdict, Verdict::Fail | Verdict::Error)
-            && let Some(path) = transcript(r, runs)
+            && let Some((label, path)) = transcript(r, runs)
         {
-            writeln!(out, "                     transcript: {}", path.display())?;
+            writeln!(out, "                     {label}: {}", path.display())?;
         }
     }
     writeln!(out, "{}", counts_line(&results))
@@ -179,9 +179,9 @@ fn testcase(out: &mut String, r: &CheckResult, runs: &[ScenarioRun]) {
             out.push_str(&xml_text(&r.detail));
             out.push('\n');
             out.push_str(&format!("spec: {}", xml_text(&checks::spec_url(c))));
-            if let Some(path) = transcript(r, runs) {
+            if let Some((label, path)) = transcript(r, runs) {
                 out.push('\n');
-                out.push_str(&format!("transcript: {}", xml_text(&path.display().to_string())));
+                out.push_str(&format!("{label}: {}", xml_text(&path.display().to_string())));
             }
             out.push_str(&format!("</{tag}>\n"));
             out.push_str("    </testcase>\n");
@@ -242,19 +242,24 @@ pub fn markdown_report(server: &[String], runs: &[ScenarioRun]) -> String {
         ));
     }
 
-    let failures: Vec<(&CheckResult, &Path)> =
+    let failures: Vec<_> =
         results.iter().copied().filter(|r| interesting(r)).filter_map(|r| Some((r, transcript(r, runs)?))).collect();
     if !failures.is_empty() {
         out.push_str("\nTranscripts:\n\n");
-        for (r, path) in failures {
-            out.push_str(&format!("- {}: {}\n", r.id, code_span(&path.display().to_string())));
+        for (r, (label, path)) in failures {
+            out.push_str(&format!("- {}: {label}: {}\n", r.id, code_span(&path.display().to_string())));
         }
     }
     out
 }
 
-fn transcript<'a>(r: &CheckResult, runs: &'a [ScenarioRun]) -> Option<&'a Path> {
-    runs.iter().find(|run| run.name == r.scenario)?.transcript.as_deref()
+fn transcript<'a>(r: &CheckResult, runs: &'a [ScenarioRun]) -> Option<(&'static str, &'a Path)> {
+    if r.scenario == "all" {
+        let path = runs.iter().find_map(|run| run.transcript.as_deref())?;
+        Some(("transcripts", path.parent()?))
+    } else {
+        Some(("transcript", runs.iter().find(|run| run.name == r.scenario)?.transcript.as_deref()?))
+    }
 }
 
 fn verdict_cell(verdict: Verdict) -> &'static str {
@@ -273,6 +278,7 @@ fn markdown_cell(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
+            '&' => out.push_str("&amp;"),
             '\\' => out.push_str("\\\\"),
             '`' => out.push_str("\\`"),
             '*' => out.push_str("\\*"),
@@ -290,6 +296,7 @@ fn markdown_cell(text: &str) -> String {
 
 /// A code span that survives any run of backticks in `text`.
 fn code_span(text: &str) -> String {
+    let text = text.replace('\r', "\\r").replace('\n', "\\n");
     let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest + 1);
     let pad = if text.starts_with('`') || text.starts_with(' ') || text.ends_with('`') || text.ends_with(' ') {
@@ -470,7 +477,7 @@ mod tests {
             &server(),
             &[scenario(vec![
                 result("F1", Verdict::Pass, ""),
-                result("L7", Verdict::Fail, "a | b `c` *d* _e_ [f] <g> h\\i\nnext"),
+                result("L7", Verdict::Fail, "a | b `c` *d* _e_ [f] <g> h\\i\nnext &copy; &#169; &amp;"),
                 result("J1", Verdict::Error, "no answer"),
                 result("L1", Verdict::Skip, "not for this server"),
                 result("D1", Verdict::NotExercised, ""),
@@ -493,7 +500,7 @@ mod tests {
         assert!(text.contains(
             "| ❌ FAIL | [L7](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#exit) \
              | SHOULD | exit without shutdown ends the process with status 1 \
-             | a \\| b \\`c\\` \\*d\\* \\_e\\_ \\[f\\] \\<g\\> h\\\\i<br>next |"
+             | a \\| b \\`c\\` \\*d\\* \\_e\\_ \\[f\\] \\<g\\> h\\\\i<br>next &amp;copy; &amp;#169; &amp;amp; |"
         ), "{text}");
         assert!(text.contains("| ⚠️ ERROR | [J1]"));
         assert!(text.contains("| ✅ PASS | [F1]"));
@@ -506,7 +513,55 @@ mod tests {
         let mut run = scenario(vec![result("L7", Verdict::Fail, "bad"), result("F1", Verdict::Pass, "")]);
         run.transcript = Some(PathBuf::from("/tmp/out/lifecycle.jsonl"));
         let text = markdown_report(&server(), &[run]);
-        assert!(text.contains("\nTranscripts:\n\n- L7: `/tmp/out/lifecycle.jsonl`\n"), "{text}");
+        assert!(text.contains("\nTranscripts:\n\n- L7: transcript: `/tmp/out/lifecycle.jsonl`\n"), "{text}");
+    }
+
+    #[test]
+    fn reports_reference_aggregate_evidence_only_for_failures_and_errors() {
+        for verdict in [Verdict::Fail, Verdict::Error, Verdict::Pass, Verdict::Skip, Verdict::NotExercised] {
+            for recorded in [false, true] {
+                let mut aggregate = result("F1", verdict, "in framing: evidence");
+                aggregate.scenario = "all";
+                let runs = [
+                    ScenarioRun { name: "unstarted", results: vec![], observed: None, transcript: None },
+                    ScenarioRun {
+                        name: "framing",
+                        results: vec![],
+                        observed: None,
+                        transcript: recorded.then(|| PathBuf::from("evidence/framing.jsonl")),
+                    },
+                    ScenarioRun {
+                        name: "lifecycle",
+                        results: vec![],
+                        observed: None,
+                        transcript: recorded.then(|| PathBuf::from("evidence/lifecycle.jsonl")),
+                    },
+                    ScenarioRun { name: "all", results: vec![aggregate], observed: None, transcript: None },
+                ];
+                let expected = recorded && matches!(verdict, Verdict::Fail | Verdict::Error);
+                let mut terminal = Vec::new();
+                print_terminal(&mut terminal, "gopls serve", &runs).unwrap();
+                let terminal = String::from_utf8(terminal).unwrap();
+                let xml = junit_report(&server(), &runs);
+                let markdown = markdown_report(&server(), &runs);
+                assert_eq!(terminal.contains("transcripts: evidence\n"), expected, "{terminal}");
+                assert_eq!(xml.contains("\ntranscripts: evidence</"), expected, "{xml}");
+                assert_eq!(markdown.contains("- F1: transcripts: `evidence`\n"), expected, "{markdown}");
+                assert!(!terminal.contains("transcript:"), "{terminal}");
+                assert!(!xml.contains("transcript:"), "{xml}");
+                assert!(!markdown.contains("transcript:"), "{markdown}");
+            }
+        }
+    }
+
+    #[test]
+    fn code_spans_display_line_breaks_in_commands_and_paths() {
+        let mut run = scenario(vec![result("L7", Verdict::Fail, "bad")]);
+        run.transcript = Some(PathBuf::from("evidence\r\n\n# path`name.jsonl"));
+        let text =
+            markdown_report(&["python3".into(), "-c".into(), "print('ready')\r\n\n# server`script".into()], &[run]);
+        assert!(text.contains("Server: ``python3 -c print('ready')\\r\\n\\n# server`script`` · "), "{text}");
+        assert!(text.contains("- L7: transcript: ``evidence\\r\\n\\n# path`name.jsonl``\n"), "{text}");
     }
 
     #[test]

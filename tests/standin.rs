@@ -349,6 +349,28 @@ fn junit_and_markdown_reports_agree_with_json() {
 }
 
 #[test]
+fn aggregate_reports_reference_recorded_transcript_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let junit = dir.path().join("report.xml");
+    let markdown = dir.path().join("report.md");
+    let transcripts = dir.path().join("evidence");
+    let r = run_command_in(
+        &["--only", "F1", "--junit", junit.to_str().unwrap(), "--markdown", markdown.to_str().unwrap()],
+        &[STANDIN, "--fault", "stdout-banner"],
+        None,
+        transcripts.clone(),
+    );
+    assert_eq!(r.status, 1, "{}", r.stdout);
+    assert_eq!(r.verdicts.get("F1").map(String::as_str), Some("fail"));
+    assert!(std::fs::read_dir(&transcripts).unwrap().next().is_some());
+    assert!(r.stdout.contains(&format!("transcripts: {}\n", transcripts.display())), "{}", r.stdout);
+    let xml = std::fs::read_to_string(junit).unwrap();
+    assert!(xml.contains(&format!("\ntranscripts: {}</failure>", transcripts.display())), "{xml}");
+    let text = std::fs::read_to_string(markdown).unwrap();
+    assert!(text.contains(&format!("- F1: transcripts: `{}`\n", transcripts.display())), "{text}");
+}
+
+#[test]
 fn lawful_variations_fail_nothing() {
     for name in [
         "extension-header",
