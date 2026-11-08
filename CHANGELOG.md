@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Transcripts keep fast replies after their requests even when read during a write's flush, avoiding false missing
+  replies in replay summaries on Windows.
 - R1 includes queued responses in its frozen read window and keeps earlier ParseErrors from hiding wrong-code replies.
 - Robustness checks avoid false framing failures and missed leftover processes during cleanup; R2 stays inconclusive
   when skipped output could contain the follow-up reply, even if the server exits.

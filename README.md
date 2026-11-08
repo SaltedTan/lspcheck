@@ -231,7 +231,7 @@ With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It h
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of
 stderr, and timestamps, so you can see what happened in a failing scenario. Each file includes a meta line naming the
 workspace the scenario ran in and the files it held, so a replay can recreate it. A `stdin closed` meta event marks when
-lspcheck closed the server's input.
+lspcheck closed the server's input. Events are ordered by timestamp, including replies read while a write is flushing.
 
 ### Reproducing a failure
 
