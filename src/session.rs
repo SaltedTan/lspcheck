@@ -341,6 +341,7 @@ pub struct Finish {
     pub unmatched: Vec<Unmatched>,
     /// Requests that were answered, with when their response was read.
     pub answered: Vec<(Duration, Id)>,
+    answers: HashMap<Id, usize>,
     /// Requests lspcheck sent whole, with when each was registered (just
     /// before it was written).
     pub sent: Vec<(Duration, Id)>,
@@ -359,6 +360,10 @@ pub struct Finish {
 }
 
 impl Finish {
+    pub fn answer_to(&self, id: &Id) -> Option<&Message> {
+        self.answers.get(id).map(|&i| &self.messages[i].1)
+    }
+
     /// Why lspcheck may have missed something the server sent between `from`
     /// and `to`, judged over the whole session (see [`Session::incomplete_within`]).
     pub fn incomplete_within(&self, from: Duration, to: Duration) -> Option<String> {
@@ -758,13 +763,6 @@ impl Session {
             let (at, m) = &self.messages[i];
             (*at >= from && *at <= to).then_some(m)
         })
-    }
-
-    /// The response the session matched to this request, if it read one: the
-    /// same match the session uses to answer a wait, so a reply read after
-    /// the caller stopped waiting still counts.
-    pub fn answer_to(&self, id: &Id) -> Option<&Message> {
-        self.answers.get(id).map(|&i| &self.messages[i].1)
     }
 
     /// Sends a request, registering it so only a later response can answer it.
@@ -1228,6 +1226,7 @@ impl Session {
             problems: evidence.problems,
             unmatched,
             answered: std::mem::take(&mut self.answered),
+            answers: std::mem::take(&mut self.answers),
             sent: {
                 let mut sent: Vec<(Duration, Id)> = self
                     .used_ids

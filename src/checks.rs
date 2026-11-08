@@ -492,7 +492,8 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
             return Ok(unstarted(format!("could not start {}: {e}", cfg.server.display())));
         }
     };
-    let mut ctx = Ctx { s: session, cfg, root, results: Vec::new(), scenario: name, j3_exercise: None };
+    let mut ctx =
+        Ctx { s: session, cfg, root, results: Vec::new(), scenario: name, j3_exercise: None, k1_pending: None };
     // The workspace, so a transcript of this scenario can be replayed in a
     // recreated one (files written later are recorded when they are written),
     // and the settings, so a replay answers the server's questions alike.
@@ -531,8 +532,17 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         "end-of-input" => end_of_input(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
-    let Ctx { s, mut results, j3_exercise, .. } = ctx;
+    let Ctx { s, mut results, j3_exercise, k1_pending, .. } = ctx;
     let finish = s.finish(cfg.leftover_grace).await;
+    if let Some(pending) = k1_pending {
+        let (verdict, detail) = match judge_k1(pending, &finish) {
+            Judgement::Fail(detail) => (Verdict::Fail, detail),
+            Judgement::Error(detail) => (Verdict::Error, detail),
+            Judgement::NotExercised(detail) => (Verdict::NotExercised, detail),
+            Judgement::Pass(detail) => (Verdict::Pass, detail),
+        };
+        results.push(result(name, "K1", verdict, detail));
+    }
     for id in scenario.checks {
         if !results.iter().any(|r| r.id == *id) {
             results.push(result(name, id, Verdict::Error, "the scenario ended before reaching this check"));
@@ -626,6 +636,7 @@ struct Ctx<'a> {
     scenario: &'static str,
     /// How the json-rpc scenario's dedicated J3 exercise went.
     j3_exercise: Option<(Verdict, String)>,
+    k1_pending: Option<K1Pending>,
 }
 
 /// Why initialization didn't succeed.
@@ -1795,18 +1806,18 @@ async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
             return ctx.report("K1", Verdict::Error, format!("initialize didn't succeed: {why}"));
         }
     };
-    let pending = k1(ctx, &reply).await;
+    ctx.k1_pending = Some(k1(ctx, &reply).await);
     leave(ctx).await;
-    let judgement = match pending {
+}
+
+fn judge_k1(pending: K1Pending, finish: &Finish) -> Judgement {
+    match pending {
         K1Pending::Judged(judgement) => judgement,
         K1Pending::Sent { mut asked, notes } => {
-            // A reply that came after K1 stopped waiting, perhaps while
-            // `leave` answered the server's requests, still answers its
-            // request. LSP sets no deadline for a response.
             for a in &mut asked {
                 if a.outcome == capabilities::Outcome::Unanswered
                     && let Some(id) = &a.id
-                    && let Some(m) = ctx.s.answer_to(id)
+                    && let Some(m) = finish.answer_to(id)
                 {
                     a.outcome = k1_outcome(m);
                 }
@@ -1814,12 +1825,6 @@ async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
             let asked: Vec<(String, capabilities::Outcome)> = asked.into_iter().map(|a| (a.label, a.outcome)).collect();
             capabilities::judge(&asked, &notes)
         }
-    };
-    match judgement {
-        Judgement::Fail(detail) => ctx.fail("K1", detail),
-        Judgement::Error(detail) => ctx.report("K1", Verdict::Error, detail),
-        Judgement::NotExercised(detail) => ctx.report("K1", Verdict::NotExercised, detail),
-        Judgement::Pass(detail) => ctx.pass_with("K1", detail),
     }
 }
 
@@ -1877,24 +1882,25 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
         }
     }
 
-    // One at a time, each waiting up to `--timeout`. After one goes unanswered
-    // or can't be sent, the rest aren't sent: the server has stopped, or each
-    // would only wait as long again. A wait that ends is not evidence: the
-    // reply may still arrive while `leave` shuts the server down, so only
-    // `capabilities_scenario`, after it, decides what a request got.
     let mut asked: Vec<K1Asked> = Vec::new();
+    let mut wait = true;
     for (i, r) in requests.iter().enumerate() {
-        let sent = match ask(ctx, r.method, r.params.clone()).await {
-            Ok((a, Ok(m))) => K1Asked { label: r.label.clone(), id: Some(a.id), outcome: k1_outcome(&m) },
-            Ok((a, Err(_))) => {
-                K1Asked { label: r.label.clone(), id: Some(a.id), outcome: capabilities::Outcome::Unanswered }
+        let sent = match if wait {
+            ask(ctx, r.method, r.params.clone()).await.map(|(a, reply)| (a.id, reply.ok()))
+        } else {
+            ctx.s.request(r.method, Some(r.params.clone())).await.map(|id| (id, None))
+        } {
+            Ok((id, Some(m))) => K1Asked { label: r.label.clone(), id: Some(id), outcome: k1_outcome(&m) },
+            Ok((id, None)) => {
+                wait = false;
+                K1Asked { label: r.label.clone(), id: Some(id), outcome: capabilities::Outcome::Unanswered }
             }
             Err(e) => {
                 let why = if e == WriteError::Closed { with_exit(ctx, e.to_string()).await } else { e.to_string() };
                 K1Asked { label: r.label.clone(), id: None, outcome: capabilities::Outcome::Undelivered(why) }
             }
         };
-        let stop = matches!(sent.outcome, capabilities::Outcome::Unanswered | capabilities::Outcome::Undelivered(_));
+        let stop = matches!(sent.outcome, capabilities::Outcome::Undelivered(_));
         asked.push(sent);
         if stop {
             let rest = requests.len() - i - 1;

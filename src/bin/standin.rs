@@ -246,6 +246,15 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: advertise colorProvider, and answer textDocument/documentColor with RequestFailed (-32803)",
     ),
     ("ignores-advertised", "advertise colorProvider, and never answer textDocument/documentColor"),
+    ("defer-hover-until-shutdown", "lawful: answer hover requests only when shutdown arrives"),
+    (
+        "advertised-error-after-shutdown",
+        "answer shutdown, then have a helper answer held hover requests with MethodNotFound after stdin closes",
+    ),
+    (
+        "advertised-result-after-shutdown",
+        "answer shutdown, then have a helper answer held hover requests with null after stdin closes",
+    ),
     (
         "config-before-log-finish",
         "with the reply to workspace/symbol, ask for configuration and finish a log notification only after the answer",
@@ -268,6 +277,7 @@ fn main() {
         Some("--child") => return child(false),
         Some("--escaped-child") => return child(true),
         Some("--relay") => return relay(args[1].parse().unwrap()),
+        Some("--reply-after-input") => return reply_after_input(&args[1]),
         _ => {}
     }
     let mut faults = Vec::new();
@@ -320,6 +330,7 @@ fn main() {
     let mut late_reply: Option<Value> = None;
     // A workspace/symbol request whose reply waits for the next message.
     let mut deferred: Option<Value> = None;
+    let mut held_hovers: Vec<Value> = Vec::new();
     // Set by stop-after-unknown-cancel: requests are no longer answered.
     let mut no_more_answers = false;
     // For drop-first-request: whether the first document request was dropped.
@@ -1097,6 +1108,14 @@ fn main() {
                 position["character"]
             );
         }
+        if method == "textDocument/hover"
+            && ["defer-hover-until-shutdown", "advertised-error-after-shutdown", "advertised-result-after-shutdown"]
+                .iter()
+                .any(|name| fault(name))
+        {
+            held_hovers.push(id);
+            continue;
+        }
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
@@ -1142,6 +1161,30 @@ fn main() {
                     reply.as_object_mut().unwrap().remove("jsonrpc");
                 }
                 out.frame(&reply);
+                let replies: Vec<Value> = held_hovers
+                    .drain(..)
+                    .map(|id| {
+                        if fault("advertised-error-after-shutdown") {
+                            err(&id, -32601, "method not found")
+                        } else {
+                            ok(&id, Value::Null)
+                        }
+                    })
+                    .collect();
+                if fault("advertised-error-after-shutdown") || fault("advertised-result-after-shutdown") {
+                    let _helper = Command::new(std::env::current_exe().unwrap())
+                        .arg("--reply-after-input")
+                        .arg(serde_json::to_string(&replies).unwrap())
+                        .stdin(Stdio::inherit())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap();
+                    std::process::exit(0);
+                }
+                for reply in replies {
+                    out.frame(&reply);
+                }
             }
             // K1 opens a document before asking, so only its workspace/symbol
             // is affected (the other scenarios ask with none open). Like a
@@ -1697,6 +1740,17 @@ fn child(escape: bool) {
     println!("ready");
     let _ = std::io::stdout().flush();
     std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+fn reply_after_input(replies: &str) {
+    let replies: Vec<Value> = serde_json::from_str(replies).unwrap();
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    let stdout = std::io::stdout();
+    let mut out = Writer { out: stdout.lock(), faults: Vec::new(), holding: false, held: Vec::new() };
+    for reply in replies {
+        out.frame(&reply);
+    }
 }
 
 /// Writes its input to stdout once `parent` has exited: its stdin ends when

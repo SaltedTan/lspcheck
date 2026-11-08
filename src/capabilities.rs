@@ -200,7 +200,6 @@ fn advertised(caps: &Value, capability: &str, part: Option<&str>) -> bool {
 fn selects(selector: &Value, language_id: &str) -> bool {
     let Some(filters) = selector.as_array() else { return false };
     filters.iter().any(|f| match f {
-        Value::String(language) => language == language_id,
         Value::Object(f) => {
             !f.contains_key("pattern")
                 && !f.contains_key("notebook")
@@ -526,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn document_requests_need_an_open_document_and_a_selector_that_selects_it() {
+    fn k1_document_requests_need_an_open_document_and_a_selector_that_selects_it() {
         let caps = json!({"hoverProvider": true, "workspaceSymbolProvider": true});
         let (sent, notes) = requests(&caps, &doc(false), &[Spot { line: 0, column: 0 }], Encoding::Utf16);
         assert_eq!(sent.iter().map(|r| r.method).collect::<Vec<_>>(), ["workspace/symbol"]);
@@ -535,7 +534,7 @@ mod tests {
         for (selector, sent) in [
             (json!([{"language": "go"}]), true),
             (json!([{"language": "go", "scheme": "file"}]), true),
-            (json!(["go"]), true),
+            (json!(["go"]), false),
             (json!([{"language": "python"}, {"scheme": "file"}]), true),
             (json!(null), true),
             (json!([{"language": "python"}]), false),

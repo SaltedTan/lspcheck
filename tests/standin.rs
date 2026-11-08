@@ -522,6 +522,48 @@ fn a_held_reply_that_arrives_at_shutdown_still_answers_k1() {
     assert_eq!(r.status, 0, "{}", r.stdout);
 }
 
+#[test]
+fn k1_counts_replies_read_only_after_shutdown_finishes() {
+    for (fault, verdict, status) in
+        [("advertised-error-after-shutdown", "fail", 1), ("advertised-result-after-shutdown", "pass", 0)]
+    {
+        let (r, transcripts, _dir) = run_with_transcripts(&["--fault", fault], &["--only", "K1"]);
+        expect(&r, "K1", verdict);
+        assert_eq!(r.status, status, "{}", r.stdout);
+        let events: Vec<Value> = std::fs::read_to_string(transcripts.join("capabilities.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let exited = events.iter().position(|e| e["event"] == "exited").unwrap();
+        assert!(events[exited + 1..].iter().any(|e| e["dir"] == "in"), "{events:?}");
+    }
+}
+
+#[test]
+fn k1_sends_remaining_advertised_requests_after_a_timeout() {
+    let r = run(
+        &["--fault", "defer-hover-until-shutdown", "--fault", "advertises-unimplemented", "--fault", "echo-positions"],
+        &["--only", "K1"],
+    );
+    expect(&r, "K1", "fail");
+    assert_eq!(r.status, 1, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("MethodNotFound (-32601) for 1 advertised request(s): textDocument/documentColor"),
+        "{}",
+        r.stdout
+    );
+    assert_eq!(hovers(&r, "lspcheck-k1.txt"), ["0:1", "1:5", "2:1"], "{}", r.server_stderr);
+}
+
+#[test]
+fn k1_covers_all_requests_when_hover_waits_for_shutdown() {
+    let r = run(&["--fault", "defer-hover-until-shutdown"], &["--only", "K1"]);
+    expect(&r, "K1", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    assert!(r.stdout.contains("10 request(s) for 6 advertised method(s) were answered"), "{}", r.stdout);
+}
+
 /// The hover positions the stand-in reported for `file`, in order.
 fn hovers(r: &Run, file: &str) -> Vec<String> {
     let prefix = format!("standin: hover at {file} ");

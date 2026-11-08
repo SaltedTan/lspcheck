@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- K1 judges matched replies after the final stdout drain and sends remaining advertised requests after a reply
+  timeout, so late replies count and a deferred request cannot hide another method's MethodNotFound response.
+- K1 skips nonstandard language-string document selectors; LSP DocumentFilter objects determine selection.
 - R1 and R3 wait for an unprompted exit after a failed probe, so a pipe closing before the process finishes exiting
   does not turn a server crash into an inconclusive result on Windows.
 - Transcripts keep each request before its reply, even when the reply is read while the request's write is still
@@ -22,8 +25,8 @@
 
 - K1 checks that a server handles what it advertises: in a new `capabilities` scenario, lspcheck opens a document and
   sends each request the initialize result advertises (hover, definition, references, rename, symbols, formatting,
-  code actions, semantic tokens, workspace symbols and others) one at a time. MethodNotFound (-32601) for any of them
-  fails K1 whenever its reply is read, including during the graceful shutdown; a request with no response by the end
+  code actions, semantic tokens, workspace symbols and others), waiting one at a time until a reply timeout.
+  MethodNotFound (-32601) for any of them fails K1 whenever its reply is read, including during the graceful shutdown; a request with no response by the end
   of the session leaves K1 inconclusive (`ERROR`), since LSP sets no deadline for a response, and other errors are
   listed as lawful. See the [K1 reference](docs/design.md#capabilities-and-robustness).
 - Profiles accept `[document]`: the file K1 opens (`path`, from the profile's workspace), its `language_id`, and up to
