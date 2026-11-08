@@ -283,6 +283,7 @@ fn markdown_cell(text: &str) -> String {
             '`' => out.push_str("\\`"),
             '*' => out.push_str("\\*"),
             '_' => out.push_str("\\_"),
+            '~' => out.push_str("\\~"),
             '[' => out.push_str("\\["),
             ']' => out.push_str("\\]"),
             '<' => out.push_str("\\<"),
@@ -477,7 +478,7 @@ mod tests {
             &server(),
             &[scenario(vec![
                 result("F1", Verdict::Pass, ""),
-                result("L7", Verdict::Fail, "a | b `c` *d* _e_ [f] <g> h\\i\nnext &copy; &#169; &amp;"),
+                result("L7", Verdict::Fail, "a | b `c` *d* _e_ [f] <g> h\\i\nnext &copy; &#169; &amp; ~~workspace~~"),
                 result("J1", Verdict::Error, "no answer"),
                 result("L1", Verdict::Skip, "not for this server"),
                 result("D1", Verdict::NotExercised, ""),
@@ -500,7 +501,7 @@ mod tests {
         assert!(text.contains(
             "| ❌ FAIL | [L7](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#exit) \
              | SHOULD | exit without shutdown ends the process with status 1 \
-             | a \\| b \\`c\\` \\*d\\* \\_e\\_ \\[f\\] \\<g\\> h\\\\i<br>next &amp;copy; &amp;#169; &amp;amp; |"
+             | a \\| b \\`c\\` \\*d\\* \\_e\\_ \\[f\\] \\<g\\> h\\\\i<br>next &amp;copy; &amp;#169; &amp;amp; \\~\\~workspace\\~\\~ |"
         ), "{text}");
         assert!(text.contains("| ⚠️ ERROR | [J1]"));
         assert!(text.contains("| ✅ PASS | [F1]"));

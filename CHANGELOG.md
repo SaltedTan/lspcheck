@@ -5,7 +5,9 @@
 ### Fixed
 
 - Terminal, JUnit and Markdown reports reference the transcripts directory for cross-cutting failures and errors.
-- Markdown keeps character references literal in table cells and makes CR/LF visible in commands and transcript paths.
+- Markdown keeps character references and tildes literal in table cells and makes CR/LF visible in commands and
+  transcript paths.
+- The pinned v0.1.0 CI example uses supported flags; instructions for the unreleased report flags appear separately.
 
 ### Added
 

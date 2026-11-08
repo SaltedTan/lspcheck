@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; JUnit and Markdown reports with aggregate evidence references and literal-safe Markdown are done, while profiles, K1, R* and the stock-server CI matrix are still planned.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased JUnit and Markdown reports with aggregate evidence references and literal-safe Markdown are done, while profiles, K1, R* and the stock-server CI matrix are still planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -354,8 +354,8 @@ Without a profile: an empty temp workspace and a `plaintext` document. Generic c
   body; an error is an `<error>`, and skip and not-exercised are `<skipped>`. JUnit has no severity, so the process
   exit status, not the XML, applies `--strict`. Output has no timings or timestamps, so it is deterministic.
 - `--markdown`: a summary for a GitHub step summary: the terminal report's counts line, then a table with failures
-  and errors first and every cell escaped for Markdown (including literal ampersands), then the transcript paths of
-  failed or errored checks. Code spans display CR/LF as `\r`/`\n` so commands and paths stay within one paragraph.
+  and errors first and every cell escaped for Markdown (including literal ampersands and tildes), then the transcript
+  paths of failed or errored checks. Code spans display CR/LF as `\r`/`\n` so commands and paths stay within one paragraph.
 - Terminal, JUnit and Markdown evidence references use `transcript: PATH` for per-scenario failures and errors, and
   `transcripts: DIR` for cross-cutting failures and errors, using the shared parent of the recorded scenario paths.
 - `--transcripts DIR`: one JSONL per session with direction, monotonic timestamp, raw bytes (base64 when not UTF-8),

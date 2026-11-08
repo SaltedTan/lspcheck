@@ -105,8 +105,7 @@ cargo install --locked --git https://github.com/SaltedTan/lspcheck --tag v0.1.0
 
 Pin a version and its checksum, so the check only changes when you upgrade it. Checks are added and refined between
 versions, and the [changelog](CHANGELOG.md) says which. The exit status fails the job when a `MUST` check fails
-(`--strict` also fails it on `SHOULD` and `POLICY` failures). `--json`, `--junit` (JUnit XML for CI test tabs),
-`--markdown` (a summary for a GitHub step summary) and `--transcripts` keep the evidence:
+(`--strict` also fails it on `SHOULD` and `POLICY` failures). `--json` and `--transcripts` keep the evidence:
 
 ```yaml
 - name: Check the language server with lspcheck
@@ -118,9 +117,13 @@ versions, and the [changelog](CHANGELOG.md) says which. The exit status fails th
     curl -fsSLO "https://github.com/SaltedTan/lspcheck/releases/download/v$LSPCHECK_VERSION/$name.tar.gz"
     echo "$LSPCHECK_SHA256  $name.tar.gz" | sha256sum --check
     tar -xzf "$name.tar.gz"
-    "$name/lspcheck" --json lspcheck.json --markdown "$GITHUB_STEP_SUMMARY" \
+    "$name/lspcheck" --json lspcheck.json \
       --transcripts lspcheck-transcripts -- ./build/my-server --stdio
 ```
+
+`--junit` and `--markdown` are available from the next release (currently
+[Unreleased](CHANGELOG.md#unreleased)). With that release, add
+`--junit lspcheck.xml --markdown "$GITHUB_STEP_SUMMARY"` to the command above for CI test tabs and a GitHub step summary.
 
 ## Use
 
