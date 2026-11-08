@@ -13,6 +13,7 @@
 use crate::documents::{self, Change, OpenDoc, Published, Source, SyncKind, Version};
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
+use crate::profile::{self, Skip};
 use crate::session::{
     self, CallError, Finish, Options, Problem, Recv, ServerRequest, Session, Unmatched, WaitError, WriteError,
 };
@@ -294,7 +295,32 @@ pub struct Config {
     pub max_output: usize,
     /// Write each scenario's transcript into this directory.
     pub transcripts: Option<PathBuf>,
+    /// What a profile puts in each scenario's workspace.
+    pub workspace: profile::Workspace,
+    /// Sent as `initializationOptions` in every `initialize`.
+    pub initialization_options: Option<Value>,
+    /// The settings `workspace/configuration` is answered from, also sent in
+    /// a `workspace/didChangeConfiguration` after `initialized`.
+    pub configuration: Option<Value>,
+    /// Names of processes L9 allows to outlive the server.
+    pub allowed_descendants: Vec<String>,
+    /// Checks reported as skipped, and why.
+    pub skip: Vec<Skip>,
 }
+
+/// The files lspcheck writes into a scenario's workspace, and the one it
+/// names there as never existing. A profile can't put files at these paths.
+pub const OWN_FILES: &[&str] = &[DOC_A_FILE, DOC_B_FILE, UTF8_FILE, MISSING_FILE, LARGE_FILE];
+/// Document A, in the documents scenario.
+const DOC_A_FILE: &str = "doc.txt";
+/// Document B, in the documents scenario.
+const DOC_B_FILE: &str = "crlf.txt";
+/// The framing scenario's document with multibyte text (F5).
+const UTF8_FILE: &str = "lspcheck-utf8.txt";
+/// The large-document robustness scenario's file (R3).
+const LARGE_FILE: &str = "lspcheck-large.txt";
+/// The never-opened document D4 asks about, which must not exist.
+const MISSING_FILE: &str = "missing.txt";
 
 /// What a scenario observed that cross-cutting checks use.
 #[derive(Debug)]
@@ -367,10 +393,15 @@ pub const SCENARIOS: &[Scenario] = &[
 /// returns them with cross-cutting verdicts appended as a final "all" run.
 pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, String> {
     let wants = |id: &str| selected.is_empty() || selected.iter().any(|s| s == id);
-    let any_cross = CROSS_CUTTING.iter().any(|c| wants(c));
+    let skipped = |id: &str| cfg.skip.iter().any(|s| s.id == id);
+    // A scenario runs when one of its checks, or a cross-cutting check, is
+    // wanted and not skipped. It then runs whole, as it would without the
+    // skips, so skipping a check changes no other check's verdict.
+    let judges = |id: &str| wants(id) && !skipped(id);
+    let any_cross = CROSS_CUTTING.iter().any(|c| judges(c));
     let mut runs = Vec::new();
     for s in SCENARIOS {
-        if any_cross || s.checks.iter().any(|c| wants(c)) {
+        if any_cross || s.checks.iter().any(|c| judges(c)) {
             runs.push(run_scenario(s, cfg).await?);
         }
     }
@@ -383,13 +414,27 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
         judge_j3(&runs),
         unless_unreadable(&runs, judge_j5(&runs)),
         unless_unreadable(&runs, judge_j7(&runs)),
-        judge_l9(&runs),
+        judge_l9(&runs, &cfg.allowed_descendants),
     ]
     .into_iter()
     .collect();
     runs.push(ScenarioRun { name: "all", results: cross, observed: None, transcript: None });
     for run in &mut runs {
         run.results.retain(|r| wants(r.id));
+    }
+    for skip in cfg.skip.iter().filter(|s| wants(s.id)) {
+        let detail = format!("skipped by the profile: {}", skip.reason);
+        let owner = SCENARIOS.iter().find(|s| s.checks.contains(&skip.id)).map_or("all", |s| s.name);
+        match runs.iter_mut().flat_map(|r| &mut r.results).find(|r| r.id == skip.id) {
+            Some(r) => *r = result(r.scenario, skip.id, Verdict::Skip, detail),
+            // Its scenario didn't run: nothing it judges was wanted.
+            None => runs.push(ScenarioRun {
+                name: owner,
+                results: vec![result(owner, skip.id, Verdict::Skip, detail)],
+                observed: None,
+                transcript: None,
+            }),
+        }
     }
     Ok(runs)
 }
@@ -413,11 +458,15 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
     // form is a verbatim path that doesn't make a usable URI, so it is left.
     #[cfg(unix)]
     let root = root.canonicalize().unwrap_or(root);
+    if let Err(e) = profile::populate(&root, &cfg.workspace) {
+        return Ok(unstarted(format!("could not copy the profile's files into the workspace: {e}")));
+    }
     let opts = Options {
         sentinel: cfg.sentinel.clone(),
         max_body: cfg.max_body,
         max_output: cfg.max_output,
         workspace_folders: json!([{"uri": file_uri(&root), "name": "workspace"}]),
+        configuration: cfg.configuration.clone(),
         ..Options::default()
     };
     let mut cmd = cfg.server.clone();
@@ -432,8 +481,12 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
     };
     let mut ctx = Ctx { s: session, cfg, root, results: Vec::new(), scenario: name, j3_exercise: None };
     // The workspace, so a transcript of this scenario can be replayed in a
-    // recreated one (files written later are recorded when they are written).
-    ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+    // recreated one (files written later are recorded when they are written),
+    // and the settings, so a replay answers the server's questions alike.
+    ctx.record_workspace();
+    if let Some(settings) = &cfg.configuration {
+        ctx.s.record_configuration(settings.clone());
+    }
     match name {
         "lifecycle" => lifecycle(&mut ctx).await,
         "json-rpc" => json_rpc(&mut ctx).await,
@@ -572,6 +625,23 @@ enum InitFailure {
 }
 
 impl Ctx<'_> {
+    /// Records the workspace and the files in it, for a replay.
+    fn record_workspace(&self) {
+        self.s.record_workspace(
+            self.root.clone(),
+            workspace_files(&self.root, &self.cfg.workspace.names),
+            self.cfg.workspace.directories.clone(),
+        );
+    }
+
+    /// `initialize` params with the profile's `initializationOptions`, if any.
+    fn with_options(&self, mut params: Value) -> Value {
+        if let Some(options) = &self.cfg.initialization_options {
+            params["initializationOptions"] = options.clone();
+        }
+        params
+    }
+
     fn report(&mut self, id: &str, verdict: Verdict, detail: impl Into<String>) {
         let r = result(self.scenario, id, verdict, detail);
         self.results.push(r);
@@ -655,12 +725,13 @@ impl Ctx<'_> {
     /// Initializes the server with these params and sends `initialized`.
     async fn initialize_with(&mut self, params: Value) -> Result<Message, InitFailure> {
         let t = self.cfg.startup_timeout;
+        let params = self.with_options(params);
         let reply = match self.s.call("initialize", Some(params), t).await {
             Ok(reply) => reply,
             Err(CallError::Wait(WaitError::Timeout)) => {
                 return Err(InitFailure::Blocked(format!(
                     "no reply to initialize within {} s (--startup-timeout)",
-                    t.as_secs()
+                    seconds(t)
                 )));
             }
             Err(CallError::Wait(WaitError::Closed)) => {
@@ -684,6 +755,13 @@ impl Ctx<'_> {
         }
         if let Err(e) = self.s.notify("initialized", Some(json!({}))).await {
             return Err(InitFailure::Blocked(format!("initialized: {e}")));
+        }
+        // Some servers read their settings only this way, not by asking.
+        if let Some(settings) = &self.cfg.configuration {
+            let params = json!({"settings": settings});
+            if let Err(e) = self.s.notify("workspace/didChangeConfiguration", Some(params)).await {
+                return Err(InitFailure::Blocked(format!("workspace/didChangeConfiguration: {e}")));
+            }
         }
         Ok(reply)
     }
@@ -1295,7 +1373,8 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
     // L3. Why the server can no longer be relied on, if it can't.
     let mut stopped: Option<&str> = None;
     let since = ctx.s.elapsed();
-    match ctx.s.call("initialize", Some(initialize_params(&ctx.root)), t).await {
+    let params = ctx.with_options(initialize_params(&ctx.root));
+    match ctx.s.call("initialize", Some(params), t).await {
         Ok(m) => match &m.kind {
             Kind::Response { outcome: Outcome::Error { code: Some(_), .. }, .. } => {
                 if !answers {
@@ -1548,12 +1627,12 @@ async fn large_document_scenario(ctx: &mut Ctx<'_>) -> bool {
             return true;
         }
     };
-    let path = ctx.root.join("lspcheck-large.txt");
+    let path = ctx.root.join(LARGE_FILE);
     if let Err(error) = std::fs::write(&path, text.as_bytes()) {
         ctx.report("R3", Verdict::Error, format!("couldn't write the large document: {error}"));
         return true;
     }
-    ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+    ctx.record_workspace();
     let uri = file_uri(&path);
     if let Err(error) = ctx
         .s
@@ -2163,9 +2242,9 @@ async fn documents(ctx: &mut Ctx<'_>) {
             ctx.report(id, Verdict::Skip, detail);
         }
         // D4 still runs: doc.txt on disk, never opened.
-        let path = ctx.root.join("doc.txt");
+        let path = ctx.root.join(DOC_A_FILE);
         let _ = std::fs::write(&path, documents::doc_a());
-        ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+        ctx.record_workspace();
         let uri = file_uri(&path);
         d4(ctx, &caps, false, &uri, None).await;
         leave(ctx).await;
@@ -2179,9 +2258,9 @@ async fn documents(ctx: &mut Ctx<'_>) {
             }
             // D4 doesn't need the encoding, and runs with the document
             // never opened, as when the server doesn't ask for didOpen.
-            let path = ctx.root.join("doc.txt");
+            let path = ctx.root.join(DOC_A_FILE);
             let _ = std::fs::write(&path, documents::doc_a());
-            ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+            ctx.record_workspace();
             let uri = file_uri(&path);
             d4(ctx, &caps, false, &uri, None).await;
             leave(ctx).await;
@@ -2191,12 +2270,12 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let sync = documents::sync_kind(result);
 
     // Document A, saved in the workspace as an editor would open it.
-    let path = ctx.root.join("doc.txt");
+    let path = ctx.root.join(DOC_A_FILE);
     let text = documents::doc_a();
     if let Err(e) = std::fs::write(&path, &text) {
         ctx.s.note(format!("couldn't write {}: {e}", path.display()));
     }
-    ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+    ctx.record_workspace();
     let uri = file_uri(&path);
     let from = ctx.s.messages.len();
     let opened_at = ctx.s.elapsed();
@@ -2295,12 +2374,12 @@ async fn documents(ctx: &mut Ctx<'_>) {
     // opened document, so D1 and D2 judge its positions and publishes too; D3
     // concerns only A. B is closed before D4 runs, so D4's requests concern
     // only A and `missing.txt`, as before.
-    let b_path = ctx.root.join("crlf.txt");
+    let b_path = ctx.root.join(DOC_B_FILE);
     let b_text = documents::doc_b();
     if let Err(e) = std::fs::write(&b_path, &b_text) {
         ctx.s.note(format!("couldn't write {}: {e}", b_path.display()));
     }
-    ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+    ctx.record_workspace();
     let b_uri = file_uri(&b_path);
     let b_from = ctx.s.messages.len();
     let b_opened_at = ctx.s.elapsed();
@@ -2594,7 +2673,7 @@ async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: O
         return closed_at;
     }
     let t = ctx.cfg.request_timeout;
-    let missing = file_uri(&ctx.root.join("missing.txt"));
+    let missing = file_uri(&ctx.root.join(MISSING_FILE));
     let closed_label = if closed { "the closed document" } else { "the document on disk (never opened)" };
     let mut outcomes = Vec::new();
     for (label, doc_uri) in
@@ -2649,7 +2728,7 @@ async fn end_of_input(ctx: &mut Ctx<'_>) {
     let wait = ctx.cfg.exit_timeout;
     match ctx.s.wait_exit(Instant::now() + wait).await {
         Some(_) => ctx.pass("L8"),
-        None => ctx.fail("L8", format!("still running {} s after its stdin closed", wait.as_secs())),
+        None => ctx.fail("L8", format!("still running {} s after its stdin closed", seconds(wait))),
     }
 }
 
@@ -2659,7 +2738,7 @@ async fn end_of_input(ctx: &mut Ctx<'_>) {
 /// couldn't write doesn't excuse it: a server waiting for an answer would be
 /// reading its input.
 fn still_running(ctx: &mut Ctx<'_>, id: &'static str) {
-    let waited = ctx.cfg.exit_timeout.as_secs();
+    let waited = seconds(ctx.cfg.exit_timeout);
     let to = ctx.s.elapsed();
     ctx.fail(id, format!("still running {waited} s after exit"));
     let r = ctx.results.last_mut().expect("just reported");
@@ -2742,7 +2821,7 @@ async fn exchange(ctx: &mut Ctx<'_>, ids: &[Id], bytes: &[u8], cuts: &[usize]) -
     }
     let Some(e) = why else { return Probe::Answered };
     let what = match e {
-        WaitError::Timeout => format!("no response within {} s", t.as_secs()),
+        WaitError::Timeout => format!("no response within {} s", seconds(t)),
         WaitError::Closed => "the server closed its stdout without responding".into(),
     };
     let mut detail =
@@ -2933,10 +3012,10 @@ async fn framing(ctx: &mut Ctx<'_>) {
     let mut f5_passed = false;
     if !skip(ctx, "F5", &broken) {
         let opened = if opens_documents {
-            let path = ctx.root.join("lspcheck-utf8.txt");
+            let path = ctx.root.join(UTF8_FILE);
             let text = format!("ASCII line\n{MULTIBYTE}\nlast line\n");
             let _ = std::fs::write(&path, &text);
-            ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+            ctx.record_workspace();
             let doc = json!({"uri": file_uri(&path), "languageId": "plaintext", "version": 1, "text": text});
             ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await.map_err(|e| e.to_string())
         } else {
@@ -3445,18 +3524,27 @@ fn judge_j7(runs: &[ScenarioRun]) -> CheckResult {
     }
 }
 
-fn judge_l9(runs: &[ScenarioRun]) -> CheckResult {
+/// L9, where a leftover named in `allowed` (a profile's `allow.descendants`)
+/// fails nothing but is named in the detail.
+fn judge_l9(runs: &[ScenarioRun], allowed: &[String]) -> CheckResult {
     let all = observed(runs).collect::<Vec<_>>();
     if all.iter().any(|(_, o)| o.coverage == Coverage::None) {
         return result("all", "L9", Verdict::NotExercised, "lspcheck can't track descendants on this platform yet");
     }
-    let failures: Vec<String> = all
-        .iter()
-        .filter(|(_, o)| !o.killed && !o.leftovers.is_empty())
-        .map(|(name, o)| {
-            let list: Vec<String> = o.leftovers.iter().map(ProcInfo::to_string).collect();
-            format!("in {name}, still running after the server exited: {}", list.join(", "))
-        })
+    let is_allowed = |p: &&ProcInfo| allowed.contains(&p.name);
+    let leftovers = |keep: bool| {
+        all.iter()
+            .filter(|(_, o)| !o.killed)
+            .filter_map(|(name, o)| {
+                let list: Vec<String> =
+                    o.leftovers.iter().filter(|p| is_allowed(p) == keep).map(ProcInfo::to_string).collect();
+                (!list.is_empty()).then(|| (name, list.join(", ")))
+            })
+            .collect::<Vec<_>>()
+    };
+    let failures: Vec<String> = leftovers(false)
+        .into_iter()
+        .map(|(name, list)| format!("in {name}, still running after the server exited: {list}"))
         .collect();
     // A leak seen in one scenario stands even if another's search failed.
     if failures.is_empty()
@@ -3473,11 +3561,17 @@ fn judge_l9(runs: &[ScenarioRun]) -> CheckResult {
             "lspcheck had to stop the server in every scenario, so its cleanup wasn't tested",
         );
     }
-    let mut detail = String::new();
-    if all.iter().any(|(_, o)| o.coverage == Coverage::GroupOnly) {
-        detail =
-            "searched the server's process group only; a descendant that called setsid wouldn't be seen here".into();
+    let mut notes = Vec::new();
+    let permitted: Vec<String> = leftovers(true).into_iter().map(|(name, list)| format!("in {name}, {list}")).collect();
+    if !permitted.is_empty() {
+        notes.push(format!("allowed by the profile to outlive the server: {}", permitted.join("; ")));
     }
+    if all.iter().any(|(_, o)| o.coverage == Coverage::GroupOnly) {
+        notes.push(
+            "searched the server's process group only; a descendant that called setsid wouldn't be seen here".into(),
+        );
+    }
+    let mut detail = notes.join("; ");
     let not_stopped: Vec<String> = all.iter().flat_map(|(_, o)| &o.not_stopped).map(ProcInfo::to_string).collect();
     if !not_stopped.is_empty() {
         detail = format!(
@@ -3507,7 +3601,7 @@ fn describe_outcome(outcome: &Outcome) -> String {
 fn describe_call_error(e: &CallError, timeout: Duration) -> String {
     match e {
         CallError::Wait(WaitError::Timeout) => {
-            format!("no response within {} s", timeout.as_secs())
+            format!("no response within {} s", seconds(timeout))
         }
         other => other.to_string(),
     }
@@ -3547,22 +3641,35 @@ pub fn initialize_params(root: &Path) -> Value {
     })
 }
 
-/// The files in a workspace, as (relative name, text) pairs, for the
-/// workspace line of a transcript.
-fn workspace_files(root: &Path) -> Vec<(String, String)> {
-    let mut files = Vec::new();
+/// The files in a workspace, as (relative name, bytes) pairs, for the
+/// workspace line of a transcript: those at its top, and the profile's
+/// `names` (relative, with `/` separators) wherever they are.
+fn workspace_files(root: &Path, names: &[String]) -> Vec<(String, Vec<u8>)> {
+    let mut files = std::collections::BTreeMap::new();
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file()
-                && let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(text) = std::fs::read(&path)
             {
-                files.push((entry.file_name().to_string_lossy().into_owned(), text));
+                files.insert(entry.file_name().to_string_lossy().into_owned(), text);
             }
         }
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    files
+    for name in names {
+        let path: PathBuf =
+            std::iter::once(root.as_os_str()).chain(name.split('/').map(std::ffi::OsStr::new)).collect();
+        if let Ok(text) = std::fs::read(&path) {
+            files.insert(name.clone(), text);
+        }
+    }
+    files.into_iter().collect()
+}
+
+/// A duration in seconds for a message: whole seconds as before, a fraction
+/// only for a profile's sub-second timeout.
+fn seconds(d: Duration) -> String {
+    if d.subsec_nanos() == 0 { d.as_secs().to_string() } else { d.as_secs_f64().to_string() }
 }
 
 /// A `file:` URI for an absolute path, percent-encoding all but unreserved bytes.
@@ -3792,12 +3899,12 @@ mod tests {
         let leak = ProcInfo { pid: 42, ppid: 1, pgid: 42, name: "helper".into() };
         let runs =
             [observed_run("lifecycle", vec![leak], None), observed_run("pre-initialize", vec![], Some("no /proc"))];
-        let r = judge_l9(&runs);
+        let r = judge_l9(&runs, &[]);
         assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
         assert!(r.detail.contains("helper"), "{}", r.detail);
         // Without the leak, the failed search makes the result unknown.
         let runs = [observed_run("lifecycle", vec![], None), observed_run("pre-initialize", vec![], Some("no /proc"))];
-        assert_eq!(judge_l9(&runs).verdict, Verdict::Error);
+        assert_eq!(judge_l9(&runs, &[]).verdict, Verdict::Error);
     }
 
     #[test]

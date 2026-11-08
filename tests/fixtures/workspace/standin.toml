@@ -1,0 +1,2 @@
+# What the stand-in's needs-workspace-file fault looks for.
+require = "src/nested/lib.txt"

@@ -1,0 +1,4 @@
+# The stand-in's needs-workspace-file fault looks for standin.toml in its workspace;
+# this fixture holds it. The path is relative to this file.
+[workspace]
+path = "workspace"

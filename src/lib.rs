@@ -11,6 +11,7 @@ pub mod checks;
 pub mod documents;
 pub mod message;
 pub mod process;
+pub mod profile;
 pub mod replay;
 pub mod report;
 pub mod session;

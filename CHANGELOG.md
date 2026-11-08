@@ -12,6 +12,9 @@
 - Robustness checks avoid false framing failures and missed leftover processes during cleanup; R2 stays inconclusive
   when skipped output could contain the follow-up reply, even if the server exits.
 - R2 rejects malformed error responses, including invalid codes and missing or non-string messages.
+- Transcripts keep requests before fast replies even when a pipe flush finishes after the reply is read, fixing
+  intermittent missing recorded replies during replay on Windows.
+- Inline profile files can replace read-only fixture files, using default file creation permissions.
 - Terminal, JUnit and Markdown reports reference the transcripts directory for cross-cutting failures and errors.
 - Markdown keeps character references and tildes literal in table cells and makes CR/LF visible in commands and
   transcript paths.
@@ -28,6 +31,26 @@
   service, and R4, which checks exact round-trips for valid unusual request ids.
 - Keep each unanswered R4 request's evidence window. J3 includes the well-formed R2, R3 and R4 scenarios, but not R1's
   deliberately malformed-input scenario.
+- Profiles: `lspcheck --profile PATH` reads a TOML file that gives a server what it needs and says what its
+  maintainers accept ([README](README.md#profiles)). `[server]` sets the command (used when none follows `--`) and the
+  timeouts (a flag on the command line still wins); `[workspace]` copies a fixture directory and writes inline files
+  into each scenario's workspace; `[client]` sets `initializationOptions` and the settings that answer
+  `workspace/configuration` (also sent in `workspace/didChangeConfiguration` after `initialized`); `[allow]` lets
+  named descendants outlive the server (L9) and skips checks with a reason. A bad profile is a usage error (exit
+  status 2) naming the key, before any server starts. The terminal header and the JSON report's new `"profile"` field
+  name the profile; transcripts record its files (including binary contents and Unix read, write and execute
+  permissions), empty directories and settings,
+  so `replay` recreates them. Fixture roots must not be symbolic links, and workspace names must be portable.
+  Profiles and replay refuse paths with inconsistent ASCII case in any shared component; inline fixture overrides
+  with the exact same spelling remain supported.
+  R3 preserves the profile workspace in its transcript and reserves its own `lspcheck-large.txt` from profile files.
+  The `[document]` section, `[client].capabilities` and K1 are still planned.
+- Stand-in faults `needs-init-option`, `needs-workspace-file` and `needs-configuration`, which a profile satisfies.
+
+### Changed
+
+- The JSON report has a top-level `"profile"` field (`null` without a profile); the schema id is unchanged.
+- Dependency: `toml` 1.2 (features `parse` and `serde`), to read profiles.
 
 ## 0.1.0 (2026-11-08)
 

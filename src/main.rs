@@ -4,6 +4,7 @@
 use clap::{Parser, Subcommand};
 use lspcheck::checks::{self, Config};
 use lspcheck::process::{self, SENTINEL_ARG, ServerCommand};
+use lspcheck::profile;
 use lspcheck::replay;
 use lspcheck::report;
 use std::ffi::OsString;
@@ -14,6 +15,8 @@ use std::time::Duration;
 /// Checks that a language server speaks the Language Server Protocol correctly.
 ///
 /// Example: lspcheck -- gopls
+///
+/// A command-line flag overrides the profile, which overrides the default.
 #[derive(Parser)]
 #[command(version, args_conflicts_with_subcommands = true)]
 struct Cli {
@@ -40,17 +43,22 @@ struct Cli {
     #[arg(long)]
     strict: bool,
 
-    /// Seconds to wait for responses other than initialize and R3's probe.
-    #[arg(long, default_value_t = 10, value_name = "SECS")]
-    timeout: u64,
+    /// Read a TOML profile: the server command, timeouts, workspace files,
+    /// client settings, and what to allow.
+    #[arg(long, value_name = "PATH")]
+    profile: Option<PathBuf>,
 
-    /// Seconds to wait for initialize and R3's probe after opening the large document.
-    #[arg(long, default_value_t = 30, value_name = "SECS")]
-    startup_timeout: u64,
+    /// Seconds to wait for responses other than initialize and R3's probe [default: 10, or the profile's request_timeout].
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<u64>,
 
-    /// Seconds to wait for the server to exit after exit.
-    #[arg(long, default_value_t = 5, value_name = "SECS")]
-    exit_timeout: u64,
+    /// Seconds to wait for initialize and R3's probe after opening the large document [default: 30, or the profile's startup_timeout].
+    #[arg(long, value_name = "SECS")]
+    startup_timeout: Option<u64>,
+
+    /// Seconds to wait for the server to exit after exit [default: 5, or the profile's exit_timeout].
+    #[arg(long, value_name = "SECS")]
+    exit_timeout: Option<u64>,
 
     /// Run only these checks (comma-separated ids, such as L4,L6).
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
@@ -69,7 +77,7 @@ struct Cli {
     #[arg(long, default_value_t = 256, value_name = "MIB")]
     max_output_mib: usize,
 
-    /// The server command and its arguments, after `--`.
+    /// The server command and its arguments, after `--` (else the profile's command).
     #[arg(last = true, value_name = "SERVER")]
     server: Vec<OsString>,
 }
@@ -158,10 +166,26 @@ fn main() {
             }
         }
     }
-    if cli.server.is_empty() {
-        eprintln!("lspcheck: give the server command after `--`, for example: lspcheck -- gopls");
+    // A bad profile fails here, before any server starts.
+    let loaded = match &cli.profile {
+        Some(path) => match profile::load(path) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("lspcheck: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    let Some(argv) = profile::server_argv(&cli.server, loaded.as_ref()) else {
+        match &cli.profile {
+            Some(path) => {
+                eprintln!("lspcheck: give the server command after `--` or as server.command in {}", path.display())
+            }
+            None => eprintln!("lspcheck: give the server command after `--`, for example: lspcheck -- gopls"),
+        }
         std::process::exit(2);
-    }
+    };
     for id in &cli.only {
         if !checks::CATALOGUE.iter().any(|c| c.id == id) {
             eprintln!("lspcheck: unknown check {id:?}; `lspcheck list` shows them");
@@ -175,17 +199,23 @@ fn main() {
         std::process::exit(2);
     }
     process::enable_subreaper();
+    let p = loaded.unwrap_or_default();
     let cfg = Config {
-        server: ServerCommand::new(&cli.server),
+        server: ServerCommand::new(&argv),
         sentinel: std::env::current_exe().ok(),
-        request_timeout: Duration::from_secs(cli.timeout),
-        startup_timeout: Duration::from_secs(cli.startup_timeout),
-        exit_timeout: Duration::from_secs(cli.exit_timeout),
+        request_timeout: profile::timeout(cli.timeout, p.request_timeout, 10),
+        startup_timeout: profile::timeout(cli.startup_timeout, p.startup_timeout, 30),
+        exit_timeout: profile::timeout(cli.exit_timeout, p.exit_timeout, 5),
         leftover_grace: Duration::from_secs(1),
         large_document_mib: cli.large_document_mib.get(),
         max_body: cli.max_frame_mib.saturating_mul(1024 * 1024),
         max_output: cli.max_output_mib.saturating_mul(1024 * 1024),
         transcripts: cli.transcripts.clone(),
+        workspace: p.workspace,
+        initialization_options: p.initialization_options,
+        configuration: p.configuration,
+        allowed_descendants: p.allowed_descendants,
+        skip: p.skip,
     };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     let runs = match rt.block_on(checks::run(&cfg, &cli.only)) {
@@ -196,10 +226,12 @@ fn main() {
         }
     };
     let server = cfg.server.display();
-    let _ = report::print_terminal(&mut std::io::stdout().lock(), &server, &runs);
-    let argv: Vec<String> = cli.server.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    let profile_path = cli.profile.as_deref();
+    let _ = report::print_terminal(&mut std::io::stdout().lock(), &server, profile_path, &runs);
+    let argv: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
     if let Some(path) = &cli.json {
-        let text = serde_json::to_string_pretty(&report::json_report(&argv, &runs)).expect("report serializes");
+        let report = report::json_report(&argv, profile_path, &runs);
+        let text = serde_json::to_string_pretty(&report).expect("report serializes");
         if let Err(e) = std::fs::write(path, text + "\n") {
             eprintln!("lspcheck: can't write {}: {e}", path.display());
             std::process::exit(2);

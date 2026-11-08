@@ -4,7 +4,8 @@ lspcheck starts a language server and checks that it speaks the
 [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) correctly. It checks message
 framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, document positions, request parameter handling,
 malformed JSON and large-document robustness, unusual request ids, and whether the server leaves processes behind. It
-works with any server that talks over stdio, whatever language it is written in, and needs no configuration.
+works with any server that talks over stdio, whatever language it is written in, and needs no configuration; an
+optional [profile](#profiles) gives a server the project files and settings it needs.
 
 Example output from the development version (see [Unreleased](CHANGELOG.md#unreleased)):
 
@@ -145,6 +146,7 @@ lspcheck --only L4,L6 -- my-server       # run some checks
 lspcheck --large-document-mib 8 -- my-server --stdio
 lspcheck --json report.json --transcripts out/ -- my-server
 lspcheck --junit report.xml --markdown summary.md -- my-server
+lspcheck --profile gopls.toml            # with a profile that names the server
 lspcheck list                            # every check, with its specification section
 ```
 
@@ -155,10 +157,10 @@ With `--transcripts`, terminal, JUnit and Markdown reports point to the evidence
 See the [report format reference](docs/design.md#report) for verdict mappings, `--strict` in JUnit, escaping and
 transcript references.
 
-lspcheck runs the server several times, once per scenario, each time with an empty temporary workspace as its working
-directory. A server path with a directory part, such as `./my-server`, is resolved before that; a bare name is looked up
-on `PATH`. The checks on the server's output (F1, F2, F8) and on leftover processes (L9) are judged across every
-scenario, as are the JSON-RPC correlation checks J1, J2, J5 and J7.
+lspcheck runs the server several times, once per scenario, each time with a fresh temporary workspace as its working
+directory: empty, or holding a [profile](#profiles)'s files. A server path with a directory part, such as `./my-server`,
+is resolved before that; a bare name is looked up on `PATH`. The checks on the server's output (F1, F2, F8) and on
+leftover processes (L9) are judged across every scenario, as are the JSON-RPC correlation checks J1, J2, J5 and J7.
 
 The JSON-RPC scenario writes four requests, with numeric and string ids, before reading any reply (J6), and then sends
 unknown notifications followed by probes to show that a notification gets no response (J3). A reply whose id only
@@ -167,8 +169,8 @@ duplicate, unasked or premature reply fails J2.
 
 lspcheck answers the server's own requests as it reads them, including during
 [exit waits](docs/design.md#lifecycle). J7 checks for unanswered id reuse and continued service
-after those answers; the [design reference](docs/design.md#json-rpc-correlation) defines the judging rules and fixed
-answers. Configurable answers are planned for M3 profiles.
+after those answers; the [design reference](docs/design.md#json-rpc-correlation) defines the judging rules and the
+answers. A profile's `[client].configuration` answers `workspace/configuration`; without one, each item gets `null`.
 
 The checks on how the server reads its input (F3 to F7) send small requests the server doesn't know, which every server
 must answer, written in different ways: split across many writes, several frames in one write, with a `Content-Type`
@@ -186,7 +188,7 @@ publishes. Every position the server sends about the document must fall between 
 the two sides agreed (UTF-16 unless the server chose another): never between the halves of a UTF-16 surrogate pair or
 inside a UTF-8 multibyte sequence. The document is built so that counting in the wrong units lands inside a
 character, and a failure says which counting would have fit. A position past the end of a line isn't judged, because
-the client clamps it. Most language servers ignore a plain-text document without a profile, and then D1 is `N/E`.
+the client clamps it. Most language servers ignore a plain-text document, and then D1 is `N/E`.
 
 The same scenario also checks diagnostics versions (D2): when the server labels a `publishDiagnostics` for the opened
 document with a `version`, it must be one lspcheck sent for it before the notification was read — so a server that
@@ -232,7 +234,79 @@ With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It h
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of
 stderr, and timestamps, so you can see what happened in a failing scenario. Each file includes a meta line naming the
 workspace the scenario ran in and the files it held, so a replay can recreate it. A `stdin closed` meta event marks when
-lspcheck closed the server's input. Events are ordered by timestamp, including replies read while a write is flushing.
+lspcheck closed the server's input. Events follow their timestamps, keeping a fast server's reply after the write
+it answers even when the client's pipe flush finishes later.
+
+### Profiles
+
+`--profile` is available from the next release (currently [Unreleased](CHANGELOG.md#unreleased)).
+
+Many servers refuse to initialize, or check little, without a project or settings. A profile is a TOML file that
+gives lspcheck what a server needs, and says what its maintainers accept. The four sections and their top-level keys
+are optional; each `allow.skip` entry requires both `id` and `reason`.
+The example below uses supported fields; [planned profile fields](docs/design.md#profiles-optional-toml) are not
+accepted yet.
+
+```toml
+[server]
+command = ["gopls", "serve"]   # used when no command follows `--`
+startup_timeout = "30s"        # like --startup-timeout
+request_timeout = "10s"        # like --timeout
+exit_timeout = "5s"            # like --exit-timeout
+
+[workspace]                    # each scenario's fresh temporary workspace gets these files
+path = "fixtures/go"           # a directory copied in, relative to this file
+files = { "go.mod" = "module example\n\ngo 1.22\n" }   # written after copying `path`, over any same-named file
+
+[client]
+initialization_options = { hints = true }              # initializeParams.initializationOptions
+configuration = { gopls = { staticcheck = false } }    # answers to workspace/configuration
+
+[allow]
+descendants = ["gopls-helper"]                         # process names allowed to outlive exit (L9)
+skip = [{ id = "L7", reason = "exits 0 by design, see issue 12" }]
+```
+
+```sh
+lspcheck --profile go.toml                    # the profile's command
+lspcheck --profile go.toml -- ./gopls serve   # this command instead
+lspcheck --profile go.toml --timeout 30 -- gopls
+```
+
+- **Precedence.** A command after `--` overrides `[server].command`; with neither, lspcheck stops with a usage error.
+  A timeout flag on the command line overrides the profile's, which overrides the default (30 s to initialize, 10 s per
+  request, 5 s to exit). Durations are strings: `"500ms"`, `"30s"` or `"2m"`. `--only`, `--strict`, `--json`,
+  `--transcripts` and the size limits are command-line only.
+- **Paths** are relative to the profile file's directory: `[workspace].path`, and a `[server].command` program with a
+  directory part (`bin/server`; a bare name is looked up on `PATH`). The fixture directory may hold only regular files
+  and directories: symbolic links, including the fixture root itself, are refused. Workspace file and directory
+  names must be portable relative paths with `/` between directories: empty, absolute, `.` and `..` parts,
+  backslashes, control characters, `: < > " | ? *`, trailing dots or spaces, and Windows device names (`CON`, `PRN`,
+  `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, also with extensions) are refused. Paths must use consistent ASCII case
+  in every component across fixture and inline entries; `src/A.json` with `SRC/b.json`, or `A.json` with `a.json`,
+  is a usage error naming both paths. An inline file may replace a fixture file with the exact same spelling,
+  including a read-only file; the replacement uses default file creation permissions. Missing directories are created.
+- **lspcheck's own files.** lspcheck writes `doc.txt`, `crlf.txt`, `lspcheck-utf8.txt` and `lspcheck-large.txt` at the
+  top of the workspace, and asks about `missing.txt` there, which must not exist. A profile can't put a file or directory at those names,
+  compared ignoring ASCII case.
+- **`[client]`.** `initialization_options` is converted using the [TOML-to-JSON rules](docs/design.md#profiles-optional-toml)
+  and sent in every `initialize`, including L3's second one. When the `configuration` table is given, lspcheck answers
+  each `workspace/configuration` item by looking up
+  its `section` as a dot-separated path in it (`"gopls.staticcheck"` gives `false`; a missing path gives `null`; an item
+  without a section gets the whole table), and sends it once in `workspace/didChangeConfiguration` right after
+  `initialized`, for servers that read settings only that way.
+- **`[allow]`.** L9 doesn't fail for a leftover process whose name, as lspcheck reports it, is in `descendants`; the
+  `PASS` detail names what was allowed. (On Linux that name is the kernel's command name, at most 15 bytes.) A check in
+  `skip` reports `SKIP` with the reason given, and doesn't affect the exit status. The
+  [design reference](docs/design.md#profiles-optional-toml) explains when skipped checks let a scenario be omitted.
+- **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
+  type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name or an unknown check id is a usage
+  error (exit status 2) naming the file and the key, with TOML's line and column where it has them.
+
+The report names the profile: in the terminal's first line, and as `"profile"` in the JSON report (`null` without
+one). Transcripts record the profile's files, including binary contents, directories (including empty ones), and
+settings, so `lspcheck replay` recreates the workspace and answers `workspace/configuration` the same way. On Unix,
+transcripts also record and restore file read, write and execute permissions, so fixture helpers remain executable.
 
 ### Reproducing a failure
 
@@ -242,12 +316,13 @@ lspcheck closed the server's input. Events are ordered by timestamp, including r
 lspcheck replay out/lifecycle.jsonl -- my-server --stdio
 ```
 
-It recreates the recorded workspace (refusing to touch an existing non-empty one), re-sends every client write in the
-transcript in order, and reports what the server did this time: each request's outcome against the recorded one, the
-exit status, and how many server-to-client requests were answered. Responses the server sends once lspcheck has begun
+It recreates the recorded workspace (refusing an existing non-empty one or recorded paths with inconsistent ASCII
+case in any component), re-sends every client write in the transcript in order, and reports what the server did this
+time: each request's outcome against the recorded one, the exit status, and how many server-to-client requests were
+answered. Responses the server sends once lspcheck has begun
 stopping it don't count as replies, in the recording or the replay. Gaps under 200 ms between writes are kept as pauses;
 longer ones are sent back-to-back. Server-to-client requests are answered with the same auto-answers a live run uses,
-so they don't stall the replay. The replay's own transcript goes to `--transcript FILE`; it never overwrites an existing
+including a profile's settings when the transcript recorded them, so they don't stall the replay. The replay's own transcript goes to `--transcript FILE`; it never overwrites an existing
 file, so pass `--transcript` to choose another path or remove the existing output. The workspace is removed afterwards
 only when replay created it; an existing empty workspace is kept. The exit status is 0 when the replay ran, 2 for usage
 errors and transcripts that can't be read. Replay shows *what changed*; to judge checks on the server, run `lspcheck` on it.
@@ -272,7 +347,7 @@ deliver gives `ERROR`, never `FAIL`. A header section longer than 1 MiB also sto
 | --- | --- |
 | `PASS` | The rule held. |
 | `FAIL` | The rule was broken; the detail line says how. |
-| `SKIP` | The rule doesn't apply to this server. |
+| `SKIP` | The rule doesn't apply to this server, or the profile skips it with a reason. |
 | `N/E` | Not exercised: the rule applies, but the run produced no evidence either way. |
 | `ERROR` | The result is unknown: the server couldn't start or refused to initialize, a timeout ran out, or the evidence is incomplete. It says nothing about the rule. |
 
@@ -287,7 +362,7 @@ not leaving child processes behind.
 - **2:** a usage or report-writing error, or an `ERROR` verdict with no `MUST` failure.
 
 Some servers refuse to initialize without project files or settings. lspcheck reports that as `ERROR`, with the
-server's message, rather than as a failure.
+server's message, rather than as a failure; a [profile](#profiles) can give the server what it needs.
 
 ## Platforms
 

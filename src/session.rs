@@ -46,6 +46,9 @@ pub struct Options {
     pub auto_respond: bool,
     /// The answer to `workspace/workspaceFolders`.
     pub workspace_folders: Value,
+    /// The settings `workspace/configuration` is answered from (a profile's
+    /// `[client].configuration`); without them, each item gets `null`.
+    pub configuration: Option<Value>,
 }
 
 impl Default for Options {
@@ -59,6 +62,7 @@ impl Default for Options {
             stderr_limit: 1024 * 1024,
             auto_respond: true,
             workspace_folders: Value::Null,
+            configuration: None,
         }
     }
 }
@@ -91,8 +95,13 @@ pub enum EventKind {
     /// can be replayed in a recreated workspace.
     Workspace {
         path: PathBuf,
-        files: Vec<(String, String)>,
+        files: Vec<(String, Vec<u8>)>,
+        directories: Vec<String>,
+        file_modes: std::collections::BTreeMap<String, u32>,
     },
+    /// The settings `workspace/configuration` is answered from, so a replay
+    /// answers the same way.
+    Configuration(Value),
 }
 
 /// Something wrong with the server's output stream.
@@ -127,6 +136,19 @@ impl std::fmt::Display for Problem {
             }
         }
     }
+}
+
+/// The answer to one `workspace/configuration` item: its `section` looked up
+/// as a dot-separated path into `settings`, `null` where the path leads
+/// nowhere. An item without a section (or with an empty one) gets all of it.
+pub fn configuration_item(settings: &Value, item: &Value) -> Value {
+    let section = match item.get("section") {
+        None | Some(Value::Null) => return settings.clone(),
+        Some(Value::String(s)) if s.is_empty() => return settings.clone(),
+        Some(Value::String(s)) => s,
+        Some(_) => return Value::Null,
+    };
+    section.split('.').try_fold(settings, |v, key| v.get(key)).cloned().unwrap_or(Value::Null)
 }
 
 /// A short, escaped rendering of some bytes.
@@ -499,8 +521,27 @@ impl Session {
     }
 
     /// Records the workspace and the files in it, for [`crate::replay`].
-    pub fn record_workspace(&self, path: PathBuf, files: Vec<(String, String)>) {
-        record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files });
+    pub fn record_workspace(&self, path: PathBuf, files: Vec<(String, Vec<u8>)>, directories: Vec<String>) {
+        #[cfg(unix)]
+        let file_modes = {
+            use std::os::unix::fs::PermissionsExt;
+            files
+                .iter()
+                .filter_map(|(name, _)| {
+                    std::fs::metadata(path.join(name))
+                        .ok()
+                        .map(|metadata| (name.clone(), metadata.permissions().mode() & 0o777))
+                })
+                .collect()
+        };
+        #[cfg(not(unix))]
+        let file_modes = std::collections::BTreeMap::new();
+        record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files, directories, file_modes });
+    }
+
+    /// Records the settings `workspace/configuration` is answered from, for [`crate::replay`].
+    pub fn record_configuration(&self, settings: Value) {
+        record(&self.transcript, self.start.elapsed(), EventKind::Configuration(settings));
     }
 
     /// Why evidence is incomplete so far, if it is: an inspection limit,
@@ -850,8 +891,12 @@ impl Session {
     async fn answer(&mut self, id: &Id, method: &str, request: &Value, deadline: Instant) {
         let reply = match method {
             "workspace/configuration" => {
-                let n = request.pointer("/params/items").and_then(Value::as_array).map_or(0, Vec::len);
-                message::response(id, Value::Array(vec![Value::Null; n]))
+                let items = request.pointer("/params/items").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+                let answers = match &self.opts.configuration {
+                    Some(settings) => items.iter().map(|item| configuration_item(settings, item)).collect(),
+                    None => vec![Value::Null; items.len()],
+                };
+                message::response(id, Value::Array(answers))
             }
             "workspace/workspaceFolders" => message::response(id, self.opts.workspace_folders.clone()),
             "workspace/applyEdit" => message::response(id, json!({"applied": false})),
@@ -1112,7 +1157,11 @@ impl Session {
         // the unfinished frame above included, makes judging J3 inconclusive.
         let ongoing = [evidence.stopped.as_ref(), self.own_limit.as_ref()];
         let j3_incomplete = self.initialized_at.and_then(|from| incomplete_between(&evidence.lost, ongoing, from, now));
-        let transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
+        let mut transcript = std::mem::take(&mut *self.transcript.lock().expect("transcript lock"));
+        // Writes are recorded after flushing, so the reader may append a
+        // later reply first. Restore occurrence order, retaining append order
+        // for equal timestamps (including pieces of a split write).
+        transcript.sort_by_key(|event| event.at);
         let whole = evidence.done && !evidence.cut;
         let (miscounted, unchecked) = miscounted_frames(&evidence.unparsed, &transcript, whole);
         // Whether an unmatched reply is a duplicate, early, aborted or only
@@ -1422,6 +1471,53 @@ pub fn describe_status(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_items_are_looked_up_by_dotted_section() {
+        let settings = json!({"gopls": {"staticcheck": false, "ui": {"hints": [1]}}, "x.y": 1});
+        let item = |v: Value| configuration_item(&settings, &v);
+        assert_eq!(item(json!({"section": "gopls"})), settings["gopls"]);
+        assert_eq!(item(json!({"section": "gopls.staticcheck"})), json!(false));
+        assert_eq!(item(json!({"section": "gopls.ui.hints"})), json!([1]));
+        // A whole table without a section; null where the path leads nowhere.
+        assert_eq!(item(json!({"scopeUri": "file:///x"})), settings);
+        assert_eq!(item(json!({"section": ""})), settings);
+        assert_eq!(item(json!({"section": "gopls.missing"})), Value::Null);
+        assert_eq!(item(json!({"section": "gopls.staticcheck.deeper"})), Value::Null);
+        // A dot always separates: a key spelled with one isn't found.
+        assert_eq!(item(json!({"section": "x.y"})), Value::Null);
+        assert_eq!(item(json!({"section": 3})), Value::Null);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn finished_transcripts_preserve_occurrence_order_when_writes_flush_late() {
+        let cmd = ServerCommand::new(&["sleep".into(), "30".into()]);
+        let s = Session::start(&cmd, Options::default()).await.unwrap();
+        let id = Id::int(7);
+        let request = transport::encode(&serde_json::to_vec(&message::request(&id, "probe", None)).unwrap());
+        let reply = transport::encode(&serde_json::to_vec(&message::response(&id, Value::Null)).unwrap());
+        let exit = transport::encode(&serde_json::to_vec(&message::notification("exit", None)).unwrap());
+        // Force the Windows pipe schedule: the reader records the reply
+        // before the writer's flush completes and records the earlier send.
+        record(&s.transcript, Duration::from_nanos(2), EventKind::Read(reply));
+        // Equal timestamps must preserve split-write byte order too.
+        let cut = request.len() / 2;
+        record(&s.transcript, Duration::from_nanos(1), EventKind::Sent(request[..cut].to_vec()));
+        record(&s.transcript, Duration::from_nanos(1), EventKind::Sent(request[cut..].to_vec()));
+        record(&s.transcript, Duration::from_nanos(3), EventKind::Sent(exit));
+        let finish = s.finish(Duration::from_millis(200)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recording.jsonl");
+        crate::transcript::write(&path, &finish.transcript).unwrap();
+        let plan = crate::replay::parse(&path).unwrap();
+        // The JSON Lines transcript contract orders the request before its
+        // reply, so replay must retain the result and gate the next write.
+        assert_eq!(plan.requests.len(), 1);
+        assert_eq!(plan.requests[0].recorded.as_deref(), Some("result"));
+        assert_eq!(plan.steps[2].gates, vec![id]);
+        assert!(finish.transcript.windows(2).all(|pair| pair[0].at <= pair[1].at));
+    }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]

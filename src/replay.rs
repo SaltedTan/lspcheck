@@ -31,8 +31,11 @@ use tokio::time::{Instant, sleep};
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub path: PathBuf,
-    /// (relative name, text) pairs.
-    pub files: Vec<(String, String)>,
+    /// (relative name, bytes) pairs.
+    pub files: Vec<(String, Vec<u8>)>,
+    pub directories: Vec<String>,
+    /// Unix rwx bits, absent in older recordings and ignored on other platforms.
+    pub file_modes: std::collections::BTreeMap<String, u32>,
 }
 
 /// One `out` event of the recording, in order.
@@ -77,6 +80,9 @@ pub struct StdinClose {
 pub struct Plan {
     /// The workspace to recreate, when the recording has one.
     pub workspace: Option<Workspace>,
+    /// The settings the recording answered `workspace/configuration` from,
+    /// when a profile gave some.
+    pub configuration: Option<Value>,
     pub steps: Vec<Step>,
     /// The request frame occurrences in send order.
     pub requests: Vec<RequestOccurrence>,
@@ -220,6 +226,7 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
     let mut plan = Plan {
         workspace: None,
+        configuration: None,
         steps: Vec::new(),
         requests: Vec::new(),
         stdin_close: None,
@@ -328,13 +335,39 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
                     let mut files = Vec::new();
                     if let Some(entries) = v.get("files").and_then(Value::as_object) {
                         for (name, value) in entries {
-                            let text = value.as_str().ok_or_else(|| {
-                                format!("{}: line {line}: workspace file {name:?} is not text", path.display())
+                            let bytes = if let Some(text) = value.as_str() {
+                                Some(text.as_bytes().to_vec())
+                            } else if value.get("encoding").and_then(Value::as_str) == Some("base64") {
+                                value.get("data").and_then(Value::as_str).and_then(transcript::base64_decode)
+                            } else {
+                                None
+                            }
+                            .ok_or_else(|| {
+                                format!(
+                                    "{}: line {line}: workspace file {name:?} is not text or base64 data",
+                                    path.display()
+                                )
                             })?;
-                            files.push((name.clone(), text.to_string()));
+                            files.push((name.clone(), bytes));
                         }
                     }
-                    plan.workspace = Some(Workspace { path: PathBuf::from(dir), files });
+                    let directories = match v.get("directories") {
+                        Some(value) => serde_json::from_value::<Vec<String>>(value.clone()).map_err(|e| {
+                            format!("{}: line {line}: invalid workspace directories: {e}", path.display())
+                        })?,
+                        None => Vec::new(),
+                    };
+                    let file_modes = match v.get("file_modes") {
+                        Some(value) => serde_json::from_value::<std::collections::BTreeMap<String, u32>>(value.clone())
+                            .map_err(|e| {
+                                format!("{}: line {line}: invalid workspace file modes: {e}", path.display())
+                            })?,
+                        None => std::collections::BTreeMap::new(),
+                    };
+                    plan.workspace = Some(Workspace { path: PathBuf::from(dir), files, directories, file_modes });
+                }
+                if let Some(settings) = v.get("configuration") {
+                    plan.configuration = Some(settings.clone());
                 }
                 if v.get("event").and_then(Value::as_str) == Some("stdin closed") {
                     plan.stdin_close =
@@ -379,34 +412,35 @@ fn event_bytes(v: &Value) -> Option<Vec<u8>> {
     v.get("data_base64").and_then(Value::as_str).and_then(transcript::base64_decode)
 }
 
-fn validate_workspace_files(files: &[(String, String)]) -> Result<Vec<PathBuf>, String> {
-    let mut paths: Vec<PathBuf> = Vec::with_capacity(files.len());
-    for (name, _) in files {
-        let invalid = || format!("invalid workspace file key {name:?}");
-        // Keys are written with '/' between directories. A backslash is
-        // part of a file name on Unix, and can't be one on Windows.
-        if name.is_empty()
-            || name.starts_with('/')
-            || (cfg!(windows) && name.contains('\\'))
-            || (name.as_bytes().get(1) == Some(&b':') && name.as_bytes()[0].is_ascii_alphabetic())
-        {
-            return Err(invalid());
+fn workspace_key(name: &str) -> Result<PathBuf, String> {
+    crate::profile::safe_name(name)
+        .map(|parts| parts.into_iter().collect())
+        .map_err(|e| format!("invalid workspace file key {e}"))
+}
+
+fn validate_workspace(w: &Workspace) -> Result<Vec<PathBuf>, String> {
+    for (name, mode) in &w.file_modes {
+        if *mode > 0o777 || !w.files.iter().any(|(file, _)| file == name) {
+            return Err(format!("invalid workspace file mode for {name:?}: expected rwx bits for a recorded file"));
         }
-        let parts: Vec<&str> = name.split('/').collect();
-        if parts.iter().any(|part| part.is_empty() || *part == "." || *part == "..") {
-            return Err(invalid());
-        }
-        let mut path = PathBuf::new();
-        for part in parts {
-            path.push(part);
-        }
-        if path.is_absolute() || path.components().any(|part| !matches!(part, Component::Normal(_))) {
-            return Err(invalid());
-        }
+    }
+    crate::profile::validate_name_case(
+        w.files.iter().map(|(name, _)| name.as_str()).chain(w.directories.iter().map(String::as_str)),
+    )
+    .map_err(|e| format!("invalid workspace names: {e}"))?;
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(w.files.len());
+    for (name, _) in &w.files {
+        let path = workspace_key(name)?;
         if paths.iter().any(|existing| path == *existing || path.starts_with(existing) || existing.starts_with(&path)) {
             return Err(format!("workspace file key {name:?} conflicts with another file key"));
         }
         paths.push(path);
+    }
+    for name in &w.directories {
+        let path = workspace_key(name)?;
+        if paths.iter().any(|file| path.starts_with(file)) {
+            return Err(format!("workspace directory key {name:?} conflicts with a file key"));
+        }
     }
     Ok(paths)
 }
@@ -445,7 +479,7 @@ impl WorkspaceGuard {
             cleaned: false,
         };
         if let Some(w) = w {
-            let paths = validate_workspace_files(&w.files)?;
+            let paths = validate_workspace(w)?;
             let root = path.as_ref().expect("a workspace has a path");
             match std::fs::symlink_metadata(root) {
                 Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
@@ -473,25 +507,33 @@ impl WorkspaceGuard {
         Ok(guard)
     }
 
-    fn write_files(&mut self, w: &Workspace, paths: &[PathBuf]) -> Result<(), String> {
-        for ((name, text), relative) in w.files.iter().zip(paths) {
-            let root = self.path.as_ref().expect("workspace path");
-            let mut parent = root.clone();
-            if let Some(relative_parent) = relative.parent() {
-                for component in relative_parent.components() {
-                    parent.push(component);
-                    match std::fs::symlink_metadata(&parent) {
-                        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
-                        Ok(_) => return Err(format!("workspace parent {} is not a real directory", parent.display())),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            std::fs::create_dir(&parent)
-                                .map_err(|e| format!("can't create workspace directory {}: {e}", parent.display()))?;
-                            self.created_dirs.push(parent.clone());
-                        }
-                        Err(e) => return Err(format!("can't inspect workspace directory {}: {e}", parent.display())),
-                    }
+    fn create_dirs(&mut self, relative: &Path) -> Result<(), String> {
+        let mut parent = self.path.as_ref().expect("workspace path").clone();
+        for component in relative.components() {
+            parent.push(component);
+            match std::fs::symlink_metadata(&parent) {
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+                Ok(_) => return Err(format!("workspace parent {} is not a real directory", parent.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&parent)
+                        .map_err(|e| format!("can't create workspace directory {}: {e}", parent.display()))?;
+                    self.created_dirs.push(parent.clone());
                 }
+                Err(e) => return Err(format!("can't inspect workspace directory {}: {e}", parent.display())),
             }
+        }
+        Ok(())
+    }
+
+    fn write_files(&mut self, w: &Workspace, paths: &[PathBuf]) -> Result<(), String> {
+        for name in &w.directories {
+            self.create_dirs(&workspace_key(name)?)?;
+        }
+        for ((name, bytes), relative) in w.files.iter().zip(paths) {
+            if let Some(relative_parent) = relative.parent() {
+                self.create_dirs(relative_parent)?;
+            }
+            let root = self.path.as_ref().expect("workspace path");
             let file_path = root.join(relative);
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
@@ -499,8 +541,14 @@ impl WorkspaceGuard {
                 .open(&file_path)
                 .map_err(|e| format!("can't create workspace file {name:?} at {}: {e}", file_path.display()))?;
             self.created_files.push(file_path.clone());
-            file.write_all(text.as_bytes())
+            file.write_all(bytes)
                 .map_err(|e| format!("can't write workspace file {name:?} at {}: {e}", file_path.display()))?;
+            #[cfg(unix)]
+            if let Some(mode) = w.file_modes.get(name) {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(*mode))
+                    .map_err(|e| format!("can't set workspace file permissions for {name:?}: {e}"))?;
+            }
         }
         Ok(())
     }
@@ -568,6 +616,7 @@ pub async fn replay(
             .as_ref()
             .map(|root| json!([{"uri": file_uri(root), "name": "workspace"}]))
             .unwrap_or(Value::Null),
+        configuration: plan.configuration.clone(),
         ..Options::default()
     };
     let mut session = match Session::start(&cmd, opts).await {
@@ -576,7 +625,10 @@ pub async fn replay(
     };
 
     if let Some(recorded) = &plan.workspace {
-        session.record_workspace(recorded.path.clone(), recorded.files.clone());
+        session.record_workspace(recorded.path.clone(), recorded.files.clone(), recorded.directories.clone());
+    }
+    if let Some(settings) = &plan.configuration {
+        session.record_configuration(settings.clone());
     }
     // Each recorded event, in order, waits for the replies the original run
     // had already read, including events replaced by the session's auto-answer.
@@ -797,7 +849,18 @@ mod tests {
         let p = plan(&jsonl);
         let w = p.workspace.expect("a workspace");
         assert_eq!(w.path, PathBuf::from("/tmp/ws"));
-        assert_eq!(w.files, vec![("doc.txt".to_string(), "hello\n".to_string())]);
+        assert_eq!(w.files, vec![("doc.txt".to_string(), b"hello\n".to_vec())]);
+        assert!(p.configuration.is_none());
+    }
+
+    #[test]
+    fn recorded_settings_are_kept_for_the_answers() {
+        let jsonl = [
+            r#"{"t_ms": 0.0, "dir": "meta", "configuration": {"gopls": {"staticcheck": false}}}"#.to_string(),
+            line("out", 1.0, b""),
+        ]
+        .join("\n");
+        assert_eq!(plan(&jsonl).configuration, Some(json!({"gopls": {"staticcheck": false}})));
     }
 
     #[test]
@@ -1006,18 +1069,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_backslash_is_part_of_a_unix_file_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("workspace");
-        let mut guard = WorkspaceGuard::new(Some(&workspace(root.clone(), &[("nested\\doc.txt", "text")]))).unwrap();
-        let names: Vec<String> =
-            std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-        assert_eq!(names, vec!["nested\\doc.txt".to_string()]);
-        assert!(guard.remove());
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn a_workspace_symlink_is_refused_however_it_is_spelled() {
         use std::os::unix::fs::symlink;
 
@@ -1044,7 +1095,12 @@ mod tests {
     }
 
     fn workspace(path: PathBuf, files: &[(&str, &str)]) -> Workspace {
-        Workspace { path, files: files.iter().map(|(name, text)| ((*name).into(), (*text).into())).collect() }
+        Workspace {
+            path,
+            files: files.iter().map(|(name, text)| ((*name).into(), text.as_bytes().to_vec())).collect(),
+            directories: Vec::new(),
+            file_modes: std::collections::BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -1111,12 +1167,147 @@ mod tests {
     }
 
     #[test]
-    fn partially_written_workspace_is_cleaned_up() {
+    fn profile_regression_replay_rejects_nonportable_files_and_directories() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("workspace");
-        // An embedded NUL is a normal path component but the OS refuses to create it.
-        let w = workspace(root.clone(), &[("a", "one"), ("\0", "two")]);
+        let mut names =
+            vec!["missing.txt:payload".to_string(), "a\\b".to_string(), "file.".to_string(), "file ".to_string()];
+        names.extend(":<>\"|?*".chars().map(|c| format!("a/{c}/file")));
+        names.extend((0..=31).chain(127..=159).map(|c| format!("a/{}", char::from_u32(c).unwrap())));
+        for stem in ["CON", "PRN", "AUX", "NUL"] {
+            names.push(stem.to_string());
+            names.push(format!("a/{}.txt/file", stem.to_lowercase()));
+        }
+        for prefix in ["COM", "LPT"] {
+            for n in 1..=9 {
+                names.push(format!("{prefix}{n}"));
+                names.push(format!("a/{}{n}.txt/file", prefix.to_lowercase()));
+            }
+        }
+        for name in names {
+            let w = workspace(root.clone(), &[(&name, "unsafe")]);
+            assert!(WorkspaceGuard::new(Some(&w)).is_err(), "{name:?}");
+            let w = Workspace {
+                path: root.clone(),
+                files: Vec::new(),
+                directories: vec![name.clone()],
+                file_modes: std::collections::BTreeMap::new(),
+            };
+            assert!(WorkspaceGuard::new(Some(&w)).is_err(), "{name:?}");
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn profile_regression_recorded_bytes_and_empty_directories_are_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let recording = json!({
+            "dir": "meta", "workspace": root,
+            "files": {"assets/payload.bin": {"encoding": "base64", "data": "/wCA"}, "old.txt": "hello\n"},
+            "directories": ["cache/empty", "assets"]
+        });
+        let p = plan(&recording.to_string());
+        let mut guard = WorkspaceGuard::new(p.workspace.as_ref()).unwrap();
+        assert_eq!(std::fs::read(root.join("assets/payload.bin")).unwrap(), [255, 0, 128]);
+        assert_eq!(std::fs::read(root.join("old.txt")).unwrap(), b"hello\n");
+        assert_eq!(std::fs::read_dir(root.join("cache/empty")).unwrap().count(), 0);
+        assert!(guard.remove());
+        assert!(!root.exists());
+        let old = json!({"dir": "meta", "workspace": root, "files": {"old.txt": "old"}});
+        let p = plan(&old.to_string());
+        let mut guard = WorkspaceGuard::new(p.workspace.as_ref()).unwrap();
+        assert_eq!(std::fs::read(root.join("old.txt")).unwrap(), b"old");
+        assert!(guard.remove());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_file_modes_restore_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        // The transcript's numeric modes are Unix rwx bits: executable and
+        // read-only fixtures must retain their distinct access permissions.
+        let recording = json!({
+            "dir": "meta", "workspace": root,
+            "files": {"bin/helper": "helper", "readonly": "data"},
+            "file_modes": {"bin/helper": 0o751, "readonly": 0o440}
+        });
+        let p = plan(&recording.to_string());
+        let mut guard = WorkspaceGuard::new(p.workspace.as_ref()).unwrap();
+        assert_eq!(std::fs::metadata(root.join("bin/helper")).unwrap().permissions().mode() & 0o777, 0o751);
+        assert_eq!(std::fs::metadata(root.join("readonly")).unwrap().permissions().mode() & 0o777, 0o440);
+        assert!(guard.remove());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn workspace_file_modes_reject_invalid_entries_before_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        for (name, mode) in [("helper", 0o4755), ("unrecorded", 0o755), ("../outside", 0o755)] {
+            let recording = json!({
+                "dir": "meta", "workspace": root,
+                "files": {"helper": "helper"}, "file_modes": {name: mode}
+            });
+            let p = plan(&recording.to_string());
+            assert!(WorkspaceGuard::new(p.workspace.as_ref()).is_err());
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn profile_regression_directory_file_collisions_are_rejected_before_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        for name in ["a", "a/b"] {
+            let mut w = workspace(root.clone(), &[("a", "text")]);
+            w.directories.push(name.into());
+            assert!(WorkspaceGuard::new(Some(&w)).is_err());
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn profile_regression_partial_workspace_creation_is_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let long_name = "x".repeat(300);
+        let mut w = workspace(root.clone(), &[("a", "one"), (&long_name, "two")]);
+        w.directories.push("cache/empty".into());
         assert!(WorkspaceGuard::new(Some(&w)).is_err());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn profile_case_collisions_in_replay_are_rejected_before_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        for (left, left_directory, right, right_directory) in [
+            ("Settings.json", false, "settings.json", false),
+            ("src/one.txt", false, "SRC/two.txt", false),
+            ("src", true, "SRC", true),
+            ("src/empty", true, "SRC/other", true),
+            ("src/empty", true, "SRC/one.txt", false),
+            ("src", false, "SRC/empty", true),
+            ("src/one.txt", false, "SRC", true),
+        ] {
+            let mut w = workspace(root.clone(), &[]);
+            for (name, directory) in [(left, left_directory), (right, right_directory)] {
+                if directory {
+                    w.directories.push(name.into());
+                } else {
+                    w.files.push((name.into(), b"text".to_vec()));
+                }
+            }
+            let error = match WorkspaceGuard::new(Some(&w)) {
+                Ok(_) => panic!("accepted {left:?} and {right:?}"),
+                Err(error) => error,
+            };
+            assert!(error.contains(left) && error.contains(right) && error.contains("ASCII case"), "{error}");
+            assert!(!root.exists());
+        }
     }
 }
