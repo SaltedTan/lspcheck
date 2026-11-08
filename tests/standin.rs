@@ -201,6 +201,22 @@ fn only_fails(run: &Run, failing: &[&str]) {
     passes_except(run, &expected);
 }
 
+/// Like [`only_fails`], but a check may pass or fail when the scenario's
+/// output timing determines whether it observed a separate unasked response.
+fn only_fails_allowing(run: &Run, failing: &[&str], variable: &[&str]) {
+    for (id, verdict) in &run.verdicts {
+        if id == "L9" && !cfg!(unix) {
+            continue;
+        }
+        if variable.contains(&id.as_str()) {
+            assert!(matches!(verdict.as_str(), "pass" | "fail"), "{id}\n{}", run.stdout);
+        } else {
+            let want = if failing.contains(&id.as_str()) { "fail" } else { "pass" };
+            assert_eq!(verdict, want, "{id}\n{}", run.stdout);
+        }
+    }
+}
+
 /// Every check passes except those listed, which get the verdict given.
 fn passes_except(run: &Run, expected: &[(&str, &str)]) {
     for (id, verdict) in &run.verdicts {
@@ -239,6 +255,8 @@ fn only_fails_unread_with(run: &Run, failing: &[&str], inconclusive: &[&str]) {
 fn the_clean_standin_passes_every_check() {
     let r = run(&[], &[]);
     only_fails(&r, &[]);
+    expect(&r, "R1", "pass");
+    expect(&r, "R3", "pass");
     expect(&r, "R2", "pass");
     expect(&r, "R4", "pass");
     assert_eq!(r.status, 0, "{}", r.stdout);
@@ -253,6 +271,8 @@ fn the_clean_standin_passes_every_check() {
     assert!(r.stdout.contains("informative position(s) on character boundaries after the change"), "{}", r.stdout);
     assert!(r.stdout.contains("textDocument/hover (hoverProvider) returned InvalidParams (-32602)"), "{}", r.stdout);
     assert!(r.stdout.contains("all 8 requests got responses with their exact ids"), "{}", r.stdout);
+    assert!(r.stdout.contains("ParseError (-32700) response(s) with id null"), "{}", r.stdout);
+    assert!(r.stdout.contains("following didOpen of a 4 MiB document"), "{}", r.stdout);
     // D4 passed on evidence: the closed, the never-opened and the plain
     // request were all answered.
     assert!(r.stdout.contains("all three answered"), "{}", r.stdout);
@@ -411,11 +431,22 @@ fn lawful_variations_fail_nothing() {
         "await-progress-answer",
         "wrong-params-other-code",
         "trailing-fragment",
+        "silent-on-bad-json",
+        "slow-large-document",
     ] {
-        let r = fault(name);
+        let r = if name == "slow-large-document" {
+            run(&["--fault", name], &["--timeout", "1", "--startup-timeout", "10", "--large-document-mib", "2"])
+        } else {
+            fault(name)
+        };
         if name == "wrong-params-other-code" {
             expect(&r, "R2", "pass");
             assert!(r.stdout.contains("not InvalidParams (which is preferred)"), "{}", r.stdout);
+        }
+        if name == "slow-large-document" {
+            expect(&r, "R3", "pass");
+            assert!(r.server_stderr.contains("slow-large-document sleeping"), "{}", r.server_stderr);
+            assert!(r.stdout.contains("following didOpen of a 2 MiB document"), "{}", r.stdout);
         }
         // With no versioned publish for the opened document, D2 has nothing
         // to judge and is not exercised instead of passing. A server that
@@ -846,8 +877,9 @@ fn a_refused_initialize_is_an_error_not_a_failure() {
 #[test]
 fn replies_sent_before_their_requests_dont_count() {
     // The guessed ids are never sent, so they are unasked responses (J2); the
-    // fault also answers unknown requests wrongly (J4).
-    only_fails(&fault("early-replies"), &["J2", "J4"]);
+    // the fault also answers unknown requests wrongly (J4). R1 may or may not
+    // read those replies in its own evidence window.
+    only_fails_allowing(&fault("early-replies"), &["J2", "J4"], &["R1"]);
 }
 
 #[test]
@@ -899,14 +931,18 @@ fn odd_id_failures_survive_later_unreadable_output() {
 }
 
 #[test]
-fn a_skipped_frame_before_exit_makes_r2_inconclusive() {
+fn a_skipped_frame_before_exit_makes_r1_r2_r3_inconclusive() {
     // The plain request after the wrongly typed one is answered in a frame
     // over the limit, then the server exits: the skipped frame may have held
     // the answer, so R2 can't fail. Read whole, it passes.
-    let r = run(&["--fault", "big-reply-then-exit"], &["--only", "R2", "--max-frame-mib", "1"]);
-    expect(&r, "R2", "error");
-    let r = run(&["--fault", "big-reply-then-exit"], &["--only", "R2"]);
-    expect(&r, "R2", "pass");
+    // The same holds for R1 and R3, whose plain requests follow a non-JSON body
+    // and a large document.
+    for id in ["R1", "R2", "R3"] {
+        let r = run(&["--fault", "big-reply-then-exit"], &["--only", id, "--max-frame-mib", "1"]);
+        expect(&r, id, "error");
+        let r = run(&["--fault", "big-reply-then-exit"], &["--only", id]);
+        expect(&r, id, "pass");
+    }
 }
 
 #[test]
@@ -953,10 +989,63 @@ fn exiting_on_wrongly_typed_params_fails_r2() {
 }
 
 #[test]
+fn non_json_bodies_are_rejected_or_ignored_without_losing_service() {
+    let r = fault("parse-error-wrong-code");
+    only_fails(&r, &["R1"]);
+    expect(&r, "R1", "fail");
+    expect(&r, "J2", "pass");
+    expect(&r, "J5", "pass");
+    assert!(
+        r.stdout.contains("unmatched response with id null wasn't ParseError (-32700): error -32600"),
+        "{}",
+        r.stdout
+    );
+
+    let r = fault("silent-on-bad-json");
+    only_fails(&r, &[]);
+    expect(&r, "R1", "pass");
+    assert!(r.stdout.contains("ignored the non-JSON body"), "{}", r.stdout);
+
+    let r = fault("dies-on-bad-json");
+    only_fails(&r, &["R1"]);
+    expect(&r, "R1", "fail");
+}
+
+#[test]
+fn large_document_failure_and_transcript_replay() {
+    let r = fault("dies-on-large-document");
+    only_fails(&r, &["R3"]);
+    expect(&r, "R3", "fail");
+
+    let (r, transcripts, _keep) = run_with_transcripts(&[], &["--only", "R3"]);
+    expect(&r, "R3", "pass");
+    assert!(r.stdout.contains("following didOpen of a 4 MiB document"), "{}", r.stdout);
+    let transcript = transcripts.join("large-document.jsonl");
+    let out = replay(&transcript, &[], &[STANDIN]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("requests"), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+#[test]
+fn large_document_size_must_be_nonzero() {
+    let output = Command::new(LSPCHECK).args(["--large-document-mib", "0", "--", STANDIN]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--large-document-mib"), "{stderr}");
+    assert!(stderr.contains("invalid value"), "{stderr}");
+}
+
+#[test]
 fn duplicate_and_unsent_responses_fail_j2() {
     only_fails(&fault("reply-twice"), &["J2"]);
     let r = fault("reply-unsent-id");
-    only_fails(&r, &["J2"]);
+    only_fails_allowing(&r, &["J2"], &["R1"]);
     assert!(r.stdout.contains("which lspcheck never sent"), "{}", r.stdout);
 }
 
@@ -1351,7 +1440,10 @@ fn unreadable_frames_make_other_failures_inconclusive() {
 #[test]
 fn a_server_that_doesnt_open_documents_skips_d1() {
     let r = fault("no-open-close");
-    passes_except(&r, &[("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D5", "skip"), ("D6", "skip")]);
+    passes_except(
+        &r,
+        &[("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D5", "skip"), ("D6", "skip"), ("R3", "fail")],
+    );
     // D4 still runs: doc.txt on disk, never opened.
     assert!(r.stdout.contains("the document on disk (never opened)"), "{}", r.stdout);
     assert_eq!(r.status, 0, "{}", r.stdout);

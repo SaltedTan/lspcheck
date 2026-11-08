@@ -176,11 +176,25 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "textDocument_selectionRange"
     ),
     check!(
+        "R1",
+        CapabilitiesAndRobustness,
+        Policy,
+        "A well-framed body that isn't JSON gets ParseError (-32700) with id null or is ignored, and the server keeps serving",
+        "responseMessage"
+    ),
+    check!(
         "R2",
         CapabilitiesAndRobustness,
         Policy,
         "A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving",
         "responseMessage"
+    ),
+    check!(
+        "R3",
+        CapabilitiesAndRobustness,
+        Policy,
+        "A large document (default 4 MiB, configurable) is accepted or refused without the server failing",
+        "textDocument_didOpen"
     ),
     check!(
         "R4",
@@ -274,6 +288,8 @@ pub struct Config {
     pub exit_timeout: Duration,
     /// How long descendants may take to exit after the server does.
     pub leftover_grace: Duration,
+    /// Size of R3's document, in MiB.
+    pub large_document_mib: usize,
     pub max_body: usize,
     pub max_output: usize,
     /// Write each scenario's transcript into this directory.
@@ -334,6 +350,7 @@ pub struct Scenario {
 pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "lifecycle", checks: &["L2", "J4", "L4", "L6"] },
     Scenario { name: "json-rpc", checks: &["J6"] },
+    Scenario { name: "not-json", checks: &["R1"] },
     Scenario { name: "odd-ids", checks: &["R4"] },
     Scenario { name: "pre-initialize", checks: &["L1"] },
     Scenario { name: "exit-without-shutdown", checks: &["L7"] },
@@ -342,6 +359,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
     Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5", "D6"] },
     Scenario { name: "wrong-params", checks: &["R2"] },
+    Scenario { name: "large-document", checks: &["R3"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
 ];
 
@@ -419,8 +437,13 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
     match name {
         "lifecycle" => lifecycle(&mut ctx).await,
         "json-rpc" => json_rpc(&mut ctx).await,
-        // Both end with a graceful shutdown, not cleanup's kill, so output
+        // These end with a graceful shutdown, not cleanup's kill, so output
         // still in flight is read whole and leftovers are seen by L9.
+        "not-json" => {
+            if not_json(&mut ctx).await {
+                leave(&mut ctx).await;
+            }
+        }
         "odd-ids" => {
             if odd_ids(&mut ctx).await {
                 leave(&mut ctx).await;
@@ -434,6 +457,11 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         "documents" => documents(&mut ctx).await,
         "wrong-params" => {
             if wrong_params(&mut ctx).await {
+                leave(&mut ctx).await;
+            }
+        }
+        "large-document" => {
+            if large_document_scenario(&mut ctx).await {
                 leave(&mut ctx).await;
             }
         }
@@ -768,6 +796,111 @@ async fn json_rpc(ctx: &mut Ctx<'_>) {
         let _ = ctx.s.notify("exit", None).await;
         let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
     }
+}
+
+fn is_parse_error(m: &Message) -> bool {
+    matches!(&m.kind, Kind::Response { id: Id::Null, outcome: Outcome::Error { code: Some(codes::PARSE_ERROR), .. } })
+}
+
+fn unexpected_after_non_json(m: &Message, unmatched: &mut Vec<Id>) -> Option<String> {
+    let Kind::Response { id, outcome } = &m.kind else { return None };
+    let index = unmatched.iter().position(|unmatched_id| unmatched_id == id)?;
+    unmatched.remove(index);
+    if *id == Id::Null && is_parse_error(m) {
+        None
+    } else if *id == Id::Null {
+        Some(format!(
+            "after the non-JSON body, an unmatched response with id null wasn't ParseError (-32700): {}",
+            describe_outcome(outcome)
+        ))
+    } else {
+        Some(format!(
+            "after the non-JSON body, received an unmatched response with id {id}: {}",
+            describe_outcome(outcome)
+        ))
+    }
+}
+
+/// Sends a non-JSON body as a complete frame, then checks a fresh request to
+/// show the server kept serving.
+/// Returns whether initialize succeeded, so the scenario can end gracefully.
+async fn not_json(ctx: &mut Ctx<'_>) -> bool {
+    if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
+        ctx.initialize().await
+    {
+        ctx.report("R1", Verdict::Error, format!("initialize didn't succeed: {why}"));
+        return false;
+    }
+
+    let since = ctx.s.elapsed();
+    let before = ctx.s.messages.len();
+    let body = b"lspcheck: this body is not JSON {";
+    if let Err(error) = ctx.s.write_raw(&transport::encode(body)).await {
+        ctx.report("R1", Verdict::Error, format!("couldn't send a complete non-JSON frame: {error}"));
+        return true;
+    }
+
+    let id = ctx.s.fresh_id();
+    let t = ctx.cfg.request_timeout;
+    let probed = ctx.s.elapsed();
+    let reply = ctx.s.call_with_id(&id, PROBE, Some(json!({})), t).await;
+    let to = ctx.s.elapsed();
+    let alive = ctx.s.is_alive();
+    let messages = ctx.s.messages[before..].to_vec();
+    let parse_errors = messages.iter().filter(|(_, message)| is_parse_error(message)).count();
+    let mut unmatched = ctx.s.unmatched_ids(since);
+    let unexpected: Vec<String> =
+        messages.iter().filter_map(|(_, message)| unexpected_after_non_json(message, &mut unmatched)).collect();
+
+    if !unexpected.is_empty() {
+        let detail = unexpected.join("; ");
+        ctx.report_judged("R1", since, to, |missed| {
+            (Verdict::Fail, format!("{detail}{}", missed.map_or(String::new(), |why| format!("; {why}"))))
+        });
+        return true;
+    }
+
+    match reply {
+        Ok(_) => ctx.report_judged("R1", since, to, |missed| {
+            if let Some(why) = missed {
+                (Verdict::Error, format!("inconclusive because {why}"))
+            } else if parse_errors > 0 {
+                (
+                    Verdict::Pass,
+                    format!(
+                        "the server returned {parse_errors} ParseError (-32700) response(s) with id null and answered a later plain request"
+                    ),
+                )
+            } else {
+                (Verdict::Pass, "the server ignored the non-JSON body and answered a later plain request".into())
+            }
+        }),
+        Err(error) if !alive => {
+            let status = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+            let detail = status.map_or_else(
+                || "the server exited after the non-JSON body and did not answer the plain request".into(),
+                |status| {
+                    format!(
+                        "the server exited with {} after the non-JSON body and did not answer the plain request",
+                        session::describe_status(status)
+                    )
+                },
+            );
+            // A delivered plain request's answer may be in output lspcheck
+            // couldn't read while it waited, so keep that window.
+            match error {
+                CallError::Wait(_) => ctx.fail_absent_between("R1", probed, to, detail),
+                CallError::Write(_) => ctx.fail("R1", detail),
+            }
+        }
+        Err(error) => ctx.fail_call(
+            "R1",
+            since,
+            format!("the server didn't answer a plain request after the non-JSON body ({})", describe_call_error(&error, t)),
+            &error,
+        ),
+    }
+    true
 }
 
 /// Requests whose ids cover the less common values allowed by LSP 3.17.
@@ -1346,6 +1479,154 @@ async fn wrong_params(ctx: &mut Ctx<'_>) -> bool {
             ctx.fail_absent("R2", since, format!("{method} returned {error}; {detail}"));
         }
         Err(StepFailure::Unsent(why)) => ctx.report("R2", Verdict::Error, format!("{method} returned {error}; {why}")),
+    }
+    true
+}
+
+fn large_document(mib: usize) -> Result<String, String> {
+    const LINE_BYTES: usize = 80;
+    const WORDS: &[&str] = &[
+        "protocol",
+        "diagnostic",
+        "workspace",
+        "document",
+        "position",
+        "request",
+        "response",
+        "language",
+        "server",
+        "client",
+        "symbol",
+        "encoding",
+        "range",
+        "change",
+        "version",
+        "method",
+        "result",
+        "error",
+        "stream",
+        "syntax",
+        "parser",
+        "buffer",
+        "feature",
+        "module",
+        "source",
+        "token",
+        "project",
+        "compile",
+        "inspect",
+        "resolve",
+        "thread",
+        "signal",
+    ];
+    let bytes =
+        mib.checked_mul(1024 * 1024).ok_or_else(|| "the requested document size overflows usize".to_string())?;
+    let mut text = String::new();
+    text.try_reserve_exact(bytes).map_err(|error| format!("couldn't allocate a {mib} MiB document: {error}"))?;
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    while text.len() < bytes {
+        let line_start = text.len();
+        let line_end = line_start.saturating_add(LINE_BYTES).min(bytes);
+        while text.len() + 1 < line_end {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let word = WORDS[(state as usize) % WORDS.len()];
+            if text.len() > line_start {
+                text.push(' ');
+            }
+            let remaining = line_end - text.len() - 1;
+            text.push_str(&word[..word.len().min(remaining)]);
+        }
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+/// Opens a configurable large plain-text document, then verifies a plain
+/// request is answered within the startup deadline.
+/// Returns whether initialize succeeded, so the scenario can end gracefully.
+async fn large_document_scenario(ctx: &mut Ctx<'_>) -> bool {
+    if let Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) =
+        ctx.initialize().await
+    {
+        ctx.report("R3", Verdict::Error, format!("initialize didn't succeed: {why}"));
+        return false;
+    }
+    let mib = ctx.cfg.large_document_mib;
+    let text = match large_document(mib) {
+        Ok(text) => text,
+        Err(why) => {
+            ctx.report("R3", Verdict::Error, why);
+            return true;
+        }
+    };
+    let path = ctx.root.join("lspcheck-large.txt");
+    if let Err(error) = std::fs::write(&path, text.as_bytes()) {
+        ctx.report("R3", Verdict::Error, format!("couldn't write the large document: {error}"));
+        return true;
+    }
+    ctx.s.record_workspace(ctx.root.clone(), workspace_files(&ctx.root));
+    let uri = file_uri(&path);
+    if let Err(error) = ctx
+        .s
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "plaintext",
+                    "version": 1,
+                    "text": text
+                }
+            })),
+        )
+        .await
+    {
+        ctx.report("R3", Verdict::Error, format!("couldn't send a complete didOpen: {error}"));
+        return true;
+    }
+
+    let since = ctx.s.elapsed();
+    let started = Instant::now();
+    let timeout = ctx.cfg.startup_timeout;
+    let reply = ctx.s.call(PROBE, Some(json!({})), timeout).await;
+    let waited = ctx.s.elapsed();
+    match reply {
+        Ok(_) => ctx.pass_with(
+            "R3",
+            format!(
+                "answered a plain request after {:.3} s following didOpen of a {mib} MiB document",
+                started.elapsed().as_secs_f64()
+            ),
+        ),
+        Err(error) => {
+            let detail = format!(
+                "didn't answer a plain request within {} s after didOpen of a {mib} MiB document ({})",
+                timeout.as_secs(),
+                describe_call_error(&error, timeout)
+            );
+            if !ctx.s.is_alive() {
+                let status = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+                let detail = status.map_or_else(
+                    || format!("the server exited after didOpen of the {mib} MiB document; {detail}"),
+                    |status| {
+                        format!(
+                            "the server exited with {} after didOpen of the {mib} MiB document; {detail}",
+                            session::describe_status(status)
+                        )
+                    },
+                );
+                // A delivered plain request's answer may be in output lspcheck
+                // couldn't read while it waited, so keep that window.
+                match error {
+                    CallError::Wait(_) => ctx.fail_absent_between("R3", since, waited, detail),
+                    CallError::Write(_) => ctx.fail("R3", detail),
+                }
+            } else {
+                ctx.fail_call("R3", since, detail, &error);
+            }
+        }
     }
     true
 }
@@ -2950,6 +3231,7 @@ const J3_SCENARIOS: &[&str] = &[
     "cancellation",
     "documents",
     "wrong-params",
+    "large-document",
     "end-of-input",
     "exit-without-shutdown",
 ];
@@ -2958,8 +3240,9 @@ const J3_SCENARIOS: &[&str] = &[
 /// (`id` missing or null) is read after `initialized`, to the end of the
 /// session (a reply to `exit` answers a notification too), or until a write
 /// of lspcheck's stopped partway through a frame: the server may answer that
-/// malformed input with a null-id error. (Such a write also makes the
-/// session's evidence incomplete, so a pass becomes an error.)
+/// malformed input with a null-id error. The `not-json` scenario is excluded
+/// because its complete body is deliberately not JSON. A write that stopped
+/// partway through a frame also stops the J3 window and makes evidence incomplete.
 fn judge_j3(runs: &[ScenarioRun]) -> CheckResult {
     let mut failures = Vec::new();
     let mut incomplete: Option<(&'static str, String)> = None;
@@ -3321,6 +3604,19 @@ pub fn file_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_document_has_the_requested_size_and_bounded_lines() {
+        let mib = 2;
+        let bytes = mib * 1024 * 1024;
+        let document = large_document(mib).unwrap();
+        assert_eq!(document.len(), bytes);
+        assert!(document.is_ascii());
+        assert!(document.ends_with('\n'));
+        let lines: Vec<&str> = document.strip_suffix('\n').unwrap().split('\n').collect();
+        assert!(lines[..lines.len() - 1].iter().all(|line| line.len() == 79));
+        assert_eq!(lines.last().unwrap().len(), bytes % 80 - 1);
+    }
 
     #[test]
     fn j6_fails_on_a_delivered_request_left_unanswered_even_if_the_rest_couldnt_be_sent() {

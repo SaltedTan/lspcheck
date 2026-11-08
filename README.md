@@ -2,8 +2,8 @@
 
 lspcheck starts a language server and checks that it speaks the
 [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) correctly. It checks message
-framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, document positions, request parameter handling and
-unusual request ids, and whether the server leaves processes behind. It
+framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, document positions, request parameter handling,
+malformed JSON and large-document robustness, unusual request ids, and whether the server leaves processes behind. It
 works with any server that talks over stdio, whatever language it is written in, and needs no configuration.
 
 Example output from the development version (see [Unreleased](CHANGELOG.md#unreleased)):
@@ -58,16 +58,20 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
                      3 informative position(s) on character boundaries about the line-ending document, counted in UTF-16 code units; 32 position(s) about it
   SKIP  D6  MUST    A selectionRange result has one entry per position, each range contains its position, and each parent contains its child
                      the server advertises no selectionRangeProvider, so lspcheck sends no selectionRange request
+  PASS  R1  POLICY  A well-framed body that isn't JSON gets ParseError (-32700) with id null or is ignored, and the server keeps serving
+                     the server returned ParseError (-32700) with id null and answered a later plain request
   FAIL  R2  POLICY  A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving
                      textDocument/hover returned a result for parameters of the wrong types: "null"
+  PASS  R3  POLICY  A large document (default 4 MiB, configurable) is accepted or refused without the server failing
+                     answered a plain request after 0.012 s following didOpen of a 4 MiB document
   PASS  R4  POLICY  Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string
                      all 8 requests got responses with their exact ids
-35 checks: 30 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 1 skipped, 0 not exercised, 0 errors
+37 checks: 32 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 1 skipped, 0 not exercised, 0 errors
 ```
 
 lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions and
-parameter and request-id robustness.
-The [robustness reference](docs/design.md#capabilities-and-robustness) explains R2 and R4's verdict rules.
+parameter, malformed-body, large-document and request-id robustness.
+The [robustness reference](docs/design.md#capabilities-and-robustness) explains the R checks' verdict rules.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
@@ -138,6 +142,7 @@ versions, and the [changelog](CHANGELOG.md) says which. The exit status fails th
 ```sh
 lspcheck -- my-server --stdio            # run every check
 lspcheck --only L4,L6 -- my-server       # run some checks
+lspcheck --large-document-mib 8 -- my-server --stdio
 lspcheck --json report.json --transcripts out/ -- my-server
 lspcheck --junit report.xml --markdown summary.md -- my-server
 lspcheck list                            # every check, with its specification section
@@ -217,6 +222,20 @@ A server that advertises no `selectionRangeProvider` leaves D6 `SKIP`; one that 
 no reply, or whose ranges can't be compared, leaves it `N/E`. A `selectionRange` request lspcheck couldn't send, or one
 cut off because the server's output closed, makes D6 `ERROR` unless it already failed.
 
+R1 sends a complete, correctly framed body that isn't JSON. The server may
+ignore it, or reply with JSON-RPC `ParseError` (`-32700`) and `id: null`; it
+must then answer a plain request. A wrong response or a delivered request that
+goes unanswered fails R1. The intentionally malformed body is not included in
+J3's no-response-to-notifications check; J2 treats null-id responses as
+unassigned, and J5 still validates their envelopes.
+
+R3 opens `lspcheck-large.txt` as `plaintext` with 4 MiB of text by default.
+`--large-document-mib N` changes the size and must be greater than zero. After
+the complete `didOpen`, lspcheck waits up to `--startup-timeout` for a plain
+request to be answered. The server may accept or refuse the document, but must
+remain serving. A `didOpen` or probe that lspcheck can't deliver is `ERROR`;
+an unanswered delivered probe fails only when lspcheck's evidence is complete.
+
 With `--transcripts DIR`, lspcheck writes one JSON Lines file per scenario. It holds the bytes that reached the server's
 stdin and the bytes read from its stdout, exactly as written and read, how lspcheck split them into frames, the first MiB of
 stderr, and timestamps, so you can see what happened in a failing scenario. Each file includes a meta line naming the
@@ -246,7 +265,7 @@ These are lspcheck's own limits, not protocol rules: past them it keeps reading 
 inspecting. A reply that never arrived is then reported as `ERROR` (inconclusive), not `FAIL`, if a frame lspcheck
 skipped was arriving at any time between sending the request and giving up on the reply, or lspcheck stopped inspecting
 before it gave up, since the reply might have been in what it didn't inspect. See the
-[robustness reference](docs/design.md#capabilities-and-robustness) for R4's treatment of multiple unanswered ids.
+[robustness reference](docs/design.md#capabilities-and-robustness) for R1, R3 and R4's evidence rules.
 A frame that was complete before the request was sent can't have held its reply, so it excuses nothing.
 Likewise, a `PASS` or `NOT EXERCISED` that relied on lspcheck seeing everything in a window becomes `ERROR` if it finds,
 once the server's output has been read to the end, that it missed something there (a frame still arriving at the time

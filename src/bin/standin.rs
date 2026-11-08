@@ -14,6 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 
+const R1_BAD_JSON: &[u8] = b"lspcheck: this body is not JSON {";
+
 const FAULTS: &[(&str, &str)] = &[
     ("stdout-banner", "print a line to stdout before the first frame"),
     ("preinit-banner", "print a line to stdout when a request arrives before initialize"),
@@ -25,6 +27,9 @@ const FAULTS: &[(&str, &str)] = &[
     ("trailing-junk", "send one non-ASCII notification whose body is JSON then a header and {}, correctly counted"),
     ("newline-after-body", "lawful: end every outgoing body with a newline, counted in its Content-Length"),
     ("bad-bodies", "on initialize, send 70 frames whose body isn't JSON"),
+    ("parse-error-wrong-code", "answer a non-JSON body with InvalidRequest (-32600), not ParseError"),
+    ("silent-on-bad-json", "lawful: ignore a non-JSON body without answering it"),
+    ("dies-on-bad-json", "exit when a non-JSON body arrives"),
     ("json-into-next-header", "send a correctly counted body that the next frame's first header line would complete"),
     ("json-into-bad-header", "like json-into-next-header, with a space before that header line, making it invalid"),
     ("long-miscount", "send one long non-ASCII log message declaring a Content-Length of 1"),
@@ -65,10 +70,14 @@ const FAULTS: &[(&str, &str)] = &[
     ("wrong-params-result-and-error", "answer wrongly typed params with both result and error"),
     (
         "trailing-fragment",
-        "lawful: after the last odd-id probe, and after the probe that follows wrongly typed params, begin a \
-         logMessage and finish it only when shutdown arrives",
+        "lawful: after the last odd-id probe, and after the probe that follows wrongly typed params, a non-JSON \
+         body or a large document, begin a logMessage and finish it only when shutdown arrives",
     ),
-    ("big-reply-then-exit", "answer the probe that follows wrongly typed params with a 2 MiB error, then exit"),
+    (
+        "big-reply-then-exit",
+        "answer the probe that follows wrongly typed params, a non-JSON body or a large document with a 2 MiB error, \
+         then exit",
+    ),
     ("reply-twice", "answer every lspcheck/probe twice"),
     ("reply-unsent-id", "after initialize, send a response with an id lspcheck never used"),
     ("reply-to-notification", "answer an unknown notification with an error whose id is null"),
@@ -156,7 +165,9 @@ const FAULTS: &[(&str, &str)] = &[
         "answer initialized twice with an error whose id is null, once a cancel arrives",
     ),
     ("big-frame-after-drop", "after dropping a request, send a 2 MiB log message with the next answer"),
-    ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
+    ("no-open-close", "don't ask for didOpen, but exit if one arrives"),
+    ("dies-on-large-document", "exit when a document larger than 1 MiB is opened"),
+    ("slow-large-document", "lawful: take 3 s to process a document larger than 1 MiB"),
     ("utf8-positions-as-utf16", "count positions in UTF-8 bytes while UTF-16 is negotiated"),
     ("codepoint-positions", "count positions in code points while UTF-16 is negotiated"),
     ("lf-only-lines", "split lines at \\n only; a \\r is an ordinary character"),
@@ -287,8 +298,9 @@ fn main() {
     let mut initialized_reply = fault("initialized-reply-after-cancel");
     // For null-reply-after-first-probe: whether a request was answered since initialize.
     let mut answered_one = false;
-    // A wrongly typed request was just answered, and the next probe not yet.
-    let mut after_wrong_params = false;
+    // Wrongly typed params, a non-JSON body or a large document just came,
+    // and the next probe not yet.
+    let mut after_odd_input = false;
     // The rest of a notification begun after the checks were done, written
     // only once `shutdown` arrives.
     let mut unfinished: Option<Vec<u8>> = None;
@@ -341,7 +353,23 @@ fn main() {
         {
             continue;
         }
-        let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
+        let msg = match serde_json::from_slice::<Value>(&body) {
+            Ok(msg) => msg,
+            Err(_) => {
+                if body.as_slice() != R1_BAD_JSON {
+                    continue;
+                }
+                if fault("dies-on-bad-json") {
+                    std::process::exit(2);
+                }
+                if !fault("silent-on-bad-json") {
+                    let code = if fault("parse-error-wrong-code") { -32600 } else { -32700 };
+                    out.frame(&err(&Value::Null, code, "parse error"));
+                }
+                after_odd_input = true;
+                continue;
+            }
+        };
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
         // An answer to one of this server's own requests: nothing to do.
         if msg.get("method").is_none() && (msg.get("result").is_some() || msg.get("error").is_some()) {
@@ -436,6 +464,16 @@ fn main() {
                     msg.pointer("/params/textDocument/text").and_then(Value::as_str),
                 )
             {
+                let large = text.len() > 1024 * 1024;
+                after_odd_input |= large;
+                if large && fault("dies-on-large-document") {
+                    eprintln!("standin: dies-on-large-document");
+                    std::process::exit(2);
+                }
+                if large && fault("slow-large-document") {
+                    eprintln!("standin: slow-large-document sleeping");
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
                 let version = msg.pointer("/params/textDocument/version").and_then(Value::as_i64).unwrap_or(0);
                 docs.insert(uri.to_string(), (text.to_string(), version));
                 if fault("close-stdin-before-change") && text.contains("word") {
@@ -457,7 +495,7 @@ fn main() {
                     );
                     std::process::exit(0);
                 }
-                if !fault("no-diagnostics") {
+                if !fault("no-diagnostics") && !large {
                     let mut label = Some(json!(version));
                     if fault("diagnostics-own-version") {
                         // Its own counter instead: versions the document never had.
@@ -957,7 +995,7 @@ fn main() {
                 reply["result"] = Value::Null;
             }
             out.frame(&reply);
-            after_wrong_params = true;
+            after_odd_input = true;
             continue;
         }
         if std::mem::take(&mut dropped) && fault("big-frame-after-drop") {
@@ -969,8 +1007,8 @@ fn main() {
         if fault("reply-twice") && method == "lspcheck/probe" {
             out.frame(&err(&id, -32601, "method not found"));
         }
-        let follows_wrong_params = method == "lspcheck/probe" && std::mem::take(&mut after_wrong_params);
-        if follows_wrong_params && fault("big-reply-then-exit") {
+        let follows_odd_input = method == "lspcheck/probe" && std::mem::take(&mut after_odd_input);
+        if follows_odd_input && fault("big-reply-then-exit") {
             let mut reply = err(&id, -32601, "method not found");
             reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
             out.frame(&reply);
@@ -1092,7 +1130,7 @@ fn main() {
                 reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
                 out.frame(&reply);
             }
-            "lspcheck/probe" if fault("trailing-fragment") && (follows_wrong_params || id == json!("7")) => {
+            "lspcheck/probe" if fault("trailing-fragment") && (follows_odd_input || id == json!("7")) => {
                 let mut reply = out.encode(&err(&id, -32601, "method not found"));
                 let bytes = out.encode(&json!({
                     "jsonrpc": "2.0",

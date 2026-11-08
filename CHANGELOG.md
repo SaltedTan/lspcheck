@@ -16,9 +16,13 @@
 
 - `--junit PATH` and `--markdown PATH` add CI reports alongside JSON. See [usage](README.md#use) and the
   [report format reference](docs/design.md#report).
+- R1 sends a correctly framed body that isn't JSON and checks for a null-id ParseError (or the body being ignored)
+  and that the server keeps serving; R3 opens a large document (`--large-document-mib`, 4 MiB by default) and
+  checks that the server keeps serving.
 - Added R2, which sends wrongly typed parameters to an advertised request and checks for an error response and continued
   service, and R4, which checks exact round-trips for valid unusual request ids.
-- Preserve each unanswered R4 request's evidence window and include both robustness scenarios in J3's verdict.
+- Keep each unanswered R4 request's evidence window. J3 includes the well-formed R2, R3 and R4 scenarios, but not R1's
+  deliberately malformed-input scenario.
 
 ## 0.1.0 (2026-11-08)
 
