@@ -887,7 +887,7 @@ async fn not_json(ctx: &mut Ctx<'_>) {
                 describe_call_error(&error, t)
             );
             match error {
-                CallError::Wait(_) => ctx.fail_absent_between("R1", since, to, detail),
+                CallError::Wait(_) => ctx.fail_absent_between("R1", probed, to, detail),
                 CallError::Write(_) => ctx.report("R1", Verdict::Error, detail),
             }
         }

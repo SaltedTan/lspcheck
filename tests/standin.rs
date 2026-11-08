@@ -217,22 +217,6 @@ fn only_fails(run: &Run, failing: &[&str]) {
     passes_except(run, &expected);
 }
 
-/// Like [`only_fails`], but a check may pass or fail when the scenario's
-/// output timing determines whether it observed a separate unasked response.
-fn only_fails_allowing(run: &Run, failing: &[&str], variable: &[&str]) {
-    for (id, verdict) in &run.verdicts {
-        if id == "L9" && !cfg!(unix) {
-            continue;
-        }
-        if variable.contains(&id.as_str()) {
-            assert!(matches!(verdict.as_str(), "pass" | "fail"), "{id}\n{}", run.stdout);
-        } else {
-            let want = if failing.contains(&id.as_str()) { "fail" } else { "pass" };
-            assert_eq!(verdict, want, "{id}\n{}", run.stdout);
-        }
-    }
-}
-
 /// Every check passes except those listed, which get the verdict given.
 fn passes_except(run: &Run, expected: &[(&str, &str)]) {
     for (id, verdict) in &run.verdicts {
@@ -871,10 +855,7 @@ fn a_refused_initialize_is_an_error_not_a_failure() {
 
 #[test]
 fn replies_sent_before_their_requests_dont_count() {
-    // The guessed ids are never sent, so they are unasked responses (J2); the
-    // the fault also answers unknown requests wrongly (J4). R1 may or may not
-    // read those replies in its own evidence window.
-    only_fails_allowing(&fault("early-replies"), &["J2", "J4"], &["R1"]);
+    only_fails(&fault("early-replies"), &["J2", "J4"]);
 }
 
 #[test]
