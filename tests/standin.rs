@@ -216,13 +216,17 @@ fn passes_except(run: &Run, expected: &[(&str, &str)]) {
 /// (F1): such a frame might have been a response or message the correlation
 /// and envelope checks judge, so J1, J2, J5 and J7 are inconclusive.
 fn only_fails_unread(run: &Run, failing: &[&str]) {
+    only_fails_unread_with(run, failing, &["J1", "J2", "J5", "J7"]);
+}
+
+fn only_fails_unread_with(run: &Run, failing: &[&str], inconclusive: &[&str]) {
     for (id, verdict) in &run.verdicts {
         if id == "L9" && !cfg!(unix) {
             continue;
         }
         let want = if failing.contains(&id.as_str()) {
             "fail"
-        } else if ["J1", "J2", "J5", "J7"].contains(&id.as_str()) {
+        } else if inconclusive.contains(&id.as_str()) {
             "error"
         } else {
             "pass"
@@ -235,6 +239,8 @@ fn only_fails_unread(run: &Run, failing: &[&str]) {
 fn the_clean_standin_passes_every_check() {
     let r = run(&[], &[]);
     only_fails(&r, &[]);
+    expect(&r, "R2", "pass");
+    expect(&r, "R4", "pass");
     assert_eq!(r.status, 0, "{}", r.stdout);
     assert_eq!(r.verdicts.len(), lspcheck::checks::CATALOGUE.len());
     // D1, D2 and D3 passed on evidence, not for lack of it.
@@ -245,6 +251,8 @@ fn the_clean_standin_passes_every_check() {
         r.stdout
     );
     assert!(r.stdout.contains("informative position(s) on character boundaries after the change"), "{}", r.stdout);
+    assert!(r.stdout.contains("textDocument/hover (hoverProvider) returned InvalidParams (-32602)"), "{}", r.stdout);
+    assert!(r.stdout.contains("all 8 requests got responses with their exact ids"), "{}", r.stdout);
     // D4 passed on evidence: the closed, the never-opened and the plain
     // request were all answered.
     assert!(r.stdout.contains("all three answered"), "{}", r.stdout);
@@ -401,8 +409,14 @@ fn lawful_variations_fail_nothing() {
         "empty-selection",
         "reuse-answered-request-id",
         "await-progress-answer",
+        "wrong-params-other-code",
+        "trailing-fragment",
     ] {
         let r = fault(name);
+        if name == "wrong-params-other-code" {
+            expect(&r, "R2", "pass");
+            assert!(r.stdout.contains("not InvalidParams (which is preferred)"), "{}", r.stdout);
+        }
         // With no versioned publish for the opened document, D2 has nothing
         // to judge and is not exercised instead of passing. A server that
         // takes no changes gives D3 none to judge, so it skips.
@@ -613,7 +627,7 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
 fn a_content_length_counted_in_characters_fails_f2() {
     let r = fault("char-length");
     // The frame can't be read either, so F1 fails too.
-    only_fails_unread(&r, &["F1", "F2"]);
+    only_fails_unread_with(&r, &["F1", "F2"], &["J1", "J2", "J3", "J5", "J7", "R4"]);
     assert!(r.stdout.contains("counts characters, but"), "{}", r.stdout);
     // Also with whitespace after the JSON, or an extension header before the next frame's Content-Length.
     for other in ["newline-after-body", "extension-header", "long-header"] {
@@ -671,15 +685,16 @@ fn escaped_non_ascii_output_leaves_f2_not_exercised() {
 fn a_server_lost_on_the_f2_probe_doesnt_fail_what_follows() {
     // The probe for F2's evidence has a string id, and this server exits on
     // it. F3's last part comes after it, and isn't run. The same exit leaves
-    // the concurrent string-id requests unanswered, so J6 fails: that is the
-    // rule this server breaks, not an artefact of what follows.
+    // concurrent and odd string-id requests unanswered, so J6 and R4 fail.
     let r = fault("exit-on-string-id");
     expect(&r, "F2", "not-exercised");
     expect(&r, "F3", "pass");
     expect(&r, "J1", "not-exercised");
     expect(&r, "J6", "fail");
+    expect(&r, "R4", "fail");
     assert!(r.stdout.contains("the part that splits multibyte characters wasn't run"), "{}", r.stdout);
-    assert!(r.verdicts.iter().all(|(id, v)| v != "fail" || id == "J6"), "{}", r.stdout);
+    assert!(r.stdout.contains("the server exited with status 2"), "{}", r.stdout);
+    assert!(r.verdicts.iter().all(|(id, v)| v != "fail" || matches!(id.as_str(), "J6" | "R4")), "{}", r.stdout);
 }
 
 #[test]
@@ -712,11 +727,13 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
     // no position or versioned diagnostics come back, which says nothing
     // about how it counts them. It had stopped answering before D4's
     // requests, so their going unanswered says nothing about documents that
-    // aren't open: D4 is an error.
+    // aren't open: D4 is an error. R4 also fails because this request includes
+    // a valid non-ASCII string id that the server can't parse.
     passes_except(
         &r,
         &[
             ("F5", "fail"),
+            ("R4", "fail"),
             ("F2", "not-exercised"),
             ("D1", "not-exercised"),
             ("D2", "not-exercised"),
@@ -812,6 +829,7 @@ fn bad_initialize_results_fail_l2() {
             ("D4", "skip"),
             ("D5", "skip"),
             ("D6", "skip"),
+            ("R2", "not-exercised"),
         ],
     );
 }
@@ -842,9 +860,96 @@ fn wrong_unknown_method_errors_fail_j4() {
 fn a_string_id_answered_as_a_number_fails_j1() {
     let r = fault("string-id-to-number");
     // The concurrent request whose id was changed never gets a reply with its
-    // own id, so J6 fails too: one fault, two rules.
-    only_fails(&r, &["J1", "J6"]);
+    // own id, so J6 fails too; R4 also checks the numeric-looking string id.
+    only_fails(&r, &["J1", "J6", "R4"]);
+    expect(&r, "R4", "fail");
     assert!(r.stdout.contains("where lspcheck sent"), "{}", r.stdout);
+}
+
+#[test]
+fn mangled_odd_string_ids_fail_r4() {
+    let r = fault("mangles-odd-ids");
+    expect(&r, "R4", "fail");
+    assert!(
+        r.verdicts.iter().all(|(id, verdict)| { verdict != "fail" || matches!(id.as_str(), "R4" | "J1" | "J2") }),
+        "{}",
+        r.stdout
+    );
+    assert!(r.stdout.contains("likely id mangling"), "{}", r.stdout);
+}
+
+#[test]
+fn negative_integer_ids_must_get_a_response() {
+    let r = fault("drops-negative-ids");
+    only_fails(&r, &["R4"]);
+    expect(&r, "R4", "fail");
+    assert!(r.stdout.contains("-1"), "{}", r.stdout);
+}
+
+#[test]
+fn odd_id_failures_survive_later_unreadable_output() {
+    let r = run(
+        &["--fault", "drops-negative-ids", "--fault", "big-frame-after-drop", "--fault", "char-length"],
+        &["--max-frame-mib", "1"],
+    );
+    expect(&r, "R4", "fail");
+    expect(&r, "J3", "error");
+    assert!(r.stdout.contains("-1"), "{}", r.stdout);
+    assert!(r.stdout.contains("inspection limit"), "{}", r.stdout);
+}
+
+#[test]
+fn a_skipped_frame_before_exit_makes_r2_inconclusive() {
+    // The plain request after the wrongly typed one is answered in a frame
+    // over the limit, then the server exits: the skipped frame may have held
+    // the answer, so R2 can't fail. Read whole, it passes.
+    let r = run(&["--fault", "big-reply-then-exit"], &["--only", "R2", "--max-frame-mib", "1"]);
+    expect(&r, "R2", "error");
+    let r = run(&["--fault", "big-reply-then-exit"], &["--only", "R2"]);
+    expect(&r, "R2", "pass");
+}
+
+#[test]
+fn accepting_wrongly_typed_params_fails_r2() {
+    let r = fault("accepts-wrong-params");
+    only_fails(&r, &["R2"]);
+    expect(&r, "R2", "fail");
+    assert!(r.stdout.contains("returned a result for parameters of the wrong types"), "{}", r.stdout);
+}
+
+#[test]
+fn malformed_errors_fail_r2() {
+    for (name, problem) in [
+        ("wrong-params-null-error", "code isn't an integer"),
+        ("wrong-params-string-code", "code isn't an integer"),
+        ("wrong-params-large-code", "outside LSP's integer range"),
+        ("wrong-params-missing-message", "message isn't a string"),
+        ("wrong-params-numeric-message", "message isn't a string"),
+        ("wrong-params-result-and-error", "both \"result\" and \"error\""),
+    ] {
+        let r = run(&["--fault", name], &["--only", "R2,J5"]);
+        only_fails(&r, &["R2", "J5"]);
+        expect(&r, "R2", "fail");
+        expect(&r, "J5", "fail");
+        assert_eq!(r.status, 1, "{name}\n{}", r.stdout);
+        assert!(r.stdout.contains("returned a malformed response instead of an error"), "{name}\n{}", r.stdout);
+        assert!(r.stdout.contains(problem), "{name}\n{}", r.stdout);
+    }
+    for args in [vec![], vec!["--fault", "wrong-params-other-code"]] {
+        let r = run(&args, &["--only", "R2,J5"]);
+        only_fails(&r, &[]);
+        expect(&r, "R2", "pass");
+        expect(&r, "J5", "pass");
+        assert_eq!(r.status, 0, "{}", r.stdout);
+    }
+}
+
+#[test]
+fn exiting_on_wrongly_typed_params_fails_r2() {
+    let r = fault("dies-on-wrong-params");
+    only_fails(&r, &["R2"]);
+    expect(&r, "R2", "fail");
+    assert!(r.stdout.contains("closed its stdout without responding"), "{}", r.stdout);
 }
 
 #[test]
@@ -960,7 +1065,7 @@ fn malformed_envelopes_fail_j5() {
 #[test]
 fn dropping_a_concurrent_request_fails_j6() {
     // Protocol order decides this, not where the OS ended its reads: J6's batch
-    // is the only one with an all-digit string id, and all four requests are
+    // is the only one with a six-digit string id, and all four requests are
     // written before any reply is read, so the next frame is always there.
     let r = fault("drop-concurrent");
     only_fails(&r, &["J6"]);

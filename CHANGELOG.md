@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Robustness checks avoid false framing failures and missed leftover processes during cleanup; R2 stays inconclusive
+  when skipped output could contain the follow-up reply, even if the server exits.
+- R2 rejects malformed error responses, including invalid codes and missing or non-string messages.
 - Terminal, JUnit and Markdown reports reference the transcripts directory for cross-cutting failures and errors.
 - Markdown keeps character references and tildes literal in table cells and makes CR/LF visible in commands and
   transcript paths.
@@ -13,6 +16,9 @@
 
 - `--junit PATH` and `--markdown PATH` add CI reports alongside JSON. See [usage](README.md#use) and the
   [report format reference](docs/design.md#report).
+- Added R2, which sends wrongly typed parameters to an advertised request and checks for an error response and continued
+  service, and R4, which checks exact round-trips for valid unusual request ids.
+- Preserve each unanswered R4 request's evidence window and include both robustness scenarios in J3's verdict.
 
 ## 0.1.0 (2026-11-08)
 

@@ -353,7 +353,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn result(id: &'static str, verdict: Verdict, detail: &str) -> CheckResult {
-        CheckResult { id, verdict, detail: detail.into(), scenario: "test", absent_at: None, unless_missed: None }
+        CheckResult { id, verdict, detail: detail.into(), scenario: "test", absent_at: Vec::new(), unless_missed: None }
     }
 
     fn scenario(results: Vec<CheckResult>) -> ScenarioRun {

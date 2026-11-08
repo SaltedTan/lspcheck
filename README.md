@@ -2,9 +2,11 @@
 
 lspcheck starts a language server and checks that it speaks the
 [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) correctly. It checks message
-framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, document positions, and whether the server leaves
-processes behind. It
+framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, document positions, request parameter handling and
+unusual request ids, and whether the server leaves processes behind. It
 works with any server that talks over stdio, whatever language it is written in, and needs no configuration.
+
+Example output from the development version (see [Unreleased](CHANGELOG.md#unreleased)):
 
 ```console
 $ lspcheck -- basedpyright-langserver --stdio
@@ -56,10 +58,16 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
                      3 informative position(s) on character boundaries about the line-ending document, counted in UTF-16 code units; 32 position(s) about it
   SKIP  D6  MUST    A selectionRange result has one entry per position, each range contains its position, and each parent contains its child
                      the server advertises no selectionRangeProvider, so lspcheck sends no selectionRange request
-33 checks: 29 pass, 3 fail (0 MUST, 2 SHOULD, 1 POLICY), 1 skipped, 0 not exercised, 0 errors
+  FAIL  R2  POLICY  A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving
+                     textDocument/hover returned a result for parameters of the wrong types: "null"
+  PASS  R4  POLICY  Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string
+                     all 8 requests got responses with their exact ids
+35 checks: 30 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 1 skipped, 0 not exercised, 0 errors
 ```
 
-lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation and document positions.
+lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions and
+parameter and request-id robustness.
+The [robustness reference](docs/design.md#capabilities-and-robustness) explains R2 and R4's verdict rules.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
@@ -237,10 +245,12 @@ lspcheck inspects at most `--max-output-mib` (256) of stdout per scenario and fr
 These are lspcheck's own limits, not protocol rules: past them it keeps reading so the server isn't blocked, but stops
 inspecting. A reply that never arrived is then reported as `ERROR` (inconclusive), not `FAIL`, if a frame lspcheck
 skipped was arriving at any time between sending the request and giving up on the reply, or lspcheck stopped inspecting
-before it gave up, since the reply might have been in what it didn't inspect. A frame that was complete before the
-request was sent can't have held its reply, so it excuses nothing. Likewise, a `PASS` or `NOT EXERCISED` that relied on
-lspcheck seeing everything in a window becomes `ERROR` if it finds, once the server's output has been read to the end,
-that it missed something there (a frame still arriving at the time may turn out to be cut short). A failure lspcheck saw
+before it gave up, since the reply might have been in what it didn't inspect. See the
+[robustness reference](docs/design.md#capabilities-and-robustness) for R4's treatment of multiple unanswered ids.
+A frame that was complete before the request was sent can't have held its reply, so it excuses nothing.
+Likewise, a `PASS` or `NOT EXERCISED` that relied on lspcheck seeing everything in a window becomes `ERROR` if it finds,
+once the server's output has been read to the end, that it missed something there (a frame still arriving at the time
+may turn out to be cut short). A failure lspcheck saw
 directly, such as a wrong result, stays `FAIL`. The same happens when some of the server's frames can't be read at all,
 and when lspcheck couldn't finish writing to a server that stopped reading its input: a request lspcheck couldn't
 deliver gives `ERROR`, never `FAIL`. A header section longer than 1 MiB also stops inspection.

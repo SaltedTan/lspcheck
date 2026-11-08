@@ -52,6 +52,23 @@ const FAULTS: &[(&str, &str)] = &[
     ("early-replies", "answer guessed request ids before they are sent, then answer unknown requests wrongly"),
     ("wrong-unknown-error", "answer unknown requests with InvalidRequest"),
     ("string-id-to-number", "reply to a request whose id is a string of digits with that number as id"),
+    ("mangles-odd-ids", "drop non-ASCII characters from string request ids before replying"),
+    ("drops-negative-ids", "never answer a request with a negative integer id"),
+    ("accepts-wrong-params", "answer a request with wrongly typed params with result null"),
+    ("dies-on-wrong-params", "exit when a request arrives with wrongly typed params"),
+    ("wrong-params-other-code", "lawful: answer wrongly typed params with InternalError (-32603)"),
+    ("wrong-params-null-error", "answer wrongly typed params with error null"),
+    ("wrong-params-string-code", "answer wrongly typed params with a string error code"),
+    ("wrong-params-large-code", "answer wrongly typed params with an error code outside the signed 32-bit range"),
+    ("wrong-params-missing-message", "answer wrongly typed params with no error message"),
+    ("wrong-params-numeric-message", "answer wrongly typed params with a numeric error message"),
+    ("wrong-params-result-and-error", "answer wrongly typed params with both result and error"),
+    (
+        "trailing-fragment",
+        "lawful: after the last odd-id probe, and after the probe that follows wrongly typed params, begin a \
+         logMessage and finish it only when shutdown arrives",
+    ),
+    ("big-reply-then-exit", "answer the probe that follows wrongly typed params with a 2 MiB error, then exit"),
     ("reply-twice", "answer every lspcheck/probe twice"),
     ("reply-unsent-id", "after initialize, send a response with an id lspcheck never used"),
     ("reply-to-notification", "answer an unknown notification with an error whose id is null"),
@@ -138,7 +155,7 @@ const FAULTS: &[(&str, &str)] = &[
         "initialized-reply-after-cancel",
         "answer initialized twice with an error whose id is null, once a cancel arrives",
     ),
-    ("big-frame-after-drop", "after cancelled-no-reply drops a request, send a 2 MiB log message with the next answer"),
+    ("big-frame-after-drop", "after dropping a request, send a 2 MiB log message with the next answer"),
     ("no-open-close", "lawful: don't ask for didOpen, and exit if one arrives anyway"),
     ("utf8-positions-as-utf16", "count positions in UTF-8 bytes while UTF-16 is negotiated"),
     ("codepoint-positions", "count positions in code points while UTF-16 is negotiated"),
@@ -270,6 +287,11 @@ fn main() {
     let mut initialized_reply = fault("initialized-reply-after-cancel");
     // For null-reply-after-first-probe: whether a request was answered since initialize.
     let mut answered_one = false;
+    // A wrongly typed request was just answered, and the next probe not yet.
+    let mut after_wrong_params = false;
+    // The rest of a notification begun after the checks were done, written
+    // only once `shutdown` arrives.
+    let mut unfinished: Option<Vec<u8>> = None;
     // For inflated-on-first-probe.
     let mut probed = false;
     // Messages read by await-progress-answer while it waited, to handle next.
@@ -295,7 +317,7 @@ fn main() {
         }
         let Some((mut headers, mut body)) = queued.pop_front().or_else(|| input.next()) else { break };
         // A server that answers only the latest of several concurrent requests:
-        // J6's batch is the only one with an all-digit string id, and lspcheck
+        // J6's batch is the only one with a six-digit string id, and lspcheck
         // writes all four requests before reading, so waiting for the next
         // frame is guaranteed to succeed. This depends on protocol order, not
         // on where the OS happened to end its reads.
@@ -671,7 +693,11 @@ fn main() {
             no_more_answers = true;
             continue;
         }
-        if fault("drop-first-request") && !dropped_first && method.starts_with("textDocument/") {
+        if fault("drop-first-request")
+            && !dropped_first
+            && method.starts_with("textDocument/")
+            && msg.pointer("/params/textDocument/uri").and_then(Value::as_str).is_some()
+        {
             dropped_first = true;
             continue;
         }
@@ -701,6 +727,11 @@ fn main() {
         let id = match id.as_str().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
             Some(s) if fault("string-id-to-number") => s.parse::<i64>().map_or(id, |n| json!(n)),
             _ => id,
+        };
+        let id = if let Some(s) = id.as_str().filter(|s| !s.is_ascii()) {
+            if fault("mangles-odd-ids") { json!(s.chars().filter(|c| c.is_ascii()).collect::<String>()) } else { id }
+        } else {
+            id
         };
         if fault("replay-gate") && method == "m" {
             replay_gate_id = Some(id);
@@ -898,6 +929,37 @@ fn main() {
             deferred = Some(id.clone());
             continue;
         }
+        if fault("drops-negative-ids") && id.as_i64().is_some_and(|n| n < 0) {
+            dropped = true;
+            continue;
+        }
+        if wrong_param_types(&method, msg.get("params").unwrap_or(&Value::Null)) {
+            if fault("dies-on-wrong-params") {
+                std::process::exit(2);
+            }
+            if fault("accepts-wrong-params") {
+                out.frame(&ok(&id, Value::Null));
+                continue;
+            }
+            let code = if fault("wrong-params-other-code") { -32603 } else { -32602 };
+            let mut reply = err(&id, code, "invalid params");
+            if fault("wrong-params-null-error") {
+                reply["error"] = Value::Null;
+            } else if fault("wrong-params-string-code") {
+                reply["error"]["code"] = json!("-32602");
+            } else if fault("wrong-params-large-code") {
+                reply["error"]["code"] = json!(2147483648_i64);
+            } else if fault("wrong-params-missing-message") {
+                reply["error"].as_object_mut().unwrap().remove("message");
+            } else if fault("wrong-params-numeric-message") {
+                reply["error"]["message"] = json!(42);
+            } else if fault("wrong-params-result-and-error") {
+                reply["result"] = Value::Null;
+            }
+            out.frame(&reply);
+            after_wrong_params = true;
+            continue;
+        }
         if std::mem::take(&mut dropped) && fault("big-frame-after-drop") {
             let text = "x".repeat(2 * 1024 * 1024);
             out.frame(
@@ -906,6 +968,18 @@ fn main() {
         }
         if fault("reply-twice") && method == "lspcheck/probe" {
             out.frame(&err(&id, -32601, "method not found"));
+        }
+        let follows_wrong_params = method == "lspcheck/probe" && std::mem::take(&mut after_wrong_params);
+        if follows_wrong_params && fault("big-reply-then-exit") {
+            let mut reply = err(&id, -32601, "method not found");
+            reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
+            out.frame(&reply);
+            std::process::exit(0);
+        }
+        if method == "shutdown"
+            && let Some(rest) = unfinished.take()
+        {
+            out.raw(&rest);
         }
         match method.as_str() {
             "shutdown" => {
@@ -1017,6 +1091,17 @@ fn main() {
                 let mut reply = err(&id, -32601, "method not found");
                 reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
                 out.frame(&reply);
+            }
+            "lspcheck/probe" if fault("trailing-fragment") && (follows_wrong_params || id == json!("7")) => {
+                let mut reply = out.encode(&err(&id, -32601, "method not found"));
+                let bytes = out.encode(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "window/logMessage",
+                    "params": {"type": 4, "message": "still writing"}
+                }));
+                reply.push(bytes[0]);
+                out.raw(&reply);
+                unfinished = Some(bytes[1..].to_vec());
             }
             _ if fault("ignore-unknown-requests") => {}
             _ if fault("wrong-unknown-error") => out.frame(&err(&id, -32600, "unknown")),
@@ -1522,6 +1607,18 @@ fn err(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
+fn wrong_param_types(method: &str, params: &Value) -> bool {
+    match method {
+        "textDocument/hover" | "textDocument/definition" => {
+            !params.get("textDocument").is_some_and(Value::is_object)
+                || !params.get("position").is_some_and(Value::is_object)
+        }
+        "textDocument/documentSymbol" => !params.get("textDocument").is_some_and(Value::is_object),
+        "workspace/symbol" => !params.get("query").is_some_and(Value::is_string),
+        _ => false,
+    }
+}
+
 /// Where the cancel faults' messages go: straight out, or held until the
 /// next request has been answered (late-cancel-replies), so a client can't
 /// count on them arriving before that answer.
@@ -1702,13 +1799,13 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Whether `body` is a request whose id is a non-empty all-digit string. Only
-/// J6 sends one, which is what makes drop-concurrent act in protocol order.
+/// Whether `body` is a request whose id is J6's six-digit string. That is what
+/// makes drop-concurrent act in protocol order without catching other probes.
 fn is_digit_string_request(body: &[u8]) -> bool {
     serde_json::from_slice::<Value>(body).is_ok_and(|v| {
         v.get("method").is_some_and(Value::is_string)
             && v.get("id")
                 .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()))
     })
 }

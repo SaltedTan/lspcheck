@@ -680,6 +680,12 @@ impl Session {
         }
     }
 
+    /// Keeps [`Session::fresh_id`] from choosing this id. It remains available
+    /// to a caller that deliberately sends a request with that id.
+    pub fn reserve_id(&mut self, id: Id) {
+        self.reserved.insert(id);
+    }
+
     /// Whether lspcheck has sent a request with this id in this session.
     pub fn sent(&self, id: &Id) -> bool {
         self.used_ids.contains_key(id)
@@ -892,6 +898,20 @@ impl Session {
         let id = self.fresh_id();
         self.request_until(&id, method, params, deadline).await.map_err(CallError::Write)?;
         self.wait_response(&id, deadline).await.map_err(CallError::Wait)
+    }
+
+    /// Sends a request with a caller-chosen id and waits for its response by
+    /// one absolute deadline.
+    pub async fn call_with_id(
+        &mut self,
+        id: &Id,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Message, CallError> {
+        let deadline = Instant::now() + timeout;
+        self.request_until(id, method, params, deadline).await.map_err(CallError::Write)?;
+        self.wait_response(id, deadline).await.map_err(CallError::Wait)
     }
 
     /// Receives everything until `deadline` or until stdout closes.

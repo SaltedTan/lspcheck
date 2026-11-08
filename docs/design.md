@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report) are done, while profiles, K1, R* and the stock-server CI matrix are still planned.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report) and [R2 and R4](#capabilities-and-robustness) are done, while profiles, K1, R1, R3 and the stock-server CI matrix are still planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -34,7 +34,7 @@ no evidence, e.g. no non-ASCII output was ever seen), or `error` (the checker or
 Lessons from virgil-lsp: an unexercised check must never render as a pass, and a checker failure must keep the first
 useful evidence rather than be replaced by a cleanup error.
 
-## Check catalogue (v0.1)
+## Check catalogue
 Each session starts a fresh server process unless noted, so one failure can't contaminate the next. Spec references
 are to LSP 3.17 and JSON-RPC 2.0.
 
@@ -313,9 +313,35 @@ a document request is advertised.
 | K1 | MUST | Every advertised request capability with a position or document parameter answers (not MethodNotFound) at profile positions or generic ones. |
 | K2 | MUST | Replies validate against the LSP 3.17 metaModel (vendored, CC BY 4.0 attribution). **v0.2.** |
 | R1 | POLICY | A well-framed body that isn't JSON gets ParseError `-32700` with id `null` or is ignored, and the server keeps serving. |
-| R2 | POLICY | Wrong param types get an error (InvalidParams preferred), not a crash. |
+| R2 | POLICY | A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving. |
 | R3 | POLICY | A large document (default 4 MiB, configurable) is accepted or refused with an error; the server keeps serving. |
-| R4 | POLICY | Unusual but valid ids (0, negative, 2^53, long and non-ASCII strings) round-trip. |
+| R4 | POLICY | Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string. |
+
+R4 runs in the separate `odd-ids` scenario after initialization. It sends `lspcheck/probe` with each of these ids,
+one at a time: `0`, `-1`, `2147483647`, `-2147483648`, `""`, a 1000-character ASCII string, `"é中😀𝄞"` and
+`"7"`. Each request waits for a response or its deadline before the next is sent; a closed output stream or a failed
+write stops the sequence. It passes only when every request gets a response with its exact id (a result or an error is
+acceptable). Only delivered requests with no exact-id response can fail R4. The detail names unanswered ids and any
+unmatched response ids seen; long strings are truncated. Each unanswered request retains its own wait window for
+the evidence recheck after cleanup; any fully inspected window establishes a failure. If every such window has
+incomplete evidence, the verdict is `ERROR`. Initialization or delivery failure is also `ERROR` unless an earlier
+delivered request establishes a failure. J1 and J2 independently judge mismatched ids under their `MUST` rules.
+Numeric ids stay within LSP 3.17's signed 32-bit range, so `2^53` is deliberately excluded.
+
+R2 runs in its own `wrong-params` scenario so a server crash cannot contaminate other checks. From the initialize
+capabilities it selects the first advertised method among hover, definition, document symbols and workspace symbols.
+It sends the corresponding method with a number where an object or string is required. After an error response,
+it sends a plain probe; a response to that probe passes. `InvalidParams` is preferred but any error code passes
+when the initial response satisfies [J5's envelope rules](#json-rpc-correlation).
+A result or malformed response, no response to a delivered request, or a server that stops serving fails R2;
+missing replies become `ERROR` when lspcheck missed output during that request's wait. This also applies when
+the server exits while the delivered follow-up probe is pending: its wait window ends when the reply wait ends,
+before waiting for process exit or cleanup. Initialization or delivery failure is
+`ERROR`. If none of those capabilities is advertised, R2 is not exercised. Both robustness scenarios have
+well-formed JSON-RPC input, so the [J3 judging rules](#json-rpc-correlation) apply to them too.
+
+After successful initialization, both robustness scenarios attempt a bounded `shutdown`/`exit` exchange before
+cleanup. This lets lawful output still in flight finish and lets L9 observe descendants that outlive the server.
 
 ## Profiles (optional TOML)
 ```toml
@@ -385,11 +411,12 @@ Single crate, `src/` modules:
   group first so the PGID can't be recycled while we scan for descendants (the reuse bug virgil-lsp hit). Kill escalation:
   SIGTERM, grace, SIGKILL. Descendant scan: Linux `/proc`, macOS `proc_listpids`, Windows job process list.
 - `session`: tokio tasks for stdout (parsed there, so framing evidence is complete even if replies aren't consumed)
-  and stderr (always drained); stdin writes bounded by a deadline. Request ids are random 31-bit integers, so a server
-  can't prepare a reply before it sees the request (output already read when a request is sent can't answer it, but
-  bytes still in the pipe can, so the randomness is what matters); ids match by **JSON value** (`1` and `1.0` are the
-  same number). Each call has one absolute deadline covering its write and its reply; each scenario has its own
-  timeouts and a bounded cleanup. After a write stops partway through a frame, lspcheck sends nothing more.
+  and stderr (always drained); stdin writes bounded by a deadline. Generated request ids are random positive 31-bit
+  integers, so a server can't prepare a reply before it sees the request (output already read when a request is sent
+  can't answer it, but bytes still in the pipe can, so the randomness is what matters); ids match by **JSON value** (`1` and `1.0` are the
+  same number). Scenarios can also choose explicit ids; R4 reserves its test ids before initialization so generated
+  ids cannot collide with them. Each call has one absolute deadline covering its write and its reply; each scenario
+  has its own timeouts and a bounded cleanup. After a write stops partway through a frame, lspcheck sends nothing more.
 - `checks`: one module per area; each check declares id, basis, spec link, and a function over a `Session`.
 - `profile`, `report`, `cli` (clap).
 Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, toml, thiserror; `nix` on Unix,
