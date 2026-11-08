@@ -1104,9 +1104,11 @@ fn large_document_size_must_be_nonzero() {
 
 #[test]
 fn duplicate_and_unsent_responses_fail_j2() {
-    only_fails_allowing(&fault("reply-twice"), &["J2"], &["R1"]);
+    // A duplicate or unasked reply in R1's window is J2's alone: only a
+    // response with id null can answer a body without an id.
+    only_fails(&fault("reply-twice"), &["J2"]);
     let r = fault("reply-unsent-id");
-    only_fails_allowing(&r, &["J2"], &["R1"]);
+    only_fails(&r, &["J2"]);
     assert!(r.stdout.contains("which lspcheck never sent"), "{}", r.stdout);
 }
 

@@ -798,21 +798,17 @@ fn is_parse_error(m: &Message) -> bool {
     matches!(&m.kind, Kind::Response { id: Id::Null, outcome: Outcome::Error { code: Some(codes::PARSE_ERROR), .. } })
 }
 
+/// Why an unmatched response read after the non-JSON body breaks R1, if it
+/// does. The body has no id, so only a response with id null can answer it;
+/// one with another id is a duplicate or unasked reply, which is J2's rule.
 fn unexpected_after_non_json(m: &Message) -> Option<String> {
-    let Kind::Response { id, outcome } = &m.kind else { return None };
-    if *id == Id::Null && is_parse_error(m) {
-        None
-    } else if *id == Id::Null {
-        Some(format!(
+    let Kind::Response { id: Id::Null, outcome } = &m.kind else { return None };
+    (!is_parse_error(m)).then(|| {
+        format!(
             "after the non-JSON body, an unmatched response with id null wasn't ParseError (-32700): {}",
             describe_outcome(outcome)
-        ))
-    } else {
-        Some(format!(
-            "after the non-JSON body, received an unmatched response with id {id}: {}",
-            describe_outcome(outcome)
-        ))
-    }
+        )
+    })
 }
 
 /// Sends a non-JSON body as a complete frame, then checks a fresh request to

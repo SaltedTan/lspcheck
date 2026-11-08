@@ -319,8 +319,9 @@ a document request is advertised.
 | R4 | POLICY | Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string. |
 
 R1 runs in `not-json` after initialization. It writes one complete frame whose body is not JSON, then sends a plain
-request. An ignored body is lawful; any unmatched responses must have `id: null` and error code `-32700`
-(ParseError). An unmatched response with another id or code, or a result, fails R1. Both the response verdict and
+request. An ignored body is lawful. The body has no id, so only a response with `id: null` can answer it: one
+with another error code than `-32700` (ParseError), or a result, fails R1. An unmatched response with another id is a
+duplicate or unasked reply, which J2 judges, not R1. Both the response verdict and
 ParseError count use unmatched response occurrences read from the start of the malformed-body write through the
 end of the probe wait. Judging follows graceful shutdown so queued messages are included, with earlier and later
 reads excluded. The plain request must be answered. An exit before the answer or an unanswered delivered request
