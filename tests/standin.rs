@@ -577,6 +577,29 @@ fn k1_covers_all_requests_when_hover_waits_for_shutdown() {
     assert!(r.stdout.contains("10 request(s) for 6 advertised method(s) were answered"), "{}", r.stdout);
 }
 
+#[test]
+fn k1_names_every_unsent_request_after_an_unanswered_request_and_exit() {
+    let r = run(&["--fault", "exit-on-first-hover", "--fault", "advertises-unimplemented"], &["--only", "K1"]);
+    expect(&r, "K1", "error");
+    assert_eq!(r.status, 2, "{}", r.stdout);
+    assert!(r.stdout.contains("no response to textDocument/hover at 1:2"), "{}", r.stdout);
+    for label in [
+        "textDocument/hover at 2:6",
+        "textDocument/hover at 3:2",
+        "textDocument/documentHighlight at 1:2",
+        "textDocument/documentHighlight at 2:6",
+        "textDocument/documentHighlight at 3:2",
+        "textDocument/selectionRange",
+        "textDocument/documentSymbol",
+        "textDocument/foldingRange",
+        "textDocument/documentColor",
+        "workspace/symbol",
+    ] {
+        assert!(r.stdout.contains(&format!("couldn't send {label}")), "{label}: {}", r.stdout);
+    }
+    assert!(r.stdout.contains("the server exited with status 17"), "{}", r.stdout);
+}
+
 /// The hover positions the stand-in reported for `file`, in order.
 fn hovers(r: &Run, file: &str) -> Vec<String> {
     let prefix = format!("standin: hover at {file} ");

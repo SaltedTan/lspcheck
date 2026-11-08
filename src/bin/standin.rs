@@ -228,6 +228,7 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: on didClose, publish unversioned diagnostics for the file on disk, which another tool changed to ASCII",
     ),
     ("drop-first-request", "never answer the first request about a document, then answer normally"),
+    ("exit-on-first-hover", "exit with status 17 without answering the first hover request"),
     ("stop-at-crlf", "stop answering anything from the first request about crlf.txt"),
     ("exit-at-version-42", "exit, without answering, at the first request about a document at version 42"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
@@ -788,6 +789,9 @@ fn main() {
         {
             no_more_answers = true;
             continue;
+        }
+        if method == "textDocument/hover" && fault("exit-on-first-hover") {
+            std::process::exit(17);
         }
         if fault("drop-first-request")
             && !dropped_first

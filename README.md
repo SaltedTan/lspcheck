@@ -228,15 +228,9 @@ no reply, or whose ranges can't be compared, leaves it `N/E`. A `selectionRange`
 cut off because the server's output closed, makes D6 `ERROR` unless it already failed.
 
 K1 checks that the server handles what it advertises: it opens a document (a profile's
-[`[document]`](#profiles), or a plain-text one of lspcheck's own) and sends, one at a time, each request whose
-capability the initialize result advertises (hover, definition, references, rename, symbols, folding ranges,
-formatting, code actions, semantic tokens, workspace symbols and others), at a few positions for those that take
-one. After the first reply timeout, it sends the remaining requests without waiting for each reply; only a delivery
-failure stops sending. An answer of MethodNotFound (-32601) fails K1, whenever it was read, including during shutdown and after another response with the same id; any other error is lawful and listed in the detail. LSP sets no deadline for a response, so a request with no
-response by the end of the session makes K1 `ERROR`, not `FAIL`: lspcheck first shuts the server down gracefully,
-answering the server's requests on the way, and judges every request after draining the final output. K1 doesn't
-judge what the answers say. See the [K1 reference](docs/design.md#capabilities-and-robustness) for the request table and
-verdict rules.
+[`[document]`](#profiles), or a plain-text one of lspcheck's own) and probes advertised methods without judging the
+content of their results. See the [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage,
+MethodNotFound failures, late and duplicate replies, and details naming unanswered and undeliverable requests.
 
 R1 checks continued service after malformed JSON; R3 checks it after opening a large document.
 If a follow-up request fails, both checks wait up to `--exit-timeout` for an unprompted server exit before judging it.

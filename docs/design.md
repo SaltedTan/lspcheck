@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. Profiles part 1 is done (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[allow]`), including portable workspace names with consistent ASCII case, inline overrides of read-only fixtures, and replay of binary files, empty directories and Unix file permissions; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies; profiles part 2 has `[document]` and [K1](#capabilities-and-robustness), with complete request coverage after a timeout and verdicts based on the final stdout drain, and example profiles for gopls, rust-analyzer, lua-language-server and basedpyright that pass K1; `[client].capabilities` and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. Profiles part 1 is done (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[allow]`), including portable workspace names with consistent ASCII case, inline overrides of read-only fixtures, and replay of binary files, empty directories and Unix file permissions; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies; profiles part 2 has `[document]` and [K1](#capabilities-and-robustness), including late and duplicate response handling and named delivery failures, and example profiles for gopls, rust-analyzer, lua-language-server and basedpyright that pass K1; `[client].capabilities` and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -380,23 +380,25 @@ remaining requests are sent without waiting for each reply. Only a delivery fail
 counts any requests left unsent). LSP sets no deadline for a response, so a wait that ends is not evidence against
 the server: after sending the requests, the scenario shuts the server down gracefully (`shutdown`, then `exit`),
 answering the server's requests on the way. Once session cleanup has drained the final stdout, K1 judges every
-request by its matched response, including replies read during shutdown or the final drain.
+request by its matched response, including replies read during shutdown or the final drain. A MethodNotFound reply
+counts when its id equals the request's exactly and it was read at or after the request was sent, even after another
+response with that id (the duplicate is J2's).
 
-- **fail:** a request was answered with an error whose code is -32601, whenever its reply was read, even after another
-  response with the same id (that duplicate is J2's). The detail names each such request (method and position), any
-  request that was still unanswered and each one lspcheck tried and couldn't send (with the delivery cause, including
-  the server's exit status when observed), and counts the requests left unsent after that. This is seen evidence and
-  stands whatever happened to the other requests.
+For either a failure or an error, the detail names every unanswered or undeliverable request, including those not
+attempted after a delivery failure. Undeliverable entries include the delivery cause and the server's exit status
+when observed.
+
+- **fail:** a request was answered with an error whose code is -32601. The detail names each such request (method
+  and position). This is seen evidence and stands whatever happened to the other requests.
 - **error:** initialize didn't succeed, the server chose an encoding lspcheck didn't offer (see L2), the document
   couldn't be written, read or opened (`didOpen` not delivered), or a request couldn't be delivered. A delivered
   request with no response by the end of the session is also `ERROR` (`no response to <method> at <position> by the
-  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1. The detail names
-  every request that went unanswered and each one lspcheck tried and couldn't send (with the delivery cause, including
-  the server's exit status when observed), and counts the requests left unsent after that.
+  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1.
 - **not-exercised:** the initialize result has no capabilities object, or the server advertises none of the requests
-  above, or none could be sent (the detail says why).
-- **pass:** every request sent was answered with a result or another error by the end of the session. The detail
-  counts the requests and methods, and lists the other errors by code with the requests that got them.
+  above, or all advertised requests were excluded by the `didOpen` or selector rules (the detail says why).
+- **pass:** every request selected for delivery was answered with a result or another error by the end of the
+  session. The detail counts the requests and methods, and lists the other errors by code with the requests that
+  got them.
 
 Responses to K1's requests are judged by J1, J2 and J5 like any other, and the scenario's input is all well formed,
 so it is included in J3. K1 judges only the error code, never a result's content.
