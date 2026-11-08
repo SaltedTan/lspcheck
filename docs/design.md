@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; profiles, K1, R*, JUnit/Markdown output and the stock-server CI matrix are still planned.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; JUnit and Markdown reports are done, while profiles, K1, R* and the stock-server CI matrix are still planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -348,7 +348,13 @@ Without a profile: an empty temp workspace and a `plaintext` document. Generic c
 ## Report
 - Terminal summary grouped by area, with counts and a line per failure naming the transcript.
 - `--json`: versioned `report-v1` schema (checks, basis, verdict, evidence, timings, server argv, checker version,
-  host OS/arch, profile hash). `--junit` for CI test tabs; `--markdown` for a GitHub step summary.
+  host OS/arch, profile hash).
+- `--junit`: JUnit XML for CI test tabs, one testsuite per check area in catalogue order with correct counts and a
+  testcase per check. A failure carries its basis in `type` and its detail, specification link and transcript in the
+  body; an error is an `<error>`, and skip and not-exercised are `<skipped>`. JUnit has no severity, so the process
+  exit status, not the XML, applies `--strict`. Output has no timings or timestamps, so it is deterministic.
+- `--markdown`: a summary for a GitHub step summary: the terminal report's counts line, then a table with failures
+  and errors first and every cell escaped for Markdown, then the transcript paths of failed or errored checks.
 - `--transcripts DIR`: one JSONL per session with direction, monotonic timestamp, raw bytes (base64 when not UTF-8),
   how the reader split them into frames, and stderr. Each file includes a meta line naming the workspace and the
   files it held, so a replay can recreate it.

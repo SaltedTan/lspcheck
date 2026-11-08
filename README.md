@@ -105,7 +105,8 @@ cargo install --locked --git https://github.com/SaltedTan/lspcheck --tag v0.1.0
 
 Pin a version and its checksum, so the check only changes when you upgrade it. Checks are added and refined between
 versions, and the [changelog](CHANGELOG.md) says which. The exit status fails the job when a `MUST` check fails
-(`--strict` also fails it on `SHOULD` and `POLICY` failures), and `--json` and `--transcripts` keep the evidence:
+(`--strict` also fails it on `SHOULD` and `POLICY` failures). `--json`, `--junit` (JUnit XML for CI test tabs),
+`--markdown` (a summary for a GitHub step summary) and `--transcripts` keep the evidence:
 
 ```yaml
 - name: Check the language server with lspcheck
@@ -117,7 +118,8 @@ versions, and the [changelog](CHANGELOG.md) says which. The exit status fails th
     curl -fsSLO "https://github.com/SaltedTan/lspcheck/releases/download/v$LSPCHECK_VERSION/$name.tar.gz"
     echo "$LSPCHECK_SHA256  $name.tar.gz" | sha256sum --check
     tar -xzf "$name.tar.gz"
-    "$name/lspcheck" --json lspcheck.json --transcripts lspcheck-transcripts -- ./build/my-server --stdio
+    "$name/lspcheck" --json lspcheck.json --markdown "$GITHUB_STEP_SUMMARY" \
+      --transcripts lspcheck-transcripts -- ./build/my-server --stdio
 ```
 
 ## Use
@@ -126,8 +128,13 @@ versions, and the [changelog](CHANGELOG.md) says which. The exit status fails th
 lspcheck -- my-server --stdio            # run every check
 lspcheck --only L4,L6 -- my-server       # run some checks
 lspcheck --json report.json --transcripts out/ -- my-server
+lspcheck --junit report.xml --markdown summary.md -- my-server
 lspcheck list                            # every check, with its specification section
 ```
+
+`--json` writes a versioned machine-readable report, `--junit` a JUnit XML report with one testsuite per check area,
+and `--markdown` a summary table for a CI step summary. Any combination may be given. The JUnit `type` on a failure
+is its basis (`MUST`, `SHOULD` or `POLICY`); the process exit status, not the XML, applies `--strict`.
 
 lspcheck runs the server several times, once per scenario, each time with an empty temporary workspace as its working
 directory. A server path with a directory part, such as `./my-server`, is resolved before that; a bare name is looked up
