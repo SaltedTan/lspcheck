@@ -11,13 +11,58 @@ use lspcheck::message::{Kind, Message};
 use lspcheck::transport::{Chunk, FrameReader};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const LSPCHECK: &str = env!("CARGO_BIN_EXE_lspcheck");
 const STANDIN: &str = env!("CARGO_BIN_EXE_lspcheck-standin");
 /// No run should take this long; a hang fails the test instead of the job.
 const WATCHDOG: Duration = Duration::from_secs(90);
+
+/// Capture output in files so a full pipe can't block exit while the watchdog
+/// polls. This also keeps the watchdog independent of output-reader threads.
+fn output_with_watchdog(cmd: &mut Command) -> std::process::Output {
+    let stdout = tempfile::NamedTempFile::new().unwrap();
+    let stderr = tempfile::NamedTempFile::new().unwrap();
+    cmd.stdout(stdout.reopen().unwrap()).stderr(stderr.reopen().unwrap());
+    let started = Instant::now();
+    let mut child = cmd.spawn().unwrap();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return std::process::Output {
+                status,
+                stdout: std::fs::read(stdout.path()).unwrap(),
+                stderr: std::fs::read(stderr.path()).unwrap(),
+            };
+        }
+        if started.elapsed() > WATCHDOG {
+            let _ = child.kill();
+            panic!("command ran longer than {WATCHDOG:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn watchdog_capture_doesnt_block_on_large_output() {
+    // LSP lifecycle input makes the stand-in emit over a pipe's capacity on
+    // exit. The capture must let it finish and retain the final bytes too.
+    let input = tempfile::NamedTempFile::new().unwrap();
+    let messages = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "exit"}),
+    ];
+    let bytes: Vec<u8> =
+        messages.iter().flat_map(|m| lspcheck::transport::encode(&serde_json::to_vec(m).unwrap())).collect();
+    std::fs::write(input.path(), bytes).unwrap();
+    let mut cmd = Command::new(STANDIN);
+    cmd.args(["--fault", "exit-flood"]).stdin(input.reopen().unwrap());
+    let out = output_with_watchdog(&mut cmd);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.len() > 1024 * 1024);
+    assert!(out.stdout.ends_with(b"goodbye\n"));
+}
 
 struct Run {
     status: i32,
@@ -50,30 +95,12 @@ fn run_command_in(
             cmd.args([flag, value]);
         }
     }
-    cmd.args(lspcheck_args)
-        .arg("--json")
-        .arg(&report)
-        .arg("--transcripts")
-        .arg(&transcripts)
-        .arg("--")
-        .args(server)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(lspcheck_args).arg("--json").arg(&report).arg("--transcripts").arg(&transcripts).arg("--").args(server);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
     let started = Instant::now();
-    let mut child = cmd.spawn().unwrap();
-    let out = loop {
-        if child.try_wait().unwrap().is_some() {
-            break child.wait_with_output().unwrap();
-        }
-        if started.elapsed() > WATCHDOG {
-            let _ = child.kill();
-            panic!("lspcheck ran longer than {WATCHDOG:?}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let out = output_with_watchdog(&mut cmd);
     let took = started.elapsed();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let text = std::fs::read_to_string(&report).unwrap_or_else(|e| {
@@ -126,19 +153,8 @@ fn replay(transcript: &std::path::Path, lspcheck_args: &[&str], server: &[&str])
             cmd.args([flag, value]);
         }
     }
-    cmd.args(lspcheck_args).arg("--").args(server).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let started = Instant::now();
-    let mut child = cmd.spawn().unwrap();
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
-        }
-        if started.elapsed() > WATCHDOG {
-            let _ = child.kill();
-            panic!("replay ran longer than {WATCHDOG:?}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    cmd.args(lspcheck_args).arg("--").args(server);
+    output_with_watchdog(&mut cmd)
 }
 
 /// The workspace a transcript was recorded in.
@@ -239,6 +255,8 @@ fn only_fails_unread_with(run: &Run, failing: &[&str], inconclusive: &[&str]) {
 fn the_clean_standin_passes_every_check() {
     let r = run(&[], &[]);
     only_fails(&r, &[]);
+    expect(&r, "R1", "pass");
+    expect(&r, "R3", "pass");
     expect(&r, "R2", "pass");
     expect(&r, "R4", "pass");
     assert_eq!(r.status, 0, "{}", r.stdout);
@@ -253,6 +271,8 @@ fn the_clean_standin_passes_every_check() {
     assert!(r.stdout.contains("informative position(s) on character boundaries after the change"), "{}", r.stdout);
     assert!(r.stdout.contains("textDocument/hover (hoverProvider) returned InvalidParams (-32602)"), "{}", r.stdout);
     assert!(r.stdout.contains("all 8 requests got responses with their exact ids"), "{}", r.stdout);
+    assert!(r.stdout.contains("ParseError (-32700) response(s) with id null"), "{}", r.stdout);
+    assert!(r.stdout.contains("following didOpen of a 4 MiB document"), "{}", r.stdout);
     // D4 passed on evidence: the closed, the never-opened and the plain
     // request were all answered.
     assert!(r.stdout.contains("all three answered"), "{}", r.stdout);
@@ -284,21 +304,8 @@ fn junit_and_markdown_reports_agree_with_json() {
         .arg(dir.path().join("t"))
         .arg("--")
         .arg(STANDIN)
-        .args(["--fault", "shutdown-result"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let started = Instant::now();
-    let mut child = cmd.spawn().unwrap();
-    let out = loop {
-        if child.try_wait().unwrap().is_some() {
-            break child.wait_with_output().unwrap();
-        }
-        if started.elapsed() > WATCHDOG {
-            let _ = child.kill();
-            panic!("lspcheck ran longer than {WATCHDOG:?}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+        .args(["--fault", "shutdown-result"]);
+    let out = output_with_watchdog(&mut cmd);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -411,11 +418,22 @@ fn lawful_variations_fail_nothing() {
         "await-progress-answer",
         "wrong-params-other-code",
         "trailing-fragment",
+        "silent-on-bad-json",
+        "slow-large-document",
     ] {
-        let r = fault(name);
+        let r = if name == "slow-large-document" {
+            run(&["--fault", name], &["--timeout", "1", "--startup-timeout", "10", "--large-document-mib", "2"])
+        } else {
+            fault(name)
+        };
         if name == "wrong-params-other-code" {
             expect(&r, "R2", "pass");
             assert!(r.stdout.contains("not InvalidParams (which is preferred)"), "{}", r.stdout);
+        }
+        if name == "slow-large-document" {
+            expect(&r, "R3", "pass");
+            assert!(r.server_stderr.contains("slow-large-document sleeping"), "{}", r.server_stderr);
+            assert!(r.stdout.contains("following didOpen of a 2 MiB document"), "{}", r.stdout);
         }
         // With no versioned publish for the opened document, D2 has nothing
         // to judge and is not exercised instead of passing. A server that
@@ -466,16 +484,6 @@ fn output_written_just_before_exit_is_still_judged() {
     let r = run(&["--fault", "exit-flood"], &["--exit-timeout", "30"]);
     expect(&r, "F1", "fail");
     assert!(r.stdout.contains("goodbye"), "{}", r.stdout);
-}
-
-#[test]
-fn messages_still_queued_at_exit_are_classified() {
-    // 200,000 valid notifications, then one without "jsonrpc", are written
-    // after exit. The last one is J5's failure even though it is still queued
-    // when the server exits; a slow runner may take a while to read it all, so
-    // the exit allowance is generous.
-    let r = run(&["--fault", "exit-flood-bad-envelope"], &["--exit-timeout", "30"]);
-    expect(&r, "J5", "fail");
 }
 
 #[test]
@@ -608,7 +616,9 @@ fn a_reply_skipped_while_lspcheck_waited_makes_its_absence_inconclusive() {
 fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
     // The server stops reading while lspcheck answers its request, so
     // lspcheck can't deliver the requests J4 and L4 depend on.
-    let r = run(&["--fault", "block-after-init"], &["--timeout", "1"]);
+    // Only run the three scenarios asserted below: waiting on this blocked
+    // server in every scenario can exceed the watchdog on Windows.
+    let r = run(&["--fault", "block-after-init"], &["--timeout", "1", "--only", "L2,J4,L4,L6,F3,F4,F5,F6,F7,L7"]);
     expect(&r, "L2", "pass");
     for id in ["J4", "L4", "L6"] {
         expect(&r, id, "error");
@@ -845,8 +855,6 @@ fn a_refused_initialize_is_an_error_not_a_failure() {
 
 #[test]
 fn replies_sent_before_their_requests_dont_count() {
-    // The guessed ids are never sent, so they are unasked responses (J2); the
-    // fault also answers unknown requests wrongly (J4).
     only_fails(&fault("early-replies"), &["J2", "J4"]);
 }
 
@@ -899,14 +907,18 @@ fn odd_id_failures_survive_later_unreadable_output() {
 }
 
 #[test]
-fn a_skipped_frame_before_exit_makes_r2_inconclusive() {
+fn a_skipped_frame_before_exit_makes_r1_r2_r3_inconclusive() {
     // The plain request after the wrongly typed one is answered in a frame
     // over the limit, then the server exits: the skipped frame may have held
     // the answer, so R2 can't fail. Read whole, it passes.
-    let r = run(&["--fault", "big-reply-then-exit"], &["--only", "R2", "--max-frame-mib", "1"]);
-    expect(&r, "R2", "error");
-    let r = run(&["--fault", "big-reply-then-exit"], &["--only", "R2"]);
-    expect(&r, "R2", "pass");
+    // The same holds for R1 and R3, whose plain requests follow a non-JSON body
+    // and a large document.
+    for id in ["R1", "R2", "R3"] {
+        let r = run(&["--fault", "big-reply-then-exit"], &["--only", id, "--max-frame-mib", "1"]);
+        expect(&r, id, "error");
+        let r = run(&["--fault", "big-reply-then-exit"], &["--only", id]);
+        expect(&r, id, "pass");
+    }
 }
 
 #[test]
@@ -953,7 +965,128 @@ fn exiting_on_wrongly_typed_params_fails_r2() {
 }
 
 #[test]
+fn non_json_bodies_are_rejected_or_ignored_without_losing_service() {
+    let r = fault("parse-error-wrong-code");
+    only_fails(&r, &["R1"]);
+    expect(&r, "R1", "fail");
+    expect(&r, "J2", "pass");
+    expect(&r, "J5", "pass");
+    assert!(
+        r.stdout.contains("unmatched response with id null wasn't ParseError (-32700): error -32600"),
+        "{}",
+        r.stdout
+    );
+
+    let r = fault("silent-on-bad-json");
+    only_fails(&r, &[]);
+    expect(&r, "R1", "pass");
+    assert!(r.stdout.contains("ignored the non-JSON body"), "{}", r.stdout);
+
+    let r = fault("dies-on-bad-json");
+    only_fails(&r, &["R1"]);
+    expect(&r, "R1", "fail");
+}
+
+#[test]
+fn r1_response_window_includes_queued_wrong_code_responses() {
+    for faults in [
+        vec!["--fault", "bad-json-reply-after-probe"],
+        vec!["--fault", "parse-error-with-initialize", "--fault", "bad-json-reply-after-probe"],
+    ] {
+        let r = run(&faults, &["--only", "R1", "--strict"]);
+        expect(&r, "R1", "fail");
+        assert_eq!(r.status, 1, "{faults:?}\n{}", r.stdout);
+        assert!(
+            r.stdout.contains("unmatched response with id null wasn't ParseError (-32700): error -32600"),
+            "{faults:?}\n{}",
+            r.stdout
+        );
+    }
+}
+
+#[test]
+fn r1_response_window_keeps_response_occurrences_separate() {
+    let r = run(
+        &["--fault", "parse-error-with-initialize", "--fault", "parse-error-wrong-code"],
+        &["--only", "R1", "--strict"],
+    );
+    expect(&r, "R1", "fail");
+    assert_eq!(r.status, 1, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("unmatched response with id null wasn't ParseError (-32700): error -32600"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn r1_response_window_excludes_earlier_parse_errors() {
+    let r = run(&["--fault", "parse-error-with-initialize", "--fault", "silent-on-bad-json"], &["--only", "R1"]);
+    expect(&r, "R1", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    assert!(r.stdout.contains("ignored the non-JSON body"), "{}", r.stdout);
+}
+
+#[test]
+fn r1_response_window_preserves_lawful_replies_and_service() {
+    for faults in [
+        vec![],
+        vec!["--fault", "silent-on-bad-json"],
+        vec!["--fault", "reply-to-exit"],
+        vec!["--fault", "await-progress-answer"],
+        vec!["--fault", "trailing-fragment"],
+        vec!["--fault", "big-reply-then-exit"],
+        vec!["--fault", "parse-error-with-initialize"],
+    ] {
+        let r = run(&faults, &["--only", "R1,R2,R4,J1,J2,J6"]);
+        expect(&r, "R1", "pass");
+        expect(&r, "R2", "pass");
+        expect(&r, "R4", "pass");
+        expect(&r, "J1", "pass");
+        expect(&r, "J6", "pass");
+        if !faults.contains(&"parse-error-with-initialize") {
+            expect(&r, "J2", "pass");
+        }
+        if !faults.contains(&"silent-on-bad-json") {
+            assert!(r.stdout.contains("returned 1 ParseError (-32700) response(s)"), "{faults:?}\n{}", r.stdout);
+        }
+    }
+}
+
+#[test]
+fn large_document_failure_and_transcript_replay() {
+    let r = fault("dies-on-large-document");
+    only_fails(&r, &["R3"]);
+    expect(&r, "R3", "fail");
+
+    let (r, transcripts, _keep) = run_with_transcripts(&[], &["--only", "R3"]);
+    expect(&r, "R3", "pass");
+    assert!(r.stdout.contains("following didOpen of a 4 MiB document"), "{}", r.stdout);
+    let transcript = transcripts.join("large-document.jsonl");
+    let out = replay(&transcript, &[], &[STANDIN]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("requests"), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+#[test]
+fn large_document_size_must_be_nonzero() {
+    let output = Command::new(LSPCHECK).args(["--large-document-mib", "0", "--", STANDIN]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--large-document-mib"), "{stderr}");
+    assert!(stderr.contains("invalid value"), "{stderr}");
+}
+
+#[test]
 fn duplicate_and_unsent_responses_fail_j2() {
+    // A duplicate or unasked reply in R1's window is J2's alone: only a
+    // response with id null can answer a body without an id.
     only_fails(&fault("reply-twice"), &["J2"]);
     let r = fault("reply-unsent-id");
     only_fails(&r, &["J2"]);
@@ -1351,7 +1484,10 @@ fn unreadable_frames_make_other_failures_inconclusive() {
 #[test]
 fn a_server_that_doesnt_open_documents_skips_d1() {
     let r = fault("no-open-close");
-    passes_except(&r, &[("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D5", "skip"), ("D6", "skip")]);
+    passes_except(
+        &r,
+        &[("D1", "skip"), ("D2", "skip"), ("D3", "skip"), ("D5", "skip"), ("D6", "skip"), ("R3", "fail")],
+    );
     // D4 still runs: doc.txt on disk, never opened.
     assert!(r.stdout.contains("the document on disk (never opened)"), "{}", r.stdout);
     assert_eq!(r.status, 0, "{}", r.stdout);

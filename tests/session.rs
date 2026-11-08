@@ -5,7 +5,7 @@
 
 #![cfg(all(unix, feature = "standin"))]
 
-use lspcheck::message::Id;
+use lspcheck::message::{Id, Kind};
 use lspcheck::process::ServerCommand;
 use lspcheck::session::{CallError, Options, Session, WaitError, WriteError};
 use serde_json::json;
@@ -150,4 +150,8 @@ sys.stdout.buffer.flush()
     assert_eq!(finish.messages.len(), 1001, "messages recorded at the end");
     let last = &finish.messages.last().unwrap().1.value;
     assert!(last.get("jsonrpc").is_none(), "the last message should be the one without jsonrpc: {last}");
+    assert!(
+        matches!(&finish.messages.last().unwrap().1.kind, Kind::Invalid(_)),
+        "the queued malformed envelope must be classified for J5"
+    );
 }

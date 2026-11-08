@@ -392,7 +392,7 @@ pub struct Session {
     aborted: HashSet<Id>,
     /// Requests that were answered, with when the response was read.
     answered: Vec<(Duration, Id)>,
-    unmatched: Vec<(Duration, Id)>,
+    unmatched: Vec<usize>,
     /// The server's requests, in the order they were read.
     server_requests: Vec<ServerRequest>,
     group: Group,
@@ -693,7 +693,14 @@ impl Session {
 
     /// The ids of unmatched responses read at or after `since`.
     pub fn unmatched_ids(&self, since: Duration) -> Vec<Id> {
-        self.unmatched.iter().filter(|(at, _)| *at >= since).map(|(_, id)| id.clone()).collect()
+        self.unmatched_responses(since, Duration::MAX).filter_map(|m| m.response_id().cloned()).collect()
+    }
+
+    pub fn unmatched_responses(&self, from: Duration, to: Duration) -> impl Iterator<Item = &Message> {
+        self.unmatched.iter().filter_map(move |&i| {
+            let (at, m) = &self.messages[i];
+            (*at >= from && *at <= to).then_some(m)
+        })
     }
 
     /// Sends a request, registering it so only a later response can answer it.
@@ -836,7 +843,7 @@ impl Session {
                 self.answers.insert(id.clone(), self.messages.len() - 1);
                 self.answered.push((at, id.clone()));
             }
-            _ => self.unmatched.push((at, id.clone())),
+            _ => self.unmatched.push(self.messages.len() - 1),
         }
     }
 
@@ -1114,16 +1121,18 @@ impl Session {
         // after the reply.
         let unmatched = std::mem::take(&mut self.unmatched)
             .into_iter()
-            .map(|(at, id)| {
-                let sent_at = self.used_ids.get(&id).copied();
+            .map(|i| {
+                let (at, m) = &self.messages[i];
+                let id = m.response_id().expect("unmatched response");
+                let sent_at = self.used_ids.get(id).copied();
                 Unmatched {
-                    at,
-                    duplicate: self.answers.contains_key(&id),
+                    at: *at,
+                    duplicate: self.answers.contains_key(id),
                     unsent: sent_at.is_none(),
-                    early: sent_at.is_some_and(|sent| sent > at),
-                    aborted: self.aborted.contains(&id),
-                    loose: self.used_ids.keys().find(|sent| message::loosely_equal(&id, sent)).cloned(),
-                    id,
+                    early: sent_at.is_some_and(|sent| sent > *at),
+                    aborted: self.aborted.contains(id),
+                    loose: self.used_ids.keys().find(|sent| message::loosely_equal(id, sent)).cloned(),
+                    id: id.clone(),
                 }
             })
             .collect();

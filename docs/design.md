@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report) and [R2 and R4](#capabilities-and-robustness) are done, while profiles, K1, R1, R3 and the stock-server CI matrix are still planned.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies, while profiles, K1 and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -62,7 +62,7 @@ whole, because a missing reply to it can't be told apart from a slow start.
 |---|---|---|
 | J1 | MUST | A reply's `id` is the same value as the request's: a number stays a number with the same exact value (`7` and `7.0` are the same; no rounding through floating point), and `"7"` stays a string. A reply that is only loosely equal (the number spelled as a string, or equal only after rounding) fails with both spellings; a request with a string id and one with a number id must each be answered exactly somewhere in the run. |
 | J2 | MUST | No response is unmatched: no duplicate for a request already answered, none to an id lspcheck never sent, and none read before its request was sent. Responses with a null id and those to a request lspcheck couldn't deliver are lawful; loosely equal ids belong to J1. A request that never got its reply is judged by the check that sent it. |
-| J3 | MUST | No response to notifications, including unknown ones and unknown `$/` ones. A response without an id (`id` missing or `null`) read after `initialized` (a reply to `exit` included), in a scenario whose input is all well formed (every one but `framing` and `pre-initialize`), answers one of lspcheck's notifications. |
+| J3 | MUST | No response to notifications, including unknown ones and unknown `$/` ones. A response without an id (`id` missing or `null`) read after `initialized` (a reply to `exit` included), in a scenario whose input is all well formed (every one but `framing`, `pre-initialize` and `not-json`), answers one of lspcheck's notifications. |
 | J4 | MUST | An unknown request method gets error `-32601` MethodNotFound; an unknown `$/` request too. |
 | J5 | MUST | Envelopes: `"jsonrpc": "2.0"`, exactly one of `result`/`error`, error `code` an integer and `message` a string; request ids integers or strings, response ids integers, strings or `null`, integers (ids and error codes) within LSP's signed 32-bit range; `params`, when present, an object or an array. |
 | J6 | MUST | Concurrent requests (sent before any reply) are each answered with the right id; order may differ. |
@@ -73,9 +73,10 @@ and J3: after `initialize`, four requests are written before any reply is read (
 one non-numeric string), and each must be answered with its exact id in any order; then two unknown notifications are
 followed by two probes; this guarantees J3 is exercised. Across the other scenarios with well-formed input, any response
 without an id read after `initialized` fails J3 too, since it can only answer a notification (C3 leaves to J3 the ones
-it can't attribute to a cancel), until a write of lspcheck's stops partway through a frame: the server may answer
-that malformed input with a null-id ParseError. A frame lspcheck skipped or couldn't read since `initialized`, or such a
-write, makes a pass an error. A frame
+it can't attribute to a cancel). The `not-json` scenario is excluded because its complete body is deliberately not JSON
+and a null-id ParseError is lawful there. A write of lspcheck's that stops partway through a frame may also get a
+null-id ParseError; a frame lspcheck skipped or couldn't read since `initialized`, or such a write, makes a pass an
+error. A frame
 lspcheck couldn't read anywhere (F1) also makes a J1, J2, J5 or J7 pass an error: it might have held what they judge.
 
 J7 treats an earlier request as unanswered when lspcheck never wrote its whole answer. For a completed answer,
@@ -314,8 +315,32 @@ a document request is advertised.
 | K2 | MUST | Replies validate against the LSP 3.17 metaModel (vendored, CC BY 4.0 attribution). **v0.2.** |
 | R1 | POLICY | A well-framed body that isn't JSON gets ParseError `-32700` with id `null` or is ignored, and the server keeps serving. |
 | R2 | POLICY | A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving. |
-| R3 | POLICY | A large document (default 4 MiB, configurable) is accepted or refused with an error; the server keeps serving. |
+| R3 | POLICY | A large document (default 4 MiB, configurable) is accepted or refused without the server failing, and it keeps serving. |
 | R4 | POLICY | Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string. |
+
+R1 runs in `not-json` after initialization. It writes one complete frame whose body is not JSON, then sends a plain
+request. An ignored body is lawful. The body has no id, so only a response with `id: null` can answer it: one
+with another error code than `-32700` (ParseError), or a result, fails R1. An unmatched response with another id is a
+duplicate or unasked reply, which J2 judges, not R1. Both the response verdict and
+ParseError count use unmatched response occurrences read from the start of the malformed-body write through the
+end of the probe wait. Judging follows graceful shutdown so queued messages are included, with earlier and later
+reads excluded. The plain request must be answered. An exit before the answer or an unanswered delivered request
+fails; missing answers become `ERROR` when evidence from the start of the probe write through the end of its wait
+is incomplete. Output skipped before the probe write cannot have held its answer. An exit while a
+delivered probe is pending preserves that probe's wait window, ending before shutdown or cleanup. Once the probe
+is answered, a later exit does not fail R1. Incomplete delivery of the malformed body is `ERROR`; an undeliverable
+probe is also `ERROR` unless an observed exit establishes a failure. J2 doesn't attribute null-id errors to a
+request, J5 validates their envelope, and this deliberately malformed-input scenario is excluded from J3.
+After a failed probe, R1 waits up to `--exit-timeout` for the server to exit before attempting shutdown: a closed
+stdin can precede the process's exit status, especially on Windows.
+
+R3 runs in `large-document` after initialization. It writes `lspcheck-large.txt` into the scenario workspace and
+opens it as `plaintext`; [usage](../README.md#use) documents the size option and default. Once the full `didOpen` is
+delivered, lspcheck sends a plain request and waits up to `--startup-timeout`. The server may accept or refuse the
+document; it must answer the probe. An incomplete `didOpen` is `ERROR`. A probe lspcheck couldn't deliver is also
+`ERROR` unless an observed exit establishes a failure. A delivered probe that goes unanswered fails only when
+lspcheck saw complete evidence during its wait, even if the server exits. Once the probe is answered, a later exit
+does not fail R3. As with R1, a failed probe allows up to `--exit-timeout` to observe an exit before shutdown.
 
 R4 runs in the separate `odd-ids` scenario after initialization. It sends `lspcheck/probe` with each of these ids,
 one at a time: `0`, `-1`, `2147483647`, `-2147483648`, `""`, a 1000-character ASCII string, `"é中😀𝄞"` and
@@ -337,10 +362,10 @@ A result or malformed response, no response to a delivered request, or a server 
 missing replies become `ERROR` when lspcheck missed output during that request's wait. This also applies when
 the server exits while the delivered follow-up probe is pending: its wait window ends when the reply wait ends,
 before waiting for process exit or cleanup. Initialization or delivery failure is
-`ERROR`. If none of those capabilities is advertised, R2 is not exercised. Both robustness scenarios have
-well-formed JSON-RPC input, so the [J3 judging rules](#json-rpc-correlation) apply to them too.
+`ERROR`. If none of those capabilities is advertised, R2 is not exercised. The well-formed `wrong-params`,
+`large-document` and `odd-ids` scenarios are included in [J3 judging](#json-rpc-correlation); `not-json` is not.
 
-After successful initialization, both robustness scenarios attempt a bounded `shutdown`/`exit` exchange before
+After successful initialization, all four robustness scenarios attempt a bounded `shutdown`/`exit` exchange before
 cleanup. This lets lawful output still in flight finish and lets L9 observe descendants that outlive the server.
 
 ## Profiles (optional TOML)
@@ -379,7 +404,8 @@ Without a profile: an empty temp workspace and a `plaintext` document. Generic c
   testcase per check. Every failed check is a `<failure>`, carrying its basis (`MUST`, `SHOULD` or `POLICY`) in `type`
   and its detail, specification link and transcript reference (when recorded) in the
   body; an error is an `<error>`, and skip and not-exercised are `<skipped>`. JUnit has no severity, so the process
-  exit status, not the XML, applies `--strict`. Output has no timings or timestamps, so it is deterministic.
+  exit status, not the XML, applies `--strict`. It has no time or timestamp attributes; check details can still
+  vary between runs (some name the milliseconds at which evidence was seen).
   Text and attributes use XML 1.0 escaping: illegal characters become U+FFFD, and attribute LF, CR and tab characters
   become numeric character references (`&#10;`, `&#13;`, `&#9;`) to preserve arbitrary server text.
 - `--markdown`: a heading with pass/fail counts and the server command in a backtick-safe code span, followed by
@@ -390,7 +416,8 @@ Without a profile: an empty temp workspace and a `plaintext` document. Generic c
   `transcripts: DIR` for cross-cutting failures and errors, using the shared parent of the recorded scenario paths.
 - `--transcripts DIR`: one JSONL per session with direction, monotonic timestamp, raw bytes (base64 when not UTF-8),
   how the reader split them into frames, and stderr. Each file includes a meta line naming the workspace and the
-  files it held, so a replay can recreate it.
+  files it held, so a replay can recreate it. Events are stably ordered by timestamp before writing, so replies read
+  while a write is flushing follow that write's start.
 - `lspcheck replay TRANSCRIPT -- SERVER`: re-runs one recorded session against a server. It recreates the recorded
   workspace (refusing a non-empty or symlink path; preserving an existing empty directory), re-sends every client write
   in order (gaps under 200 ms kept as pauses), and answers server-to-client requests with the same auto-answers a live run
@@ -438,10 +465,11 @@ Dependencies: tokio, serde, serde_json (`raw_value`, `preserve_order`), clap, to
 - **M0** repository, CI (fmt, clippy, test on Linux/macOS/Windows), transport + process + session, stand-in skeleton.
 - **M1** framing and lifecycle checks (F*, L*), terminal + JSON report.
 - **M2** correlation, cancellation, documents (J*, C*, D*), transcripts and `replay`.
-- **M3** profiles, K1, R*, JUnit/Markdown; stock-server CI matrix; v0.1.0 release with prebuilt binaries
+- **M3** profiles, K1, JUnit/Markdown; stock-server CI matrix; v0.1.0 release with prebuilt binaries
   (Linux x86_64/aarch64 static, macOS arm64/x86_64, Windows x86_64) and checksums. crates.io publishing needs the
   maintainer's token.
 - **M4** dogfood in virgil-lsp: a pinned binary download in CI (a dependency + workflow change, so a human merge there).
+  Done: virgil-lsp's `lspcheck-linux` job checks its freshly built server with the pinned v0.1.0 release.
 - Later: K2 metaModel validation; language profiles with seeded source mutation and recovery oracles, ported from
   `test/protocol/source_mutations.py`.
 

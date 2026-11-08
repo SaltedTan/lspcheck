@@ -7,6 +7,7 @@ use lspcheck::process::{self, SENTINEL_ARG, ServerCommand};
 use lspcheck::replay;
 use lspcheck::report;
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -39,11 +40,11 @@ struct Cli {
     #[arg(long)]
     strict: bool,
 
-    /// Seconds to wait for each response.
+    /// Seconds to wait for responses other than initialize and R3's probe.
     #[arg(long, default_value_t = 10, value_name = "SECS")]
     timeout: u64,
 
-    /// Seconds to wait for the reply to initialize.
+    /// Seconds to wait for initialize and R3's probe after opening the large document.
     #[arg(long, default_value_t = 30, value_name = "SECS")]
     startup_timeout: u64,
 
@@ -59,6 +60,10 @@ struct Cli {
     /// and makes the scenario's failures inconclusive.
     #[arg(long, default_value_t = 64, value_name = "MIB")]
     max_frame_mib: usize,
+
+    /// MiB of text in the large document sent by R3 (must be greater than zero).
+    #[arg(long, default_value = "4", value_name = "MIB")]
+    large_document_mib: NonZeroUsize,
 
     /// The most stdout to inspect per scenario, in MiB.
     #[arg(long, default_value_t = 256, value_name = "MIB")]
@@ -177,6 +182,7 @@ fn main() {
         startup_timeout: Duration::from_secs(cli.startup_timeout),
         exit_timeout: Duration::from_secs(cli.exit_timeout),
         leftover_grace: Duration::from_secs(1),
+        large_document_mib: cli.large_document_mib.get(),
         max_body: cli.max_frame_mib.saturating_mul(1024 * 1024),
         max_output: cli.max_output_mib.saturating_mul(1024 * 1024),
         transcripts: cli.transcripts.clone(),
