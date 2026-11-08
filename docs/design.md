@@ -375,23 +375,23 @@ for `didOpen` has no open document to be asked about (only `workspace/symbol` is
 document's language id and its `scheme` (if any) is `file`; a filter with a glob `pattern`, or for notebooks, isn't
 evaluated and doesn't select it.
 
-The requests are sent one at a time, each bounded by `--timeout` from its write to its reply. After one goes
-unanswered or can't be sent, the rest aren't sent (the detail counts them). When the output closed while waiting, or
-stdin closed while writing, lspcheck waits up to `--exit-timeout` for the exit status, which the detail names; the
-verdict doesn't depend on it.
+The requests are sent one at a time, each waiting up to `--timeout` for its reply. After one goes unanswered or can't
+be sent, the rest aren't sent (the detail counts them). LSP sets no deadline for a response, so a wait that ends is
+not evidence against the server: after sending the requests, the scenario shuts the server down gracefully
+(`shutdown`, then `exit`), answering the server's requests on the way, and judges every request by the responses read
+at any point in the session, including during that shutdown.
 
-- **fail:** a request was answered with an error whose code is -32601. The detail names each such request (method
-  and position). This is seen evidence and stands whatever happened to the other requests.
-- **fail**, through the [absence rules](#cancellation): a delivered request got no response within `--timeout`
-  (including when the server's output closed). The failure keeps that request's window, from its write to the end of
-  the wait, and is `ERROR` when lspcheck missed output in it. A response read only after the wait is named in the
-  detail; whether it was read yet is a matter of timing, so it doesn't change the verdict.
+- **fail:** a request was answered with an error whose code is -32601, whenever its reply was read. The detail names
+  each such request (method and position) and any request that was still unanswered. This is seen evidence and stands
+  whatever happened to the other requests.
 - **error:** initialize didn't succeed, the server chose an encoding lspcheck didn't offer (see L2), the document
-  couldn't be written, read or opened (`didOpen` not delivered), or a request couldn't be delivered.
+  couldn't be written, read or opened (`didOpen` not delivered), or a request couldn't be delivered. A delivered
+  request with no response by the end of the session is also `ERROR` (`no response to <method> at <position> by the
+  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1.
 - **not-exercised:** the initialize result has no capabilities object, or the server advertises none of the requests
   above, or none could be sent (the detail says why).
-- **pass:** every request sent was answered with a result or another error. The detail counts the requests and
-  methods, and lists the other errors by code with the requests that got them.
+- **pass:** every request sent was answered with a result or another error by the end of the session. The detail
+  counts the requests and methods, and lists the other errors by code with the requests that got them.
 
 Responses to K1's requests are judged by J1, J2 and J5 like any other, and the scenario's input is all well formed,
 so it is included in J3. K1 judges only the error code, never a result's content.

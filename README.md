@@ -231,9 +231,12 @@ K1 checks that the server handles what it advertises: it opens a document (a pro
 [`[document]`](#profiles), or a plain-text one of lspcheck's own) and sends, one at a time, each request whose
 capability the initialize result advertises (hover, definition, references, rename, symbols, folding ranges,
 formatting, code actions, semantic tokens, workspace symbols and others), at a few positions for those that take
-one. An answer of MethodNotFound (-32601) fails K1, as does a request left unanswered within `--timeout`; any other
-error is lawful and listed in the detail. K1 doesn't judge what the answers say. See the
-[K1 reference](docs/design.md#capabilities-and-robustness) for the request table and verdict rules.
+one. An answer of MethodNotFound (-32601) fails K1, whenever it was read, including while lspcheck shuts the server
+down; any other error is lawful and listed in the detail. LSP sets no deadline for a response, so a request with no
+response by the end of the session makes K1 `ERROR`, not `FAIL`: lspcheck first shuts the server down gracefully,
+answering the server's requests on the way, and judges every request by what it read at any point. K1 doesn't judge
+what the answers say. See the [K1 reference](docs/design.md#capabilities-and-robustness) for the request table and
+verdict rules.
 
 R1 checks continued service after malformed JSON; R3 checks it after opening a large document.
 If a follow-up request fails, both checks wait up to `--exit-timeout` for an unprompted server exit before judging it.

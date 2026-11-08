@@ -10,7 +10,6 @@
 use crate::message::codes;
 use crate::text::{self, Encoding, Position};
 use serde_json::{Value, json};
-use std::time::Duration;
 
 /// How many positions a profile's `[document]` may give.
 pub const MAX_POSITIONS: usize = 5;
@@ -299,9 +298,8 @@ pub enum Outcome {
     Answered,
     /// Answered with an error with this code.
     Error(i64),
-    /// Delivered, and no response came while lspcheck waited from `since` to
-    /// `waited`.
-    Unanswered { why: String, since: Duration, waited: Duration },
+    /// Delivered, and no response was read by the end of the session.
+    Unanswered,
     /// lspcheck couldn't deliver it.
     Undelivered(String),
 }
@@ -311,13 +309,8 @@ pub enum Outcome {
 pub enum Judgement {
     /// A failure seen: MethodNotFound for an advertised request.
     Fail(String),
-    /// A delivered request got no response: a failure unless lspcheck missed
-    /// evidence while it waited.
-    Absent {
-        detail: String,
-        since: Duration,
-        waited: Duration,
-    },
+    /// K1 couldn't judge: a request wasn't delivered, or no response to a
+    /// delivered one was read by the end of the session.
     Error(String),
     NotExercised(String),
     Pass(String),
@@ -368,8 +361,9 @@ fn other_errors(asked: &[(String, Outcome)]) -> Option<String> {
 
 /// K1's verdict over the requests it sent, in order, with `notes` on what it
 /// didn't send. MethodNotFound for any of them is a failure seen, whatever
-/// happened to the rest; a delivered request left unanswered is a failure
-/// through the absence rules; one lspcheck couldn't deliver is an error.
+/// happened to the rest. LSP sets no deadline for a response, so a delivered
+/// request with no response by the end of the session is inconclusive rather
+/// than a failure; one lspcheck couldn't deliver is an error too.
 pub fn judge(asked: &[(String, Outcome)], notes: &[String]) -> Judgement {
     let with_notes = |detail: String| {
         let mut parts = vec![detail];
@@ -382,10 +376,8 @@ pub fn judge(asked: &[(String, Outcome)], notes: &[String]) -> Judgement {
         .filter(|(_, o)| *o == Outcome::Error(codes::METHOD_NOT_FOUND))
         .map(|(label, _)| label.as_str())
         .collect();
-    let unanswered = asked.iter().find_map(|(label, o)| match o {
-        Outcome::Unanswered { why, since, waited } => Some((label, why, *since, *waited)),
-        _ => None,
-    });
+    let unanswered: Vec<&str> =
+        asked.iter().filter(|(_, o)| *o == Outcome::Unanswered).map(|(label, _)| label.as_str()).collect();
     let undelivered = asked.iter().find_map(|(label, o)| match o {
         Outcome::Undelivered(why) => Some((label, why)),
         _ => None,
@@ -393,16 +385,18 @@ pub fn judge(asked: &[(String, Outcome)], notes: &[String]) -> Judgement {
     if !not_found.is_empty() {
         let mut detail =
             format!("MethodNotFound (-32601) for {} advertised request(s): {}", not_found.len(), not_found.join(", "));
-        if let Some((label, why, ..)) = unanswered {
-            detail.push_str(&format!("; {label} went unanswered ({why})"));
+        if !unanswered.is_empty() {
+            detail.push_str(&format!("; no response to {} by the end of the session", unanswered.join(", ")));
         } else if let Some((label, why)) = undelivered {
             detail.push_str(&format!("; lspcheck couldn't send {label} ({why})"));
         }
         return Judgement::Fail(with_notes(detail));
     }
-    if let Some((label, why, since, waited)) = unanswered {
-        let detail = format!("{label} went unanswered ({why})");
-        return Judgement::Absent { detail: with_notes(detail), since, waited };
+    if !unanswered.is_empty() {
+        let each = if unanswered.len() == 1 { "it" } else { "them" };
+        let detail =
+            format!("no response to {} by the end of the session, so K1 couldn't judge {each}", unanswered.join(", "));
+        return Judgement::Error(with_notes(detail));
     }
     if let Some((label, why)) = undelivered {
         return Judgement::Error(with_notes(format!("lspcheck couldn't send {label} ({why})")));
@@ -563,39 +557,31 @@ mod tests {
 
     #[test]
     fn method_not_found_fails_whatever_else_happened() {
-        let ms = Duration::from_millis;
-        let unanswered = Outcome::Unanswered { why: "no response within 5 s".into(), since: ms(1), waited: ms(2) };
         let asked = [
             answered("textDocument/hover at 1:2", Outcome::Answered),
             answered("textDocument/foldingRange", Outcome::Error(-32601)),
             answered("textDocument/codeLens", Outcome::Error(-32803)),
-            answered("textDocument/documentColor", unanswered),
+            answered("textDocument/documentColor", Outcome::Unanswered),
         ];
         let Judgement::Fail(detail) = judge(&asked, &[]) else { panic!() };
         assert!(detail.starts_with("MethodNotFound (-32601) for 1 advertised request(s): textDocument/foldingRange"));
-        assert!(detail.contains("textDocument/documentColor went unanswered"), "{detail}");
+        assert!(detail.contains("no response to textDocument/documentColor by the end of the session"), "{detail}");
         assert!(detail.contains("-32803 (RequestFailed) for textDocument/codeLens"), "{detail}");
     }
 
     #[test]
-    fn an_unanswered_request_keeps_its_window_and_an_undelivered_one_is_an_error() {
-        let ms = Duration::from_millis;
+    fn an_unanswered_request_is_inconclusive_and_an_undelivered_one_is_an_error() {
         let asked = [
             answered("workspace/symbol", Outcome::Error(-32801)),
-            answered(
-                "textDocument/hover at 1:1",
-                Outcome::Unanswered { why: "no response within 5 s".into(), since: ms(10), waited: ms(20) },
-            ),
+            answered("textDocument/hover at 1:1", Outcome::Unanswered),
         ];
         assert_eq!(
             judge(&asked, &[]),
-            Judgement::Absent {
-                detail: "textDocument/hover at 1:1 went unanswered (no response within 5 s); \
-                         other errors, which are lawful: -32801 (ContentModified) for workspace/symbol"
-                    .into(),
-                since: ms(10),
-                waited: ms(20),
-            }
+            Judgement::Error(
+                "no response to textDocument/hover at 1:1 by the end of the session, so K1 couldn't judge it; \
+                 other errors, which are lawful: -32801 (ContentModified) for workspace/symbol"
+                    .into()
+            )
         );
         let asked = [
             answered("textDocument/hover at 1:1", Outcome::Answered),

@@ -246,6 +246,10 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: advertise colorProvider, and answer textDocument/documentColor with RequestFailed (-32803)",
     ),
     ("ignores-advertised", "advertise colorProvider, and never answer textDocument/documentColor"),
+    (
+        "config-before-log-finish",
+        "with the reply to workspace/symbol, ask for configuration and finish a log notification only after the answer",
+    ),
     ("echo-positions", "lawful: say on stderr where each hover request asks, as FILE LINE:CHARACTER"),
     ("needs-init-option", "refuse to initialize unless initializationOptions has standin = \"ready\""),
     (
@@ -1027,10 +1031,7 @@ fn main() {
             out.frame(&err(&id, -32600, "shutting down"));
             continue;
         }
-        // Only while no document is open: the cancellation scenario opens
-        // none and sends a cancel right after the request, while K1 opens one
-        // and sends nothing until its workspace/symbol is answered.
-        if method == "workspace/symbol" && holds && docs.is_empty() {
+        if method == "workspace/symbol" && holds {
             deferred = Some(id.clone());
             continue;
         }
@@ -1141,6 +1142,39 @@ fn main() {
                     reply.as_object_mut().unwrap().remove("jsonrpc");
                 }
                 out.frame(&reply);
+            }
+            // K1 opens a document before asking, so only its workspace/symbol
+            // is affected (the other scenarios ask with none open). Like a
+            // server that reads settings before going on, this one holds what
+            // follows a request until the answer arrives: if lspcheck records
+            // but doesn't answer the request, the log notification stays half
+            // written and F1 would see a truncated frame, though the server is
+            // behaving lawfully.
+            "workspace/symbol" if fault("config-before-log-finish") && !docs.is_empty() => {
+                let config_id = json!("standin-config");
+                let config = json!({
+                    "jsonrpc": "2.0",
+                    "id": config_id,
+                    "method": "workspace/configuration",
+                    "params": {"items": []}
+                });
+                let log = out.encode(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "window/logMessage",
+                    "params": {"type": 4, "message": "configuration answered"}
+                }));
+                let mut bytes = out.encode(&ok(&id, Value::Null));
+                bytes.extend(out.encode(&config));
+                bytes.push(log[0]);
+                out.raw(&bytes);
+                while let Some(frame) = input.next() {
+                    let Ok(v) = serde_json::from_slice::<Value>(&frame.1) else { continue };
+                    if v.get("method").is_none() && v.get("id") == Some(&config_id) {
+                        out.raw(&log[1..]);
+                        break;
+                    }
+                    queued.push_back(frame);
+                }
             }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
             "textDocument/documentSymbol"

@@ -486,10 +486,40 @@ fn an_advertised_request_answered_with_method_not_found_fails_k1() {
 }
 
 #[test]
-fn an_advertised_request_left_unanswered_fails_k1() {
+fn an_advertised_request_left_unanswered_leaves_k1_inconclusive() {
+    // LSP sets no deadline for a response, so a request answered neither with
+    // MethodNotFound nor anything else by the end of the session is ERROR.
     let r = fault("ignores-advertised");
-    only_fails(&r, &["K1"]);
-    assert!(r.stdout.contains("textDocument/documentColor went unanswered (no response within 5 s)"), "{}", r.stdout);
+    passes_except(&r, &[("K1", "error")]);
+    assert!(
+        r.stdout
+            .contains("no response to textDocument/documentColor by the end of the session, so K1 couldn't judge it"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn a_configuration_request_that_comes_with_k1s_last_reply_is_answered() {
+    // A lawful server may hold what follows a request until its answer, and
+    // this one asks for configuration with the reply to K1's last request.
+    // lspcheck must answer it while it shuts the server down, or the half
+    // written log notification is a false F1.
+    let r = run(&["--fault", "config-before-log-finish"], &["--only", "K1,F1"]);
+    passes_except(&r, &[]);
+    expect(&r, "K1", "pass");
+    expect(&r, "F1", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn a_held_reply_that_arrives_at_shutdown_still_answers_k1() {
+    // A server that holds its workspace/symbol reply until the next input
+    // answers it when `shutdown` arrives. With no document open, that is
+    // K1's only request, and the reply read during `leave` still counts.
+    let r = run(&["--fault", "no-open-close", "--fault", "defer-until-next"], &["--only", "K1"]);
+    expect(&r, "K1", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
 }
 
 /// The hover positions the stand-in reported for `file`, in order.
@@ -499,12 +529,13 @@ fn hovers(r: &Run, file: &str) -> Vec<String> {
 }
 
 #[test]
-fn a_request_about_a_document_left_unanswered_fails_k1_only() {
-    // The documents scenario takes an unanswered request as no evidence, so
-    // only K1, which asks one at a time and waits for each, sees the miss.
+fn a_request_about_a_document_left_unanswered_leaves_k1_inconclusive() {
+    // The documents scenario takes an unanswered request as no evidence, and
+    // K1 can't judge a request with no response by the end of the session
+    // either: it is an error, not a failure.
     let r = fault("drop-first-request");
-    only_fails(&r, &["K1"]);
-    assert!(r.stdout.contains("textDocument/hover at 1:2 went unanswered (no response within 5 s)"), "{}", r.stdout);
+    passes_except(&r, &[("K1", "error")]);
+    assert!(r.stdout.contains("no response to textDocument/hover at 1:2 by the end of the session"), "{}", r.stdout);
 }
 
 #[test]
@@ -1638,9 +1669,10 @@ fn a_server_that_recovered_from_an_earlier_timeout_still_fails_d4() {
     // The first document request goes unanswered, then the server answers
     // the rest at both versions, then stops at the closed document. It had
     // recovered, so D4 fails rather than calling it a server that had
-    // already stopped answering. K1's first request goes unanswered too.
+    // already stopped answering. K1's first request gets no response by the
+    // end of the session either, which it can't judge.
     let r = run(&["--fault", "drop-first-request", "--fault", "stop-after-unopened"], &[]);
-    only_fails(&r, &["D4", "K1"]);
+    passes_except(&r, &[("D4", "fail"), ("K1", "error")]);
     assert!(r.stdout.contains("the closed document went unanswered"), "{}", r.stdout);
 }
 

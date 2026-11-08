@@ -1767,10 +1767,26 @@ async fn with_exit(ctx: &mut Ctx<'_>, why: String) -> String {
     }
 }
 
+/// A request K1 sent, and the id whose response may still arrive while
+/// lspcheck shuts the server down.
+struct K1Asked {
+    label: String,
+    /// The request's id, unless lspcheck couldn't send it.
+    id: Option<Id>,
+    outcome: capabilities::Outcome,
+}
+
+/// What K1 has left for after the graceful shutdown: its verdict, or the
+/// requests whose replies `leave` may still read.
+enum K1Pending {
+    Judged(Judgement),
+    Sent { asked: Vec<K1Asked>, notes: Vec<String> },
+}
+
 /// K1: opens the profile's document (or lspcheck's own), sends each request
 /// the server advertises about it one at a time, and checks none is answered
 /// with MethodNotFound. Ends with a graceful shutdown when initialize
-/// succeeded.
+/// succeeded; a reply read during it still answers its request.
 async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
     let params = capabilities_initialize_params(&ctx.root);
     let reply = match ctx.initialize_with(params).await {
@@ -1779,11 +1795,28 @@ async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
             return ctx.report("K1", Verdict::Error, format!("initialize didn't succeed: {why}"));
         }
     };
-    let judgement = k1(ctx, &reply).await;
+    let pending = k1(ctx, &reply).await;
     leave(ctx).await;
+    let judgement = match pending {
+        K1Pending::Judged(judgement) => judgement,
+        K1Pending::Sent { mut asked, notes } => {
+            // A reply that came after K1 stopped waiting, perhaps while
+            // `leave` answered the server's requests, still answers its
+            // request. LSP sets no deadline for a response.
+            for a in &mut asked {
+                if a.outcome == capabilities::Outcome::Unanswered
+                    && let Some(id) = &a.id
+                    && let Some(m) = ctx.s.answer_to(id)
+                {
+                    a.outcome = k1_outcome(m);
+                }
+            }
+            let asked: Vec<(String, capabilities::Outcome)> = asked.into_iter().map(|a| (a.label, a.outcome)).collect();
+            capabilities::judge(&asked, &notes)
+        }
+    };
     match judgement {
         Judgement::Fail(detail) => ctx.fail("K1", detail),
-        Judgement::Absent { detail, since, waited } => ctx.fail_absent_between("K1", since, waited, detail),
         Judgement::Error(detail) => ctx.report("K1", Verdict::Error, detail),
         Judgement::NotExercised(detail) => ctx.report("K1", Verdict::NotExercised, detail),
         Judgement::Pass(detail) => ctx.pass_with("K1", detail),
@@ -1791,13 +1824,13 @@ async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
 }
 
 /// K1's requests, after a successful initialize. The caller leaves.
-async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> Judgement {
+async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
     let Some(caps) = initialize_capabilities(reply).filter(|c| c.is_object()).cloned() else {
-        return Judgement::NotExercised("initialize had no capabilities object (see L2)".into());
+        return K1Pending::Judged(Judgement::NotExercised("initialize had no capabilities object (see L2)".into()));
     };
     let encoding = match negotiated_encoding(reply) {
         Ok(encoding) => encoding,
-        Err(why) => return Judgement::Error(why),
+        Err(why) => return K1Pending::Judged(Judgement::Error(why)),
     };
     let (name, language_id, given) = match &ctx.cfg.document {
         Some(d) => (d.path.clone(), d.language_id.clone(), d.positions.clone()),
@@ -1807,7 +1840,7 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> Judgement {
         std::iter::once(ctx.root.as_os_str()).chain(name.split('/').map(std::ffi::OsStr::new)).collect();
     if ctx.cfg.document.is_none() {
         if let Err(e) = std::fs::write(&path, K1_TEXT) {
-            return Judgement::Error(format!("couldn't write {name}: {e}"));
+            return K1Pending::Judged(Judgement::Error(format!("couldn't write {name}: {e}")));
         }
         ctx.record_workspace();
     }
@@ -1815,13 +1848,17 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> Judgement {
     // the profile was read, but the fixture may have changed since.
     let text = match std::fs::read(&path).map(String::from_utf8) {
         Ok(Ok(text)) => text,
-        Ok(Err(_)) => return Judgement::Error(format!("{name} in the workspace isn't UTF-8 text")),
-        Err(e) => return Judgement::Error(format!("couldn't read {name} in the workspace: {e}")),
+        Ok(Err(_)) => {
+            return K1Pending::Judged(Judgement::Error(format!("{name} in the workspace isn't UTF-8 text")));
+        }
+        Err(e) => {
+            return K1Pending::Judged(Judgement::Error(format!("couldn't read {name} in the workspace: {e}")));
+        }
     };
     let spots = match given {
         Some(spots) => {
             if let Some(e) = spots.iter().find_map(|s| s.check(&text).err()) {
-                return Judgement::Error(format!("{name} changed since the profile was read: {e}"));
+                return K1Pending::Judged(Judgement::Error(format!("{name} changed since the profile was read: {e}")));
             }
             spots
         }
@@ -1836,36 +1873,29 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> Judgement {
     if requests.iter().any(|r| r.params.get("textDocument").is_some()) {
         let doc = json!({"uri": uri, "languageId": language_id, "version": 1, "text": text});
         if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await {
-            return Judgement::Error(format!("lspcheck couldn't send didOpen for {name}: {e}"));
+            return K1Pending::Judged(Judgement::Error(format!("lspcheck couldn't send didOpen for {name}: {e}")));
         }
     }
 
-    // One at a time, each by its own `--timeout`. After one goes unanswered
-    // or can't be sent, the rest aren't sent: the server has stopped, or
-    // each would only wait as long again.
-    let t = ctx.cfg.request_timeout;
-    let mut asked: Vec<(String, capabilities::Outcome)> = Vec::new();
-    // The request left unanswered: its place in `asked`, its id and when it was sent.
-    let mut unanswered: Option<(usize, Id, Duration)> = None;
+    // One at a time, each waiting up to `--timeout`. After one goes unanswered
+    // or can't be sent, the rest aren't sent: the server has stopped, or each
+    // would only wait as long again. A wait that ends is not evidence: the
+    // reply may still arrive while `leave` shuts the server down, so only
+    // `capabilities_scenario`, after it, decides what a request got.
+    let mut asked: Vec<K1Asked> = Vec::new();
     for (i, r) in requests.iter().enumerate() {
-        let outcome = match ask(ctx, r.method, r.params.clone()).await {
-            Ok((_, Ok(m))) => k1_outcome(&m),
-            Ok((a, Err(e))) => {
-                let waited = ctx.s.elapsed();
-                let mut why = describe_call_error(&CallError::Wait(e), t);
-                if e == WaitError::Closed {
-                    why = with_exit(ctx, why).await;
-                }
-                unanswered = Some((asked.len(), a.id, a.at));
-                capabilities::Outcome::Unanswered { why, since: a.at, waited }
+        let sent = match ask(ctx, r.method, r.params.clone()).await {
+            Ok((a, Ok(m))) => K1Asked { label: r.label.clone(), id: Some(a.id), outcome: k1_outcome(&m) },
+            Ok((a, Err(_))) => {
+                K1Asked { label: r.label.clone(), id: Some(a.id), outcome: capabilities::Outcome::Unanswered }
             }
             Err(e) => {
                 let why = if e == WriteError::Closed { with_exit(ctx, e.to_string()).await } else { e.to_string() };
-                capabilities::Outcome::Undelivered(why)
+                K1Asked { label: r.label.clone(), id: None, outcome: capabilities::Outcome::Undelivered(why) }
             }
         };
-        let stop = matches!(outcome, capabilities::Outcome::Unanswered { .. } | capabilities::Outcome::Undelivered(_));
-        asked.push((r.label.clone(), outcome));
+        let stop = matches!(sent.outcome, capabilities::Outcome::Unanswered | capabilities::Outcome::Undelivered(_));
+        asked.push(sent);
         if stop {
             let rest = requests.len() - i - 1;
             if rest > 0 {
@@ -1874,17 +1904,7 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> Judgement {
             break;
         }
     }
-    // A reply read after lspcheck stopped waiting is named in the detail
-    // only: whether it has been read yet is a matter of timing, so the
-    // verdict is the absence's.
-    ctx.s.take_in();
-    if let Some((i, id, since)) = unanswered
-        && let Some((_, m)) = ctx.s.messages.iter().find(|(at, m)| *at >= since && m.response_id() == Some(&id))
-        && let capabilities::Outcome::Unanswered { why, .. } = &mut asked[i].1
-    {
-        why.push_str(&format!("; {} came only after lspcheck stopped waiting", describe_response(m)));
-    }
-    capabilities::judge(&asked, &notes)
+    K1Pending::Sent { asked, notes }
 }
 
 /// The index in `messages` of the first response to `id` at or after `from`.

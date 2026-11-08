@@ -760,6 +760,13 @@ impl Session {
         })
     }
 
+    /// The response the session matched to this request, if it read one: the
+    /// same match the session uses to answer a wait, so a reply read after
+    /// the caller stopped waiting still counts.
+    pub fn answer_to(&self, id: &Id) -> Option<&Message> {
+        self.answers.get(id).map(|&i| &self.messages[i].1)
+    }
+
     /// Sends a request, registering it so only a later response can answer it.
     pub async fn request(&mut self, method: &str, params: Option<Value>) -> Result<Id, WriteError> {
         let id = self.fresh_id();
