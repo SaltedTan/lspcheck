@@ -1787,21 +1787,26 @@ impl<R: Read> Input<R> {
         }
         self.buf.extend_from_slice(&chunk);
         if self.fault("first-frame-per-read") {
-            let mut ends = Vec::new();
+            // Only F4's shape: a request, $/setTrace, then another frame, all
+            // in one read. Any notification would also match `initialized`
+            // coalescing with J6's requests, which this fault must not touch.
+            // Everything before $/setTrace is kept (the read may also hold the
+            // end of an earlier frame), so exactly the second request is lost.
+            let mut frames = Vec::new();
             let mut at = 0;
-            let mut set_trace = false;
             while let Parsed::Frame((_, body), used) = self.parse(&self.buf[at..]) {
-                at += used;
-                ends.push(at);
-                // Only F4's shape: two requests with $/setTrace between them.
-                // Any notification would also match `initialized` coalescing
-                // with J6's requests, which this fault must not touch.
-                set_trace |= serde_json::from_slice::<Value>(&body).is_ok_and(|v| {
+                let set_trace = serde_json::from_slice::<Value>(&body).is_ok_and(|v| {
                     v.get("id").is_none() && v.get("method").and_then(Value::as_str) == Some("$/setTrace")
                 });
+                frames.push((at, set_trace));
+                at += used;
             }
-            if ends.len() >= 3 && set_trace {
-                self.buf.truncate(ends[0]);
+            if let Some(i) = frames.iter().position(|&(_, set_trace)| set_trace)
+                && i >= 1
+                && i + 1 < frames.len()
+            {
+                eprintln!("standin: first-frame-per-read dropped a frame");
+                self.buf.truncate(frames[i].0);
             }
         }
         true

@@ -719,7 +719,9 @@ fn input_split_across_writes_must_be_read() {
 
 #[test]
 fn frames_coalesced_in_one_write_must_all_be_read() {
-    let r = fault("first-frame-per-read");
+    // Where the server's reads end decides whether the fault can act, so
+    // repeat until it says it did.
+    let r = fault_taking_effect("first-frame-per-read", "first-frame-per-read dropped");
     only_fails(&r, &["F4"]);
     assert!(r.stdout.contains("1 of 2 requests went unanswered"), "{}", r.stdout);
     // Even when slow reads make the server read each frame separately, the
