@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. Profiles part 1 is done (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[allow]`), including portable workspace names with consistent ASCII case and replay of binary files and empty directories; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies; part 2 (`[document]`, `[client].capabilities`, K1) and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. Profiles part 1 is done (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[allow]`), including portable workspace names with consistent ASCII case and replay of binary files, empty directories and Unix file permissions; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies; part 2 (`[document]`, `[client].capabilities`, K1) and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -452,9 +452,12 @@ it was before profiles (the JSON report has `"profile": null`). Generic checks s
 - **Replay.** A transcript's workspace line records the files at the workspace's top (as before) and every file the
   profile put there, nested ones named with `/`. Text files remain JSON strings; binary files are objects with
   `"encoding":"base64"` and a `"data"` string in the standard base64 alphabet. An optional `"directories"` array
-  preserves fixture directories, including empty ones. Old transcripts without these additions still replay.
+  preserves fixture directories, including empty ones. An optional `"file_modes"` object maps file names to numeric
+  Unix read, write and execute permission bits (0 through 511); replay restores them on Unix after writing each
+  file. Other platforms ignore these modes. Names must match recorded files; privileged mode bits are refused.
+  Old transcripts without these additions still replay with default file permissions.
   Replay validates portable names and consistent ASCII case in every shared path component across recorded files
-  and directories before writing. File permissions are not preserved during replay. There is no size limit. A `{"dir":"meta","configuration":…}`
+  and directories before writing. There is no size limit. A `{"dir":"meta","configuration":…}`
   line records the settings, and replay answers `workspace/configuration` from it. `initializationOptions` and the
   `didChangeConfiguration` are in the recorded bytes. Replay's own timeouts are still its flags; it doesn't read
   profiles.

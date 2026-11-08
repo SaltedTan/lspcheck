@@ -97,6 +97,7 @@ pub enum EventKind {
         path: PathBuf,
         files: Vec<(String, Vec<u8>)>,
         directories: Vec<String>,
+        file_modes: std::collections::BTreeMap<String, u32>,
     },
     /// The settings `workspace/configuration` is answered from, so a replay
     /// answers the same way.
@@ -521,7 +522,21 @@ impl Session {
 
     /// Records the workspace and the files in it, for [`crate::replay`].
     pub fn record_workspace(&self, path: PathBuf, files: Vec<(String, Vec<u8>)>, directories: Vec<String>) {
-        record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files, directories });
+        #[cfg(unix)]
+        let file_modes = {
+            use std::os::unix::fs::PermissionsExt;
+            files
+                .iter()
+                .filter_map(|(name, _)| {
+                    std::fs::metadata(path.join(name))
+                        .ok()
+                        .map(|metadata| (name.clone(), metadata.permissions().mode() & 0o777))
+                })
+                .collect()
+        };
+        #[cfg(not(unix))]
+        let file_modes = std::collections::BTreeMap::new();
+        record(&self.transcript, self.start.elapsed(), EventKind::Workspace { path, files, directories, file_modes });
     }
 
     /// Records the settings `workspace/configuration` is answered from, for [`crate::replay`].

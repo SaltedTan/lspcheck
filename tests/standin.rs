@@ -2350,6 +2350,39 @@ fn profile_regression_binary_fixtures_and_empty_directories_replay() {
     assert!(workspace["directories"].as_array().unwrap().contains(&Value::String("cache/empty".into())));
 }
 
+#[cfg(unix)]
+#[test]
+fn profile_regression_executable_fixture_permissions_replay() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A server may require executable project helpers before initializing.
+    // Recreating their bytes alone must not change initialization's result.
+    let (path, keep) = profile("[workspace]\npath = \"fixture\"\nfiles = { \"settings.txt\" = \"override\" }\n");
+    let fixture = keep.path().join("fixture");
+    std::fs::create_dir_all(fixture.join("bin")).unwrap();
+    std::fs::create_dir_all(fixture.join("cache/empty")).unwrap();
+    std::fs::write(fixture.join("payload.bin"), [255]).unwrap();
+    std::fs::write(fixture.join("settings.txt"), "original").unwrap();
+    let helper = fixture.join("bin/helper");
+    std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        fixture.join("standin.toml"),
+        "require_executable = \"bin/helper\"\nrequire = \"payload.bin\"\nrequire_directory = \"cache/empty\"\n",
+    )
+    .unwrap();
+    let transcripts = keep.path().join("t");
+    let server = [STANDIN, "--fault", "needs-workspace-file"];
+    let r =
+        run_command_in(&["--profile", path.to_str().unwrap(), "--only", "L2,L6"], &server, None, transcripts.clone());
+    expect(&r, "L2", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    for recording in ["lifecycle.jsonl", "lifecycle.replay.jsonl"] {
+        let stdout = replays_alike(&transcripts.join(recording), "needs-workspace-file");
+        assert!(stdout.contains("result -> result"), "{stdout}");
+    }
+}
+
 #[test]
 fn profile_case_collisions_are_usage_errors_before_startup() {
     let (path, keep) = profile("");

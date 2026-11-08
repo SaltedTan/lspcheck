@@ -34,6 +34,8 @@ pub struct Workspace {
     /// (relative name, bytes) pairs.
     pub files: Vec<(String, Vec<u8>)>,
     pub directories: Vec<String>,
+    /// Unix rwx bits, absent in older recordings and ignored on other platforms.
+    pub file_modes: std::collections::BTreeMap<String, u32>,
 }
 
 /// One `out` event of the recording, in order.
@@ -355,7 +357,12 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
                         })?,
                         None => Vec::new(),
                     };
-                    plan.workspace = Some(Workspace { path: PathBuf::from(dir), files, directories });
+                    let file_modes = match v.get("file_modes") {
+                        Some(value) => serde_json::from_value::<std::collections::BTreeMap<String, u32>>(value.clone())
+                            .map_err(|e| format!("{}: line {line}: invalid workspace file modes: {e}", path.display()))?,
+                        None => std::collections::BTreeMap::new(),
+                    };
+                    plan.workspace = Some(Workspace { path: PathBuf::from(dir), files, directories, file_modes });
                 }
                 if let Some(settings) = v.get("configuration") {
                     plan.configuration = Some(settings.clone());
@@ -410,6 +417,11 @@ fn workspace_key(name: &str) -> Result<PathBuf, String> {
 }
 
 fn validate_workspace(w: &Workspace) -> Result<Vec<PathBuf>, String> {
+    for (name, mode) in &w.file_modes {
+        if *mode > 0o777 || !w.files.iter().any(|(file, _)| file == name) {
+            return Err(format!("invalid workspace file mode for {name:?}: expected rwx bits for a recorded file"));
+        }
+    }
     crate::profile::validate_name_case(
         w.files.iter().map(|(name, _)| name.as_str()).chain(w.directories.iter().map(String::as_str)),
     )
@@ -529,6 +541,12 @@ impl WorkspaceGuard {
             self.created_files.push(file_path.clone());
             file.write_all(bytes)
                 .map_err(|e| format!("can't write workspace file {name:?} at {}: {e}", file_path.display()))?;
+            #[cfg(unix)]
+            if let Some(mode) = w.file_modes.get(name) {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(*mode))
+                    .map_err(|e| format!("can't set workspace file permissions for {name:?}: {e}"))?;
+            }
         }
         Ok(())
     }
@@ -1079,6 +1097,7 @@ mod tests {
             path,
             files: files.iter().map(|(name, text)| ((*name).into(), text.as_bytes().to_vec())).collect(),
             directories: Vec::new(),
+            file_modes: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1166,7 +1185,12 @@ mod tests {
         for name in names {
             let w = workspace(root.clone(), &[(&name, "unsafe")]);
             assert!(WorkspaceGuard::new(Some(&w)).is_err(), "{name:?}");
-            let w = Workspace { path: root.clone(), files: Vec::new(), directories: vec![name.clone()] };
+            let w = Workspace {
+                path: root.clone(),
+                files: Vec::new(),
+                directories: vec![name.clone()],
+                file_modes: std::collections::BTreeMap::new(),
+            };
             assert!(WorkspaceGuard::new(Some(&w)).is_err(), "{name:?}");
             assert!(!root.exists());
         }
@@ -1193,6 +1217,43 @@ mod tests {
         let mut guard = WorkspaceGuard::new(p.workspace.as_ref()).unwrap();
         assert_eq!(std::fs::read(root.join("old.txt")).unwrap(), b"old");
         assert!(guard.remove());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_file_modes_restore_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        // The transcript's numeric modes are Unix rwx bits: executable and
+        // read-only fixtures must retain their distinct access permissions.
+        let recording = json!({
+            "dir": "meta", "workspace": root,
+            "files": {"bin/helper": "helper", "readonly": "data"},
+            "file_modes": {"bin/helper": 0o751, "readonly": 0o440}
+        });
+        let p = plan(&recording.to_string());
+        let mut guard = WorkspaceGuard::new(p.workspace.as_ref()).unwrap();
+        assert_eq!(std::fs::metadata(root.join("bin/helper")).unwrap().permissions().mode() & 0o777, 0o751);
+        assert_eq!(std::fs::metadata(root.join("readonly")).unwrap().permissions().mode() & 0o777, 0o440);
+        assert!(guard.remove());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn workspace_file_modes_reject_invalid_entries_before_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        for (name, mode) in [("helper", 0o4755), ("unrecorded", 0o755), ("../outside", 0o755)] {
+            let recording = json!({
+                "dir": "meta", "workspace": root,
+                "files": {"helper": "helper"}, "file_modes": {name: mode}
+            });
+            let p = plan(&recording.to_string());
+            assert!(WorkspaceGuard::new(p.workspace.as_ref()).is_err());
+            assert!(!root.exists());
+        }
     }
 
     #[test]

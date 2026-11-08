@@ -297,8 +297,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
 
 The report names the profile: in the terminal's first line, and as `"profile"` in the JSON report (`null` without
 one). Transcripts record the profile's files, including binary contents, directories (including empty ones), and
-settings, so `lspcheck replay` recreates the workspace and answers `workspace/configuration` the same way. File
-permissions are not preserved during replay.
+settings, so `lspcheck replay` recreates the workspace and answers `workspace/configuration` the same way. On Unix,
+transcripts also record and restore file read, write and execute permissions, so fixture helpers remain executable.
 
 ### Reproducing a failure
 
