@@ -325,7 +325,8 @@ duplicate or unasked reply, which J2 judges, not R1. Both the response verdict a
 ParseError count use unmatched response occurrences read from the start of the malformed-body write through the
 end of the probe wait. Judging follows graceful shutdown so queued messages are included, with earlier and later
 reads excluded. The plain request must be answered. An exit before the answer or an unanswered delivered request
-fails; missing answers become `ERROR` when evidence in the applicable window is incomplete. An exit while a
+fails; missing answers become `ERROR` when evidence from the start of the probe write through the end of its wait
+is incomplete. Output skipped before the probe write cannot have held its answer. An exit while a
 delivered probe is pending preserves that probe's wait window, ending before shutdown or cleanup. Once the probe
 is answered, a later exit does not fail R1. Incomplete delivery of the malformed body is `ERROR`; an undeliverable
 probe is also `ERROR` unless an observed exit establishes a failure. J2 doesn't attribute null-id errors to a
