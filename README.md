@@ -316,8 +316,9 @@ lspcheck --profile go.toml --timeout 30 -- gopls
 - **`[document]`.** K1 opens this file (at version 1, with the `language_id` given) instead of a plain-text document of
   lspcheck's own, and asks position requests at `positions`, each converted to the position encoding the server
   chose. `path` must name a file of `[workspace]` (from `path` or `files`) holding UTF-8 text; each position must be
-  on a line the file has, at most one column past the line's last character. Without `positions`, K1 asks one
-  character into the file's first three identifier-like words. Other checks still use their own documents.
+  on a line the file has, at most one column past the line's last character. Without `positions`, K1
+  [chooses positions from the document's text](docs/design.md#capabilities-and-robustness).
+  Other checks still use their own documents.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
   type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name, an unknown check id, or a
   `[document]` whose file, language id or positions don't fit is a usage error (exit status 2) naming the file and
