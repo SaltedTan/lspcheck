@@ -1092,22 +1092,20 @@ fn main() {
                 reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
                 out.frame(&reply);
             }
+            "lspcheck/probe" if fault("trailing-fragment") && (follows_wrong_params || id == json!("7")) => {
+                let mut reply = out.encode(&err(&id, -32601, "method not found"));
+                let bytes = out.encode(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "window/logMessage",
+                    "params": {"type": 4, "message": "still writing"}
+                }));
+                reply.push(bytes[0]);
+                out.raw(&reply);
+                unfinished = Some(bytes[1..].to_vec());
+            }
             _ if fault("ignore-unknown-requests") => {}
             _ if fault("wrong-unknown-error") => out.frame(&err(&id, -32600, "unknown")),
             _ => out.frame(&err(&id, -32601, "method not found")),
-        }
-        if fault("trailing-fragment") && (follows_wrong_params || (method == "lspcheck/probe" && id == json!("7"))) {
-            // A lawful notification still on its way when the checks are done:
-            // lspcheck must read it whole rather than kill the server mid-frame.
-            let bytes = out.encode(&json!({
-                "jsonrpc": "2.0",
-                "method": "window/logMessage",
-                "params": {"type": 4, "message": "still writing"}
-            }));
-            // Finished only when `shutdown` arrives, so a client that kills
-            // the server instead of shutting it down always sees it cut short.
-            out.raw(&bytes[..1]);
-            unfinished = Some(bytes[1..].to_vec());
         }
         if !std::mem::replace(&mut answered_one, true) && fault("null-reply-after-first-probe") {
             // As if `initialized` had been answered late.
