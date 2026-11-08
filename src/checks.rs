@@ -1912,24 +1912,14 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
                 K1Asked { label: r.label.clone(), id: None, outcome: capabilities::Outcome::Undelivered(why) }
             }
         };
-        let undelivered = match &sent.outcome {
-            capabilities::Outcome::Undelivered(why) => Some(why.clone()),
-            _ => None,
-        };
+        let stop = matches!(sent.outcome, capabilities::Outcome::Undelivered(_));
         asked.push(sent);
-        if let Some(why) = undelivered {
-            let rest = requests.len() - i - 1;
-            if rest > 0 {
-                notes.insert(0, format!("the {rest} request(s) after {} weren't sent", r.label));
+        if stop {
+            // The cause is in the failed request's entry; name the rest once.
+            let rest: Vec<&str> = requests[i + 1..].iter().map(|remaining| remaining.label.as_str()).collect();
+            if !rest.is_empty() {
+                notes.insert(0, format!("not sent after that: {}", rest.join(", ")));
             }
-            asked.extend(requests[i + 1..].iter().map(|remaining| K1Asked {
-                label: remaining.label.clone(),
-                id: None,
-                outcome: capabilities::Outcome::Undelivered(format!(
-                    "not attempted after {} couldn't be delivered: {why}",
-                    r.label
-                )),
-            }));
             break;
         }
     }

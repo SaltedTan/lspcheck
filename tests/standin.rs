@@ -582,22 +582,21 @@ fn k1_names_every_unsent_request_after_an_unanswered_request_and_exit() {
     let r = run(&["--fault", "exit-on-first-hover", "--fault", "advertises-unimplemented"], &["--only", "K1"]);
     expect(&r, "K1", "error");
     assert_eq!(r.status, 2, "{}", r.stdout);
-    assert!(r.stdout.contains("no response to textDocument/hover at 1:2"), "{}", r.stdout);
-    for label in [
-        "textDocument/hover at 2:6",
-        "textDocument/hover at 3:2",
-        "textDocument/documentHighlight at 1:2",
-        "textDocument/documentHighlight at 2:6",
-        "textDocument/documentHighlight at 3:2",
-        "textDocument/selectionRange",
-        "textDocument/documentSymbol",
-        "textDocument/foldingRange",
-        "textDocument/documentColor",
-        "workspace/symbol",
-    ] {
-        assert!(r.stdout.contains(&format!("couldn't send {label}")), "{label}: {}", r.stdout);
+    let detail = r.stdout.replace("\n", " ").split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(detail.contains("no response to textDocument/hover at 1:2"), "{detail}");
+    assert!(detail.contains("couldn't send textDocument/hover at 2:6 ("), "{detail}");
+    assert!(detail.contains("the server exited with status 17"), "{detail}");
+    let unsent = "not sent after that: textDocument/hover at 3:2, textDocument/documentHighlight at 1:2, \
+                  textDocument/documentHighlight at 2:6, textDocument/documentHighlight at 3:2, \
+                  textDocument/selectionRange";
+    assert!(detail.contains(unsent), "{detail}");
+    for label in
+        ["textDocument/documentSymbol", "textDocument/foldingRange", "textDocument/documentColor", "workspace/symbol"]
+    {
+        assert!(detail.contains(&format!(", {label}")), "{label}: {detail}");
     }
-    assert!(r.stdout.contains("the server exited with status 17"), "{}", r.stdout);
+    // The cause is given once, not repeated for each request left unsent.
+    assert_eq!(detail.matches("exited with status 17").count(), 1, "{detail}");
 }
 
 /// The hover positions the stand-in reported for `file`, in order.

@@ -377,16 +377,15 @@ evaluated and doesn't select it.
 
 The requests are sent one at a time, each waiting up to `--timeout` for its reply. After one goes unanswered, the
 remaining requests are sent without waiting for each reply. Only a delivery failure stops sending (the detail
-counts any requests left unsent). LSP sets no deadline for a response, so a wait that ends is not evidence against
+lists the requests left unsent). LSP sets no deadline for a response, so a wait that ends is not evidence against
 the server: after sending the requests, the scenario shuts the server down gracefully (`shutdown`, then `exit`),
 answering the server's requests on the way. Once session cleanup has drained the final stdout, K1 judges every
 request by its matched response, including replies read during shutdown or the final drain. A MethodNotFound reply
 counts when its id equals the request's exactly and it was read at or after the request was sent, even after another
 response with that id (the duplicate is J2's).
 
-For either a failure or an error, the detail names every unanswered or undeliverable request, including those not
-attempted after a delivery failure. Undeliverable entries include the delivery cause and the server's exit status
-when observed.
+For either a failure or an error, the detail names every unanswered request and the request lspcheck couldn't send,
+with the cause (including the server's exit status when observed), and lists the requests not sent after it.
 
 - **fail:** a request was answered with an error whose code is -32601. The detail names each such request (method
   and position). This is seen evidence and stands whatever happened to the other requests.

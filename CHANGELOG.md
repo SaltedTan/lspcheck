@@ -4,11 +4,6 @@
 
 ### Fixed
 
-- K1 judges matched replies after the final stdout drain and sends remaining advertised requests after a reply
-  timeout, so late replies count and a deferred request cannot hide another method's MethodNotFound response.
-  MethodNotFound also counts after an earlier result with the same exact id; delivery failures name every request
-  left unsent, including those not attempted, with the delivery cause and the server's exit status when observed.
-- K1 skips nonstandard language-string document selectors; LSP DocumentFilter objects determine selection.
 - R1 and R3 wait for an unprompted exit after a failed probe, so a pipe closing before the process finishes exiting
   does not turn a server crash into an inconclusive result on Windows.
 - Transcripts keep each request before its reply, even when the reply is read while the request's write is still
