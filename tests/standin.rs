@@ -632,7 +632,9 @@ fn a_reply_skipped_while_lspcheck_waited_makes_its_absence_inconclusive() {
 fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
     // The server stops reading while lspcheck answers its request, so
     // lspcheck can't deliver the requests J4 and L4 depend on.
-    let r = run(&["--fault", "block-after-init"], &["--timeout", "1"]);
+    // Only run the three scenarios asserted below: waiting on this blocked
+    // server in every scenario can exceed the watchdog on Windows.
+    let r = run(&["--fault", "block-after-init"], &["--timeout", "1", "--only", "L2,J4,L4,L6,F3,F4,F5,F6,F7,L7"]);
     expect(&r, "L2", "pass");
     for id in ["J4", "L4", "L6"] {
         expect(&r, id, "error");
