@@ -67,7 +67,7 @@ lspcheck 0.1.0 — basedpyright-langserver --stdio
 
 lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions and
 parameter and request-id robustness.
-R2 accepts only well-formed error responses, including a signed 32-bit integer code and a string message.
+The [robustness reference](docs/design.md#capabilities-and-robustness) explains R2 and R4's verdict rules.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
