@@ -65,8 +65,8 @@ const FAULTS: &[(&str, &str)] = &[
     ("wrong-params-result-and-error", "answer wrongly typed params with both result and error"),
     (
         "trailing-fragment",
-        "lawful: after the last odd-id probe, and after the probe that follows wrongly typed params, send a \
-         logMessage in two writes a second apart",
+        "lawful: after the last odd-id probe, and after the probe that follows wrongly typed params, begin a \
+         logMessage and finish it only when shutdown arrives",
     ),
     ("big-reply-then-exit", "answer the probe that follows wrongly typed params with a 2 MiB error, then exit"),
     ("reply-twice", "answer every lspcheck/probe twice"),
@@ -289,6 +289,9 @@ fn main() {
     let mut answered_one = false;
     // A wrongly typed request was just answered, and the next probe not yet.
     let mut after_wrong_params = false;
+    // The rest of a notification begun after the checks were done, written
+    // only once `shutdown` arrives.
+    let mut unfinished: Option<Vec<u8>> = None;
     // For inflated-on-first-probe.
     let mut probed = false;
     // Messages read by await-progress-answer while it waited, to handle next.
@@ -973,6 +976,11 @@ fn main() {
             out.frame(&reply);
             std::process::exit(0);
         }
+        if method == "shutdown"
+            && let Some(rest) = unfinished.take()
+        {
+            out.raw(&rest);
+        }
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
@@ -1096,9 +1104,10 @@ fn main() {
                 "method": "window/logMessage",
                 "params": {"type": 4, "message": "still writing"}
             }));
+            // Finished only when `shutdown` arrives, so a client that kills
+            // the server instead of shutting it down always sees it cut short.
             out.raw(&bytes[..1]);
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            out.raw(&bytes[1..]);
+            unfinished = Some(bytes[1..].to_vec());
         }
         if !std::mem::replace(&mut answered_one, true) && fault("null-reply-after-first-probe") {
             // As if `initialized` had been answered late.
