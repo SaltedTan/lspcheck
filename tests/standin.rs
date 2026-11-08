@@ -918,6 +918,33 @@ fn accepting_wrongly_typed_params_fails_r2() {
 }
 
 #[test]
+fn malformed_errors_fail_r2() {
+    for (name, problem) in [
+        ("wrong-params-null-error", "code isn't an integer"),
+        ("wrong-params-string-code", "code isn't an integer"),
+        ("wrong-params-large-code", "outside LSP's integer range"),
+        ("wrong-params-missing-message", "message isn't a string"),
+        ("wrong-params-numeric-message", "message isn't a string"),
+        ("wrong-params-result-and-error", "both \"result\" and \"error\""),
+    ] {
+        let r = run(&["--fault", name], &["--only", "R2,J5"]);
+        only_fails(&r, &["R2", "J5"]);
+        expect(&r, "R2", "fail");
+        expect(&r, "J5", "fail");
+        assert_eq!(r.status, 1, "{name}\n{}", r.stdout);
+        assert!(r.stdout.contains("returned a malformed response instead of an error"), "{name}\n{}", r.stdout);
+        assert!(r.stdout.contains(problem), "{name}\n{}", r.stdout);
+    }
+    for args in [vec![], vec!["--fault", "wrong-params-other-code"]] {
+        let r = run(&args, &["--only", "R2,J5"]);
+        only_fails(&r, &[]);
+        expect(&r, "R2", "pass");
+        expect(&r, "J5", "pass");
+        assert_eq!(r.status, 0, "{}", r.stdout);
+    }
+}
+
+#[test]
 fn exiting_on_wrongly_typed_params_fails_r2() {
     let r = fault("dies-on-wrong-params");
     only_fails(&r, &["R2"]);

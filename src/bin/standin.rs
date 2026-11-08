@@ -57,6 +57,12 @@ const FAULTS: &[(&str, &str)] = &[
     ("accepts-wrong-params", "answer a request with wrongly typed params with result null"),
     ("dies-on-wrong-params", "exit when a request arrives with wrongly typed params"),
     ("wrong-params-other-code", "lawful: answer wrongly typed params with InternalError (-32603)"),
+    ("wrong-params-null-error", "answer wrongly typed params with error null"),
+    ("wrong-params-string-code", "answer wrongly typed params with a string error code"),
+    ("wrong-params-large-code", "answer wrongly typed params with an error code outside the signed 32-bit range"),
+    ("wrong-params-missing-message", "answer wrongly typed params with no error message"),
+    ("wrong-params-numeric-message", "answer wrongly typed params with a numeric error message"),
+    ("wrong-params-result-and-error", "answer wrongly typed params with both result and error"),
     (
         "trailing-fragment",
         "lawful: after the last odd-id probe, and after the probe that follows wrongly typed params, send a \
@@ -933,7 +939,21 @@ fn main() {
                 continue;
             }
             let code = if fault("wrong-params-other-code") { -32603 } else { -32602 };
-            out.frame(&err(&id, code, "invalid params"));
+            let mut reply = err(&id, code, "invalid params");
+            if fault("wrong-params-null-error") {
+                reply["error"] = Value::Null;
+            } else if fault("wrong-params-string-code") {
+                reply["error"]["code"] = json!("-32602");
+            } else if fault("wrong-params-large-code") {
+                reply["error"]["code"] = json!(2147483648_i64);
+            } else if fault("wrong-params-missing-message") {
+                reply["error"].as_object_mut().unwrap().remove("message");
+            } else if fault("wrong-params-numeric-message") {
+                reply["error"]["message"] = json!(42);
+            } else if fault("wrong-params-result-and-error") {
+                reply["result"] = Value::Null;
+            }
+            out.frame(&reply);
             after_wrong_params = true;
             continue;
         }

@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- R2 rejects malformed error responses, including invalid codes and missing or non-string messages.
 - Terminal, JUnit and Markdown reports reference the transcripts directory for cross-cutting failures and errors.
 - Markdown keeps character references and tildes literal in table cells and makes CR/LF visible in commands and
   transcript paths.

@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report), R2 and R4 are done with per-request evidence windows and J3 coverage, while profiles, K1, R1, R3 and the stock-server CI matrix are still planned.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed. M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report), R2 and R4 are done with per-request evidence windows, J3 coverage and R2 error-envelope validation, while profiles, K1, R1, R3 and the stock-server CI matrix are still planned.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -331,7 +331,8 @@ Numeric ids stay within LSP 3.17's signed 32-bit range, so `2^53` is deliberatel
 R2 runs in its own `wrong-params` scenario so a server crash cannot contaminate other checks. From the initialize
 capabilities it selects the first advertised method among hover, definition, document symbols and workspace symbols.
 It sends the corresponding method with a number where an object or string is required. After an error response,
-it sends a plain probe; a response to that probe passes. `InvalidParams` is preferred but any error code passes.
+it sends a plain probe; a response to that probe passes. `InvalidParams` is preferred but any signed 32-bit integer
+error code passes when the response satisfies J5's envelope rules, including a string error message.
 A result or malformed response, no response to a delivered request, or a server that stops serving fails R2;
 missing replies become `ERROR` when lspcheck's inspection was incomplete. Initialization or delivery failure is
 `ERROR`. If none of those capabilities is advertised, R2 is not exercised. Both robustness scenarios have

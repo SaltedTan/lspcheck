@@ -1310,12 +1310,17 @@ async fn wrong_params(ctx: &mut Ctx<'_>) -> bool {
             return true;
         }
     };
+    if let Some(why) = envelope_problem(&response) {
+        ctx.fail("R2", format!("{method} returned a malformed response instead of an error: {why}"));
+        return true;
+    }
     let error = match &response.kind {
-        Kind::Response { outcome: Outcome::Error { code, .. }, .. } => match code {
-            Some(codes::INVALID_PARAMS) => format!("InvalidParams ({})", codes::INVALID_PARAMS),
-            Some(code) => format!("error {code}, not InvalidParams (which is preferred)"),
-            None => "error without an integer code".into(),
-        },
+        Kind::Response { outcome: Outcome::Error { code: Some(codes::INVALID_PARAMS), .. }, .. } => {
+            format!("InvalidParams ({})", codes::INVALID_PARAMS)
+        }
+        Kind::Response { outcome: Outcome::Error { code: Some(code), .. }, .. } => {
+            format!("error {code}, not InvalidParams (which is preferred)")
+        }
         Kind::Response { outcome: Outcome::Result(value), .. } => {
             ctx.fail(
                 "R2",
@@ -1326,11 +1331,7 @@ async fn wrong_params(ctx: &mut Ctx<'_>) -> bool {
             );
             return true;
         }
-        Kind::Response { outcome: Outcome::Malformed(why), .. } => {
-            ctx.fail("R2", format!("{method} returned a malformed response instead of an error: {why}"));
-            return true;
-        }
-        _ => unreachable!("call waits for a response"),
+        _ => unreachable!("a well-formed response has a result or an integer error code"),
     };
 
     match back_in_step_result(ctx, "the wrongly typed request").await {
