@@ -135,12 +135,12 @@ lspcheck --junit report.xml --markdown summary.md -- my-server
 lspcheck list                            # every check, with its specification section
 ```
 
-`--json` writes a versioned machine-readable report, `--junit` a JUnit XML report with one testsuite per check area,
-and `--markdown` a summary table for a CI step summary. Any combination may be given. The JUnit `type` on a failure
-is its basis (`MUST`, `SHOULD` or `POLICY`); the process exit status, not the XML, applies `--strict`.
-With `--transcripts`, terminal, JUnit and Markdown reports reference a failed or errored check's scenario file as
-`transcript: PATH`, or the directory holding all scenario files as `transcripts: DIR` for checks judged across scenarios.
-Markdown preserves literal text in cells and displays line breaks in commands and paths as `\r` and `\n`.
+`--json` writes a versioned machine-readable report, `--junit` a JUnit XML report for CI test tabs,
+and `--markdown` a summary table for a CI step summary. Any combination may be given; these flags apply to checks,
+not `replay`. Report files are overwritten; a write failure prints a diagnostic and exits with status 2.
+With `--transcripts`, terminal, JUnit and Markdown reports point to the evidence for failed or errored checks.
+See the [report format reference](docs/design.md#report) for verdict mappings, `--strict` in JUnit, escaping and
+transcript references.
 
 lspcheck runs the server several times, once per scenario, each time with an empty temporary workspace as its working
 directory. A server path with a directory part, such as `./my-server`, is resolved before that; a bare name is looked up
@@ -263,7 +263,7 @@ not leaving child processes behind.
 
 - **0:** no `MUST` check failed.
 - **1:** a `MUST` check failed, or with `--strict`, any check failed.
-- **2:** a usage error, or an `ERROR` verdict with no `MUST` failure.
+- **2:** a usage or report-writing error, or an `ERROR` verdict with no `MUST` failure.
 
 Some servers refuse to initialize without project files or settings. lspcheck reports that as `ERROR`, with the
 server's message, rather than as a failure.

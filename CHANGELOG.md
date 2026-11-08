@@ -11,11 +11,8 @@
 
 ### Added
 
-- `--junit PATH` writes a JUnit XML report for CI test tabs: one testsuite per check area with counts and a testcase
-  per check, a failure carrying its basis in `type`, and the detail, specification link and transcript in the body.
-- `--markdown PATH` writes a Markdown summary for a CI step summary: the terminal report's counts line, a table with
-  failures and errors first, and the transcript paths of failed or errored checks. Both formats combine with
-  `--json` and with each other.
+- `--junit PATH` and `--markdown PATH` add CI reports alongside JSON. See [usage](README.md#use) and the
+  [report format reference](docs/design.md#report).
 
 ## 0.1.0 (2026-11-08)
 
