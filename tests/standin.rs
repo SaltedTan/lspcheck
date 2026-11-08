@@ -257,6 +257,120 @@ fn the_clean_standin_passes_every_check() {
 }
 
 #[test]
+fn junit_and_markdown_reports_agree_with_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let json_path = dir.path().join("report.json");
+    let junit_path = dir.path().join("report.xml");
+    let markdown_path = dir.path().join("report.md");
+    let mut cmd = Command::new(LSPCHECK);
+    for (flag, value) in [("--timeout", "5"), ("--startup-timeout", "5"), ("--exit-timeout", "2")] {
+        cmd.args([flag, value]);
+    }
+    cmd.arg("--json")
+        .arg(&json_path)
+        .arg("--junit")
+        .arg(&junit_path)
+        .arg("--markdown")
+        .arg(&markdown_path)
+        .arg("--transcripts")
+        .arg(dir.path().join("t"))
+        .arg("--")
+        .arg(STANDIN)
+        .args(["--fault", "shutdown-result"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let mut child = cmd.spawn().unwrap();
+    let out = loop {
+        if child.try_wait().unwrap().is_some() {
+            break child.wait_with_output().unwrap();
+        }
+        if started.elapsed() > WATCHDOG {
+            let _ = child.kill();
+            panic!("lspcheck ran longer than {WATCHDOG:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let json: Value = serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    let results = json["results"].as_array().unwrap();
+    let verdict = |id: &str| results.iter().find(|r| r["id"] == id).unwrap()["verdict"].as_str().unwrap();
+    assert_eq!(verdict("L4"), "fail");
+    let problems: Vec<&Value> =
+        results.iter().filter(|r| matches!(r["verdict"].as_str(), Some("fail" | "error"))).collect();
+    assert_eq!(problems.len(), 1, "the fault fails exactly L4");
+    assert_eq!(problems[0]["id"], "L4");
+
+    // The XML carries one testcase per JSON result and the same verdict elements.
+    let xml = std::fs::read_to_string(&junit_path).unwrap();
+    assert_eq!(xml.matches("<testcase ").count(), results.len());
+    assert_eq!(xml.matches("<failure ").count(), results.iter().filter(|r| r["verdict"] == "fail").count());
+    assert_eq!(xml.matches("<error ").count(), results.iter().filter(|r| r["verdict"] == "error").count());
+    assert_eq!(
+        xml.matches("<skipped ").count(),
+        results.iter().filter(|r| matches!(r["verdict"].as_str(), Some("skip" | "not-exercised"))).count()
+    );
+    assert!(xml.contains("<testsuites name=\"lspcheck\""), "{xml}");
+    assert!(xml.contains("<failure type=\"MUST\" message="), "{xml}");
+    assert!(xml.contains("name=\"L4 shutdown returns null and the server keeps running until exit\""), "{xml}");
+    assert!(xml.trim_end().ends_with("</testsuites>"));
+
+    // Every row carries its JSON verdict, and the failure comes first.
+    let markdown = std::fs::read_to_string(&markdown_path).unwrap();
+    let rows: Vec<&str> = markdown
+        .lines()
+        .skip_while(|line| !line.starts_with("| Verdict |"))
+        .skip(2)
+        .take_while(|line| line.starts_with('|'))
+        .collect();
+    assert_eq!(rows.len(), results.len(), "{markdown}");
+    assert!(rows[0].starts_with("| ❌ FAIL | [L4]("), "{markdown}");
+    assert!(rows[0].contains("| MUST |"), "{markdown}");
+    for r in results {
+        let id = r["id"].as_str().unwrap();
+        let cell = match r["verdict"].as_str().unwrap() {
+            "fail" => "❌ FAIL",
+            "error" => "⚠️ ERROR",
+            "skip" => "⏭️ SKIP",
+            "not-exercised" => "➖ N/E",
+            _ => "✅ PASS",
+        };
+        let row =
+            rows.iter().find(|line| line.contains(&format!("| [{id}]("))).unwrap_or_else(|| panic!("no {id} row"));
+        assert!(row.starts_with(&format!("| {cell} | [{id}](")), "{row}");
+    }
+}
+
+#[test]
+fn aggregate_reports_reference_recorded_transcript_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let junit = dir.path().join("report.xml");
+    let markdown = dir.path().join("report.md");
+    let transcripts = dir.path().join("evidence");
+    let r = run_command_in(
+        &["--only", "F1", "--junit", junit.to_str().unwrap(), "--markdown", markdown.to_str().unwrap()],
+        &[STANDIN, "--fault", "stdout-banner"],
+        None,
+        transcripts.clone(),
+    );
+    assert_eq!(r.status, 1, "{}", r.stdout);
+    assert_eq!(r.verdicts.get("F1").map(String::as_str), Some("fail"));
+    assert!(std::fs::read_dir(&transcripts).unwrap().next().is_some());
+    assert!(r.stdout.contains(&format!("transcripts: {}\n", transcripts.display())), "{}", r.stdout);
+    let xml = std::fs::read_to_string(junit).unwrap();
+    assert!(xml.contains(&format!("\ntranscripts: {}</failure>", transcripts.display())), "{xml}");
+    let text = std::fs::read_to_string(markdown).unwrap();
+    assert!(text.contains(&format!("- F1: transcripts: `{}`\n", transcripts.display())), "{text}");
+}
+
+#[test]
 fn lawful_variations_fail_nothing() {
     for name in [
         "extension-header",

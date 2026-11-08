@@ -23,6 +23,14 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     json: Option<PathBuf>,
 
+    /// Write a JUnit XML report here.
+    #[arg(long, value_name = "PATH")]
+    junit: Option<PathBuf>,
+
+    /// Write a Markdown summary here.
+    #[arg(long, value_name = "PATH")]
+    markdown: Option<PathBuf>,
+
     /// Write each scenario's transcript as JSON Lines into this directory.
     #[arg(long, value_name = "DIR")]
     transcripts: Option<PathBuf>,
@@ -183,13 +191,25 @@ fn main() {
     };
     let server = cfg.server.display();
     let _ = report::print_terminal(&mut std::io::stdout().lock(), &server, &runs);
+    let argv: Vec<String> = cli.server.iter().map(|a| a.to_string_lossy().into_owned()).collect();
     if let Some(path) = &cli.json {
-        let argv: Vec<String> = cli.server.iter().map(|a| a.to_string_lossy().into_owned()).collect();
         let text = serde_json::to_string_pretty(&report::json_report(&argv, &runs)).expect("report serializes");
         if let Err(e) = std::fs::write(path, text + "\n") {
             eprintln!("lspcheck: can't write {}: {e}", path.display());
             std::process::exit(2);
         }
+    }
+    if let Some(path) = &cli.junit
+        && let Err(e) = std::fs::write(path, report::junit_report(&argv, &runs))
+    {
+        eprintln!("lspcheck: can't write {}: {e}", path.display());
+        std::process::exit(2);
+    }
+    if let Some(path) = &cli.markdown
+        && let Err(e) = std::fs::write(path, report::markdown_report(&argv, &runs))
+    {
+        eprintln!("lspcheck: can't write {}: {e}", path.display());
+        std::process::exit(2);
     }
     std::process::exit(report::exit_code(&runs, cli.strict));
 }

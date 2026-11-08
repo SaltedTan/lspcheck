@@ -58,6 +58,19 @@ pub enum Area {
     Documents,
 }
 
+impl Area {
+    /// The area's name in reports.
+    pub fn label(self) -> &'static str {
+        match self {
+            Area::Framing => "Framing",
+            Area::JsonRpc => "JSON-RPC",
+            Area::Lifecycle => "Lifecycle",
+            Area::Cancellation => "Cancellation",
+            Area::Documents => "Documents",
+        }
+    }
+}
+
 /// A check's identity and documentation.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct CheckInfo {

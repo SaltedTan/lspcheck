@@ -105,7 +105,7 @@ cargo install --locked --git https://github.com/SaltedTan/lspcheck --tag v0.1.0
 
 Pin a version and its checksum, so the check only changes when you upgrade it. Checks are added and refined between
 versions, and the [changelog](CHANGELOG.md) says which. The exit status fails the job when a `MUST` check fails
-(`--strict` also fails it on `SHOULD` and `POLICY` failures), and `--json` and `--transcripts` keep the evidence:
+(`--strict` also fails it on `SHOULD` and `POLICY` failures). `--json` and `--transcripts` keep the evidence:
 
 ```yaml
 - name: Check the language server with lspcheck
@@ -117,8 +117,13 @@ versions, and the [changelog](CHANGELOG.md) says which. The exit status fails th
     curl -fsSLO "https://github.com/SaltedTan/lspcheck/releases/download/v$LSPCHECK_VERSION/$name.tar.gz"
     echo "$LSPCHECK_SHA256  $name.tar.gz" | sha256sum --check
     tar -xzf "$name.tar.gz"
-    "$name/lspcheck" --json lspcheck.json --transcripts lspcheck-transcripts -- ./build/my-server --stdio
+    "$name/lspcheck" --json lspcheck.json \
+      --transcripts lspcheck-transcripts -- ./build/my-server --stdio
 ```
+
+`--junit` and `--markdown` are available from the next release (currently
+[Unreleased](CHANGELOG.md#unreleased)). With that release, add
+`--junit lspcheck.xml --markdown "$GITHUB_STEP_SUMMARY"` to the command above for CI test tabs and a GitHub step summary.
 
 ## Use
 
@@ -126,8 +131,16 @@ versions, and the [changelog](CHANGELOG.md) says which. The exit status fails th
 lspcheck -- my-server --stdio            # run every check
 lspcheck --only L4,L6 -- my-server       # run some checks
 lspcheck --json report.json --transcripts out/ -- my-server
+lspcheck --junit report.xml --markdown summary.md -- my-server
 lspcheck list                            # every check, with its specification section
 ```
+
+`--json` writes a versioned machine-readable report, `--junit` a JUnit XML report for CI test tabs,
+and `--markdown` a summary table for a CI step summary. Any combination may be given; these flags apply to checks,
+not `replay`. Report files are overwritten; a write failure prints a diagnostic and exits with status 2.
+With `--transcripts`, terminal, JUnit and Markdown reports point to the evidence for failed or errored checks.
+See the [report format reference](docs/design.md#report) for verdict mappings, `--strict` in JUnit, escaping and
+transcript references.
 
 lspcheck runs the server several times, once per scenario, each time with an empty temporary workspace as its working
 directory. A server path with a directory part, such as `./my-server`, is resolved before that; a bare name is looked up
@@ -250,7 +263,7 @@ not leaving child processes behind.
 
 - **0:** no `MUST` check failed.
 - **1:** a `MUST` check failed, or with `--strict`, any check failed.
-- **2:** a usage error, or an `ERROR` verdict with no `MUST` failure.
+- **2:** a usage or report-writing error, or an `ERROR` verdict with no `MUST` failure.
 
 Some servers refuse to initialize without project files or settings. lspcheck reports that as `ERROR`, with the
 server's message, rather than as a failure.

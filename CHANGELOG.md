@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+
+- Terminal, JUnit and Markdown reports reference the transcripts directory for cross-cutting failures and errors.
+- Markdown keeps character references and tildes literal in table cells and makes CR/LF visible in commands and
+  transcript paths.
+- The pinned v0.1.0 CI example uses supported flags; instructions for the unreleased report flags appear separately.
+
+### Added
+
+- `--junit PATH` and `--markdown PATH` add CI reports alongside JSON. See [usage](README.md#use) and the
+  [report format reference](docs/design.md#report).
+
 ## 0.1.0 (2026-11-08)
 
 The first release: 33 checks of framing, JSON-RPC correlation, the lifecycle, cancellation and document positions,
