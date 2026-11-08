@@ -223,6 +223,7 @@ no reply, or whose ranges can't be compared, leaves it `N/E`. A `selectionRange`
 cut off because the server's output closed, makes D6 `ERROR` unless it already failed.
 
 R1 checks continued service after malformed JSON; R3 checks it after opening a large document.
+If a follow-up request fails, both checks wait up to `--exit-timeout` for an unprompted server exit before judging it.
 `--large-document-mib N` sets R3's document size (4 MiB by default, greater than zero required), and
 `--startup-timeout` gives its follow-up request time to be answered. See the
 [robustness reference](docs/design.md#capabilities-and-robustness) for response windows, verdicts and evidence rules.

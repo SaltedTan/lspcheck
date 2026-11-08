@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- R1 and R3 wait for an unprompted exit after a failed probe, so a pipe closing before the process finishes exiting
+  does not turn a server crash into an inconclusive result on Windows.
 - Transcripts keep fast replies after their requests even when read during a write's flush, avoiding false missing
   replies in replay summaries on Windows.
 - R1 includes queued responses in its frozen read window and keeps earlier ParseErrors from hiding wrong-code replies.

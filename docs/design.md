@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting and transcript event ordering for fast replies, while profiles, K1 and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and `replay`. F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright; unreleased [JUnit and Markdown reports](#report) and [R1 to R4](#capabilities-and-robustness) are done, including R1's complete response-window accounting, bounded exit observation for R1/R3 probe failures and transcript event ordering for fast replies, while profiles, K1 and the stock-server CI matrix are still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -331,6 +331,8 @@ delivered probe is pending preserves that probe's wait window, ending before shu
 is answered, a later exit does not fail R1. Incomplete delivery of the malformed body is `ERROR`; an undeliverable
 probe is also `ERROR` unless an observed exit establishes a failure. J2 doesn't attribute null-id errors to a
 request, J5 validates their envelope, and this deliberately malformed-input scenario is excluded from J3.
+After a failed probe, R1 waits up to `--exit-timeout` for the server to exit before attempting shutdown: a closed
+stdin can precede the process's exit status, especially on Windows.
 
 R3 runs in `large-document` after initialization. It writes `lspcheck-large.txt` into the scenario workspace and
 opens it as `plaintext`; [usage](../README.md#use) documents the size option and default. Once the full `didOpen` is
@@ -338,7 +340,7 @@ delivered, lspcheck sends a plain request and waits up to `--startup-timeout`. T
 document; it must answer the probe. An incomplete `didOpen` is `ERROR`. A probe lspcheck couldn't deliver is also
 `ERROR` unless an observed exit establishes a failure. A delivered probe that goes unanswered fails only when
 lspcheck saw complete evidence during its wait, even if the server exits. Once the probe is answered, a later exit
-does not fail R3.
+does not fail R3. As with R1, a failed probe allows up to `--exit-timeout` to observe an exit before shutdown.
 
 R4 runs in the separate `odd-ids` scenario after initialization. It sends `lspcheck/probe` with each of these ids,
 one at a time: `0`, `-1`, `2147483647`, `-2147483648`, `""`, a 1000-character ASCII string, `"é中😀𝄞"` and

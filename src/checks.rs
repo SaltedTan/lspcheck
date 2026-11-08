@@ -834,7 +834,9 @@ async fn not_json(ctx: &mut Ctx<'_>) {
     let probed = ctx.s.elapsed();
     let reply = ctx.s.call_with_id(&id, PROBE, Some(json!({})), t).await;
     let to = ctx.s.elapsed();
-    let alive = ctx.s.is_alive();
+    // A pipe can close before the process's exit status is available. Wait
+    // before shutdown so only an unprompted exit can establish a failure.
+    let status = if reply.is_err() { ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await } else { None };
     leave(ctx).await;
     let messages: Vec<_> = ctx.s.unmatched_responses(since, to).collect();
     let parse_errors = messages.iter().filter(|message| is_parse_error(message)).count();
@@ -848,8 +850,8 @@ async fn not_json(ctx: &mut Ctx<'_>) {
         return;
     }
 
-    match reply {
-        Ok(_) => ctx.report_judged("R1", since, to, |missed| {
+    match (reply, status) {
+        (Ok(_), _) => ctx.report_judged("R1", since, to, |missed| {
             if let Some(why) = missed {
                 (Verdict::Error, format!("inconclusive because {why}"))
             } else if parse_errors > 0 {
@@ -863,16 +865,10 @@ async fn not_json(ctx: &mut Ctx<'_>) {
                 (Verdict::Pass, "the server ignored the non-JSON body and answered a later plain request".into())
             }
         }),
-        Err(error) if !alive => {
-            let status = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
-            let detail = status.map_or_else(
-                || "the server exited after the non-JSON body and did not answer the plain request".into(),
-                |status| {
-                    format!(
-                        "the server exited with {} after the non-JSON body and did not answer the plain request",
-                        session::describe_status(status)
-                    )
-                },
+        (Err(error), Some(status)) => {
+            let detail = format!(
+                "the server exited with {} after the non-JSON body and did not answer the plain request",
+                session::describe_status(status)
             );
             // A delivered plain request's answer may be in output lspcheck
             // couldn't read while it waited, so keep that window.
@@ -881,7 +877,7 @@ async fn not_json(ctx: &mut Ctx<'_>) {
                 CallError::Write(_) => ctx.fail("R1", detail),
             }
         }
-        Err(error) => {
+        (Err(error), None) => {
             let detail = format!(
                 "the server didn't answer a plain request after the non-JSON body ({})",
                 describe_call_error(&error, t)
@@ -1597,16 +1593,10 @@ async fn large_document_scenario(ctx: &mut Ctx<'_>) -> bool {
                 timeout.as_secs(),
                 describe_call_error(&error, timeout)
             );
-            if !ctx.s.is_alive() {
-                let status = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
-                let detail = status.map_or_else(
-                    || format!("the server exited after didOpen of the {mib} MiB document; {detail}"),
-                    |status| {
-                        format!(
-                            "the server exited with {} after didOpen of the {mib} MiB document; {detail}",
-                            session::describe_status(status)
-                        )
-                    },
+            if let Some(status) = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await {
+                let detail = format!(
+                    "the server exited with {} after didOpen of the {mib} MiB document; {detail}",
+                    session::describe_status(status)
                 );
                 // A delivered plain request's answer may be in output lspcheck
                 // couldn't read while it waited, so keep that window.
