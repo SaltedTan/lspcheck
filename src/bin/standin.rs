@@ -137,7 +137,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("inflated-on-exit", "on exit, start an inflated frame containing a progress request and stay running"),
     ("split-header", "drop input when a read ends inside a header section, as if each header came in one read"),
     ("split-utf8", "decode each read as UTF-8 on its own, mangling characters split across reads"),
-    ("first-frame-per-read", "keep only the first frame of a read that holds $/setTrace and two more"),
+    (
+        "first-frame-per-read",
+        "drop $/setTrace and the frames after it from a read that holds a request, $/setTrace and another frame",
+    ),
     ("char-length-input", "count the Content-Length of incoming frames in characters, not bytes"),
     ("no-content-type", "ignore incoming frames that have a Content-Type header"),
     ("strict-charset", "ignore incoming frames whose charset isn't spelled utf-8"),
@@ -1787,21 +1790,26 @@ impl<R: Read> Input<R> {
         }
         self.buf.extend_from_slice(&chunk);
         if self.fault("first-frame-per-read") {
-            let mut ends = Vec::new();
+            // Only F4's shape: a request, $/setTrace, then another frame, all
+            // in one read. Any notification would also match `initialized`
+            // coalescing with J6's requests, which this fault must not touch.
+            // Everything before $/setTrace is kept (the read may also hold the
+            // end of an earlier frame), so exactly the second request is lost.
+            let mut frames = Vec::new();
             let mut at = 0;
-            let mut set_trace = false;
             while let Parsed::Frame((_, body), used) = self.parse(&self.buf[at..]) {
-                at += used;
-                ends.push(at);
-                // Only F4's shape: two requests with $/setTrace between them.
-                // Any notification would also match `initialized` coalescing
-                // with J6's requests, which this fault must not touch.
-                set_trace |= serde_json::from_slice::<Value>(&body).is_ok_and(|v| {
+                let set_trace = serde_json::from_slice::<Value>(&body).is_ok_and(|v| {
                     v.get("id").is_none() && v.get("method").and_then(Value::as_str) == Some("$/setTrace")
                 });
+                frames.push((at, set_trace));
+                at += used;
             }
-            if ends.len() >= 3 && set_trace {
-                self.buf.truncate(ends[0]);
+            if let Some(i) = frames.iter().position(|&(_, set_trace)| set_trace)
+                && i >= 1
+                && i + 1 < frames.len()
+            {
+                eprintln!("standin: first-frame-per-read dropped a frame");
+                self.buf.truncate(frames[i].0);
             }
         }
         true
