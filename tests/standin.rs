@@ -2208,14 +2208,15 @@ fn allowed_descendants_dont_fail_l9_but_are_named() {
     let (path, _keep) = profile("[allow]\ndescendants = [\"some-other-daemon\"]\n");
     let r = with_profile(&["orphan-child"], &path);
     only_fails(&r, &["L9"]);
-    // The name lspcheck reports for the leftover (on Linux, the kernel's
-    // 15-byte command name).
+    // The name lspcheck reports for the leftover: the kernel's 15-byte command
+    // name on Linux, or an executable path from ps on macOS.
     let detail = r.report["results"].as_array().unwrap().iter().find(|c| c["id"] == "L9").unwrap()["detail"]
         .as_str()
         .unwrap()
         .to_string();
     let name = detail.split_once(" (").and_then(|(_, rest)| rest.split_once(')')).map(|(n, _)| n).unwrap();
-    assert!(name.starts_with("lspcheck-stand"), "{detail}");
+    let basename = std::path::Path::new(name).file_name().unwrap().to_str().unwrap();
+    assert!(basename.starts_with("lspcheck-stand"), "{detail}");
 
     let (path, _keep) = profile(&format!("[allow]\ndescendants = [{name:?}]\n"));
     let r = with_profile(&["orphan-child"], &path);
