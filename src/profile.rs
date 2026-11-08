@@ -248,7 +248,7 @@ fn to_json(v: &toml::Value, key: &str) -> Result<Value, String> {
 
 /// Validates `[workspace]`: the fixture is a directory holding only regular
 /// files and directories, inline names are safe relative paths, and nothing
-/// lands where lspcheck writes its own files or where another profile file is.
+/// occupies a path reserved for lspcheck or creates a file/directory conflict.
 fn workspace(raw: RawWorkspace, dir: &Path) -> Result<Workspace, String> {
     let mut fixture_files = BTreeSet::new();
     let mut fixture_dirs = BTreeSet::new();
