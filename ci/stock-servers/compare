@@ -1,0 +1,32 @@
+#!/bin/sh
+# Copyright 2026 The lspcheck Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Usage: ci/stock-servers/compare EXPECTED.verdicts REPORT.json
+#
+# Verdict-file format and baseline policy: README.md in this directory.
+set -eu
+expected=$1
+report=$2
+actual=$(mktemp)
+raw=$(mktemp)
+trap 'rm -f "$actual" "$raw"' EXIT
+# Keep parsing outside a pipeline so a malformed report cannot be accepted
+# after jq has already emitted a matching set of verdicts.
+jq -r '.results[] | "\(.id) \(.verdict)"' "$report" > "$raw"
+# The verdicts, with a verdict the expected line allows shown as that line,
+# so that only real differences remain in the diff.
+awk -v expected="$expected" '
+    BEGIN {
+      while ((getline line < expected) > 0) {
+        if (line ~ /^#/ || line == "") continue
+        split(line, f, " ")
+        allowed[f[1]] = f[2]
+      }
+    }
+    {
+      n = split(allowed[$1], alt, "|")
+      for (i = 1; i <= n; i++) if (alt[i] == $2) { print $1 " " allowed[$1]; next }
+      print
+    }' "$raw" > "$actual"
+grep -v -e '^#' -e '^$' "$expected" | diff -u --label "$expected" --label "$report" - "$actual"

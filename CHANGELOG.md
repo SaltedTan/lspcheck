@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- A [stock-server CI matrix](ci/stock-servers/README.md) for regression coverage against real language servers.
+
 ## 0.2.0 (2026-11-09)
 
 ### Added

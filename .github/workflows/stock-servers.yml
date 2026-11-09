@@ -1,0 +1,135 @@
+# Runs the stock-server regression matrix. Its purpose, baseline contract and
+# update procedure are documented in ci/stock-servers/README.md.
+name: Stock servers
+
+on:
+  pull_request:
+    paths: &paths
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "examples/profiles/**"
+      - "ci/stock-servers/**"
+      - ".github/workflows/stock-servers.yml"
+  push:
+    branches: [main]
+    paths: *paths
+  schedule:
+    # Weekly, so a change in the runner image (Go, Rust, Node) shows up.
+    - cron: "23 17 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-servers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: 1.27.3
+  GO_SHA256: 65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
+  GOPLS_VERSION: v0.24.0
+  RUST_ANALYZER_RELEASE: 2026-11-02
+  RUST_ANALYZER_SHA256: 5249da68c3f36bb77ea7d401824f5e8bd8d0a47a162daf5f72208eb7c1bf1500
+  LUA_LS_VERSION: 3.19.2
+  LUA_LS_SHA256: 93ad326b10f6c00911dd8c450fa098332dbd8f9f45d1052f5636a2d54479b947
+  BASEDPYRIGHT_VERSION: 1.40.2
+  BASEDPYRIGHT_SHA256: 5d1073a0e61a1adc6b40b2bed4489017aa5c1336aa8e6fdcb7157b9bf26f3fab
+
+jobs:
+  check:
+    name: ${{ matrix.server }}
+    strategy:
+      fail-fast: false
+      matrix:
+        server: [gopls, rust-analyzer, lua-language-server, basedpyright]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test the verdict comparison
+        run: python3 -I ci/stock-servers/test_compare.py
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Build lspcheck
+        run: |
+          cargo build --locked --release
+          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+          mkdir "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Install Go and gopls
+        if: matrix.server == 'gopls'
+        run: |
+          curl -fsSL --retry 3 "https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz" -o "$RUNNER_TEMP/go.tar.gz"
+          echo "$GO_SHA256  $RUNNER_TEMP/go.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/go.tar.gz" -C "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/go/bin:$PATH" GOBIN="$RUNNER_TEMP/bin" GOTOOLCHAIN=local
+          # The Go checksum database verifies gopls and its dependencies.
+          go install "golang.org/x/tools/gopls@$GOPLS_VERSION"
+          echo "$RUNNER_TEMP/go/bin" >> "$GITHUB_PATH"
+          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+          gopls version
+      - name: Install rust-analyzer
+        if: matrix.server == 'rust-analyzer'
+        run: |
+          gz="$RUNNER_TEMP/rust-analyzer.gz"
+          curl -fsSL --retry 3 -o "$gz" \
+            "https://github.com/rust-lang/rust-analyzer/releases/download/$RUST_ANALYZER_RELEASE/rust-analyzer-x86_64-unknown-linux-gnu.gz"
+          echo "$RUST_ANALYZER_SHA256  $gz" | sha256sum --check --strict
+          gunzip -c "$gz" > "$RUNNER_TEMP/bin/rust-analyzer"
+          chmod +x "$RUNNER_TEMP/bin/rust-analyzer"
+          "$RUNNER_TEMP/bin/rust-analyzer" --version
+          # The profile's project is outside this checkout, so it builds with
+          # the runner's default toolchain, not the pinned one.
+          cargo --version
+      - name: Install lua-language-server
+        if: matrix.server == 'lua-language-server'
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/lua-ls.tar.gz" \
+            "https://github.com/LuaLS/lua-language-server/releases/download/$LUA_LS_VERSION/lua-language-server-$LUA_LS_VERSION-linux-x64.tar.gz"
+          echo "$LUA_LS_SHA256  $RUNNER_TEMP/lua-ls.tar.gz" | sha256sum --check --strict
+          mkdir "$RUNNER_TEMP/lua-ls"
+          tar -xzf "$RUNNER_TEMP/lua-ls.tar.gz" -C "$RUNNER_TEMP/lua-ls"
+          ln -s "$RUNNER_TEMP/lua-ls/bin/lua-language-server" "$RUNNER_TEMP/bin/lua-language-server"
+          lua-language-server --version
+      - name: Install basedpyright
+        if: matrix.server == 'basedpyright'
+        run: |
+          # The package has no dependencies, so its tarball runs as it is.
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/basedpyright.tgz" \
+            "https://registry.npmjs.org/basedpyright/-/basedpyright-$BASEDPYRIGHT_VERSION.tgz"
+          echo "$BASEDPYRIGHT_SHA256  $RUNNER_TEMP/basedpyright.tgz" | sha256sum --check --strict
+          mkdir "$RUNNER_TEMP/basedpyright"
+          tar -xzf "$RUNNER_TEMP/basedpyright.tgz" -C "$RUNNER_TEMP/basedpyright"
+          ln -s "$RUNNER_TEMP/basedpyright/package/langserver.index.js" "$RUNNER_TEMP/bin/basedpyright-langserver"
+          node --version
+
+      - name: Run lspcheck
+        env:
+          SERVER: ${{ matrix.server }}
+        run: |
+          mkdir "$RUNNER_TEMP/out"
+          # The servers fail some checks, so the exit status says nothing here;
+          # the next step compares verdicts. A missing report fails it.
+          lspcheck --profile "examples/profiles/$SERVER.toml" --json "$RUNNER_TEMP/out/report.json" \
+            --markdown "$GITHUB_STEP_SUMMARY" --transcripts "$RUNNER_TEMP/out/transcripts" || true
+      - name: Compare verdicts with ci/stock-servers
+        env:
+          SERVER: ${{ matrix.server }}
+        run: |
+          if ! ci/stock-servers/compare "ci/stock-servers/$SERVER.verdicts" "$RUNNER_TEMP/out/report.json"; then
+            echo "::error::$SERVER's verdicts changed; see the diff above and ci/stock-servers/README.md"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: stock-servers-${{ matrix.server }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+          retention-days: 14
