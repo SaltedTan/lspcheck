@@ -2,17 +2,19 @@
 
 ## Unreleased
 
+## 0.3.0 (2026-11-09)
+
 ### Added
 
-- A [stock-server CI matrix](ci/stock-servers/README.md) for regression coverage against real language servers.
-- K2 (`MUST`) checks server message types against the LSP 3.17 meta-model across every scenario; see the
-  [K2 reference](docs/design.md#capabilities-and-robustness) for coverage and verdict rules. The meta-model is
-  [vendored unmodified under CC BY 4.0](vendor/lsp-3.17/README.md).
-
-### Fixed
-
-- K2 verdicts for validation budget exhaustion and huge-exponent zeros; see the
-  [validation rules](docs/design.md#capabilities-and-robustness).
+- K2 (`MUST`) validates what the server sends against the LSP 3.17 meta-model, across every scenario: the results of
+  lspcheck's requests (except `shutdown`, which L4 judges) and the params of the server's own requests and
+  notifications. Extra properties are lawful, and a whole number written as `41.0` counts as an integer. Running out of
+  lspcheck's validation budget never fails K2 by itself: a message too large to finish is counted as not judged,
+  unless a violation was already found in it ([reference](https://github.com/SaltedTan/lspcheck/blob/v0.3.0/docs/design.md#capabilities-and-robustness)).
+  The meta-model is [vendored unmodified under CC BY 4.0](https://github.com/SaltedTan/lspcheck/blob/v0.3.0/vendor/lsp-3.17/README.md).
+- A [stock-server CI matrix](https://github.com/SaltedTan/lspcheck/blob/v0.3.0/ci/stock-servers/README.md) runs each
+  change against pinned releases of gopls, rust-analyzer, lua-language-server and basedpyright and compares every
+  verdict with the expected one.
 
 ## 0.2.0 (2026-11-09)
 
