@@ -320,32 +320,60 @@ fn inherited(name: &str, structures: &HashMap<String, Structure>) -> Vec<Propert
 
 /// One place where a value isn't of its type.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Violation {
-    /// Where, as `result.contents.kind` or `params.items[0]`.
-    pub path: String,
+pub struct Violation<'a> {
+    root: &'a str,
+    path: Vec<Step<'a>>,
     /// How many steps below the root that is.
     depth: usize,
     /// What the meta-model requires there.
     pub expected: String,
-    /// The value found there, shortened; `None` when it is missing.
-    pub found: Option<String>,
+    found: Option<Found<'a>>,
     /// For a union nothing matched: the alternative that got deepest into
     /// the value, when one got deeper than the others.
-    pub closest: Option<Box<Violation>>,
+    pub closest: Option<Box<Violation<'a>>>,
 }
 
-impl Violation {
+impl Violation<'_> {
+    /// Where, as `result.contents.kind` or `params.items[0]`.
+    pub fn path(&self) -> String {
+        const MAX: usize = 60;
+        let mut out: String = self.root.chars().take(MAX + 1).collect();
+        for step in &self.path {
+            if out.chars().count() > MAX {
+                break;
+            }
+            match step {
+                Step::Index(i) => out.push_str(&format!("[{i}]")),
+                Step::Key(k) => {
+                    let end = k.char_indices().nth(MAX).map_or(k.len(), |(i, _)| i);
+                    let prefix = &k[..end];
+                    if is_identifier(prefix) {
+                        out.push('.');
+                        out.push_str(prefix);
+                    } else {
+                        out.push_str(&format!("[{}]", serde_json::to_string(prefix).expect("a string is JSON")));
+                    }
+                }
+            }
+        }
+        if let Some((end, _)) = out.char_indices().nth(MAX) {
+            out.truncate(end);
+            out.push('…');
+        }
+        out
+    }
+
     /// The innermost violation this one's `closest` chain leads to.
-    fn leaf(&self) -> &Violation {
+    fn leaf(&self) -> &Self {
         self.closest.as_deref().map_or(self, Violation::leaf)
     }
 }
 
-impl fmt::Display for Violation {
+impl fmt::Display for Violation<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.found {
-            None => write!(f, "{} is missing; required: {}", self.path, self.expected)?,
-            Some(found) => write!(f, "{} is {found}; required: {}", self.path, self.expected)?,
+            None => write!(f, "{} is missing; required: {}", self.path(), self.expected)?,
+            Some(found) => write!(f, "{} is {found}; required: {}", self.path(), self.expected)?,
         }
         if let Some(closest) = &self.closest {
             write!(f, " (closest: {closest})")?;
@@ -354,23 +382,35 @@ impl fmt::Display for Violation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Found<'a> {
+    Value(&'a Value),
+    Key(&'a str),
+}
+
+impl fmt::Display for Found<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&shorten(*self))
+    }
+}
+
 /// What validating one value found.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Violations {
+pub struct Violations<'a> {
     /// How many violations there were.
     pub count: usize,
     /// The first few, in the order found.
-    pub first: Vec<Violation>,
+    pub first: Vec<Violation<'a>>,
     /// The one whose [`Violation::leaf`] is deepest, the first found at that depth.
-    deepest: Option<Violation>,
+    deepest: Option<Violation<'a>>,
 }
 
-impl Violations {
+impl<'a> Violations<'a> {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
-    fn add(&mut self, v: Violation) {
+    fn add(&mut self, v: Violation<'a>) {
         self.count += 1;
         if self.deepest.as_ref().is_none_or(|d| v.leaf().depth > d.leaf().depth) {
             self.deepest = Some(v.clone());
@@ -380,7 +420,7 @@ impl Violations {
         }
     }
 
-    fn merge(&mut self, other: Violations) {
+    fn merge(&mut self, other: Violations<'a>) {
         self.count += other.count - other.first.len();
         if let Some(d) = &other.deepest
             && self.deepest.as_ref().is_none_or(|mine| d.leaf().depth > mine.leaf().depth)
@@ -412,18 +452,28 @@ pub fn on_validation_stack<R: Send>(f: impl FnOnce() -> R + Send) -> std::io::Re
 }
 
 /// Validates `value` against `ty`; paths start at `root` (`result` or `params`).
-pub fn validate(ty: &Type, value: &Value, root: &str) -> Result<Violations, TooLarge> {
+pub fn validate<'a>(ty: &'a Type, value: &'a Value, root: &'a str) -> Result<Violations<'a>, TooLarge> {
     validate_within(ty, value, root, NODE_BUDGET)
 }
 
 /// [`validate`] with a node budget of `budget`.
-pub fn validate_within(ty: &Type, value: &Value, root: &str, budget: usize) -> Result<Violations, TooLarge> {
+pub fn validate_within<'a>(
+    ty: &'a Type,
+    value: &'a Value,
+    root: &'a str,
+    budget: usize,
+) -> Result<Violations<'a>, TooLarge> {
     validate_spending(ty, value, root, budget).0
 }
 
 /// [`validate_within`], also returning how many steps of `budget` it took
 /// (all of them when the value was too large).
-pub fn validate_spending(ty: &Type, value: &Value, root: &str, budget: usize) -> (Result<Violations, TooLarge>, usize) {
+pub fn validate_spending<'a>(
+    ty: &'a Type,
+    value: &'a Value,
+    root: &'a str,
+    budget: usize,
+) -> (Result<Violations<'a>, TooLarge>, usize) {
     let mut v = Validator { model: model(), budget, root, path: Vec::new() };
     let found = v.check(ty, value, None);
     let spent = if found.is_ok() { budget - v.budget } else { budget };
@@ -432,13 +482,14 @@ pub fn validate_spending(ty: &Type, value: &Value, root: &str, budget: usize) ->
 
 /// The violation of a value of type `ty` that is missing at `root`, such as
 /// `params` absent where the meta-model gives them a type.
-pub fn missing(ty: &Type, root: &str) -> Violations {
+pub fn missing<'a>(ty: &Type, root: &'a str) -> Violations<'a> {
     let mut out = Violations::default();
-    out.add(Violation { path: root.into(), depth: 0, expected: describe(ty), found: None, closest: None });
+    out.add(Violation { root, path: Vec::new(), depth: 0, expected: describe(ty), found: None, closest: None });
     out
 }
 
 /// One step of a path.
+#[derive(Debug, Clone, PartialEq)]
 enum Step<'a> {
     Key(&'a str),
     Index(usize),
@@ -452,33 +503,18 @@ struct Validator<'a> {
 }
 
 impl<'a> Validator<'a> {
-    fn path(&self) -> String {
-        let mut out = self.root.to_string();
-        for step in &self.path {
-            match step {
-                Step::Index(i) => out.push_str(&format!("[{i}]")),
-                Step::Key(k) if is_identifier(k) => {
-                    out.push('.');
-                    out.push_str(k);
-                }
-                Step::Key(k) => out.push_str(&format!("[{}]", Value::String((*k).into()))),
-            }
-        }
-        out
+    fn violation(&self, expected: String, found: Option<Found<'a>>) -> Violation<'a> {
+        Violation { root: self.root, path: self.path.clone(), depth: self.path.len(), expected, found, closest: None }
     }
 
-    fn violation(&self, expected: String, found: Option<&Value>) -> Violation {
-        Violation { path: self.path(), depth: self.path.len(), expected, found: found.map(shorten), closest: None }
-    }
-
-    fn one(&self, expected: String, found: &Value) -> Violations {
+    fn one(&self, expected: String, found: &'a Value) -> Violations<'a> {
         let mut out = Violations::default();
-        out.add(self.violation(expected, Some(found)));
+        out.add(self.violation(expected, Some(Found::Value(found))));
         out
     }
 
     /// Validates `value` against `ty`, which the type alias `alias` names if it is one.
-    fn check(&mut self, ty: &'a Type, value: &'a Value, alias: Option<&str>) -> Result<Violations, TooLarge> {
+    fn check(&mut self, ty: &'a Type, value: &'a Value, alias: Option<&str>) -> Result<Violations<'a>, TooLarge> {
         self.budget = self.budget.checked_sub(1).ok_or(TooLarge)?;
         let expected = || match alias {
             Some(name) => format!("{name} ({})", describe(ty)),
@@ -522,7 +558,7 @@ impl<'a> Validator<'a> {
                 for (k, v) in entries {
                     self.path.push(Step::Key(k));
                     if let Some(required) = self.key_problem(key, k) {
-                        out.add(self.violation(required, Some(&Value::String(k.clone()))));
+                        out.add(self.violation(required, Some(Found::Key(k))));
                     }
                     let found = self.check(of, v, None);
                     self.path.pop();
@@ -560,7 +596,7 @@ impl<'a> Validator<'a> {
         Ok(out)
     }
 
-    fn reference(&mut self, name: &'a str, value: &'a Value) -> Result<Violations, TooLarge> {
+    fn reference(&mut self, name: &'a str, value: &'a Value) -> Result<Violations<'a>, TooLarge> {
         let model = self.model;
         if let Some(s) = model.structures.get(name) {
             if s.proposed {
@@ -586,7 +622,7 @@ impl<'a> Validator<'a> {
     }
 
     /// The properties of a structure or structure literal, in an object.
-    fn properties(&mut self, properties: &'a [Property], value: &'a Value) -> Result<Violations, TooLarge> {
+    fn properties(&mut self, properties: &'a [Property], value: &'a Value) -> Result<Violations<'a>, TooLarge> {
         let mut out = Violations::default();
         for p in properties.iter().filter(|p| !p.proposed) {
             self.path.push(Step::Key(&p.name));
@@ -608,8 +644,8 @@ impl<'a> Validator<'a> {
     /// An `or`: one alternative must match. When none does, the violation
     /// names them all, and where the alternative that got deepest into the
     /// value failed, if one got deeper than the others (through nested unions).
-    fn union(&mut self, items: &'a [Type], value: &'a Value, expected: String) -> Result<Violations, TooLarge> {
-        let mut deepest: Vec<Violation> = Vec::new();
+    fn union(&mut self, items: &'a [Type], value: &'a Value, expected: String) -> Result<Violations<'a>, TooLarge> {
+        let mut deepest: Vec<Violation<'a>> = Vec::new();
         for item in items {
             let found = self.check(item, value, None)?;
             if found.is_empty() {
@@ -617,7 +653,7 @@ impl<'a> Validator<'a> {
             }
             deepest.extend(found.deepest.map(|d| d.leaf().clone()));
         }
-        let mut v = self.violation(expected, Some(value));
+        let mut v = self.violation(expected, Some(Found::Value(value)));
         let max = deepest.iter().map(|d| d.depth).max().unwrap_or(0);
         if max > v.depth && deepest.iter().filter(|d| d.depth == max).count() == 1 {
             v.closest = deepest.into_iter().find(|d| d.depth == max).map(Box::new);
@@ -633,7 +669,8 @@ impl<'a> Validator<'a> {
         let Type::Reference { name } = key else { return None };
         if let Some(e) = self.model.enumerations.get(name) {
             let string = matches!(e.ty, Type::Base { name } if name.string_like());
-            let admitted = e.proposed || enumeration_admits(e, &Value::String(k.into()));
+            let admitted =
+                e.proposed || e.supports_custom_values || e.values.iter().any(|v| v.value.as_str() == Some(k));
             return (string && !admitted).then(|| describe_enumeration(e));
         }
         match self.model.aliases.get(name) {
@@ -703,7 +740,7 @@ fn is_identifier(k: &str) -> bool {
 }
 
 /// A value as JSON, cut short.
-fn shorten(value: &Value) -> String {
+fn shorten(value: Found<'_>) -> String {
     const MAX: usize = 60;
     fn push(text: &str, out: &mut String, left: &mut usize) -> Result<(), ()> {
         for c in text.chars() {
@@ -751,7 +788,11 @@ fn shorten(value: &Value) -> String {
 
     let mut out = String::new();
     let mut left = MAX;
-    if append(value, &mut out, &mut left).is_err() {
+    let written = match value {
+        Found::Value(value) => append(value, &mut out, &mut left),
+        Found::Key(key) => quoted(key, &mut out, &mut left),
+    };
+    if written.is_err() {
         out.push('…');
     }
     out
@@ -1086,7 +1127,7 @@ mod tests {
                 let json = value.to_string();
                 let expected: String = json.chars().take(60).collect();
                 let tail = if json.chars().count() > 60 { "…" } else { "" };
-                assert_eq!(shorten(&value), format!("{expected}{tail}"));
+                assert_eq!(shorten(Found::Value(&value)), format!("{expected}{tail}"));
             }
         }
     }
@@ -1095,14 +1136,84 @@ mod tests {
     fn previews_of_deep_large_values_are_bounded() {
         on_validation_stack(|| {
             let mut value = json!("x".repeat(8 * 1024 * 1024));
-            assert_eq!(shorten(&value), format!("\"{}…", "x".repeat(59)));
+            assert_eq!(shorten(Found::Value(&value)), format!("\"{}…", "x".repeat(59)));
             for _ in 0..100 {
                 value = Value::Array(vec![value]);
             }
-            assert_eq!(shorten(&value), format!("{}…", "[".repeat(60)));
+            assert_eq!(shorten(Found::Value(&value)), format!("{}…", "[".repeat(60)));
             assert!(validate(&reference("LSPAny"), &value, "params").unwrap().is_empty());
         })
         .unwrap();
+    }
+
+    #[test]
+    fn diagnostic_paths_bound_every_key_form() {
+        let ty = Type::Map {
+            key: Box::new(Type::Base { name: Base::String }),
+            value: Box::new(Type::Array { element: Box::new(Type::Base { name: Base::Integer }) }),
+        };
+        for (unit, expected_start) in [("a", "params.a"), ("!", "params[\"!"), ("é\n\"\\", "params[\"é\\n")] {
+            let key = unit.repeat(2 * 1024 * 1024);
+            let value = Value::Object([(key, json!([true]))].into_iter().collect());
+            let found = validate(&ty, &value, "params").unwrap();
+            assert_eq!(found.count, 1);
+            let detail = found.first[0].to_string();
+            let (path, requirement) = detail.split_once(" is true; required: ").unwrap();
+            assert_eq!(path.chars().count(), 61);
+            assert!(path.starts_with(expected_start));
+            assert!(path.ends_with('…'));
+            assert_eq!(requirement, "integer (a whole number from -2147483648 to 2147483647)");
+        }
+    }
+
+    #[test]
+    fn enum_map_key_diagnostics_are_bounded() {
+        let value = Value::Object([("!".repeat(8 * 1024 * 1024), json!(true))].into_iter().collect());
+        let ty =
+            Type::Map { key: Box::new(reference("MarkupKind")), value: Box::new(Type::Base { name: Base::Boolean }) };
+        let found = validate(&ty, &value, "params").unwrap();
+        assert_eq!(found.count, 1);
+        let detail = found.first[0].to_string();
+        assert!(detail.chars().count() < 300);
+        assert!(detail.starts_with("params[\"!"));
+        assert!(detail.ends_with(r#"required: MarkupKind: "plaintext" | "markdown""#));
+        for key in [reference("CodeActionKind"), reference("MessageType")] {
+            let ty = Type::Map { key: Box::new(key), value: Box::new(Type::Base { name: Base::Boolean }) };
+            assert!(validate(&ty, &value, "params").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn discarded_union_diagnostics_with_large_keys() {
+        on_validation_stack(|| {
+            let mut nested = json!("x".repeat(8 * 1024 * 1024));
+            for _ in 0..100 {
+                nested = Value::Array(vec![nested]);
+            }
+            let value = Value::Object([("!".repeat(8 * 1024 * 1024), nested)].into_iter().collect());
+            let ty = model().server_params("telemetry/event", false).unwrap();
+            assert!(validate_within(ty, &value, "params", 10_000).unwrap().is_empty());
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn retained_union_diagnostics_keep_the_closest_path() {
+        let value = Value::Object([("a".repeat(8 * 1024 * 1024), json!(true))].into_iter().collect());
+        let ty = Type::Or {
+            items: vec![
+                Type::Map {
+                    key: Box::new(Type::Base { name: Base::String }),
+                    value: Box::new(Type::Base { name: Base::Integer }),
+                },
+                Type::Base { name: Base::Null },
+            ],
+        };
+        let found = validate(&ty, &value, "params").unwrap();
+        assert_eq!(found.count, 1);
+        let detail = found.first[0].to_string();
+        assert!(detail.chars().count() < 400);
+        assert!(detail.contains(&format!("(closest: params.{}… is true;", "a".repeat(53))));
     }
 
     #[test]
@@ -1239,10 +1350,12 @@ mod tests {
 
     #[test]
     fn many_violations_are_counted_and_a_few_kept() {
-        let found = validate(&reference("SemanticTokens"), &json!({"data": vec![-1; 100]}), "result").unwrap();
+        let ty = reference("SemanticTokens");
+        let value = json!({"data": vec![-1; 100]});
+        let found = validate(&ty, &value, "result").unwrap();
         assert_eq!(found.count, 100);
         assert_eq!(found.first.len(), KEPT);
-        assert_eq!(found.first[1].path, "result.data[1]");
+        assert_eq!(found.first[1].path(), "result.data[1]");
     }
 
     #[test]

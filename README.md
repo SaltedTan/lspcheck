@@ -79,7 +79,7 @@ lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle
 advertised capabilities, message types, and parameter, malformed-body, large-document and request-id robustness.
 The [capabilities and robustness reference](docs/design.md#capabilities-and-robustness) explains the K1, K2 and R
 checks' verdict rules. K2 includes duplicate results, accepts whole-valued numbers such as `41.0`, and reports
-unreadable output as inconclusive when it saw no violation.
+unreadable output as inconclusive when it saw no violation. Diagnostic paths and values use bounded previews.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
