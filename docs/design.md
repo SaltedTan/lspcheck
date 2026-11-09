@@ -460,7 +460,7 @@ or escaped in full.
   meta-model requires there (`MarkupKind: "plaintext" | "markdown"`, `Position`, `uinteger (a whole number from 0 to
   2147483647)`, …) and the value found, shortened without traversing the rest of the value. For an `or` nothing matched
   it names the alternatives and, when one of them got deeper into the value than the others (through nested `or`s too),
-  where that one failed. A violation
+  or every deepest one failed in the same place, where that failed. A violation
   seen stands even if other frames couldn't be read.
 - **error:** no violation was seen, but a frame couldn't be read anywhere (as for J5: it might have held a message K2
   judges), lspcheck's inspection of the output was cut short, no scenario could start the server, or lspcheck

@@ -328,7 +328,8 @@ pub struct Violation<'a> {
     pub expected: String,
     found: Option<Found<'a>>,
     /// For a union nothing matched: the alternative that got deepest into
-    /// the value, when one got deeper than the others.
+    /// the value, when one got deeper than the others or every deepest one
+    /// failed in the same place.
     pub closest: Option<Box<Violation<'a>>>,
 }
 
@@ -365,6 +366,15 @@ impl Violation<'_> {
     /// The innermost violation this one's `closest` chain leads to.
     fn leaf(&self) -> &Self {
         self.closest.as_deref().map_or(self, Violation::leaf)
+    }
+
+    /// Whether this violation and `other` say the same thing: the same place,
+    /// the same requirement and the same value found. Values are compared as
+    /// they print, so a large one isn't traversed.
+    fn same_place(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.expected == other.expected
+            && self.found.map(|f| f.to_string()) == other.found.map(|f| f.to_string())
     }
 }
 
@@ -667,10 +677,11 @@ impl<'a> Validator<'a> {
     }
 
     /// An `or`: one alternative must match. When none does, the violation
-    /// names them all, and where the alternative that got deepest into the
-    /// value failed, if one got deeper than the others (through nested unions).
-    /// When the budget runs out, the union fails only if every alternative
-    /// was established to fail; one left undecided leaves it undecided.
+    /// names them all, and where the deepest alternative failed, if one got
+    /// deeper than the others or all the deepest ones failed in the same
+    /// place (through nested unions). When the budget runs out, the union
+    /// fails only if every alternative was established to fail; one left
+    /// undecided leaves it undecided.
     fn union(&mut self, items: &'a [Type], value: &'a Value, expected: String) -> Checked<'a> {
         let mut deepest: Vec<Violation<'a>> = Vec::new();
         let (mut exhausted, mut undecided) = (false, false);
@@ -694,8 +705,14 @@ impl<'a> Validator<'a> {
         }
         let mut v = self.violation(expected, Some(Found::Value(value)));
         let max = deepest.iter().map(|d| d.depth).max().unwrap_or(0);
-        if max > v.depth && deepest.iter().filter(|d| d.depth == max).count() == 1 {
-            v.closest = deepest.into_iter().find(|d| d.depth == max).map(Box::new);
+        if max > v.depth {
+            let tied: Vec<&Violation<'a>> = deepest.iter().filter(|d| d.depth == max).collect();
+            // Name the place when every alternative that got deepest failed
+            // there: one alternative, or several agreeing. Naming one of
+            // several that disagree would be arbitrary.
+            if tied.windows(2).all(|pair| pair[0].same_place(pair[1])) {
+                v.closest = tied.first().map(|d| Box::new((*d).clone()));
+            }
         }
         let mut out = Violations::default();
         out.add(v);
@@ -1078,6 +1095,41 @@ mod tests {
         );
         // A mix of locations and links matches no alternative.
         assert!(!check(result, json!([location, link])).is_empty());
+    }
+
+    #[test]
+    fn union_alternatives_that_tie_in_the_same_place_name_it() {
+        // clangd 23.1.0 sent this for textDocument/documentSymbol: an
+        // out-of-range SymbolTag. SymbolInformation[] and DocumentSymbol[]
+        // both fail at result[0].tags[0], so naming it helps the server author.
+        let result = model().result("textDocument/documentSymbol").unwrap();
+        let range = json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}});
+        let symbol = json!({"name": "greet", "kind": 12, "range": range, "selectionRange": range, "tags": [8]});
+        assert_eq!(
+            invalid(result, json!([symbol])),
+            "result is [{\"name\":\"greet\",\"kind\":12,\"range\":{\"start\":{\"line\":0,\"chara…; required: \
+             SymbolInformation[] | DocumentSymbol[] | null (closest: result[0].tags[0] is 8; required: SymbolTag: 1)"
+        );
+    }
+
+    #[test]
+    fn union_alternatives_that_tie_in_different_places_name_none() {
+        // Two alternatives fail one level down, but in different properties:
+        // naming either would be arbitrary, so the union names neither.
+        let property = |name: &str| Property {
+            name: name.into(),
+            ty: Type::Base { name: Base::UInteger },
+            optional: false,
+            proposed: false,
+        };
+        let ty = Type::Or {
+            items: vec![
+                Type::Literal { value: Literal { properties: vec![property("a")] } },
+                Type::Literal { value: Literal { properties: vec![property("b")] } },
+            ],
+        };
+        let found = invalid(&ty, json!({"a": "x", "b": "y"}));
+        assert!(!found.contains("closest:"), "{found}");
     }
 
     #[test]
