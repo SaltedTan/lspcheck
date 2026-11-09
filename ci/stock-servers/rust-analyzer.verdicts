@@ -21,7 +21,11 @@ L5 pass
 L6 pass
 L7 fail
 L8 pass
-L9 pass
+# rust-analyzer starts a `rustc` to discover the sysroot and exits on `exit` without waiting for or stopping it.
+# L9 passes when that rustc ends within lspcheck's one-second grace after the server and fails when it doesn't;
+# both verdicts are right for what lspcheck saw. Discovery took 0.8 s on one CI runner and 4.2 s on another
+# (2026-11-09), and a rustc slowed to 4 s locally fails L9 in every scenario.
+L9 pass|fail
 C1 pass
 C2 pass
 C3 pass
