@@ -19,6 +19,7 @@ lifecycle, and whether it leaves processes behind. Read the [README](README.md) 
 | `src/report.rs`, `src/transcript.rs` | Reports; JSON Lines transcripts. |
 | `src/bin/standin.rs` | `lspcheck-standin`, a correct test server with faults switched on one at a time. |
 | `examples/profiles/` | Example profiles for stock servers, each with a tiny project and a `[document]`. |
+| `ci/stock-servers/` | Expected verdicts of pinned stock servers, compared by `.github/workflows/stock-servers.yml`. |
 | `tests/` | The CLI against the stand-in (`standin.rs`) and session-level guarantees (`session.rs`). |
 
 ## Build, test and lint
