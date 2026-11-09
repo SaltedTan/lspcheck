@@ -235,26 +235,6 @@ fn passes_except(run: &Run, expected: &[(&str, &str)]) {
     }
 }
 
-/// Like [`passes_except`], but the checks in `either` may pass or be `error`.
-/// Used where the outcome depends on where the server's reads happen to end.
-fn passes_except_or_error(run: &Run, expected: &[(&str, &str)], either: &[&str]) {
-    for (id, verdict) in &run.verdicts {
-        if id == "L9" && !cfg!(unix) {
-            continue;
-        }
-        let want = expected.iter().find(|(e, _)| e == id).map_or("pass", |(_, v)| v);
-        if either.contains(&id.as_str()) {
-            assert!(
-                verdict == "pass" || verdict == "error",
-                "{id}: expected pass or error, got {verdict}\n{}",
-                run.stdout
-            );
-        } else {
-            assert_eq!(verdict, want, "{id}\n{}", run.stdout);
-        }
-    }
-}
-
 /// Like [`only_fails`], for a server that sends frames lspcheck can't read
 /// (F1): such a frame might have been a response or message the correlation,
 /// envelope and type checks judge, so J1, J2, J5, J7 and K2 are inconclusive.
@@ -993,15 +973,11 @@ fn a_server_lost_on_the_f2_probe_doesnt_fail_what_follows() {
 
 #[test]
 fn input_split_across_writes_must_be_read() {
-    // A reader that expects each header section in one read. F3's split
-    // writes may leave this server's input out of step, so the Content-Type
-    // variants after it are then `error`; whether it recovers in time decides.
-    let expected: &[(&str, &str)] = &[("F3", "fail")];
-    let r = fault_taking_effect("split-header", "split-header dropped");
-    passes_except_or_error(&r, expected, &["F6", "F7"]);
+    // A reader that expects each header section in one read.
+    only_fails(&fault_taking_effect("split-header", "split-header dropped"), &["F3"]);
     // A reader that decodes each read on its own, so a character cut in two is mangled.
     let r = fault_taking_effect("split-utf8", "split-utf8 mangled");
-    passes_except_or_error(&r, expected, &["F6", "F7"]);
+    only_fails(&r, &["F3"]);
     assert!(r.stdout.contains("cut inside them"), "{}", r.stdout);
 }
 
@@ -1032,15 +1008,11 @@ fn counting_incoming_characters_instead_of_bytes_fails_f5() {
     // about how it counts them. It had stopped answering before D4's
     // requests, so their going unanswered says nothing about documents that
     // aren't open: D4 is an error. R4 also fails because this request includes
-    // a valid non-ASCII string id that the server can't parse. The
-    // Content-Type variants run after F5 and can't be judged once it leaves
-    // the input out of step: F6 and F7 are errors.
+    // a valid non-ASCII string id that the server can't parse.
     passes_except(
         &r,
         &[
             ("F5", "fail"),
-            ("F6", "error"),
-            ("F7", "error"),
             ("R4", "fail"),
             ("F2", "not-exercised"),
             ("D1", "not-exercised"),
@@ -1065,21 +1037,9 @@ fn rejecting_a_client_content_type_fails_f6_and_f7() {
 }
 
 #[test]
-fn exiting_on_the_legacy_charset_fails_only_f7() {
-    // terraform-ls 0.39.1 exits on the legacy spelling. The Content-Type
-    // variants run last, so the checks before them are still judged.
-    let r = fault("exit-on-legacy-charset");
-    for id in ["F3", "F4", "F5", "F6"] {
-        expect(&r, id, "pass");
-    }
-    only_fails(&r, &["F7"]);
-    assert_eq!(r.status, 0, "F7 is a SHOULD check");
-}
-
-#[test]
 fn variants_after_the_server_stops_answering_are_inconclusive() {
-    // The server exits at F6, the first Content-Type variant; F7 comes after
-    // it and can't be judged. F3 and F5 ran before it and still pass.
+    // The server exits at F6; F7, sent to the same server after it, can't be
+    // judged. F3 to F5 have a server of their own and are still decided.
     let r = fault("exit-on-content-type");
     for id in ["F4", "F3", "F5"] {
         expect(&r, id, "pass");
@@ -1087,6 +1047,15 @@ fn variants_after_the_server_stops_answering_are_inconclusive() {
     expect(&r, "F6", "fail");
     expect(&r, "F7", "error");
     assert!(r.stdout.contains("the server exited after F6 didn't pass"), "{}", r.stdout);
+}
+
+#[test]
+fn exiting_on_the_legacy_charset_fails_only_f7() {
+    // terraform-ls 0.39.1 exits on the legacy spelling. F6 and F7 have a
+    // server of their own, so the framing variants are still decided.
+    let r = fault("exit-on-legacy-charset");
+    only_fails(&r, &["F7"]);
+    assert_eq!(r.status, 0, "F7 is a SHOULD check");
 }
 
 #[test]
@@ -2361,7 +2330,7 @@ fn replay_summary_lists_every_request_in_the_framing_recording() {
     assert_eq!(r.status, 0, "{}", r.stdout);
     let recording = transcripts.join("framing.jsonl");
     let expected = recorded_request_count(&recording);
-    assert_eq!(expected, 11, "the framing scenario's expected request count");
+    assert_eq!(expected, 9, "the framing scenario's expected request count (F6 and F7 have their own)");
     let output = replay(&recording, &[], &[STANDIN]);
     assert_eq!(output.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&output.stderr));
     let count = String::from_utf8_lossy(&output.stdout)

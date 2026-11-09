@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). Unreleased expands the [example profile catalogue](../examples/profiles/README.md), refines [K2's failure detail](#capabilities-and-robustness), and runs the framing scenario's `Content-Type` variants last, so a server that refuses one no longer leaves F3 and F5 undecided. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.2.0 release. See the [Unreleased changelog](../CHANGELOG.md#unreleased) for changes since v0.3.0.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). Unreleased expands the [example profile catalogue](../examples/profiles/README.md), refines [K2's failure detail](#capabilities-and-robustness), and gives F6 and F7 a `content-type` scenario of their own, so a server that refuses that header no longer leaves F3 and F5 undecided. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.2.0 release. See the [Unreleased changelog](../CHANGELOG.md#unreleased) for changes since v0.3.0.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -50,14 +50,15 @@ are to LSP 3.17 and JSON-RPC 2.0.
 | F7 | SHOULD | The legacy `charset=utf8` spelling is treated as UTF-8. |
 | F8 | SHOULD | A `Content-Type` the server sends declares UTF-8 (or the legacy `utf8`), the only supported charset. |
 
-F3 to F7 share one scenario. After `initialize`, a plain request for an unknown method (which must be answered, see J4)
-shows that the server answers such probes. Each variant then sends probes written its own way, and fails if one goes
-unanswered. The variants run in the order F4, F3's first part, F5, F3's second part, F6, F7. The two `Content-Type`
-variants come last, F7's legacy spelling after F6's, because a server that refuses that optional header often exits:
-run earlier, such a probe would leave F3 and F5 — MUST checks it would pass — `error` (terraform-ls 0.39.1 exits on
-F7's `charset=utf8`). After a variant that didn't pass, a plain probe checks the server is still in step; if it isn't,
-the remaining variants are `error`, since their failure would say nothing new. If the first plain probe goes
-unanswered, all five are `not-exercised` (or `error`, when lspcheck's own evidence was incomplete). `initialize` itself
+F3 to F5 share the `framing` scenario, in the order F4, F3's first part, F5, F3's second part; F6 and F7 have a
+`content-type` scenario of their own, F6 first. Each starts a server: a server that refuses the optional `Content-Type`
+header often exits (terraform-ls 0.39.1 exits on F7's `charset=utf8`), and one that reads split or multibyte input
+wrongly is left out of step, so in one scenario either kind would leave the other's variants undecided. In each
+scenario, after `initialize`, a plain request for an unknown method (which must be answered, see J4) shows that the
+server answers such probes. Each variant then sends probes written its own way, and fails if one goes unanswered.
+After a variant that didn't pass, a plain probe checks the server is still in step; if it isn't, the scenario's
+remaining variants are `error`, since their failure would say nothing new. If the first plain probe goes unanswered,
+the scenario's variants are all `not-exercised` (or `error`, when lspcheck's own evidence was incomplete). `initialize` itself
 is sent whole, because a missing reply to it can't be told apart from a slow start.
 
 ### JSON-RPC correlation
@@ -65,7 +66,7 @@ is sent whole, because a missing reply to it can't be told apart from a slow sta
 |---|---|---|
 | J1 | MUST | A reply's `id` is the same value as the request's: a number stays a number with the same exact value (`7` and `7.0` are the same; no rounding through floating point), and `"7"` stays a string. A reply that is only loosely equal (the number spelled as a string, or equal only after rounding) fails with both spellings; a request with a string id and one with a number id must each be answered exactly somewhere in the run. |
 | J2 | MUST | No response is unmatched: no duplicate for a request already answered, none to an id lspcheck never sent, and none read before its request was sent. Responses with a null id and those to a request lspcheck couldn't deliver are lawful; loosely equal ids belong to J1. A request that never got its reply is judged by the check that sent it. |
-| J3 | MUST | No response to notifications, including unknown ones and unknown `$/` ones. A response without an id (`id` missing or `null`) read after `initialized` (a reply to `exit` included), in a scenario whose input is all well formed (every one but `framing`, `pre-initialize` and `not-json`), answers one of lspcheck's notifications. |
+| J3 | MUST | No response to notifications, including unknown ones and unknown `$/` ones. A response without an id (`id` missing or `null`) read after `initialized` (a reply to `exit` included), in a scenario whose input is all well formed (every one but `framing`, `content-type`, `pre-initialize` and `not-json`), answers one of lspcheck's notifications. |
 | J4 | MUST | An unknown request method gets error `-32601` MethodNotFound; an unknown `$/` request too. |
 | J5 | MUST | Envelopes: `"jsonrpc": "2.0"`, exactly one of `result`/`error`, error `code` an integer and `message` a string; request ids integers or strings, response ids integers, strings or `null`, integers (ids and error codes) within LSP's signed 32-bit range; `params`, when present, an object or an array. |
 | J6 | MUST | Concurrent requests (sent before any reply) are each answered with the right id; order may differ. |
