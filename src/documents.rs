@@ -41,12 +41,12 @@ pub fn doc_a() -> String {
 ///
 /// - B0: `x`, ends in a lone `\r`.
 /// - B1: eight emoji, ends in `\r\n`.
-/// - B2: ` word` (leading space), ends in `\n`.
+/// - B2: `word` after nine spaces, ends in `\n`.
 /// - B3: eight emoji, ends in `\n`.
-/// - B4: ` name` (leading space), ends in `\n`.
+/// - B4: `name` after eleven spaces, ends in `\n`.
 ///
 /// Each wrong line split moves the `word` line (and, for two of the three,
-/// the `name` line) onto an emoji line, where the odd offsets 1 and 5 fall
+/// the `name` line) onto an emoji line, where the odd offsets 9 and 13 fall
 /// inside a character in UTF-8 and UTF-16 alike.
 pub const DOC_B_LINES: [&str; 5] = [
     "x",

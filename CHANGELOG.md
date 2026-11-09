@@ -10,8 +10,7 @@
 
 ### Changed
 
-- D6's failure detail says when a containment failure would hold under a line split the spec doesn't allow, naming
-  the split as D5 does; the verdict is unchanged.
+- D6's containment failure details now include [line-split hints](docs/design.md#documents-and-positions).
 
 ## 0.3.0 (2026-11-09)
 
