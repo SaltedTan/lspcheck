@@ -8,6 +8,10 @@
   vscode-json-language-server, marksman, ruff, texlab and zls in [`examples/profiles/`](examples/profiles/), each with
   a tiny project and a `[document]`.
 
+### Changed
+
+- D6's containment failure details now include [line-split hints](docs/design.md#documents-and-positions).
+
 ## 0.3.0 (2026-11-09)
 
 ### Added
