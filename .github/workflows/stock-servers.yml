@@ -47,6 +47,11 @@ env:
   TEXLAB_SHA256: 8697bd5e479d4584b14b7eed5c320c80ec4e1d91ebefbb6801e6bf38e9971300
   ZLS_VERSION: 0.17.0
   ZLS_SHA256: dfa4514e1868803fdf2ae56832c88b9d400094d70ea6bb136b57bcc91af10258
+  TERRAFORM_LS_VERSION: 0.39.1
+  TERRAFORM_LS_SHA256: fe2a158e4a1a8ec8047dae9e06c439b468412aa579929ba28b2e1258cedef9c0
+  # lemminx's native binary is published with the vscode-xml extension.
+  LEMMINX_VSCODE_XML_RELEASE: 0.29.3
+  LEMMINX_SHA256: 1acc44e24201c1d2f5ccb4e43e7426ed0df6909207a81ff199810e2808104d89
 
 jobs:
   check:
@@ -54,7 +59,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        server: [gopls, rust-analyzer, lua-language-server, basedpyright, clangd, marksman, ruff, texlab, zls]
+        server: [gopls, rust-analyzer, lua-language-server, basedpyright, clangd, marksman, ruff, texlab, zls, terraform-ls, lemminx]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -163,6 +168,23 @@ jobs:
           tar -xJf "$RUNNER_TEMP/zls.tar.xz" -C "$RUNNER_TEMP/zls"
           ln -s "$RUNNER_TEMP/zls/zls" "$RUNNER_TEMP/bin/zls"
           zls --version
+      - name: Install terraform-ls
+        if: matrix.server == 'terraform-ls'
+        run: |
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/terraform-ls.zip" \
+            "https://releases.hashicorp.com/terraform-ls/$TERRAFORM_LS_VERSION/terraform-ls_${TERRAFORM_LS_VERSION}_linux_amd64.zip"
+          echo "$TERRAFORM_LS_SHA256  $RUNNER_TEMP/terraform-ls.zip" | sha256sum --check --strict
+          unzip -q "$RUNNER_TEMP/terraform-ls.zip" terraform-ls -d "$RUNNER_TEMP/bin"
+          terraform-ls version
+      - name: Install lemminx
+        if: matrix.server == 'lemminx'
+        run: |
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/lemminx.zip" \
+            "https://github.com/redhat-developer/vscode-xml/releases/download/$LEMMINX_VSCODE_XML_RELEASE/lemminx-linux-x86_64.zip"
+          echo "$LEMMINX_SHA256  $RUNNER_TEMP/lemminx.zip" | sha256sum --check --strict
+          unzip -q "$RUNNER_TEMP/lemminx.zip" -d "$RUNNER_TEMP/lemminx"
+          ln -s "$RUNNER_TEMP/lemminx/lemminx-linux-x86_64" "$RUNNER_TEMP/bin/lemminx"
+          test -x "$RUNNER_TEMP/bin/lemminx"
 
       - name: Run lspcheck
         env:
