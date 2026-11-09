@@ -327,8 +327,7 @@ pub struct Violation<'a> {
     /// What the meta-model requires there.
     pub expected: String,
     found: Option<Found<'a>>,
-    /// A deeper violation for an unmatched union, when all deepest
-    /// alternatives agree according to [`Self::same_place`].
+    /// A deeper violation selected for an unmatched union's diagnostic.
     pub closest: Option<Box<Violation<'a>>>,
 }
 
@@ -677,9 +676,13 @@ impl<'a> Validator<'a> {
 
     /// An `or`: one alternative must match. When the budget runs out, the
     /// union fails only if every alternative was established to fail; one
-    /// left undecided leaves it undecided.
+    /// left undecided leaves it undecided. Partial counts cannot select the
+    /// fewest-violation alternative: unfinished validation can understate
+    /// how broken an alternative is.
     fn union(&mut self, items: &'a [Type], value: &'a Value, expected: String) -> Checked<'a> {
-        let mut deepest: Vec<Violation<'a>> = Vec::new();
+        // Each alternative established to fail: its deepest violation and how
+        // many violations it had.
+        let mut failed: Vec<(Violation<'a>, usize)> = Vec::new();
         let (mut exhausted, mut undecided) = (false, false);
         for item in items {
             let found = match self.check(item, value, None) {
@@ -694,20 +697,27 @@ impl<'a> Validator<'a> {
                     *seen
                 }
             };
-            deepest.extend(found.deepest.map(|d| d.leaf().clone()));
+            let count = found.count;
+            if let Some(deepest) = found.deepest {
+                failed.push((deepest.leaf().clone(), count));
+            }
         }
         if undecided {
             return Err(Box::default());
         }
         let mut v = self.violation(expected, Some(Found::Value(value)));
-        let max = deepest.iter().map(|d| d.depth).max().unwrap_or(0);
+        let max = failed.iter().map(|(d, _)| d.depth).max().unwrap_or(0);
         if max > v.depth {
-            let tied: Vec<&Violation<'a>> = deepest.iter().filter(|d| d.depth == max).collect();
+            let tied: Vec<&(Violation<'a>, usize)> = failed.iter().filter(|(d, _)| d.depth == max).collect();
             // Name the place when every alternative that got deepest failed
-            // there: one alternative, or several agreeing. Naming one of
-            // several that disagree would be arbitrary.
-            if tied.windows(2).all(|pair| pair[0].same_place(pair[1])) {
-                v.closest = tied.first().map(|d| Box::new((*d).clone()));
+            // there: one alternative, or several agreeing. Otherwise name the
+            // one alternative with strictly the fewest violations: it is the
+            // likelier type. Naming one of several that fail as much would be
+            // arbitrary.
+            if tied.windows(2).all(|pair| pair[0].0.same_place(&pair[1].0)) {
+                v.closest = tied.first().map(|(d, _)| Box::new((*d).clone()));
+            } else if !exhausted && let Some(d) = fewest(&tied) {
+                v.closest = Some(Box::new(d.clone()));
             }
         }
         let mut out = Violations::default();
@@ -729,6 +739,17 @@ impl<'a> Validator<'a> {
             Some(a) if !a.proposed => self.key_problem(&a.ty, k),
             _ => None,
         }
+    }
+}
+
+/// The violation of the tied union alternative with strictly fewer violations
+/// than the rest, when exactly one has the fewest.
+fn fewest<'v, 'a>(tied: &[&'v (Violation<'a>, usize)]) -> Option<&'v Violation<'a>> {
+    let fewest = tied.iter().map(|(_, count)| *count).min()?;
+    let mut named = tied.iter().filter(|(_, count)| *count == fewest);
+    match (named.next(), named.next()) {
+        (Some((v, _)), None) => Some(v),
+        _ => None,
     }
 }
 
@@ -1109,6 +1130,27 @@ mod tests {
     }
 
     #[test]
+    fn union_alternatives_that_tie_in_different_places_name_the_fewest() {
+        // python-lsp-server 1.15.0 sent this for textDocument/documentSymbol:
+        // SymbolInformation with a null containerName. SymbolInformation[] fails
+        // at containerName (once per symbol) and DocumentSymbol[] at the missing
+        // ranges (twice per symbol), both at depth 2 but in different places.
+        // The alternative with fewer violations names the likelier type.
+        let result = model().result("textDocument/documentSymbol").unwrap();
+        let range = json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}});
+        let symbol = |name: &str| {
+            json!({"name": name, "kind": 12, "location": {"uri": "file:///a", "range": range.clone()},
+                   "containerName": null})
+        };
+        let found = invalid(result, json!([symbol("f"), symbol("g")]));
+        assert_eq!(
+            found,
+            "result is [{\"name\":\"f\",\"kind\":12,\"location\":{\"uri\":\"file:///a\",\"range\"…; required: \
+             SymbolInformation[] | DocumentSymbol[] | null (closest: result[0].containerName is null; required: string)"
+        );
+    }
+
+    #[test]
     fn union_alternatives_that_tie_in_different_places_name_none() {
         // Two alternatives fail one level down, but in different properties:
         // naming either would be arbitrary, so the union names neither.
@@ -1126,6 +1168,29 @@ mod tests {
         };
         let found = invalid(&ty, json!({"a": "x", "b": "y"}));
         assert!(!found.contains("closest:"), "{found}");
+    }
+
+    #[test]
+    fn union_alternatives_with_incomplete_counts_do_not_name_the_fewest() {
+        let params = model().server_params("workspace/applyEdit", true).unwrap();
+        let value = json!({"edit": {"documentChanges": [{"kind": "oops", "uri": true, "options": true}]}});
+        assert_eq!(validate_spending(params, &value, "params", 13), (Err(TooLarge), 13));
+        for budget in [14, 15] {
+            let (found, spent) = validate_spending(params, &value, "params", budget);
+            let found = found.unwrap();
+            assert_eq!(spent, budget);
+            assert_eq!(found.count, 1);
+            assert_eq!(found.first[0].path(), "params.edit.documentChanges[0]");
+            assert!(found.first[0].closest.is_none(), "{}", found.first[0]);
+        }
+        let (found, spent) = validate_spending(params, &value, "params", 16);
+        let found = found.unwrap();
+        assert_eq!(spent, 16);
+        assert_eq!(found.count, 1);
+        assert_eq!(
+            found.first[0].closest.as_ref().unwrap().to_string(),
+            "params.edit.documentChanges[0].textDocument is missing; required: OptionalVersionedTextDocumentIdentifier"
+        );
     }
 
     #[test]
