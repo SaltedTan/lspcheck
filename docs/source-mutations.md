@@ -200,18 +200,26 @@ stated in `[mutation.recovery]`:
 
 - `expect = "baseline"`: the server's answers about the clean seed are fixed, and return to them within
   `recovery_timeout` of the restoration (the profile's own policy deadline). Differing answers before the last are
-  lawful (a server catching up). M3 fails when lspcheck observed the whole bound and the last answer within it, to a
-  probe asked after the restoration was delivered, differs from the stable baseline.
+  lawful (a server catching up). A polled probe that hasn't recovered when `recovery_timeout` ends gets one more
+  request, the **terminal probe**, written after the deadline; M3 fails when its answer differs from the stable
+  baseline. Judging the answer to a request sent after the deadline, not the last poll before it, keeps the verdict
+  independent of lspcheck's poll interval: a server that recovered at 19.8 s of 20 answers the terminal probe with the
+  baseline, whenever the last poll was.
 - `no_errors = true`: the seed has no Error-severity diagnostics. It must hold at baseline (pushed diagnostics labelled
   1, or a pull report); if it doesn't, M3 is `ERROR` ("the profile and the server disagree before any mutation"),
-  since lspcheck can't tell which is wrong. After restoration, the last diagnostics within the bound about the
-  restored version that include an error fail M3.
+  since lspcheck can't tell which is wrong. After restoration, a pulled report is judged by its terminal probe, as
+  above. Pushed diagnostics aren't sampled: lspcheck reads every publish as it arrives, so the last publish labelled
+  with the restored version and read by the end of `recovery_timeout` is the server's own final word within the
+  profile's deadline; if it includes an error, M3 fails. No publish labelled with the restored version by then is
+  `ERROR`, not a failure: LSP doesn't require a server to publish for every version.
 
 Either way the server confirmed the expectation itself before the mutations, then answered against it about the same
-text for the whole bound. "The last answer" is a claim that nothing later superseded it, so the failure needs complete
-evidence: polls sent until the bound ended (not stopped early by lspcheck's poll budget), every poll answered or
-judged, and nothing missed in lspcheck's reading of the server's output (a skipped or cut-short frame) between that
-answer and the end of the bound. Anything less makes M3 `ERROR` for that case, with what was missing named. That is seen evidence, which is what `FAIL` needs. Without a stated expectation, the same
+text past the deadline. A failure needs complete evidence: the terminal probe delivered and answered (for pushed
+diagnostics, the whole bound read), and nothing missed in lspcheck's reading of the server's output (a skipped or
+cut-short frame) between the deciding answer and its end (for a pull, from the terminal probe's write to its answer;
+for a push, from that publish to the end of the bound). Anything less, including polling stopped early by lspcheck's
+poll budget or a terminal probe left unanswered, makes M3 `ERROR` for that case, with what was missing named. That is
+seen evidence, which is what `FAIL` needs. Without a stated expectation, the same
 observation is reported as `ERROR` with the difference shown, and the profile's author decides.
 
 ### Verdict rules
@@ -223,8 +231,10 @@ end-of-scenario recheck, and every missing reply through `fail_absent_between`.
 
 **M1.**
 - *skip:* `--mutate` not given, no seed file, no `didOpen`, or no change sync.
-- *fail:* the process exited, or its stdout closed, after the first mutation's `didChange` began and before lspcheck
-  sent `shutdown`. The detail gives the exit status, the case and step, its operators and their offsets. After a write
+- *fail:* the process exited, or lspcheck read end of file on its stdout, after the first mutation's `didChange` began
+  and before lspcheck sent `shutdown`. Only an exit or an end of file lspcheck saw counts: today's session API reports
+  both end of file and lspcheck stopping its own reading (output over `--max-output-mib`) as `Recv::Closed`, so it must
+  tell the two apart first, and stopped inspection makes M1 `ERROR`, never `FAIL`. The detail gives the exit status, the case and step, its operators and their offsets. After a write
   lspcheck couldn't finish, it waits up to `--exit-timeout` for an exit before judging, as R1 does.
 - *error:* the server exited before the first mutation (during settle or baseline, which says nothing about broken
   source); `initialize` failed; a `didChange` couldn't be delivered and no exit was seen.
@@ -271,7 +281,8 @@ versions and evicts none:
   lawfully describe a later text: a request names column 9 of a ten-character line, a later edit shortens it to three,
   and a range ending at column 3 contains the position as clamped against that later text. In the mutation scenario D6
   uses D1's candidate rule: an entry or parent fails only when containment fails against every candidate text, each
-  with its own clamping. A reply whose candidates include an evicted text isn't judged and is counted.
+  with its own clamping. A reply whose candidates include an evicted text has its containment left unjudged, and
+  counted; its entry count is still judged, since one entry per position doesn't depend on the text.
 - **D2** takes the versions it accepts from the documents it keeps (`OpenDoc.versions`). Evicting texts must not evict
   versions, or a lawful publish labelled with an old version would fail. lspcheck keeps every version number it sent,
   with when its `didChange` was written, for the whole session (a few bytes each, at most `cases × (steps + 1) + 1`
@@ -327,7 +338,7 @@ defaults; with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--onl
 | Bound | Default | Cap | When it is reached |
 |---|---|---|---|
 | Per request | `--timeout` from when its write began | — | the request is unanswered (M2) |
-| Per case | `(steps + 1) × --timeout + recovery_timeout + 5 s` | — | the case stops; requests not yet sent aren't judged |
+| Per case | `(steps + 1) × (1 + requests_per_step) × --timeout` (every write and every reply of the steps, each with its own deadline) `+ documents × --timeout` (the restoration's writes) `+ recovery_timeout + 2 × --timeout` (the terminal probe) `+ 5 s` | — | no further step starts; the restoration is always sent |
 | Per run | `run_timeout`, 10 min | 2 h | no new case starts; the detail says how many ran |
 | Settle and baseline | `settle_timeout` | 5 min | proceed; unstable probes aren't used |
 | Cases | 20 | 1000 | usage error above the cap |
@@ -336,10 +347,20 @@ defaults; with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--onl
 | Document size | `max_document_kib`, 64 | 1024 | the operator is redrawn, `truncate` after six tries |
 | Requests per step; recovery polls per case | 4; 40 | 16; 40 | the poll stops: recovery not seen, M3 `ERROR` for that case even with an expectation |
 | Versions kept per document | 64 | 64 | older positions aren't judged, counted |
-| Bytes written to the server | 64 MiB | 256 MiB | no new case starts |
+| Bytes written to the server | 64 MiB | 256 MiB | no new case starts unless its worst case fits (below) |
 
 A case starts only when the run has at least the case budget left, so the run deadline never cuts a case short, and a
-request's own deadline is never shortened by a budget except when lspcheck itself overran. Server output stays under
+request's own deadline is never shortened by a budget except when lspcheck itself overran. The case budget counts
+every delivery as taking its full write deadline, so a server slow to read (backpressure) uses up deadlines the budget
+already reserved, not the run's. If a case's budget runs out anyway, no further step starts, but the restoration is
+still sent, with its own write deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the
+cases not run), so no case ever starts on a document lspcheck couldn't restore.
+
+The written-bytes bound is a cap, not a threshold: everything lspcheck writes in the scenario counts (the seed
+`didOpen`s, baseline probes, every `didChange`, request, poll and answer to a server request, and `shutdown` and
+`exit`), and before a case starts lspcheck reserves its worst case, computed from the caps (each step's `didChange` at
+`max_document_kib` per document plus its requests, the restoration, the most polls and the terminal probes), plus the
+shutdown allowance. A case whose worst case doesn't fit doesn't start. Server output stays under
 `--max-output-mib` and `--max-frame-mib`; missing what they exclude makes waits inconclusive as everywhere else. With
 the bytes written capped, a transcript holds at most that plus what the server wrote. None of these bounds is a
 protocol rule: reaching one gives `ERROR` or `N/E` with the bound named, or just a smaller run, never `FAIL`.
@@ -378,6 +399,9 @@ a window. Lawful faults count replies, not milliseconds.
 | Fault | Effect | Test |
 |---|---|---|
 | `exit-on-unbalanced` | exit when a document's brackets become unbalanced | M1 fails |
+| `flood-while-unbalanced` | lawful: write diagnostics past `--max-output-mib` while unbalanced, and keep serving | M1 `ERROR` (inspection stopped), never `FAIL` |
+| `late-wrong-count` | answer one `selectionRange` with `[]` after more than 64 later versions | D6 fails from the mutation scenario |
+| `recover-before-deadline` | lawful: after rebalancing, answer `documentSymbol` with `[]` until just before `recovery_timeout`, counted in replies to a poll schedule the test fixes, then with the baseline | nothing fails with `expect = "baseline"`: the terminal probe sees the baseline |
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails |
 | `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |
 | `recovery-in-skipped-frame` | after rebalancing, answer the first poll with `[]`, then send the recovered answer in a frame larger than `--max-frame-mib` | M3 `ERROR` with `expect = "baseline"`, never `FAIL` |
