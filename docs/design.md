@@ -292,7 +292,9 @@ request was sent; it is used only to clamp. For each reply with an array result,
 - **fail:** the array's length isn't the number of positions sent; a `result[i].range` doesn't contain `positions[i]`
   (start ≤ position ≤ end, comparing (line, character) pairs, after clamping each character to its line's length in
   the negotiated encoding); or a `parent.range` doesn't contain its child's range, anywhere up the chain. A seen
-  failure stands even when evidence is incomplete. The detail names the first few.
+  failure stands even when evidence is incomplete. The detail names the first few. A containment failure whose same
+  comparison holds under a line split the spec doesn't allow (the three D5 names) carries a hint naming those splits;
+  the verdict is unchanged.
 - **error:** no failure seen, but `incomplete_within` reports missed evidence in the window D1 uses, or a
   `selectionRange` request couldn't be answered: lspcheck couldn't send it, or the server's output had closed before
   its reply (the whole rest of a batch is cut off then). D6 doesn't pass on part of its evidence.

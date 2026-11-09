@@ -924,6 +924,21 @@ fn contains_range(lines: &[&str], encoding: Encoding, outer: Range, inner: Range
     Some((os.line, os.character) <= (is.line, is.character) && (ie.line, ie.character) <= (oe.line, oe.character))
 }
 
+/// The hint a D6 failure gets when the same comparison holds under a line
+/// split the spec doesn't allow: names every such split, as D5 does. Empty
+/// when none explains the failure.
+fn wrong_split_hint(text: &str, encoding: Encoding, outer: Range, inner: Range) -> String {
+    let names: Vec<&str> = WRONG_SPLITS
+        .iter()
+        .filter(|s| {
+            let lines = split_lines_wrong(text, **s);
+            contains_range(&lines, encoding, outer, inner) == Some(true)
+        })
+        .map(|s| wrong_split_name(*s))
+        .collect();
+    if names.is_empty() { String::new() } else { format!(" (holds under {}; see D5)", names.join(", or ")) }
+}
+
 /// A range, for a failure detail.
 fn fmt_range(r: Range) -> String {
     format!("({},{})-({},{})", r.start.line, r.start.character, r.end.line, r.end.character)
@@ -956,10 +971,11 @@ fn judge_chain(
                 match contains_range(&lines, encoding, rng, Range { start: p, end: p }) {
                     Some(true) => r.compared += 1,
                     Some(false) => r.failures.push(format!(
-                        "selectionRange at version {version}, entry {entry_idx}: range {} doesn't contain the position ({}, {})",
+                        "selectionRange at version {version}, entry {entry_idx}: range {} doesn't contain the position ({}, {}){}",
                         fmt_range(rng),
                         p.line,
-                        p.character
+                        p.character,
+                        wrong_split_hint(text, encoding, rng, Range { start: p, end: p })
                     )),
                     None => r.no_line += 1,
                 }
@@ -977,9 +993,10 @@ fn judge_chain(
         match contains_range(&lines, encoding, parent_range, rng) {
             Some(true) => r.compared += 1,
             Some(false) => r.failures.push(format!(
-                "selectionRange at version {version}, entry {entry_idx}: parent {} doesn't contain {}",
+                "selectionRange at version {version}, entry {entry_idx}: parent {} doesn't contain {}{}",
                 fmt_range(parent_range),
-                fmt_range(rng)
+                fmt_range(rng),
+                wrong_split_hint(text, encoding, parent_range, rng)
             )),
             None => r.no_line += 1,
         }
@@ -1994,6 +2011,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.failures.len(), 1, "{r:?}");
+    }
+
+    #[test]
+    fn d6_names_the_line_split_that_would_explain_the_failure() {
+        // zls 0.17.0's reply about B: one range for the whole document as it
+        // splits lines at `\n` only, so (4, 15) is the empty last line's end.
+        let positions = sel_positions(&[(2, 9), (2, 11), (2, 13), (4, 15)]);
+        let whole = || entry(rng(0, 0, 4, 0), None);
+        let result = serde_json::json!([whole(), whole(), whole(), whole()]);
+        let r = judge_selection_reply(&doc_b(), Encoding::Utf16, 7, &positions, &result).unwrap();
+        assert_eq!(r.failures.len(), 1, "{r:?}");
+        let failure = &r.failures[0];
+        assert!(failure.contains("doesn't contain the position (4, 15)"), "{failure}");
+        // A split at `\n` only or at `\n` and `\r\n` leaves line 4 empty,
+        // where both the position and the range's end clamp to (4, 0).
+        for split in [WrongSplit::LfOnly, WrongSplit::NoLoneCr] {
+            assert!(failure.contains(wrong_split_name(split)), "{failure}");
+        }
+        // Counting `\r\n` as two breaks puts the emoji line at 4, past the
+        // range's end.
+        assert!(!failure.contains(wrong_split_name(WrongSplit::CrLfTwo)), "{failure}");
+        assert!(failure.ends_with("; see D5)"), "{failure}");
+        let (v, detail) = judge_d6(std::slice::from_ref(&r), None);
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(detail.contains("see D5"), "{detail}");
+    }
+
+    #[test]
+    fn d6_a_parent_failure_gets_the_same_hint() {
+        // The child contains its position under the spec's split; the parent
+        // ends at (4, 0), before the child's end (4, 15). A split that leaves
+        // line 4 empty clamps both ends to (4, 0), so the parent contains it.
+        let positions = sel_positions(&[(4, 15)]);
+        let result = serde_json::json!([entry(rng(0, 0, 4, 15), Some(entry(rng(0, 0, 4, 0), None)))]);
+        let r = judge_selection_reply(&doc_b(), Encoding::Utf16, 7, &positions, &result).unwrap();
+        assert_eq!(r.failures.len(), 1, "{r:?}");
+        let failure = &r.failures[0];
+        assert!(failure.contains("parent (0,0)-(4,0) doesn't contain (0,0)-(4,15)"), "{failure}");
+        for split in [WrongSplit::LfOnly, WrongSplit::NoLoneCr] {
+            assert!(failure.contains(wrong_split_name(split)), "{failure}");
+        }
+        assert!(!failure.contains(wrong_split_name(WrongSplit::CrLfTwo)), "{failure}");
+        assert!(failure.ends_with("; see D5)"), "{failure}");
+    }
+
+    #[test]
+    fn d6_hints_only_when_a_wrong_split_explains_the_failure() {
+        // (0, 0)-(0, 0) can't contain (4, 15) under any split.
+        let positions = sel_positions(&[(4, 15)]);
+        let result = serde_json::json!([entry(rng(0, 0, 0, 0), None)]);
+        let r = judge_selection_reply(&doc_b(), Encoding::Utf16, 7, &positions, &result).unwrap();
+        assert_eq!(r.failures.len(), 1, "{r:?}");
+        assert!(r.failures[0].contains("doesn't contain the position (4, 15)"), "{r:?}");
+        assert!(!r.failures[0].contains("see D5"), "{r:?}");
+        assert_eq!(judge_d6(std::slice::from_ref(&r), None).0, Verdict::Fail);
+        // Document A has no lone `\r` or `\r\n`, so its wrong splits are its
+        // spec split: a failure there gets no hint either.
+        let a = doc_a();
+        let positions = sel_positions(&[(0, 6)]);
+        let result = serde_json::json!([entry(rng(0, 0, 0, 5), None)]);
+        let r = judge_selection_reply(&a, Encoding::Utf16, 41, &positions, &result).unwrap();
+        assert_eq!(r.failures.len(), 1, "{r:?}");
+        assert!(!r.failures[0].contains("see D5"), "{r:?}");
     }
 
     #[test]

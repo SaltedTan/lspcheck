@@ -8,6 +8,11 @@
   vscode-json-language-server, marksman, ruff, texlab and zls in [`examples/profiles/`](examples/profiles/), each with
   a tiny project and a `[document]`.
 
+### Changed
+
+- D6's failure detail says when a containment failure would hold under a line split the spec doesn't allow, naming
+  the split as D5 does; the verdict is unchanged.
+
 ## 0.3.0 (2026-11-09)
 
 ### Added
