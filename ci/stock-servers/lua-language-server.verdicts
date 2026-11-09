@@ -25,9 +25,13 @@ L9 pass
 C1 fail
 C2 pass
 C3 pass
-D1 fail
+# lua-language-server sometimes publishes diagnostics for version 42 that repeat the positions of version 41
+# (stale ones, which fall inside a character of version 42). D1 and D3 fail when those arrive within lspcheck's
+# wait for diagnostics and pass when they come later; both verdicts are right for what lspcheck saw. Seen in 2
+# of 3 local runs on 2026-11-09.
+D1 fail|pass
 D2 pass
-D3 fail
+D3 fail|pass
 D4 pass
 D5 pass
 D6 skip
