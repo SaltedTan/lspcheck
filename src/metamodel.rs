@@ -20,8 +20,7 @@ const SOURCE: &str = include_str!("../vendor/lsp-3.17/metaModel.json");
 
 /// How many (value, type) pairs one message may take to validate. Enough for
 /// several million array items, such as semantic tokens for R3's large
-/// document; a message that needs more isn't judged, since that is
-/// lspcheck's limit and not a protocol rule.
+/// document. See [`validate`] for exhaustion semantics.
 pub const NODE_BUDGET: usize = 5_000_000;
 
 /// How many steps K2 may take over a whole run, so validating takes bounded
@@ -436,7 +435,7 @@ impl<'a> Violations<'a> {
     }
 }
 
-/// The value was too large to validate within [`NODE_BUDGET`].
+/// Validation was inconclusive within the supplied step budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TooLarge;
 
@@ -452,6 +451,9 @@ pub fn on_validation_stack<R: Send>(f: impl FnOnce() -> R + Send) -> std::io::Re
 }
 
 /// Validates `value` against `ty`; paths start at `root` (`result` or `params`).
+/// Returns established violations even if the budget runs out; [`TooLarge`]
+/// means validation was inconclusive. See `docs/design.md#capabilities-and-robustness`
+/// for K2's budget and union verdict rules.
 pub fn validate<'a>(ty: &'a Type, value: &'a Value, root: &'a str) -> Result<Violations<'a>, TooLarge> {
     validate_within(ty, value, root, NODE_BUDGET)
 }

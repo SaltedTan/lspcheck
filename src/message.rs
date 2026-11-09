@@ -144,8 +144,9 @@ impl std::fmt::Display for Id {
 }
 
 /// The exact value of a JSON number as `[-]DIGITSeEXP` with no leading or
-/// trailing zeros in DIGITS (zero is `0e0`). `None` if `text` isn't a JSON
-/// number or its exponent doesn't fit in 64 bits.
+/// trailing zeros in DIGITS (zero is `0e0`, regardless of its exponent).
+/// `None` if `text` isn't a JSON number or a nonzero value's exponent can't
+/// be parsed or normalized in 64 bits.
 pub fn canonical_number(text: &str) -> Option<String> {
     let (negative, rest) = match text.strip_prefix('-') {
         Some(r) => (true, r),

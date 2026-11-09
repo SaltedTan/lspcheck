@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. Unreleased: [K2](#capabilities-and-robustness) validates what the server sends against the vendored LSP 3.17 meta-model, including duplicate results, with bounded diagnostic paths and value previews, judged across every scenario when selected and not skipped. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. Unreleased: [K2](#capabilities-and-robustness) is implemented. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -424,7 +424,8 @@ A value is of a type when:
 
 - **base types:** `integer` is a whole-valued JSON number from -2^31 to 2^31-1, including decimal and exponent
   spellings such as `41.0` and `4.1e1`; `uinteger` one from 0 to 2^31-1; `decimal` any number; `string`, `boolean`
-  and `null` as named. `URI`, `DocumentUri` and `RegExp` are strings, whose syntax isn't judged.
+  and `null` as named. Zero is exactly zero regardless of its exponent, including `0e9223372036854775808`.
+  `URI`, `DocumentUri` and `RegExp` are strings, whose syntax isn't judged.
 - **references** name a structure, an enumeration or a type alias (the names are unique across the three).
 - **structures** and structure literals: a JSON object in which every property that isn't optional, including those
   from `extends` and `mixins` (recursively; a structure's own property replaces an inherited one of the same name), is
@@ -438,12 +439,14 @@ A value is of a type when:
   key type is a string enumeration); **and:** every type; **or:** at least one; **string, integer and boolean
   literals:** exactly that value.
 
-The work is bounded: validation allows 5,000,000 (value, type) steps per message and 50,000,000 across the run. A
-message that exceeds either remaining budget isn't judged; the detail counts per-message and per-run exclusions
-separately. These are lspcheck's limits, not protocol rules, so they never fail K2 by themselves. A violation found
-before the budget ran out still stands (it was seen), except inside an `or` with an alternative left undecided. Nesting is bounded by the
-JSON parser's limit (values nested 128 deep aren't read), and validation runs on a thread with a 64 MiB stack, enough
-for the deepest values the parser accepts in a debug build too (Windows gives its main thread only 1 MiB).
+The work is bounded: validation allows 5,000,000 (value, type) steps per message and 50,000,000 across the run. These
+are lspcheck's limits, not protocol rules, so exhausting a budget never fails K2 by itself. Violations established
+before exhaustion still count. An `or` fails only when every alternative is established to fail; if none succeeds
+and any is left undecided, the union is inconclusive. A message that exhausts its budget without an established
+violation isn't judged; the detail counts per-message and per-run exclusions separately.
+Nesting is bounded by the JSON parser's limit (values nested 128 deep aren't read), and validation runs on a thread
+with a 64 MiB stack, enough for the deepest values the parser accepts in a debug build too (Windows gives its main
+thread only 1 MiB).
 Diagnostic paths and value previews are each at most 60 characters followed by `…` when shortened. Paths inspect
 bounded key prefixes, so even a large key in a discarded union alternative is never copied
 or escaped in full.
