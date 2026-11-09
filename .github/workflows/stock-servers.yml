@@ -65,7 +65,7 @@ jobs:
       - name: Install Go and gopls
         if: matrix.server == 'gopls'
         run: |
-          curl -fsSL --retry 3 "https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz" -o "$RUNNER_TEMP/go.tar.gz"
+          curl -fsSL --retry 6 --retry-delay 20 "https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz" -o "$RUNNER_TEMP/go.tar.gz"
           echo "$GO_SHA256  $RUNNER_TEMP/go.tar.gz" | sha256sum --check --strict
           tar -xzf "$RUNNER_TEMP/go.tar.gz" -C "$RUNNER_TEMP"
           export PATH="$RUNNER_TEMP/go/bin:$PATH" GOBIN="$RUNNER_TEMP/bin" GOTOOLCHAIN=local
@@ -78,7 +78,7 @@ jobs:
         if: matrix.server == 'rust-analyzer'
         run: |
           gz="$RUNNER_TEMP/rust-analyzer.gz"
-          curl -fsSL --retry 3 -o "$gz" \
+          curl -fsSL --retry 6 --retry-delay 20 -o "$gz" \
             "https://github.com/rust-lang/rust-analyzer/releases/download/$RUST_ANALYZER_RELEASE/rust-analyzer-x86_64-unknown-linux-gnu.gz"
           echo "$RUST_ANALYZER_SHA256  $gz" | sha256sum --check --strict
           gunzip -c "$gz" > "$RUNNER_TEMP/bin/rust-analyzer"
@@ -90,7 +90,7 @@ jobs:
       - name: Install lua-language-server
         if: matrix.server == 'lua-language-server'
         run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/lua-ls.tar.gz" \
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/lua-ls.tar.gz" \
             "https://github.com/LuaLS/lua-language-server/releases/download/$LUA_LS_VERSION/lua-language-server-$LUA_LS_VERSION-linux-x64.tar.gz"
           echo "$LUA_LS_SHA256  $RUNNER_TEMP/lua-ls.tar.gz" | sha256sum --check --strict
           mkdir "$RUNNER_TEMP/lua-ls"
@@ -101,7 +101,7 @@ jobs:
         if: matrix.server == 'basedpyright'
         run: |
           # The package has no dependencies, so its tarball runs as it is.
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/basedpyright.tgz" \
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/basedpyright.tgz" \
             "https://registry.npmjs.org/basedpyright/-/basedpyright-$BASEDPYRIGHT_VERSION.tgz"
           echo "$BASEDPYRIGHT_SHA256  $RUNNER_TEMP/basedpyright.tgz" | sha256sum --check --strict
           mkdir "$RUNNER_TEMP/basedpyright"
