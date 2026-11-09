@@ -327,9 +327,8 @@ pub struct Violation<'a> {
     /// What the meta-model requires there.
     pub expected: String,
     found: Option<Found<'a>>,
-    /// For a union nothing matched: the alternative that got deepest into
-    /// the value, when one got deeper than the others or every deepest one
-    /// failed in the same place.
+    /// A deeper violation for an unmatched union, when all deepest
+    /// alternatives agree according to [`Self::same_place`].
     pub closest: Option<Box<Violation<'a>>>,
 }
 
@@ -676,12 +675,9 @@ impl<'a> Validator<'a> {
         Ok(out)
     }
 
-    /// An `or`: one alternative must match. When none does, the violation
-    /// names them all, and where the deepest alternative failed, if one got
-    /// deeper than the others or all the deepest ones failed in the same
-    /// place (through nested unions). When the budget runs out, the union
-    /// fails only if every alternative was established to fail; one left
-    /// undecided leaves it undecided.
+    /// An `or`: one alternative must match. When the budget runs out, the
+    /// union fails only if every alternative was established to fail; one
+    /// left undecided leaves it undecided.
     fn union(&mut self, items: &'a [Type], value: &'a Value, expected: String) -> Checked<'a> {
         let mut deepest: Vec<Violation<'a>> = Vec::new();
         let (mut exhausted, mut undecided) = (false, false);

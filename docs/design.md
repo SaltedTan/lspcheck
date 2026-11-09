@@ -458,10 +458,10 @@ or escaped in full.
 - **fail:** at least one violation was seen. The detail gives the count and names the first five that differ, each
   with its scenario and time, the method, whether it is a result or params, a path (`result.contents.kind`), what the
   meta-model requires there (`MarkupKind: "plaintext" | "markdown"`, `Position`, `uinteger (a whole number from 0 to
-  2147483647)`, …) and the value found, shortened without traversing the rest of the value. For an `or` nothing matched
-  it names the alternatives and, when one of them got deeper into the value than the others (through nested `or`s too),
-  or every deepest one failed in the same place, where that failed. A violation
-  seen stands even if other frames couldn't be read.
+  2147483647)`, …) and the value found, shortened without traversing the rest of the value. For an `or` nothing matched,
+  it names the alternatives. It also names a failure deeper than the union (through nested `or`s too) when one
+  alternative got deepest, or all alternatives tied for deepest agree on the full path, requirement and displayed
+  value. Otherwise it names no closest failure. A violation seen stands even if other frames couldn't be read.
 - **error:** no violation was seen, but a frame couldn't be read anywhere (as for J5: it might have held a message K2
   judges), lspcheck's inspection of the output was cut short, no scenario could start the server, or lspcheck
   couldn't start the thread that validates.

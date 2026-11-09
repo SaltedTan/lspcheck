@@ -11,9 +11,9 @@
 ### Changed
 
 - D6's containment failure details now include [line-split hints](docs/design.md#documents-and-positions).
-- K2's failure detail now names where an `or` failed when several alternatives got equally deep and failed in the same
-  place, such as `textDocument/documentSymbol`'s `SymbolInformation[]` and `DocumentSymbol[]` both rejecting a `tags`
-  entry. The set of violations and every verdict are unchanged.
+- K2's failure detail now explains agreeing union alternatives that tie; see the
+  [diagnostic rules](docs/design.md#capabilities-and-robustness). The set and count of violations and every verdict are
+  unchanged.
 
 ## 0.3.0 (2026-11-09)
 
