@@ -178,9 +178,8 @@ answers. A profile's `[client].configuration` answers `workspace/configuration`;
 
 The checks on how the server reads its input (F3 to F7) send small requests the server doesn't know, which every server
 must answer, written in different ways: split across many writes, several frames in one write, with a `Content-Type`
-header, or carrying multibyte characters. Each way is judged only after a plain request has been answered, so lspcheck
-knows the server answers such requests and that its input is in step. If the server stops answering after one of
-them fails, the rest are reported as `ERROR`, not `FAIL`; if it never answers a plain request, they are `N/E`.
+header, or carrying multibyte characters. See the [framing reference](docs/design.md#framing-and-output) for scenario
+isolation, plain-request baselines, and when a variant is `ERROR` or `N/E`.
 
 F2 needs output with non-ASCII text, so lspcheck sends a request whose string id has some, which the response must
 echo. A server that escapes all non-ASCII text as `\u` sequences (which is lawful) gives no evidence, and F2 reports
