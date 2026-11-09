@@ -61,8 +61,8 @@ Existing checks keep being judged on the new scenario's evidence:
   servers send real results and diagnostics here, so K2 validates far more than in the other scenarios.
 - **Extended to the mutated documents:** D1 (positions on character boundaries), D2 (diagnostics versions), D6
   (selection-range containment) and K1 (an advertised request isn't answered with MethodNotFound). Their rules don't
-  depend on the text, only on knowing it, and lspcheck knows every version it sent. Each is judged per scenario with
-  the function it already has, and the two verdicts combine as `fail` over `error` over `pass` over `not-exercised`
+  depend on the text, only on knowing it, and lspcheck knows every version it sent. Each is judged per scenario, and
+  the two verdicts combine as `fail` over `error` over `pass` over `not-exercised`
   over `skip`; the detail names the scenario and case. K1 takes only its failure from the mutation scenario: an
   unanswered mutation request is M2's, so it never makes K1 `ERROR`.
 - **Not extended:** D3 and D5 rest on documents built so that one specific mistake lands inside a character; a
@@ -84,12 +84,18 @@ pass --mutate`), which doesn't affect the exit status.
    the baseline's stability rule below still protects M3.
 4. **Baseline**: send each recovery probe (below) about each seed document, then again each second, until two answers
    in a row are equal after projection, or `settle_timeout` ends. A probe with a stable answer is used; one that
-   errors, varies or isn't advertised isn't, and the detail says why.
+   errors, varies or isn't advertised isn't, and the detail says why. Pushed diagnostics are a notification, never
+   requested, and a lawful server may publish once per version: their baseline is the publishes labelled with version 1
+   read before the first mutation. If there is at least one and all of them are equal after projection, the last is the
+   baseline; if they differ, or none arrived, pushed diagnostics aren't used (and `no_errors` can only be established
+   from a pull report).
 5. **Cases**, in order, while the run's budget lasts. Case *k* has its own RNG streams, so it doesn't depend on the
    cases before it or on the server's timing. Each step applies one to three mutations to one document, sends them in
    one `didChange`, then sends the step's requests (default four) without waiting between them, and waits for each
    reply until its own deadline.
-6. **Restore**: one `didChange` replaces each mutated document's whole text with its clean text, at the next version.
+6. **Restore**: one `didChange` replaces each mutated document's whole text with its clean text, at the next version:
+   the full text for a server with full sync, and for incremental sync one change whose range covers the whole current
+   document.
    Then lspcheck polls the stable probes, 250 ms apart and doubling to 2 s, until every answer equals its baseline or
    `recovery_timeout` ends. Each poll is a request like any other, judged by M2 and the cross-cutting checks.
 7. After the last case, `leave()`: `shutdown`, `exit`, and L9's scan.
@@ -135,12 +141,14 @@ would be judged on lspcheck's own violation.
 No edit starts or ends between a `\r` and a `\n`. No position can name that point (a line's length excludes its end),
 so such an edit could not be sent incrementally, and splitting the pair would change two line breaks at once.
 
-**Sending edits.** With `sync = "auto"` (the default), lspcheck sends what the server's `textDocumentSync` kind asks
-for. For incremental sync, each mutation becomes one content change: the smallest range that differs (common prefix and
-suffix, in characters), counted in the negotiated encoding against the text left by the change before it, as the
+**Sending edits.** lspcheck sends what the server's `textDocumentSync` kind asks for. For incremental sync, each mutation becomes one content change: the smallest range that differs (common prefix and
+suffix, in characters), widened so that neither end falls between a `\r` and a `\n` in the text before or after the
+change (changing `x\r\ny` to `x\ry` has a common prefix `x\r`, and deleting only the `\n` would start inside a CR LF;
+widened, the change replaces `\r\n` with `\r`), counted in the negotiated encoding against the text left by the change before it, as the
 specification orders them. lspcheck applies each change with `text::apply_change` and asserts the result is the planned
 text, so a bug in its own range arithmetic stops the run as an internal error, never as a verdict. Full sync sends the
-whole text. `sync = "full"` forces full text even when incremental is advertised, to tell the two apart.
+whole text. There is no option to send full text to a server that asked for incremental changes: LSP says that after
+`didOpen` such a server receives only incremental updates, so a range-less change would be lspcheck's own violation.
 
 **Determinism.** A case's edits come from SplitMix64 seeded by (seed, case index, `"edits"`), and its requests and
 positions from a second stream seeded by (seed, case index, `"requests"`). Which methods the server advertises therefore
@@ -172,7 +180,8 @@ what describes the text and drops what may lawfully vary:
 | `textDocument/diagnostic` (a full report) | each item's range, severity, code, source | `message`, `data`, `relatedInformation`, `codeDescription`, `resultId` |
 | `publishDiagnostics` labelled with a version | the same per diagnostic | the same |
 
-Top-level arrays compare as multisets, because servers may order them by hash. `semanticTokens` is left out for now: its
+Every array of the projection compares as a multiset, recursively (a symbol's `children` too), because servers may
+order them by hash; each element is projected before the comparison. `semanticTokens` is left out for now: its
 `data` is long, and a legend change between answers would need decoding. Unlabelled `publishDiagnostics` aren't used:
 lspcheck can't tell which text they describe. The profile's `recovery.probes` may narrow the list.
 
@@ -189,15 +198,20 @@ lspcheck can observe that without knowing the language. It cannot decide:
 So a recovery not seen within the bound is `ERROR`, not `FAIL`, unless the profile states an expectation. Two can be
 stated in `[mutation.recovery]`:
 
-- `expect = "baseline"`: the server's answers about the clean seed are fixed. The last answer within the bound, to a
-  probe asked after the restoration was delivered, that differs from the stable baseline fails M3.
+- `expect = "baseline"`: the server's answers about the clean seed are fixed, and return to them within
+  `recovery_timeout` of the restoration (the profile's own policy deadline). Differing answers before the last are
+  lawful (a server catching up). M3 fails when lspcheck observed the whole bound and the last answer within it, to a
+  probe asked after the restoration was delivered, differs from the stable baseline.
 - `no_errors = true`: the seed has no Error-severity diagnostics. It must hold at baseline (pushed diagnostics labelled
   1, or a pull report); if it doesn't, M3 is `ERROR` ("the profile and the server disagree before any mutation"),
   since lspcheck can't tell which is wrong. After restoration, the last diagnostics within the bound about the
   restored version that include an error fail M3.
 
 Either way the server confirmed the expectation itself before the mutations, then answered against it about the same
-text for the whole bound. That is seen evidence, which is what `FAIL` needs. Without a stated expectation, the same
+text for the whole bound. "The last answer" is a claim that nothing later superseded it, so the failure needs complete
+evidence: polls sent until the bound ended (not stopped early by lspcheck's poll budget), every poll answered or
+judged, and nothing missed in lspcheck's reading of the server's output (a skipped or cut-short frame) between that
+answer and the end of the bound. Anything less makes M3 `ERROR` for that case, with what was missing named. That is seen evidence, which is what `FAIL` needs. Without a stated expectation, the same
 observation is reported as `ERROR` with the difference shown, and the profile's author decides.
 
 ### Verdict rules
@@ -232,8 +246,9 @@ polls.
 - *skip:* as M1.
 - *not-exercised:* no probe had a stable baseline (each one's reason is listed), or no case reached its restoration.
 - *fail:* only as stated above, with `expect` or `no_errors`. The detail names the case, the probe, the first
-  difference after projection (a path and both values, shortened like K2's) and how long lspcheck polled. A failure
-  seen stands even if other evidence was missed.
+  difference after projection (a path and both values, shortened like K2's) and how long lspcheck polled. Unlike a
+  position inside a character, this failure rests on nothing having superseded the last answer, so missed evidence
+  after it, or polling stopped by the poll budget before the bound, makes it `ERROR`, never `FAIL`.
 - *error:* without a stated expectation, a probe didn't return to its baseline within `recovery_timeout`
   ("not seen to recover within 20 s; lspcheck's bound, not a protocol rule: set `[mutation.recovery].expect` if the
   answers are fixed"); the restoring `didChange` couldn't be delivered; the server exited first (M1's failure); a
@@ -249,6 +264,19 @@ and is counted, so a long run's memory stays bounded and no position is judged a
 D2 judges every labelled publish against the versions sent before it was read; D6 every `selectionRange` reply; K1
 every MethodNotFound to an advertised request about a seed document.
 
+Two of the existing judges need changes before they can be reused here, because the documents scenario sends few
+versions and evicts none:
+
+- **D6** clamps positions against the text current when the request was sent (`judge_selection_reply`). A reply may
+  lawfully describe a later text: a request names column 9 of a ten-character line, a later edit shortens it to three,
+  and a range ending at column 3 contains the position as clamped against that later text. In the mutation scenario D6
+  uses D1's candidate rule: an entry or parent fails only when containment fails against every candidate text, each
+  with its own clamping. A reply whose candidates include an evicted text isn't judged and is counted.
+- **D2** takes the versions it accepts from the documents it keeps (`OpenDoc.versions`). Evicting texts must not evict
+  versions, or a lawful publish labelled with an old version would fail. lspcheck keeps every version number it sent,
+  with when its `didChange` was written, for the whole session (a few bytes each, at most `cases × (steps + 1) + 1`
+  per document); only the text snapshots are bounded to 64.
+
 ### Profile schema
 
 `[mutation]` is validated with the rest of the profile (`deny_unknown_fields`, errors name the key, exit status 2),
@@ -263,7 +291,6 @@ cases = 20                     # default 20, at most 1000
 steps = 3                      # most steps per case, 1 to 3
 operators = ["delete-tokens", "unbalance-bracket", "open-string", "unicode", "line-ends", "rename"]  # default: all but nest, repeat-line, control
 fragments = ["0x", "1e", "..."]                  # for the fragment operator
-sync = "auto"                  # or "full"
 requests = ["textDocument/documentSymbol", "textDocument/hover", "textDocument/completion"]  # default: K1's advertised methods
 requests_per_step = 4          # at most 16
 max_document_kib = 64          # per document, seed included; at most 1024
@@ -307,7 +334,7 @@ defaults; with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--onl
 | Mutations per step; steps per case | 1 to 3; `steps` | 3; 3 | — |
 | Inserted text per mutation | 1 KiB; stress operators the room left | 16 KiB | the operator inserts less |
 | Document size | `max_document_kib`, 64 | 1024 | the operator is redrawn, `truncate` after six tries |
-| Requests per step; recovery polls per case | 4; 40 | 16; 40 | the poll stops: recovery not seen |
+| Requests per step; recovery polls per case | 4; 40 | 16; 40 | the poll stops: recovery not seen, M3 `ERROR` for that case even with an expectation |
 | Versions kept per document | 64 | 64 | older positions aren't judged, counted |
 | Bytes written to the server | 64 MiB | 256 MiB | no new case starts |
 
@@ -353,6 +380,7 @@ a window. Lawful faults count replies, not milliseconds.
 | `exit-on-unbalanced` | exit when a document's brackets become unbalanced | M1 fails |
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails |
 | `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |
+| `recovery-in-skipped-frame` | after rebalancing, answer the first poll with `[]`, then send the recovered answer in a frame larger than `--max-frame-mib` | M3 `ERROR` with `expect = "baseline"`, never `FAIL` |
 | `errors-after-unbalanced` | once unbalanced, publish an Error diagnostic forever | M3 fails with `no_errors = true` |
 | `method-not-found-while-unbalanced` | answer advertised requests with -32601 while unbalanced | K1 fails from the mutation scenario |
 | `codepoint-positions-after-change` (exists) | count positions in code points after a change | D1 fails from the mutation scenario (with `unicode`) |
@@ -361,13 +389,14 @@ a window. Lawful faults count replies, not milliseconds.
 | `reworded-diagnostics` | lawful: put a counter in every diagnostic message | nothing fails |
 | `no-diagnostics` (exists) | lawful: never publish diagnostics | nothing fails; pushed diagnostics unused |
 | `content-modified-while-unbalanced` | lawful: answer requests with -32801 while unbalanced | nothing fails; M2 passes |
-| `shuffled-symbols` | lawful: return symbols in a different order each time, with a changing `detail` | nothing fails |
+| `shuffled-symbols` | lawful: return symbols, and each symbol's children, in a different order each time, with a changing `detail` | nothing fails |
 | `unstable-symbols` | lawful: add a symbol named by a counter to every answer | M3 `N/E`, never `FAIL` |
 
 The clean stand-in passes M1 to M3 and every extended check. Unit tests cover the planner: the same seed gives the same
 plan bytes; a pinned golden case; no edit inside a character or a CRLF; sizes within the caps; incremental changes that
 `apply_change` turns into the planned text in all three encodings, over many seeds; the default and a given lexicon;
-every profile validation error. Each regression test is run against the commit before its fix, as AGENTS.md asks.
+every profile validation error; line-end changes CR LF → CR, CR → CR LF, LF → CR LF and CR LF → LF, whose
+minimal diffs would split a CR LF without the widening. Each regression test is run against the commit before its fix, as AGENTS.md asks.
 
 ### Stock servers
 
@@ -416,7 +445,9 @@ Each step is one small pull request with its tests, docs and changelog entry whe
    M3 in the catalogue, reporting `SKIP` without `--mutate`. Stock `.verdicts` files gain their `skip` lines.
 3. **Scenario, M1 and M2.** Open, mutate, request, restore (without probes), `leave()`; the transcript meta line; the
    JSON `"mutation"` field. Stand-in bracket tracking and the M1 and M2 faults.
-4. **Extended checks.** D1, D2, D6 and K1 over the mutation scenario, with the 64-version window, and their faults.
+4. **Extended checks.** D1, D2, D6 and K1 over the mutation scenario, with the 64-text window, D2's whole-session
+   version history, D6's candidate texts, and their faults (including a lawful delayed `selectionRange` reply about a
+   later, shorter text, and a lawful publish labelled with an evicted version).
 5. **Recovery, M3.** Settle, stable baselines, projections, polling, `expect` and `no_errors`; the recovery faults,
    lawful ones included.
 6. **Isolation.** Rerunning failing cases alone and writing their transcripts.
