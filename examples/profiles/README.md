@@ -19,5 +19,4 @@ lspcheck --profile examples/profiles/gopls.toml -- ~/go/bin/gopls serve   # anot
 
 They give generous timeouts, since a server may index the project before it answers. A server still loading its
 workspace may answer with empty results or errors other than MethodNotFound; K1 accepts those and lists the error
-codes in its detail. CI runs every check with each profile against a pinned release of its server and compares the verdicts with
-[`ci/stock-servers`](../../ci/stock-servers/), so a change in how lspcheck judges a real server shows up.
+codes in its detail. These profiles also drive the [stock-server CI matrix](../../ci/stock-servers/README.md).

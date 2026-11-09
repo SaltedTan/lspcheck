@@ -404,6 +404,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 (`--list-faults`). Every check has a test showing that the clean stand-in passes and the right fault makes it fail.
 That test is required, because a check that can't fail is worse than no check.
 
+The [stock-server CI matrix](ci/stock-servers/README.md) adds regression coverage against real language servers.
+
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE).

@@ -1,10 +1,5 @@
-# Runs lspcheck, built from this commit, against pinned releases of widely used
-# language servers with the example profiles, and compares every check's
-# verdict with ci/stock-servers/<server>.verdicts. The servers are pinned, so a
-# changed verdict means lspcheck changed: either a check now judges differently
-# (update the expected verdicts, and explain why in the pull request) or a check
-# went wrong. Known failures of these servers are expected, not reported to
-# them. See ci/stock-servers/README.md.
+# Runs the stock-server regression matrix. Its purpose, baseline contract and
+# update procedure are documented in ci/stock-servers/README.md.
 name: Stock servers
 
 on:
