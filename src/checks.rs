@@ -439,9 +439,9 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
         unless_unreadable(&runs, judge_j5(&runs)),
         unless_unreadable(&runs, judge_j7(&runs)),
         judge_l9(&runs, &cfg.allowed_descendants),
-        judge_k2(&runs),
     ]
     .into_iter()
+    .chain(judges("K2").then(|| judge_k2(&runs)))
     .collect();
     runs.push(ScenarioRun { name: "all", results: cross, observed: None, transcript: None });
     for run in &mut runs {

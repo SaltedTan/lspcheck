@@ -238,7 +238,8 @@ K2 checks the types of what the server sends against the LSP 3.17 meta-model: th
 sent (except `shutdown`, which L4 judges) and the params of the server's own requests and notifications. Properties
 the meta-model doesn't name are lawful, and proposed definitions aren't judged. A failure names where the value is
 (`result.contents`), what the meta-model requires there and what was found. See the
-[K2 reference](docs/design.md#capabilities-and-robustness) for the validation rules.
+[K2 reference](docs/design.md#capabilities-and-robustness) for the validation rules. Validation runs only when K2 is
+selected and not skipped by the profile.
 
 R1 checks continued service after malformed JSON; R3 checks it after opening a large document.
 If a follow-up request fails, both checks wait up to `--exit-timeout` for an unprompted server exit before judging it.
