@@ -1038,14 +1038,24 @@ fn rejecting_a_client_content_type_fails_f6_and_f7() {
 
 #[test]
 fn variants_after_the_server_stops_answering_are_inconclusive() {
-    // The server exits at F6; nothing after it can be judged.
+    // The server exits at F6; F7, sent to the same server after it, can't be
+    // judged. F3 to F5 have a server of their own and are still decided.
     let r = fault("exit-on-content-type");
-    expect(&r, "F4", "pass");
-    expect(&r, "F6", "fail");
-    for id in ["F7", "F3", "F5"] {
-        expect(&r, id, "error");
+    for id in ["F4", "F3", "F5"] {
+        expect(&r, id, "pass");
     }
+    expect(&r, "F6", "fail");
+    expect(&r, "F7", "error");
     assert!(r.stdout.contains("the server exited after F6 didn't pass"), "{}", r.stdout);
+}
+
+#[test]
+fn exiting_on_the_legacy_charset_fails_only_f7() {
+    // terraform-ls 0.39.1 exits on the legacy spelling. F6 and F7 have a
+    // server of their own, so the framing variants are still decided.
+    let r = fault("exit-on-legacy-charset");
+    only_fails(&r, &["F7"]);
+    assert_eq!(r.status, 0, "F7 is a SHOULD check");
 }
 
 #[test]
@@ -2320,7 +2330,7 @@ fn replay_summary_lists_every_request_in_the_framing_recording() {
     assert_eq!(r.status, 0, "{}", r.stdout);
     let recording = transcripts.join("framing.jsonl");
     let expected = recorded_request_count(&recording);
-    assert_eq!(expected, 11, "the framing scenario's expected request count");
+    assert_eq!(expected, 9, "the framing scenario's expected request count (F6 and F7 have their own)");
     let output = replay(&recording, &[], &[STANDIN]);
     assert_eq!(output.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&output.stderr));
     let count = String::from_utf8_lossy(&output.stdout)

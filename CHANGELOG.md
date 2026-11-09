@@ -10,6 +10,9 @@
 
 ### Changed
 
+- F6 and F7 (a request with a `Content-Type` header) run in a scenario of their own, `content-type`, with a fresh
+  server. A server that exits on that optional header (terraform-ls 0.39.1 exits on F7's legacy `charset=utf8`) no
+  longer leaves F3 and F5 `error`, and one thrown out of step by F3 or F5 no longer leaves F6 and F7 `error`.
 - D6's containment failure details now include [line-split hints](docs/design.md#documents-and-positions).
 - K2's failure detail now explains agreeing union alternatives that tie; see the
   [diagnostic rules](docs/design.md#capabilities-and-robustness). The set and count of violations and every verdict are

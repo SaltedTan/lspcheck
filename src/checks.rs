@@ -403,7 +403,8 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "odd-ids", checks: &["R4"] },
     Scenario { name: "pre-initialize", checks: &["L1"] },
     Scenario { name: "exit-without-shutdown", checks: &["L7"] },
-    Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
+    Scenario { name: "framing", checks: &["F4", "F3", "F5"] },
+    Scenario { name: "content-type", checks: &["F6", "F7"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
     Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5", "D6"] },
@@ -527,6 +528,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         "pre-initialize" => pre_initialize(&mut ctx).await,
         "exit-without-shutdown" => exit_without_shutdown(&mut ctx).await,
         "framing" => framing(&mut ctx).await,
+        "content-type" => content_type(&mut ctx).await,
         "after-initialize" => after_initialize(&mut ctx).await,
         "cancellation" => cancellation(&mut ctx).await,
         "documents" => documents(&mut ctx).await,
@@ -3156,18 +3158,17 @@ async fn settle(ctx: &mut Ctx<'_>, id: &str, what: &str, outcome: Probe) -> Opti
     back_in_step(ctx, &format!("{id} didn't pass")).await
 }
 
-/// Variations on how the client frames its input. A plain request answered
-/// first shows the server answers probes at all; each variant is then judged
-/// only while the stream is known to be in step.
-async fn framing(ctx: &mut Ctx<'_>) {
-    const CHECKS: [&str; 5] = ["F4", "F6", "F7", "F3", "F5"];
+/// Initializes and checks that a plain request is answered, the baseline the
+/// framing variants are compared with. Returns whether the server asks for
+/// `didOpen`, or `None` once every check in `checks` has been reported.
+async fn framing_start(ctx: &mut Ctx<'_>, checks: &[&str]) -> Option<bool> {
     let opens_documents = match ctx.initialize().await {
         Ok(reply) => opens_documents(&reply),
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
-            for id in CHECKS {
+            for id in checks {
                 ctx.report(id, Verdict::Error, format!("initialize didn't succeed: {why}"));
             }
-            return;
+            return None;
         }
     };
     let t = ctx.cfg.request_timeout;
@@ -3186,14 +3187,24 @@ async fn framing(ctx: &mut Ctx<'_>) {
             }
         };
         let waited = ctx.s.elapsed();
-        for id in CHECKS {
+        for id in checks {
             ctx.report(id, verdict, why.clone());
             // Not exercised because the reply never came: unless lspcheck
             // finds at the end that it missed something that could have held it.
             ctx.unless_missed(Duration::ZERO, waited, Verdict::Error, format!("inconclusive, because {MISSED}: {why}"));
         }
-        return;
+        return None;
     }
+    Some(opens_documents)
+}
+
+/// Variations on how the client frames its input. A plain request answered
+/// first shows the server answers probes at all; each variant is then judged
+/// only while the stream is known to be in step.
+async fn framing(ctx: &mut Ctx<'_>) {
+    const CHECKS: [&str; 3] = ["F4", "F3", "F5"];
+    let Some(opens_documents) = framing_start(ctx, &CHECKS).await else { return };
+    let t = ctx.cfg.request_timeout;
 
     let probe = |ctx: &mut Ctx<'_>, params: Value| {
         let id = ctx.s.fresh_id();
@@ -3218,18 +3229,6 @@ async fn framing(ctx: &mut Ctx<'_>) {
         bytes.extend(transport::encode(&second));
         let outcome = exchange(ctx, &[a, b], &bytes, &[]).await;
         broken = settle(ctx, "F4", "two requests and a notification written in one write", outcome).await;
-    }
-
-    // F6 and F7: a Content-Type header, in the current and the legacy spelling.
-    for (check, charset) in [("F6", "utf-8"), ("F7", "utf8")] {
-        if skip(ctx, check, &broken) {
-            continue;
-        }
-        let value = format!("application/vscode-jsonrpc; charset={charset}");
-        let (id, body) = probe(ctx, json!({}));
-        let bytes = transport::encode_with_type(&body, &value);
-        let outcome = exchange(ctx, &[id], &bytes, &[]).await;
-        broken = settle(ctx, check, &format!("a request with Content-Type: {value}"), outcome).await;
     }
 
     // F3, first part: every header byte in its own write, the body cut at seeded points.
@@ -3321,6 +3320,37 @@ async fn framing(ctx: &mut Ctx<'_>) {
         ctx.s.note(format!("F3: {what}"));
         let outcome = exchange(ctx, &[id], &bytes, &cuts).await;
         broken = settle(ctx, "F3", &what, outcome).await;
+    }
+
+    // Leave politely so the server isn't killed mid-thought.
+    if broken.is_none() && ctx.s.call("shutdown", None, t).await.is_ok() {
+        let _ = ctx.s.notify("exit", None).await;
+        let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    }
+}
+
+/// F6 and F7: a request with a Content-Type header, in the current and the
+/// legacy spelling. They have a server of their own, because a server that
+/// refuses this optional header often exits, and in the framing scenario that
+/// would leave its variants undecided (or theirs leave these undecided).
+async fn content_type(ctx: &mut Ctx<'_>) {
+    const CHECKS: [&str; 2] = ["F6", "F7"];
+    if framing_start(ctx, &CHECKS).await.is_none() {
+        return;
+    }
+    let t = ctx.cfg.request_timeout;
+    let mut broken: Option<String> = None;
+    for (check, charset) in [("F6", "utf-8"), ("F7", "utf8")] {
+        if let Some(why) = &broken {
+            ctx.report(check, Verdict::Error, format!("not judged: {why}"));
+            continue;
+        }
+        let value = format!("application/vscode-jsonrpc; charset={charset}");
+        let id = ctx.s.fresh_id();
+        let body = serde_json::to_vec(&message::request(&id, PROBE, Some(json!({})))).expect("JSON values serialize");
+        let bytes = transport::encode_with_type(&body, &value);
+        let outcome = exchange(ctx, &[id], &bytes, &[]).await;
+        broken = settle(ctx, check, &format!("a request with Content-Type: {value}"), outcome).await;
     }
 
     // Leave politely so the server isn't killed mid-thought.
@@ -3528,9 +3558,10 @@ fn judge_j2(runs: &[ScenarioRun]) -> CheckResult {
 }
 
 /// The scenarios whose input is all well-formed, so a response without an id
-/// answers some notification. `framing` is left out because its variants can
-/// make a server misread the input (a null-id ParseError is then lawful), and
-/// `pre-initialize` because L1 judges what happens there.
+/// answers some notification. `framing` and `content-type` are left out
+/// because their variants can make a server misread the input (a null-id
+/// ParseError is then lawful), and `pre-initialize` because L1 judges what
+/// happens there.
 const J3_SCENARIOS: &[&str] = &[
     "lifecycle",
     "json-rpc",

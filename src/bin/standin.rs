@@ -145,6 +145,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("no-content-type", "ignore incoming frames that have a Content-Type header"),
     ("strict-charset", "ignore incoming frames whose charset isn't spelled utf-8"),
     ("exit-on-content-type", "exit when an incoming frame has a Content-Type header"),
+    ("exit-on-legacy-charset", "exit when an incoming frame's Content-Type charset is spelled utf8"),
     ("ignore-unknown-requests", "never answer requests for unknown methods"),
     ("exit-on-string-id", "exit when a request has a string id"),
     ("answers-reordered", "lawful: answer requests that arrive together in reverse order"),
@@ -413,6 +414,9 @@ fn main() {
             .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
             .map(|(_, v)| v.split_once("charset=").map_or("", |(_, c)| c).trim().to_string());
         if fault("exit-on-content-type") && charset.is_some() {
+            std::process::exit(2);
+        }
+        if fault("exit-on-legacy-charset") && charset.as_deref() == Some("utf8") {
             std::process::exit(2);
         }
         if (fault("no-content-type") && charset.is_some())
