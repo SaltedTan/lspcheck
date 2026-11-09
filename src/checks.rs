@@ -403,7 +403,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "odd-ids", checks: &["R4"] },
     Scenario { name: "pre-initialize", checks: &["L1"] },
     Scenario { name: "exit-without-shutdown", checks: &["L7"] },
-    Scenario { name: "framing", checks: &["F4", "F6", "F7", "F3", "F5"] },
+    Scenario { name: "framing", checks: &["F4", "F3", "F5", "F6", "F7"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
     Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5", "D6"] },
@@ -3160,7 +3160,7 @@ async fn settle(ctx: &mut Ctx<'_>, id: &str, what: &str, outcome: Probe) -> Opti
 /// first shows the server answers probes at all; each variant is then judged
 /// only while the stream is known to be in step.
 async fn framing(ctx: &mut Ctx<'_>) {
-    const CHECKS: [&str; 5] = ["F4", "F6", "F7", "F3", "F5"];
+    const CHECKS: [&str; 5] = ["F4", "F3", "F5", "F6", "F7"];
     let opens_documents = match ctx.initialize().await {
         Ok(reply) => opens_documents(&reply),
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
@@ -3218,18 +3218,6 @@ async fn framing(ctx: &mut Ctx<'_>) {
         bytes.extend(transport::encode(&second));
         let outcome = exchange(ctx, &[a, b], &bytes, &[]).await;
         broken = settle(ctx, "F4", "two requests and a notification written in one write", outcome).await;
-    }
-
-    // F6 and F7: a Content-Type header, in the current and the legacy spelling.
-    for (check, charset) in [("F6", "utf-8"), ("F7", "utf8")] {
-        if skip(ctx, check, &broken) {
-            continue;
-        }
-        let value = format!("application/vscode-jsonrpc; charset={charset}");
-        let (id, body) = probe(ctx, json!({}));
-        let bytes = transport::encode_with_type(&body, &value);
-        let outcome = exchange(ctx, &[id], &bytes, &[]).await;
-        broken = settle(ctx, check, &format!("a request with Content-Type: {value}"), outcome).await;
     }
 
     // F3, first part: every header byte in its own write, the body cut at seeded points.
@@ -3321,6 +3309,22 @@ async fn framing(ctx: &mut Ctx<'_>) {
         ctx.s.note(format!("F3: {what}"));
         let outcome = exchange(ctx, &[id], &bytes, &cuts).await;
         broken = settle(ctx, "F3", &what, outcome).await;
+    }
+
+    // F6 and F7: a Content-Type header, in the current and the legacy
+    // spelling. They come last because a server that refuses this optional
+    // header often exits, which would leave the variants before them
+    // undecided; F7's legacy spelling is the likeliest to be refused, so it
+    // is the last thing sent.
+    for (check, charset) in [("F6", "utf-8"), ("F7", "utf8")] {
+        if skip(ctx, check, &broken) {
+            continue;
+        }
+        let value = format!("application/vscode-jsonrpc; charset={charset}");
+        let (id, body) = probe(ctx, json!({}));
+        let bytes = transport::encode_with_type(&body, &value);
+        let outcome = exchange(ctx, &[id], &bytes, &[]).await;
+        broken = settle(ctx, check, &format!("a request with Content-Type: {value}"), outcome).await;
     }
 
     // Leave politely so the server isn't killed mid-thought.

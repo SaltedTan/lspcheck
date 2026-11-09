@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). Unreleased expands the [example profile catalogue](../examples/profiles/README.md) and refines [K2's failure detail](#capabilities-and-robustness). M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.2.0 release. See the [Unreleased changelog](../CHANGELOG.md#unreleased) for changes since v0.3.0.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). Unreleased expands the [example profile catalogue](../examples/profiles/README.md), refines [K2's failure detail](#capabilities-and-robustness), and runs the framing scenario's `Content-Type` variants last, so a server that refuses one no longer leaves F3 and F5 undecided. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.2.0 release. See the [Unreleased changelog](../CHANGELOG.md#unreleased) for changes since v0.3.0.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -52,10 +52,13 @@ are to LSP 3.17 and JSON-RPC 2.0.
 
 F3 to F7 share one scenario. After `initialize`, a plain request for an unknown method (which must be answered, see J4)
 shows that the server answers such probes. Each variant then sends probes written its own way, and fails if one goes
-unanswered. After a variant that didn't pass, a plain probe checks the server is still in step; if it isn't, the
-remaining variants are `error`, since their failure would say nothing new. If the first plain probe goes unanswered,
-all five are `not-exercised` (or `error`, when lspcheck's own evidence was incomplete). `initialize` itself is sent
-whole, because a missing reply to it can't be told apart from a slow start.
+unanswered. The variants run in the order F4, F3's first part, F5, F3's second part, F6, F7. The two `Content-Type`
+variants come last, F7's legacy spelling after F6's, because a server that refuses that optional header often exits:
+run earlier, such a probe would leave F3 and F5 — MUST checks it would pass — `error` (terraform-ls 0.39.1 exits on
+F7's `charset=utf8`). After a variant that didn't pass, a plain probe checks the server is still in step; if it isn't,
+the remaining variants are `error`, since their failure would say nothing new. If the first plain probe goes
+unanswered, all five are `not-exercised` (or `error`, when lspcheck's own evidence was incomplete). `initialize` itself
+is sent whole, because a missing reply to it can't be told apart from a slow start.
 
 ### JSON-RPC correlation
 | ID | Basis | Check |

@@ -10,6 +10,9 @@
 
 ### Changed
 
+- The framing scenario runs its two `Content-Type` variants (F6, F7) last, so a server that refuses that optional
+  header — terraform-ls 0.39.1 exits on the legacy `charset=utf8` spelling — no longer leaves F3 and F5, which it would
+  pass, undecided as `error`.
 - D6's containment failure details now include [line-split hints](docs/design.md#documents-and-positions).
 - K2's failure detail now explains agreeing union alternatives that tie; see the
   [diagnostic rules](docs/design.md#capabilities-and-robustness). The set and count of violations and every verdict are
