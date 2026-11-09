@@ -11,8 +11,9 @@ Each matrix job first runs [`test_compare.py`](test_compare.py); a test failure 
 is used.
 
 A line may list alternatives, as in `F1 pass|fail`, only for a check that a race in the server itself can flip, with a
-comment above it that says what the race is and where it was seen. See [gopls.verdicts](gopls.verdicts) for the known
-server race and the checks it affects.
+comment above it that says what the race is and where it was seen. Two are known:
+[gopls](gopls.verdicts) sometimes exits mid-frame, and [lua-language-server](lua-language-server.verdicts) sometimes
+publishes stale diagnostics within lspcheck's wait.
 
 The workflow owns the pinned release versions and SHA-256 digests; the `.verdicts` files own the expected results.
 Server releases and Go are pinned, but rust-analyzer's project toolchain and basedpyright's Node come from the runner
