@@ -329,7 +329,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   the key, with TOML's line and column where it has them.
 
 [`examples/profiles/`](examples/profiles/) has small self-contained profiles for gopls, rust-analyzer,
-lua-language-server and basedpyright, each with a tiny project and a `[document]`:
+lua-language-server, basedpyright, clangd, typescript-language-server, bash-language-server, yaml-language-server,
+vscode-json-language-server, marksman, ruff, texlab and zls, each with a tiny project and a `[document]`:
 
 ```sh
 lspcheck --profile examples/profiles/gopls.toml --only K1

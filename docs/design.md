@@ -522,7 +522,9 @@ Profiles are implemented in `src/profile.rs`; the [README](../README.md#profiles
 command and timeout precedence, path rules, and common usage. This section records implementation details and
 planned extensions. The documents scenario still uses its [plain-text probe documents](#documents-and-positions);
 only K1 uses `[document]`. [`examples/profiles/`](../examples/profiles/) has a profile for each of gopls,
-rust-analyzer, lua-language-server and basedpyright.
+rust-analyzer, lua-language-server and basedpyright (the stock-server matrix's servers), and for clangd,
+typescript-language-server, bash-language-server, yaml-language-server, vscode-json-language-server, marksman, ruff,
+texlab and zls.
 
 This field is planned, and refused for now:
 

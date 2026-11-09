@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Example profiles for clangd, typescript-language-server, bash-language-server, yaml-language-server,
+  vscode-json-language-server, marksman, ruff, texlab and zls in [`examples/profiles/`](examples/profiles/), each with
+  a tiny project and a `[document]`.
+
 ## 0.3.0 (2026-11-09)
 
 ### Added

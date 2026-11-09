@@ -11,6 +11,15 @@ understands.
 | [rust-analyzer.toml](rust-analyzer.toml) | `rust-analyzer` | `rust-analyzer`, `cargo` |
 | [lua-language-server.toml](lua-language-server.toml) | `lua-language-server` | `lua-language-server` |
 | [basedpyright.toml](basedpyright.toml) | `basedpyright-langserver --stdio` | `basedpyright-langserver` |
+| [clangd.toml](clangd.toml) | `clangd` | `clangd` |
+| [typescript-language-server.toml](typescript-language-server.toml) | `typescript-language-server --stdio` | `typescript-language-server`, with the `typescript` package installed beside it |
+| [bash-language-server.toml](bash-language-server.toml) | `bash-language-server start` | `bash-language-server` |
+| [yaml-language-server.toml](yaml-language-server.toml) | `yaml-language-server --stdio` | `yaml-language-server` |
+| [vscode-json-language-server.toml](vscode-json-language-server.toml) | `vscode-json-language-server --stdio` | `vscode-json-language-server` (from `vscode-langservers-extracted`) |
+| [marksman.toml](marksman.toml) | `marksman server` | `marksman` |
+| [ruff.toml](ruff.toml) | `ruff server` | `ruff` |
+| [texlab.toml](texlab.toml) | `texlab` | `texlab` |
+| [zls.toml](zls.toml) | `zls` | `zls` |
 
 ```sh
 lspcheck --profile examples/profiles/gopls.toml --only K1
@@ -19,4 +28,4 @@ lspcheck --profile examples/profiles/gopls.toml -- ~/go/bin/gopls serve   # anot
 
 They give generous timeouts, since a server may index the project before it answers. A server still loading its
 workspace may answer with empty results or errors other than MethodNotFound; K1 accepts those and lists the error
-codes in its detail. These profiles also drive the [stock-server CI matrix](../../ci/stock-servers/README.md).
+codes in its detail. The first four also drive the [stock-server CI matrix](../../ci/stock-servers/README.md).

@@ -1,0 +1,23 @@
+# zls on one Zig file. Without zig on PATH it still parses and analyses the file.
+[server]
+command = ["zls"]
+startup_timeout = "60s"
+request_timeout = "30s"
+
+[workspace.files]
+"main.zig" = """
+const std = @import("std");
+
+fn greet(name: []const u8) []const u8 {
+    return name;
+}
+
+pub fn main() void {
+    std.debug.print("{s}\\n", .{greet("world")});
+}
+"""
+
+[document]
+path = "main.zig"
+language_id = "zig"
+positions = ["3:4", "3:10", "8:32"]   # greet, name, the call to greet

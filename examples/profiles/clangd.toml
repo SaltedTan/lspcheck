@@ -1,0 +1,27 @@
+# clangd on one C file.
+[server]
+command = ["clangd"]
+startup_timeout = "60s"
+request_timeout = "30s"
+
+[workspace.files]
+"compile_flags.txt" = """
+-std=c11
+"""
+"main.c" = """
+#include <stdio.h>
+
+static const char *greet(const char *name) {
+  return name;
+}
+
+int main(void) {
+  puts(greet("world"));
+  return 0;
+}
+"""
+
+[document]
+path = "main.c"
+language_id = "c"
+positions = ["3:20", "3:38", "8:8"]   # greet, name, the call to greet
