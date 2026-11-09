@@ -3838,20 +3838,20 @@ fn judge_l9(runs: &[ScenarioRun], allowed: &[String]) -> CheckResult {
 
 /// What K2 judges in a message, if anything: its role (`result` or
 /// `params`), the method, and the type the meta-model gives it.
-fn k2_subject<'m>(o: &Observations, index: usize, m: &'m Message) -> Option<K2Subject<'m>> {
+fn k2_subject<'m>(o: &'m Observations, index: usize, m: &'m Message) -> Option<K2Subject<'m>> {
     let model = metamodel::model();
     match &m.kind {
         // L4 judges shutdown's result; one bug shouldn't fail two checks.
         Kind::Response { outcome: Outcome::Result(result), .. } => {
             let method = o.answered_methods.get(&index).filter(|m| m.as_str() != "shutdown")?;
             let ty = model.result(method)?;
-            Some(K2Subject { role: K2Role::Result, method: method.clone(), ty, value: Some(result) })
+            Some(K2Subject { role: K2Role::Result, method, ty, value: Some(result) })
         }
         Kind::Request { method, .. } | Kind::Notification { method } => {
             let request = matches!(m.kind, Kind::Request { .. });
             let ty = model.server_params(method, request)?;
             let role = if request { K2Role::Request } else { K2Role::Notification };
-            Some(K2Subject { role, method: method.clone(), ty, value: m.value.get("params") })
+            Some(K2Subject { role, method, ty, value: m.value.get("params") })
         }
         _ => None,
     }
@@ -3866,7 +3866,7 @@ enum K2Role {
 
 struct K2Subject<'m> {
     role: K2Role,
-    method: String,
+    method: &'m str,
     ty: &'static metamodel::Type,
     /// `None` when absent, which only params may be.
     value: Option<&'m Value>,
