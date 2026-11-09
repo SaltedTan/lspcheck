@@ -1,0 +1,21 @@
+# bash-language-server on one shell script.
+[server]
+command = ["bash-language-server", "start"]
+startup_timeout = "60s"
+request_timeout = "30s"
+
+[workspace.files]
+"main.sh" = """
+#!/usr/bin/env bash
+greet() {
+  local name="$1"
+  echo "hello, $name"
+}
+
+greet world
+"""
+
+[document]
+path = "main.sh"
+language_id = "shellscript"
+positions = ["2:1", "3:9", "7:1"]   # greet, name, the call to greet

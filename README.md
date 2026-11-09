@@ -328,8 +328,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   `[document]` whose file, language id or positions don't fit is a usage error (exit status 2) naming the file and
   the key, with TOML's line and column where it has them.
 
-[`examples/profiles/`](examples/profiles/) has small self-contained profiles for gopls, rust-analyzer,
-lua-language-server and basedpyright, each with a tiny project and a `[document]`:
+The [example profile catalogue](examples/profiles/README.md) lists the available servers and what each needs on
+`PATH`. Each profile is self-contained, with a tiny project and a `[document]`:
 
 ```sh
 lspcheck --profile examples/profiles/gopls.toml --only K1

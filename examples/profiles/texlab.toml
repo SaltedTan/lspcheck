@@ -1,0 +1,19 @@
+# texlab on one LaTeX file.
+[server]
+command = ["texlab"]
+startup_timeout = "60s"
+request_timeout = "30s"
+
+[workspace.files]
+"main.tex" = """
+\\documentclass{article}
+\\begin{document}
+\\section{Greeting}\\label{sec:greeting}
+Hello, see Section~\\ref{sec:greeting}.
+\\end{document}
+"""
+
+[document]
+path = "main.tex"
+language_id = "latex"
+positions = ["3:2", "3:26", "4:25"]   # section, the label, the reference
