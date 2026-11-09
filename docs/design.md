@@ -440,7 +440,8 @@ A value is of a type when:
 
 The work is bounded: validation allows 5,000,000 (value, type) steps per message and 50,000,000 across the run. A
 message that exceeds either remaining budget isn't judged; the detail counts per-message and per-run exclusions
-separately. These are lspcheck's limits, not protocol rules, so they never fail K2. Nesting is bounded by the
+separately. These are lspcheck's limits, not protocol rules, so they never fail K2 by themselves. A violation found
+before the budget ran out still stands (it was seen), except inside an `or` with an alternative left undecided. Nesting is bounded by the
 JSON parser's limit (values nested 128 deep aren't read), and validation runs on a thread with a 64 MiB stack, enough
 for the deepest values the parser accepts in a debug build too (Windows gives its main thread only 1 MiB).
 Diagnostic paths and value previews are each at most 60 characters followed by `…` when shortened. Paths inspect

@@ -475,9 +475,32 @@ pub fn validate_spending<'a>(
     budget: usize,
 ) -> (Result<Violations<'a>, TooLarge>, usize) {
     let mut v = Validator { model: model(), budget, root, path: Vec::new() };
-    let found = v.check(ty, value, None);
-    let spent = if found.is_ok() { budget - v.budget } else { budget };
-    (found, spent)
+    match v.check(ty, value, None) {
+        Ok(found) => (Ok(found), budget - v.budget),
+        // A violation established before the budget ran out stands: it was
+        // seen, whatever the rest of the value holds.
+        Err(seen) if !seen.is_empty() => (Ok(*seen), budget),
+        Err(_) => (Err(TooLarge), budget),
+    }
+}
+
+/// What validating found, or, when the budget ran out, the violations it had
+/// already established (which hold whatever the rest of the value is).
+type Checked<'a> = Result<Violations<'a>, Box<Violations<'a>>>;
+
+/// Adds `found` to `out`, or, when the budget ran out, ends with everything
+/// established so far.
+fn absorb<'a>(out: &mut Violations<'a>, found: Checked<'a>) -> Result<(), Box<Violations<'a>>> {
+    match found {
+        Ok(found) => {
+            out.merge(found);
+            Ok(())
+        }
+        Err(seen) => {
+            out.merge(*seen);
+            Err(Box::new(std::mem::take(out)))
+        }
+    }
 }
 
 /// The violation of a value of type `ty` that is missing at `root`, such as
@@ -514,8 +537,8 @@ impl<'a> Validator<'a> {
     }
 
     /// Validates `value` against `ty`, which the type alias `alias` names if it is one.
-    fn check(&mut self, ty: &'a Type, value: &'a Value, alias: Option<&str>) -> Result<Violations<'a>, TooLarge> {
-        self.budget = self.budget.checked_sub(1).ok_or(TooLarge)?;
+    fn check(&mut self, ty: &'a Type, value: &'a Value, alias: Option<&str>) -> Checked<'a> {
+        self.budget = self.budget.checked_sub(1).ok_or_else(Box::default)?;
         let expected = || match alias {
             Some(name) => format!("{name} ({})", describe(ty)),
             None => describe(ty),
@@ -538,7 +561,7 @@ impl<'a> Validator<'a> {
                     self.path.push(Step::Index(i));
                     let found = self.check(element, item, None);
                     self.path.pop();
-                    out.merge(found?);
+                    absorb(&mut out, found)?;
                 }
             }
             Type::Tuple { items } => {
@@ -550,7 +573,7 @@ impl<'a> Validator<'a> {
                     self.path.push(Step::Index(i));
                     let found = self.check(ty, item, None);
                     self.path.pop();
-                    out.merge(found?);
+                    absorb(&mut out, found)?;
                 }
             }
             Type::Map { key, value: of } => {
@@ -562,12 +585,12 @@ impl<'a> Validator<'a> {
                     }
                     let found = self.check(of, v, None);
                     self.path.pop();
-                    out.merge(found?);
+                    absorb(&mut out, found)?;
                 }
             }
             Type::And { items } => {
                 for item in items {
-                    out.merge(self.check(item, value, None)?);
+                    absorb(&mut out, self.check(item, value, None))?;
                 }
             }
             Type::Or { items } => return self.union(items, value, expected()),
@@ -596,7 +619,7 @@ impl<'a> Validator<'a> {
         Ok(out)
     }
 
-    fn reference(&mut self, name: &'a str, value: &'a Value) -> Result<Violations<'a>, TooLarge> {
+    fn reference(&mut self, name: &'a str, value: &'a Value) -> Checked<'a> {
         let model = self.model;
         if let Some(s) = model.structures.get(name) {
             if s.proposed {
@@ -622,7 +645,7 @@ impl<'a> Validator<'a> {
     }
 
     /// The properties of a structure or structure literal, in an object.
-    fn properties(&mut self, properties: &'a [Property], value: &'a Value) -> Result<Violations<'a>, TooLarge> {
+    fn properties(&mut self, properties: &'a [Property], value: &'a Value) -> Checked<'a> {
         let mut out = Violations::default();
         for p in properties.iter().filter(|p| !p.proposed) {
             self.path.push(Step::Key(&p.name));
@@ -632,7 +655,7 @@ impl<'a> Validator<'a> {
                 Some(v) => {
                     let found = self.check(&p.ty, v, None);
                     self.path.pop();
-                    out.merge(found?);
+                    absorb(&mut out, found)?;
                     continue;
                 }
             }
@@ -644,14 +667,28 @@ impl<'a> Validator<'a> {
     /// An `or`: one alternative must match. When none does, the violation
     /// names them all, and where the alternative that got deepest into the
     /// value failed, if one got deeper than the others (through nested unions).
-    fn union(&mut self, items: &'a [Type], value: &'a Value, expected: String) -> Result<Violations<'a>, TooLarge> {
+    /// When the budget runs out, the union fails only if every alternative
+    /// was established to fail; one left undecided leaves it undecided.
+    fn union(&mut self, items: &'a [Type], value: &'a Value, expected: String) -> Checked<'a> {
         let mut deepest: Vec<Violation<'a>> = Vec::new();
+        let (mut exhausted, mut undecided) = (false, false);
         for item in items {
-            let found = self.check(item, value, None)?;
-            if found.is_empty() {
-                return Ok(Violations::default());
-            }
+            let found = match self.check(item, value, None) {
+                Ok(found) if found.is_empty() => return Ok(Violations::default()),
+                Ok(found) => found,
+                Err(seen) if seen.is_empty() => {
+                    (exhausted, undecided) = (true, true);
+                    continue;
+                }
+                Err(seen) => {
+                    exhausted = true;
+                    *seen
+                }
+            };
             deepest.extend(found.deepest.map(|d| d.leaf().clone()));
+        }
+        if undecided {
+            return Err(Box::default());
         }
         let mut v = self.violation(expected, Some(Found::Value(value)));
         let max = deepest.iter().map(|d| d.depth).max().unwrap_or(0);
@@ -660,7 +697,7 @@ impl<'a> Validator<'a> {
         }
         let mut out = Violations::default();
         out.add(v);
-        Ok(out)
+        if exhausted { Err(Box::new(out)) } else { Ok(out) }
     }
 
     /// Why a map key isn't of the key type, if it isn't. JSON keys are
@@ -1345,6 +1382,24 @@ mod tests {
         let tokens = json!({"data": vec![1; 1000]});
         let ty = reference("SemanticTokens");
         assert!(validate_within(&ty, &tokens, "result", 2000).unwrap().is_empty());
+        assert_eq!(validate_within(&ty, &tokens, "result", 500), Err(TooLarge));
+    }
+
+    #[test]
+    fn a_violation_found_before_the_budget_runs_out_stands() {
+        let params = model().server_params("$/progress", false).unwrap();
+        // The token is wrong; the value is lawful but too large to finish.
+        let bad = json!({"token": true, "value": vec![0; 1000]});
+        let found = validate_within(params, &bad, "params", 500).unwrap();
+        assert_eq!(found.count, 1, "{:?}", found.first);
+        assert!(found.first[0].to_string().starts_with("params.token "), "{}", found.first[0]);
+        // A lawful token with the same value: nothing established, so not judged.
+        let good = json!({"token": 1, "value": vec![0; 1000]});
+        assert_eq!(validate_within(params, &good, "params", 500), Err(TooLarge));
+        // A union with an alternative left undecided doesn't fail: here the
+        // first alternative fails and the second can't be finished.
+        let ty = Type::Or { items: vec![Type::Base { name: Base::String }, reference("SemanticTokens")] };
+        let tokens = json!({"data": vec![1; 1000]});
         assert_eq!(validate_within(&ty, &tokens, "result", 500), Err(TooLarge));
     }
 

@@ -152,9 +152,24 @@ pub fn canonical_number(text: &str) -> Option<String> {
         None => (false, text),
     };
     let (mantissa, exp) = match rest.find(['e', 'E']) {
-        Some(i) => (&rest[..i], rest[i + 1..].parse::<i64>().ok()?),
-        None => (rest, 0),
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, "0"),
     };
+    // Zero is zero however large its exponent, so recognise it before the
+    // exponent is parsed (which overflows for such numbers).
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let zeros = |t: &str| t.bytes().all(|b| b == b'0');
+    let unsigned = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+    if !int.is_empty()
+        && zeros(int)
+        && zeros(frac)
+        && !(mantissa.contains('.') && frac.is_empty())
+        && !unsigned.is_empty()
+        && unsigned.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Some("0e0".into());
+    }
+    let exp = exp.parse::<i64>().ok()?;
     let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     if int.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -406,6 +421,11 @@ mod tests {
         assert_eq!(integer_value(&n("-32601.0")), Some(-32601));
         assert_eq!(integer_value(&n("-32601.5")), None);
         assert_eq!(integer_value(&n("1e30")), None);
+        // Zero, whatever its exponent; an exponent that big on anything else isn't an integer.
+        for zero in ["0e9223372036854775808", "-0.0e-99999999999999999999", "0E+99999999999999999999"] {
+            assert_eq!(integer_value(&n(zero)), Some(0), "{zero}");
+        }
+        assert_eq!(integer_value(&n("1e9223372036854775808")), None);
     }
 
     #[test]
