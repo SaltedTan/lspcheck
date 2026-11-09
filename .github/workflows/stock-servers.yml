@@ -120,8 +120,7 @@ jobs:
         env:
           SERVER: ${{ matrix.server }}
         run: |
-          jq -r '.results[] | "\(.id) \(.verdict)"' "$RUNNER_TEMP/out/report.json" > "$RUNNER_TEMP/out/$SERVER.verdicts"
-          if ! diff -u "ci/stock-servers/$SERVER.verdicts" "$RUNNER_TEMP/out/$SERVER.verdicts"; then
+          if ! ci/stock-servers/compare "ci/stock-servers/$SERVER.verdicts" "$RUNNER_TEMP/out/report.json"; then
             echo "::error::$SERVER's verdicts changed; see the diff above and ci/stock-servers/README.md"
             exit 1
           fi

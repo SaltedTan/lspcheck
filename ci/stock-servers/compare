@@ -1,0 +1,33 @@
+#!/bin/sh
+# Copyright 2026 The lspcheck Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Usage: ci/stock-servers/compare EXPECTED.verdicts REPORT.json
+#
+# Compares a JSON report's verdicts with an expected-verdicts file: one
+# `ID verdict` line per check, in catalogue order, where `verdict` may list
+# alternatives as `pass|fail` for a check a server's own race can flip (each
+# such line needs a comment above it saying why). Prints a unified diff of
+# the differences and exits 1 if there are any.
+set -eu
+expected=$1
+report=$2
+actual=$(mktemp)
+trap 'rm -f "$actual"' EXIT
+# The verdicts, with a verdict the expected line allows shown as that line,
+# so that only real differences remain in the diff.
+jq -r '.results[] | "\(.id) \(.verdict)"' "$report" |
+  awk -v expected="$expected" '
+    BEGIN {
+      while ((getline line < expected) > 0) {
+        if (line ~ /^#/ || line == "") continue
+        split(line, f, " ")
+        allowed[f[1]] = f[2]
+      }
+    }
+    {
+      n = split(allowed[$1], alt, "|")
+      for (i = 1; i <= n; i++) if (alt[i] == $2) { print $1 " " allowed[$1]; next }
+      print
+    }' > "$actual"
+grep -v -e '^#' -e '^$' "$expected" | diff -u --label "$expected" --label "$report" - "$actual"
