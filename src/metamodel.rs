@@ -24,6 +24,11 @@ const SOURCE: &str = include_str!("../vendor/lsp-3.17/metaModel.json");
 /// lspcheck's limit and not a protocol rule.
 pub const NODE_BUDGET: usize = 5_000_000;
 
+/// How many steps K2 may take over a whole run, so validating takes bounded
+/// time however many messages a server sends; messages left when it is spent
+/// aren't judged, which is lspcheck's limit and never a failure.
+pub const RUN_BUDGET: usize = 50_000_000;
+
 /// The stack [`on_validation_stack`] gives. Validating takes a few frames for
 /// each level of a value's nesting, which serde_json limits to 128; frames are
 /// large in a debug build, and Windows gives the main thread only 1 MiB.
@@ -404,8 +409,9 @@ impl Violations {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TooLarge;
 
-/// Runs `f`, which validates, on a thread with a [`STACK`]-sized stack. Each
-/// validation's work is bounded by [`NODE_BUDGET`], so the join is bounded too.
+/// Runs `f`, which validates, on a thread with a [`STACK`]-sized stack. The
+/// caller bounds `f`'s work (K2 by [`RUN_BUDGET`]), so the join is bounded too:
+/// a wall-clock deadline instead would make verdicts depend on machine speed.
 pub fn on_validation_stack<R: Send>(f: impl FnOnce() -> R + Send) -> std::io::Result<R> {
     std::thread::scope(|s| {
         let thread = std::thread::Builder::new().name("lspcheck-validate".into()).stack_size(STACK);
@@ -421,8 +427,16 @@ pub fn validate(ty: &Type, value: &Value, root: &str) -> Result<Violations, TooL
 
 /// [`validate`] with a node budget of `budget`.
 pub fn validate_within(ty: &Type, value: &Value, root: &str, budget: usize) -> Result<Violations, TooLarge> {
+    validate_spending(ty, value, root, budget).0
+}
+
+/// [`validate_within`], also returning how many steps of `budget` it took
+/// (all of them when the value was too large).
+pub fn validate_spending(ty: &Type, value: &Value, root: &str, budget: usize) -> (Result<Violations, TooLarge>, usize) {
     let mut v = Validator { model: model(), budget, root, path: Vec::new() };
-    v.check(ty, value, None)
+    let found = v.check(ty, value, None);
+    let spent = if found.is_ok() { budget - v.budget } else { budget };
+    (found, spent)
 }
 
 /// The violation of a value of type `ty` that is missing at `root`, such as

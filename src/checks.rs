@@ -3878,35 +3878,58 @@ const K2_NAMED: usize = 5;
 /// K2: every result of a request lspcheck sent, and the params of every
 /// request and notification the server sent, that the meta-model gives a type
 /// is of that type. Seen violations stand whatever else couldn't be read.
+/// Why K2 didn't judge a message; lspcheck's limits, never a failure.
+enum Unjudged {
+    TooLarge,
+    RunBudget,
+}
+
 fn judge_k2(runs: &[ScenarioRun]) -> CheckResult {
+    judge_k2_within(runs, metamodel::RUN_BUDGET)
+}
+
+/// [`judge_k2`], validating at most `run_budget` steps in all.
+fn judge_k2_within(runs: &[ScenarioRun], run_budget: usize) -> CheckResult {
     let subjects: Vec<(&'static str, Duration, K2Subject)> = observed(runs)
         .flat_map(|(name, o)| {
             o.messages.iter().enumerate().filter_map(move |(i, (at, m))| Some((name, *at, k2_subject(o, i, m)?)))
         })
         .collect();
-    let judged = metamodel::on_validation_stack(|| {
-        subjects
-            .iter()
-            .map(|(_, _, s)| {
-                let root = if s.role == K2Role::Result { "result" } else { "params" };
-                match s.value {
-                    Some(value) => metamodel::validate(s.ty, value, root),
-                    None => Ok(metamodel::missing(s.ty, root)),
-                }
-            })
-            .collect::<Vec<_>>()
-    });
+    let judged =
+        metamodel::on_validation_stack(|| {
+            let mut left = run_budget;
+            subjects
+                .iter()
+                .map(|(_, _, s)| {
+                    let root = if s.role == K2Role::Result { "result" } else { "params" };
+                    let Some(value) = s.value else { return Ok(metamodel::missing(s.ty, root)) };
+                    let budget = metamodel::NODE_BUDGET.min(left);
+                    if budget == 0 {
+                        return Err(Unjudged::RunBudget);
+                    }
+                    let (found, spent) = metamodel::validate_spending(s.ty, value, root, budget);
+                    left -= spent;
+                    found.map_err(|TooLarge| {
+                        if budget < metamodel::NODE_BUDGET { Unjudged::RunBudget } else { Unjudged::TooLarge }
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
     let judged = match judged {
         Ok(judged) => judged,
         Err(e) => return result("all", "K2", Verdict::Error, format!("lspcheck couldn't start validating: {e}")),
     };
-    let (mut count, mut named, mut too_large) = (0, Vec::new(), 0);
+    let (mut count, mut named, mut too_large, mut over_run) = (0, Vec::new(), 0, 0);
     let mut validated = [0usize; 3];
     for ((name, at, s), found) in subjects.iter().zip(judged) {
         let found = match found {
             Ok(found) => found,
-            Err(TooLarge) => {
+            Err(Unjudged::TooLarge) => {
                 too_large += 1;
+                continue;
+            }
+            Err(Unjudged::RunBudget) => {
+                over_run += 1;
                 continue;
             }
         };
@@ -3925,11 +3948,16 @@ fn judge_k2(runs: &[ScenarioRun]) -> CheckResult {
             }
         }
     }
-    let unjudged = if too_large > 0 {
-        format!("; {too_large} message(s) not judged, too large to validate within {} steps", metamodel::NODE_BUDGET)
-    } else {
-        String::new()
-    };
+    let mut unjudged = String::new();
+    if too_large > 0 {
+        unjudged += &format!(
+            "; {too_large} message(s) not judged, too large to validate within {} steps",
+            metamodel::NODE_BUDGET
+        );
+    }
+    if over_run > 0 {
+        unjudged += &format!("; {over_run} message(s) not judged, after validating took the run's {run_budget} steps");
+    }
     if count > 0 {
         let named: Vec<String> = named.into_iter().map(|(at, v)| format!("{at}, {v}")).collect();
         let more = count - named.len();
@@ -4441,6 +4469,29 @@ mod tests {
             r.detail,
             "1 violation(s): in documents at 0 ms, a window/showMessage notification: params is missing; required: \
              ShowMessageParams"
+        );
+    }
+
+    #[test]
+    fn k2_stops_validating_when_the_runs_budget_is_spent() {
+        let log = |kind: Value| json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": kind, "message": "x"}});
+        // The first message takes the whole budget; the bad second one isn't
+        // judged, which is lspcheck's limit and not a failure.
+        let runs = k2_run(vec![log(json!(3)), log(json!(9))], &[]);
+        assert_eq!(judge_k2(&runs).verdict, Verdict::Fail);
+        let spent = metamodel::validate_spending(
+            metamodel::model().server_params("window/logMessage", false).unwrap(),
+            &json!({"type": 3, "message": "x"}),
+            "params",
+            metamodel::NODE_BUDGET,
+        )
+        .1;
+        let r = judge_k2_within(&runs, spent);
+        assert_eq!(r.verdict, Verdict::Pass, "{}", r.detail);
+        assert!(
+            r.detail.ends_with(&format!("; 1 message(s) not judged, after validating took the run's {spent} steps")),
+            "{}",
+            r.detail
         );
     }
 
