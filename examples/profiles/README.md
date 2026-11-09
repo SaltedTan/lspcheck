@@ -20,6 +20,11 @@ understands.
 | [ruff.toml](ruff.toml) | `ruff server` | `ruff` |
 | [texlab.toml](texlab.toml) | `texlab` | `texlab` |
 | [zls.toml](zls.toml) | `zls` | `zls` |
+| [jedi-language-server.toml](jedi-language-server.toml) | `jedi-language-server` | `jedi-language-server` |
+| [pylsp.toml](pylsp.toml) | `pylsp` | `pylsp` (from `python-lsp-server`) |
+| [terraform-ls.toml](terraform-ls.toml) | `terraform-ls serve` | `terraform-ls` |
+| [lemminx.toml](lemminx.toml) | `lemminx` | `lemminx` (the native binary, such as `lemminx-linux-x86_64`, under that name) |
+| [taplo.toml](taplo.toml) | `taplo lsp stdio` | `taplo` (built with its `lsp` feature, as `taplo-cli` is) |
 
 ```sh
 lspcheck --profile examples/profiles/gopls.toml --only K1

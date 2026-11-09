@@ -1,0 +1,22 @@
+# terraform-ls on one Terraform file.
+[server]
+command = ["terraform-ls", "serve"]
+startup_timeout = "60s"
+request_timeout = "30s"
+
+[workspace.files]
+"main.tf" = """
+variable "name" {
+  type    = string
+  default = "world"
+}
+
+output "greeting" {
+  value = "hello, ${var.name}"
+}
+"""
+
+[document]
+path = "main.tf"
+language_id = "terraform"
+positions = ["1:11", "6:9", "7:25"]   # the variable, the output, the reference to name

@@ -1,0 +1,22 @@
+# pylsp on one Python file.
+[server]
+command = ["pylsp"]
+startup_timeout = "60s"
+request_timeout = "30s"
+
+[workspace.files]
+"main.py" = """
+import os
+
+
+def greet(name: str) -> str:
+    return "hello, " + name
+
+
+print(greet("world"))
+"""
+
+[document]
+path = "main.py"
+language_id = "python"
+positions = ["4:5", "4:11", "8:7"]   # greet, name, the call to greet
