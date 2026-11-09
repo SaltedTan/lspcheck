@@ -301,7 +301,8 @@ request was sent; it is used only to clamp. For each reply with an array result,
 - **pass:** otherwise; the detail says how many replies and entries were judged.
 
 A range on a line the text doesn't have is not judged (counted in the detail); a malformed entry (no `range`, not an
-object, a `parent` that isn't an object) is not judged here — it is a type error for a later check — but is counted.
+object, a `parent` that isn't an object) is not judged here — it is a type error for
+[K2](#capabilities-and-robustness) — but is counted.
 The parent chain walk is bounded (1000 levels), and a chain cut short is counted.
 
 Most language servers ignore a plain-text document, so expect D1 to be `N/E` for them; D2 needs

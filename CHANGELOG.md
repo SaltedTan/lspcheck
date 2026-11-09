@@ -12,8 +12,8 @@
   lspcheck's validation budget never fails K2 by itself: a message too large to finish is counted as not judged,
   unless a violation was already found in it ([reference](https://github.com/SaltedTan/lspcheck/blob/v0.3.0/docs/design.md#capabilities-and-robustness)).
   The meta-model is [vendored unmodified under CC BY 4.0](https://github.com/SaltedTan/lspcheck/blob/v0.3.0/vendor/lsp-3.17/README.md).
-- A [stock-server CI matrix](https://github.com/SaltedTan/lspcheck/blob/v0.3.0/ci/stock-servers/README.md) runs each
-  change against pinned releases of gopls, rust-analyzer, lua-language-server and basedpyright and compares every
+- A [stock-server CI matrix](https://github.com/SaltedTan/lspcheck/blob/v0.3.0/ci/stock-servers/README.md) runs
+  lspcheck against pinned releases of gopls, rust-analyzer, lua-language-server and basedpyright and compares every
   verdict with the expected one.
 
 ## 0.2.0 (2026-11-09)

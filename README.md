@@ -223,7 +223,7 @@ The same scenario also checks selection ranges (D6): for each `selectionRange` r
 document, the result must have one entry per position, each entry's `range` must contain its position, and each
 `parent.range` must contain its child's range, all the way up the chain. Comparisons clamp each character to its
 line's length in the negotiated encoding, as a client would; a range on a line the text doesn't have isn't judged,
-and a malformed entry (no `range`, not an object, a `parent` that isn't an object) is a type error for a later check.
+and malformed entries are left to [K2](docs/design.md#capabilities-and-robustness).
 A server that advertises no `selectionRangeProvider` leaves D6 `SKIP`; one that answers with only `null`, errors, or
 no reply, or whose ranges can't be compared, leaves it `N/E`. A `selectionRange` request lspcheck couldn't send, or one
 cut off because the server's output closed, makes D6 `ERROR` unless it already failed.
