@@ -4,20 +4,19 @@
 #
 # Usage: ci/stock-servers/compare EXPECTED.verdicts REPORT.json
 #
-# Compares a JSON report's verdicts with an expected-verdicts file: one
-# `ID verdict` line per check, in catalogue order, where `verdict` may list
-# alternatives as `pass|fail` for a check a server's own race can flip (each
-# such line needs a comment above it saying why). Prints a unified diff of
-# the differences and exits 1 if there are any.
+# Verdict-file format and baseline policy: README.md in this directory.
 set -eu
 expected=$1
 report=$2
 actual=$(mktemp)
-trap 'rm -f "$actual"' EXIT
+raw=$(mktemp)
+trap 'rm -f "$actual" "$raw"' EXIT
+# Keep parsing outside a pipeline so a malformed report cannot be accepted
+# after jq has already emitted a matching set of verdicts.
+jq -r '.results[] | "\(.id) \(.verdict)"' "$report" > "$raw"
 # The verdicts, with a verdict the expected line allows shown as that line,
 # so that only real differences remain in the diff.
-jq -r '.results[] | "\(.id) \(.verdict)"' "$report" |
-  awk -v expected="$expected" '
+awk -v expected="$expected" '
     BEGIN {
       while ((getline line < expected) > 0) {
         if (line ~ /^#/ || line == "") continue
@@ -29,5 +28,5 @@ jq -r '.results[] | "\(.id) \(.verdict)"' "$report" |
       n = split(allowed[$1], alt, "|")
       for (i = 1; i <= n; i++) if (alt[i] == $2) { print $1 " " allowed[$1]; next }
       print
-    }' > "$actual"
+    }' "$raw" > "$actual"
 grep -v -e '^#' -e '^$' "$expected" | diff -u --label "$expected" --label "$report" - "$actual"

@@ -2,14 +2,14 @@
 
 The [stock-servers workflow](../../.github/workflows/stock-servers.yml) builds lspcheck from the commit under test and
 runs it against pinned releases of gopls, rust-analyzer, lua-language-server and basedpyright, each with its
-[example profile](../../examples/profiles/). Each `<server>.verdicts` file here lists the verdict the workflow expects
+[example profile](../../examples/profiles/). Each `<server>.verdicts` file here lists the verdicts the workflow allows
 for every check, one `ID verdict` line per check in catalogue order. The job passes when the verdicts match,
 whatever they are, and fails on any difference, showing it as a diff ([`compare`](compare) does the comparison).
+An unreadable or malformed report also fails the job.
 
 A line may list alternatives, as in `F1 pass|fail`, only for a check that a race in the server itself can flip, with a
-comment above it that says what the race is and where it was seen. gopls has one: after `exit`, it sometimes exits
-with a frame's header written and its body not, which F1 fails on what it saw and which leaves J1, J3, J5 and J7
-inconclusive about that frame.
+comment above it that says what the race is and where it was seen. See [gopls.verdicts](gopls.verdicts) for the known
+server race and the checks it affects.
 
 The workflow owns the pinned release versions and SHA-256 digests; the `.verdicts` files own the expected results.
 Server releases and Go are pinned, but rust-analyzer's project toolchain and basedpyright's Node come from the runner
