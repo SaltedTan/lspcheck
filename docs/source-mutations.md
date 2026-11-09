@@ -113,7 +113,10 @@ The lexicon only decides *where* to edit. No oracle depends on it, so a wrong le
 can't make a verdict wrong. That is why lspcheck can stay ignorant of the language.
 
 **Operators.** Each picks its target with the case's RNG. If it finds nothing to change (`open-string` in text without
-strings), it inserts a token from the document's own tokens instead, and the record says so.
+strings), it inserts a token from the document's own tokens instead, and the record says so. A document with no tokens
+(an empty seed, or one a `truncate` emptied) gets the first of the lexicon's brackets, else `(`, inserted at offset 0,
+so the plan stays a total function of the seed. Planner tests cover an empty seed and mutations after a truncation
+to empty.
 
 | Operator | Edit |
 |---|---|
@@ -204,7 +207,9 @@ stated in `[mutation.recovery]`:
   request, the **terminal probe**, written after the deadline; M3 fails when its answer differs from the stable
   baseline. Judging the answer to a request sent after the deadline, not the last poll before it, keeps the verdict
   independent of lspcheck's poll interval: a server that recovered at 19.8 s of 20 answers the terminal probe with the
-  baseline, whenever the last poll was.
+  baseline, whenever the last poll was. Pushed diagnostics (when they are a stable probe) are compared the same way
+  through the push rule below: the last publish labelled with the restored version and read by the end of
+  `recovery_timeout` fails M3 when its projection differs from the baseline publish's.
 - `no_errors = true`: the seed has no Error-severity diagnostics. It must hold at baseline (pushed diagnostics labelled
   1, or a pull report); if it doesn't, M3 is `ERROR` ("the profile and the server disagree before any mutation"),
   since lspcheck can't tell which is wrong. After restoration, a pulled report is judged by its terminal probe, as
@@ -305,7 +310,7 @@ fragments = ["0x", "1e", "..."]                  # for the fragment operator
 requests = ["textDocument/documentSymbol", "textDocument/hover", "textDocument/completion"]  # default: K1's advertised methods
 requests_per_step = 4          # at most 16
 max_document_kib = 64          # per document, seed included; at most 1024
-run_timeout = "10m"            # at most "2h"
+run_timeout = "1h"             # at most "4h"
 
 [mutation.lexicon]             # optional; see Mutations for the default
 line_comments = ["--"]
@@ -338,8 +343,8 @@ defaults; with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--onl
 | Bound | Default | Cap | When it is reached |
 |---|---|---|---|
 | Per request | `--timeout` from when its write began | — | the request is unanswered (M2) |
-| Per case | `(steps + 1) × (1 + requests_per_step) × --timeout` (every write and every reply of the steps, each with its own deadline) `+ documents × --timeout` (the restoration's writes) `+ recovery_timeout + 2 × --timeout` (the terminal probe) `+ 5 s` | — | no further step starts; the restoration is always sent |
-| Per run | `run_timeout`, 10 min | 2 h | no new case starts; the detail says how many ran |
+| Per case | `(steps + 1) × (1 + requests_per_step) × --timeout` (every write and every reply of the steps, each with its own deadline) `+ documents × --timeout` (the restoration's writes) `+ recovery_timeout + documents × probes × 2 × --timeout` (each terminal probe's write and reply) `+ 5 s` | — | no further step starts; the restoration is always sent |
+| Per run | `run_timeout`, 1 h | 4 h | no new case starts; the detail says how many ran |
 | Settle and baseline | `settle_timeout` | 5 min | proceed; unstable probes aren't used |
 | Cases | 20 | 1000 | usage error above the cap |
 | Mutations per step; steps per case | 1 to 3; `steps` | 3; 3 | — |
@@ -352,7 +357,10 @@ defaults; with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--onl
 A case starts only when the run has at least the case budget left, so the run deadline never cuts a case short, and a
 request's own deadline is never shortened by a budget except when lspcheck itself overran. The case budget counts
 every delivery as taking its full write deadline, so a server slow to read (backpressure) uses up deadlines the budget
-already reserved, not the run's. If a case's budget runs out anyway, no further step starts, but the restoration is
+already reserved, not the run's. The budget is a worst case: with the example profiles' 30 s request timeout it is
+over ten minutes per case, though a case usually takes seconds, which is why `run_timeout` defaults to an hour. A
+configuration whose case budget exceeds `run_timeout` is a usage error naming both (exit status 2), checked before the
+server starts, so a run never silently admits no case; each stock mutation profile is checked by a test. If a case's budget runs out anyway, no further step starts, but the restoration is
 still sent, with its own write deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the
 cases not run), so no case ever starts on a document lspcheck couldn't restore.
 
@@ -360,7 +368,11 @@ The written-bytes bound is a cap, not a threshold: everything lspcheck writes in
 `didOpen`s, baseline probes, every `didChange`, request, poll and answer to a server request, and `shutdown` and
 `exit`), and before a case starts lspcheck reserves its worst case, computed from the caps (each step's `didChange` at
 `max_document_kib` per document plus its requests, the restoration, the most polls and the terminal probes), plus the
-shutdown allowance. A case whose worst case doesn't fit doesn't start. Server output stays under
+shutdown allowance. A case whose worst case doesn't fit doesn't start. Answers to the server's own requests (such as
+`workspace/configuration`, which a profile can make large) can't be bounded in advance, so the cap is also enforced
+before every write: answers may use only what isn't reserved for the current case's restoration and the shutdown.
+When that is gone, lspcheck stops the scenario: it sends the restoration and shutdown from their reserve, leaves the
+server's request unanswered, and M3 and the cases not run are `ERROR` (lspcheck's budget, never a failure). Server output stays under
 `--max-output-mib` and `--max-frame-mib`; missing what they exclude makes waits inconclusive as everywhere else. With
 the bytes written capped, a transcript holds at most that plus what the server wrote. None of these bounds is a
 protocol rule: reaching one gives `ERROR` or `N/E` with the bound named, or just a smaller run, never `FAIL`.
@@ -406,6 +418,7 @@ a window. Lawful faults count replies, not milliseconds.
 | `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |
 | `recovery-in-skipped-frame` | after rebalancing, answer the first poll with `[]`, then send the recovered answer in a frame larger than `--max-frame-mib` | M3 `ERROR` with `expect = "baseline"`, never `FAIL` |
 | `errors-after-unbalanced` | once unbalanced, publish an Error diagnostic forever | M3 fails with `no_errors = true` |
+| `warning-after-unbalanced` | once unbalanced, publish an extra Warning forever | M3 fails with `expect = "baseline"` and pushed diagnostics as the only probe; passes with `no_errors = true` alone |
 | `method-not-found-while-unbalanced` | answer advertised requests with -32601 while unbalanced | K1 fails from the mutation scenario |
 | `codepoint-positions-after-change` (exists) | count positions in code points after a change | D1 fails from the mutation scenario (with `unicode`) |
 | `diagnostics-own-version` (exists) | label diagnostics with its own counter | D2 fails from the mutation scenario |
