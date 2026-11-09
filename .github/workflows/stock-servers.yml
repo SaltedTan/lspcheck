@@ -51,6 +51,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Test the verdict comparison
+        run: python3 -I ci/stock-servers/test_compare.py
       - name: Install the pinned toolchain
         run: rustup toolchain install
       - name: Build lspcheck
