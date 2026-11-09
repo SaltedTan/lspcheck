@@ -1,0 +1,442 @@
+# Seeded source mutation and recovery
+
+**Status:** Proposed, 2026-11-09. Nothing here is implemented. It is the milestone after v0.3.0 in the
+[design](design.md#milestones).
+
+## Context
+
+lspcheck's document checks open plain-text documents of its own. Most language servers ignore plain text, so on real
+servers D1, D2 and D6 are usually `N/E`: the code that parses, analyses and answers about real source is never asked a
+question whose answer lspcheck can judge. And nothing checks what a server does while its source is broken, which is
+most of the time in an editor.
+
+virgil-lsp has a harness for this, `test/protocol/source_mutations.py`: it edits real source with seeded, token-aware
+mutations, sends requests after each edit, restores the clean source and checks the server recovers. Some of it is
+generic and some only makes sense for Virgil:
+
+| Generic: port it | Virgil-specific: leave it |
+|---|---|
+| Seeded plan, one RNG stream per case, identical bytes for the same seed and inputs | Repair seeds and their cursor variants; the observer file |
+| Token-aware edits found by a lexer, no grammar | Virgil's token regex, keywords and malformed literals (`0i`, `0x`) |
+| Edit families: delete, duplicate, swap, replace, truncate, brackets, strings, comments, line ends, non-ASCII, rename, bounded stress edits | Worker processes, compiler trap signatures, JVM exception tables, `KNOWN_WORKER_FAILURES` |
+| Every request gets one reply; the server keeps serving | Exact clean-source answers (hover text, a definition's location, supertypes) |
+| Request, case and run deadlines checked by every read, write and wait | The coverage manifest that fails a case on a new capability |
+| Recovery once the source is clean again | The list of documented error codes per method |
+| Replayable case records, bounded artifacts that keep a failure's evidence | `window/showMessage` matching against the server log |
+
+Two things in the harness must not be ported. It sends positions in the middle of a surrogate pair on purpose; a
+client must not, and a server that mishandles such a position would be judged on lspcheck's own violation. And its
+recovery oracle knows what Virgil's clean source must answer; lspcheck can't.
+
+## Decision
+
+Add an opt-in `mutation` scenario, run only with `--mutate`. It opens seed files from the profile's workspace, records
+how the server answers about the clean text, then runs a number of seeded cases. A case edits the open documents in one
+to three steps, sends requests about the broken text after each step, restores the clean text and waits for the
+server's answers to return to what they were. Then the scenario shuts the server down.
+
+It adds three checks, all `POLICY`, because LSP doesn't say what a server must do with source that doesn't parse. The
+protocol rules are judged by checks that already exist, which gain evidence from real source and from many versions.
+
+### What is checked
+
+New checks:
+
+| ID | Basis | Check |
+|---|---|---|
+| M1 | POLICY | The server doesn't exit, or close its output, while its source is mutated or being restored. |
+| M2 | POLICY | Every request about a mutated document gets a response (any result or error) within `--timeout`. |
+| M3 | POLICY | Once the clean text is restored, the server's answers about it return to those it gave before the mutations. |
+
+Spec references, in the style of the catalogue: M1 and M3 rest on
+[`textDocument/didChange`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_didChange),
+M2 on [`responseMessage`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#responseMessage)
+and [JSON-RPC 2.0 §5](https://www.jsonrpc.org/specification#response_object). That a request is answered at all is a
+`MUST` of both; answering in a time lspcheck picks is not, so M2 is `POLICY`, like D4 and R3. Surviving broken source
+and recovering from it are lspcheck's policy, not the specification's.
+
+Existing checks keep being judged on the new scenario's evidence:
+
+- **Cross-cutting, unchanged:** F1, F2, F8, J1, J2, J3 (the scenario's input is well formed), J5, J7, L9 and K2. Real
+  servers send real results and diagnostics here, so K2 validates far more than in the other scenarios.
+- **Extended to the mutated documents:** D1 (positions on character boundaries), D2 (diagnostics versions), D6
+  (selection-range containment) and K1 (an advertised request isn't answered with MethodNotFound). Their rules don't
+  depend on the text, only on knowing it, and lspcheck knows every version it sent. Each is judged per scenario with
+  the function it already has, and the two verdicts combine as `fail` over `error` over `pass` over `not-exercised`
+  over `skip`; the detail names the scenario and case. K1 takes only its failure from the mutation scenario: an
+  unanswered mutation request is M2's, so it never makes K1 `ERROR`.
+- **Not extended:** D3 and D5 rest on documents built so that one specific mistake lands inside a character; a
+  random edit can't make that diagnosis, so D1 judges those positions. D4, the C, L1 to L8 and R checks need their own
+  scenarios.
+
+Without `--mutate`, nothing above changes: the scenario doesn't run and M1 to M3 report `SKIP` (`mutation is off;
+pass --mutate`), which doesn't affect the exit status.
+
+### The scenario
+
+1. Initialize with K1's client capabilities plus `window.workDoneProgress` and versioned `publishDiagnostics`. If the
+   server doesn't ask for `didOpen`, or takes no changes (`textDocumentSync` absent or `0`), M1 to M3 are `SKIP`.
+2. Open each seed file at version 1 with the profile's language id. The files stay as they are on disk: lspcheck never
+   writes mutated text, and `didOpen` hands the document's content to the client, so the server must not read it from
+   disk while it is open.
+3. **Settle**: wait until no work-done progress the server began is unfinished and no `publishDiagnostics` or
+   `$/progress` has arrived for 1 s, bounded by `settle_timeout`. A server that never settles is noted in the detail;
+   the baseline's stability rule below still protects M3.
+4. **Baseline**: send each recovery probe (below) about each seed document, then again each second, until two answers
+   in a row are equal after projection, or `settle_timeout` ends. A probe with a stable answer is used; one that
+   errors, varies or isn't advertised isn't, and the detail says why.
+5. **Cases**, in order, while the run's budget lasts. Case *k* has its own RNG streams, so it doesn't depend on the
+   cases before it or on the server's timing. Each step applies one to three mutations to one document, sends them in
+   one `didChange`, then sends the step's requests (default four) without waiting between them, and waits for each
+   reply until its own deadline.
+6. **Restore**: one `didChange` replaces each mutated document's whole text with its clean text, at the next version.
+   Then lspcheck polls the stable probes, 250 ms apart and doubling to 2 s, until every answer equals its baseline or
+   `recovery_timeout` ends. Each poll is a request like any other, judged by M2 and the cross-cutting checks.
+7. After the last case, `leave()`: `shutdown`, `exit`, and L9's scan.
+
+### Mutations
+
+**What the profile supplies.** The seed files (default: `[document]`'s file and language id), and optionally a lexicon
+that says where tokens are. Without one, a default lexicon is used: identifiers are runs of Unicode letters, digits and
+`_`; numbers are runs that start with an ASCII digit; whitespace and line ends are their own tokens; every other
+character is a one-character punctuation token; the brackets are `()`, `[]` and `{}`. With a lexicon, line comments,
+non-nesting block comments, strings with an escape character, extra identifier characters and keywords are recognised;
+an unterminated string or comment runs to the end of its line or of the document.
+
+The lexicon only decides *where* to edit. No oracle depends on it, so a wrong lexicon makes the edits less pointed but
+can't make a verdict wrong. That is why lspcheck can stay ignorant of the language.
+
+**Operators.** Each picks its target with the case's RNG. If it finds nothing to change (`open-string` in text without
+strings), it inserts a token from the document's own tokens instead, and the record says so.
+
+| Operator | Edit |
+|---|---|
+| `delete-tokens` | Delete 1 to 3 consecutive non-space tokens. |
+| `duplicate-tokens` | Repeat 1 to 4 consecutive tokens after themselves. |
+| `swap-tokens` | Swap two tokens of the same class (identifier, number, string). |
+| `replace-token` | Replace a token with one drawn from the document's tokens, the brackets and the keywords. |
+| `truncate` | Cut the document at a token boundary. |
+| `delete-line`, `duplicate-line` | Delete or repeat one line with its end. |
+| `unbalance-bracket` | Delete, duplicate or insert one bracket of a lexicon pair. |
+| `open-string`, `open-comment` | Remove a string's or block comment's closing delimiter, or insert a lone opening one (needs a lexicon). |
+| `insert-in-literal` | Insert characters from the fixed set below inside a string or comment, or else inside an identifier. |
+| `unicode` | Insert one character of the fixed set at a token boundary. |
+| `line-ends` | Make one line end, or every one, `\r\n` or a lone `\r`. |
+| `rename` | Replace every occurrence of one identifier with another of the document's. |
+| `fragment` | Insert one of the profile's `fragments` (malformed literals and the like) at a token boundary. |
+| `nest`, `repeat-line` | Stress: nest a bracket pair deeply, or repeat a line many times, up to the room left (off by default). |
+| `control` | Insert a C0 control character or U+0000 (off by default). |
+
+The fixed character set is `é` (2 bytes in UTF-8), `中` (3), `😀` and `𝔘` (4, a surrogate pair in UTF-16), a combining
+acute, a ZWJ, U+00A0, U+200B, U+FEFF and U+10FFFF. Every inserted character is a Unicode scalar value. Invalid UTF-8 and
+lone surrogates (`"\ud800"` in JSON) are never sent: LSP text is Unicode, and a server's reaction to text that isn't
+would be judged on lspcheck's own violation.
+
+No edit starts or ends between a `\r` and a `\n`. No position can name that point (a line's length excludes its end),
+so such an edit could not be sent incrementally, and splitting the pair would change two line breaks at once.
+
+**Sending edits.** With `sync = "auto"` (the default), lspcheck sends what the server's `textDocumentSync` kind asks
+for. For incremental sync, each mutation becomes one content change: the smallest range that differs (common prefix and
+suffix, in characters), counted in the negotiated encoding against the text left by the change before it, as the
+specification orders them. lspcheck applies each change with `text::apply_change` and asserts the result is the planned
+text, so a bug in its own range arithmetic stops the run as an internal error, never as a verdict. Full sync sends the
+whole text. `sync = "full"` forces full text even when incremental is advertised, to tell the two apart.
+
+**Determinism.** A case's edits come from SplitMix64 seeded by (seed, case index, `"edits"`), and its requests and
+positions from a second stream seeded by (seed, case index, `"requests"`). Which methods the server advertises therefore
+changes the requests but not the texts. The generator, the draw order and the operators are part of a mutation
+`format` number recorded in the report and the transcript; a seed reproduces its plan under the same format. The plan
+is a pure function, so it is unit tested directly, including a pinned golden case. No new dependency: SplitMix64 is a
+few lines, and a crate's generator may change its stream between releases. Only the server's timing varies between
+runs: how many recovery polls are sent, and what the server answers.
+
+### Requests and positions
+
+Each step sends `requests_per_step` requests, round robin over the advertised methods of K1's table that the profile's
+`requests` allows (default: all of them), with a cursor that runs across cases so every method is exercised. Their
+params are K1's. Positions are drawn from the current text: half inside an identifier, a tenth at the end of the
+document, the rest at any character boundary, never inside a character and never between `\r` and `\n`, counted in
+the negotiated encoding. `workspace/symbol` queries an identifier from the text. Rename and formatting edits are never
+applied. The requests of one step are written back to back and waited for together, each with its own deadline from
+when its write began.
+
+### Recovery
+
+A recovery probe is a request whose answer depends only on a document's text, compared after a projection that keeps
+what describes the text and drops what may lawfully vary:
+
+| Probe | Kept | Dropped |
+|---|---|---|
+| `textDocument/documentSymbol` | name, kind, ranges, children; for `SymbolInformation`, the range and container name | `detail`, `tags`, `deprecated`, `data` |
+| `textDocument/foldingRange` | start and end lines and characters, kind | `collapsedText` |
+| `textDocument/diagnostic` (a full report) | each item's range, severity, code, source | `message`, `data`, `relatedInformation`, `codeDescription`, `resultId` |
+| `publishDiagnostics` labelled with a version | the same per diagnostic | the same |
+
+Top-level arrays compare as multisets, because servers may order them by hash. `semanticTokens` is left out for now: its
+`data` is long, and a legend change between answers would need decoding. Unlabelled `publishDiagnostics` aren't used:
+lspcheck can't tell which text they describe. The profile's `recovery.probes` may narrow the list.
+
+A case has **recovered** when every stable probe of every seed document, asked after the restoring `didChange` was
+delivered, gets an answer equal to its baseline (for pushed diagnostics, a publish labelled with the restored version).
+lspcheck can observe that without knowing the language. It cannot decide:
+
+- whether the baseline was right: the clean answer might already be wrong;
+- whether an answer that never returns to baseline is a fault. A server's answers can legitimately depend on state
+  outside the text: an index that finished loading after the baseline, a cache, a project-wide analysis. Only someone
+  who knows the server can say its answers for this seed are fixed;
+- whether a slow server would have recovered after the bound.
+
+So a recovery not seen within the bound is `ERROR`, not `FAIL`, unless the profile states an expectation. Two can be
+stated in `[mutation.recovery]`:
+
+- `expect = "baseline"`: the server's answers about the clean seed are fixed. The last answer within the bound, to a
+  probe asked after the restoration was delivered, that differs from the stable baseline fails M3.
+- `no_errors = true`: the seed has no Error-severity diagnostics. It must hold at baseline (pushed diagnostics labelled
+  1, or a pull report); if it doesn't, M3 is `ERROR` ("the profile and the server disagree before any mutation"),
+  since lspcheck can't tell which is wrong. After restoration, the last diagnostics within the bound about the
+  restored version that include an error fail M3.
+
+Either way the server confirmed the expectation itself before the mutations, then answered against it about the same
+text for the whole bound. That is seen evidence, which is what `FAIL` needs. Without a stated expectation, the same
+observation is reported as `ERROR` with the difference shown, and the profile's author decides.
+
+### Verdict rules
+
+Every verdict follows the [rules that keep verdicts trustworthy](../AGENTS.md#rules-that-keep-verdicts-trustworthy).
+`FAIL` needs something lspcheck saw; lspcheck's budgets never make a `FAIL`; a request lspcheck couldn't deliver is
+`ERROR`; every `PASS` and `N/E` that relied on nothing being missed in a window goes through `report_judged` and the
+end-of-scenario recheck, and every missing reply through `fail_absent_between`.
+
+**M1.**
+- *skip:* `--mutate` not given, no seed file, no `didOpen`, or no change sync.
+- *fail:* the process exited, or its stdout closed, after the first mutation's `didChange` began and before lspcheck
+  sent `shutdown`. The detail gives the exit status, the case and step, its operators and their offsets. After a write
+  lspcheck couldn't finish, it waits up to `--exit-timeout` for an exit before judging, as R1 does.
+- *error:* the server exited before the first mutation (during settle or baseline, which says nothing about broken
+  source); `initialize` failed; a `didChange` couldn't be delivered and no exit was seen.
+- *not-exercised:* no case ran (the run budget was spent on settling).
+- *pass:* otherwise, with the number of cases and versions sent.
+
+**M2.** Judges every delivered request of the scenario after the first mutation: the step requests and the recovery
+polls.
+- *fail:* a delivered request had no response by its deadline (`--timeout` from when its write began). Each goes
+  through `fail_absent_between`, so missed evidence in its window makes it `ERROR`. A request still pending when the
+  server exited is M1's, not M2's.
+- *error:* a request couldn't be delivered; or a request's wait was cut short by a budget of lspcheck's (see Bounds),
+  which can only happen when lspcheck itself is slow.
+- *not-exercised:* no request was delivered after a mutation.
+- *pass:* every delivered request got a response. Any error is an answer, including ContentModified (-32801),
+  ServerCancelled (-32802) and RequestFailed (-32803); the detail counts them by code.
+
+**M3.**
+- *skip:* as M1.
+- *not-exercised:* no probe had a stable baseline (each one's reason is listed), or no case reached its restoration.
+- *fail:* only as stated above, with `expect` or `no_errors`. The detail names the case, the probe, the first
+  difference after projection (a path and both values, shortened like K2's) and how long lspcheck polled. A failure
+  seen stands even if other evidence was missed.
+- *error:* without a stated expectation, a probe didn't return to its baseline within `recovery_timeout`
+  ("not seen to recover within 20 s; lspcheck's bound, not a protocol rule: set `[mutation.recovery].expect` if the
+  answers are fixed"); the restoring `didChange` couldn't be delivered; the server exited first (M1's failure); a
+  stated expectation was contradicted at baseline; or nothing failed but evidence was missed in a recovery window.
+- *pass:* every case that reached restoration recovered. The detail gives the cases, the probes used and the slowest
+  recovery time.
+
+**Extended checks.** In the mutation scenario, D1 judges positions about the seed documents from their `didOpen` to
+`shutdown`, with D1's candidate rule: a reply refers to the version current when its request was sent or a later one
+sent before it was read; a labelled publish to its version; an unlabelled one to any version sent before it was read.
+lspcheck keeps the last 64 versions of each document. A position whose candidate texts reach further back isn't judged
+and is counted, so a long run's memory stays bounded and no position is judged against a text lspcheck no longer has.
+D2 judges every labelled publish against the versions sent before it was read; D6 every `selectionRange` reply; K1
+every MethodNotFound to an advertised request about a seed document.
+
+### Profile schema
+
+`[mutation]` is validated with the rest of the profile (`deny_unknown_fields`, errors name the key, exit status 2),
+before any server starts. It is inert without `--mutate`, so a profile can carry it without changing default runs.
+
+```toml
+[mutation]
+files = ["main.lua"]           # seed files the workspace provides; default: [document].path
+language_id = "lua"            # their didOpen language id; default: [document].language_id
+seed = 20261109                # default: chosen at random and reported
+cases = 20                     # default 20, at most 1000
+steps = 3                      # most steps per case, 1 to 3
+operators = ["delete-tokens", "unbalance-bracket", "open-string", "unicode", "line-ends", "rename"]  # default: all but nest, repeat-line, control
+fragments = ["0x", "1e", "..."]                  # for the fragment operator
+sync = "auto"                  # or "full"
+requests = ["textDocument/documentSymbol", "textDocument/hover", "textDocument/completion"]  # default: K1's advertised methods
+requests_per_step = 4          # at most 16
+max_document_kib = 64          # per document, seed included; at most 1024
+run_timeout = "10m"            # at most "2h"
+
+[mutation.lexicon]             # optional; see Mutations for the default
+line_comments = ["--"]
+block_comments = [["--[[", "]]"]]
+strings = [{ open = '"', close = '"', escape = '\' }, { open = "'", close = "'", escape = '\' }, { open = "[[", close = "]]" }]
+identifier_chars = "_"
+brackets = ["()", "[]", "{}"]
+keywords = ["local", "function", "end", "return", "if", "then", "else"]
+
+[mutation.recovery]
+probes = ["textDocument/documentSymbol", "publishDiagnostics"]   # default: every advertised probe
+settle_timeout = "30s"         # default: the startup timeout
+recovery_timeout = "20s"       # default: twice the request timeout
+expect = "observe"             # or "baseline"
+no_errors = true               # default false
+```
+
+That example, added to [`lua-language-server.toml`](../examples/profiles/lua-language-server.toml), mutates `main.lua`.
+Validation refuses: a seed file the workspace doesn't provide or that isn't UTF-8; a seed larger than
+`max_document_kib`; no seed file and no `[document]`; an unknown operator, probe or method; a `requests` method that
+isn't in K1's table; `steps`, `cases` or `requests_per_step` out of range; an empty delimiter; a bracket entry that
+isn't two characters; a delimiter or identifier character that is a line end; `expect` other than the two values.
+
+The command line adds `--mutate`, `--mutation-seed N` and `--mutation-cases N`, which override the profile's values.
+`--mutate` with a profile that has a `[document]` but no `[mutation]` mutates that file with the default lexicon and
+defaults; with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--only M1` without `--mutate` reports the same `SKIP` as any run without it.
+
+### Bounds
+
+| Bound | Default | Cap | When it is reached |
+|---|---|---|---|
+| Per request | `--timeout` from when its write began | — | the request is unanswered (M2) |
+| Per case | `(steps + 1) × --timeout + recovery_timeout + 5 s` | — | the case stops; requests not yet sent aren't judged |
+| Per run | `run_timeout`, 10 min | 2 h | no new case starts; the detail says how many ran |
+| Settle and baseline | `settle_timeout` | 5 min | proceed; unstable probes aren't used |
+| Cases | 20 | 1000 | usage error above the cap |
+| Mutations per step; steps per case | 1 to 3; `steps` | 3; 3 | — |
+| Inserted text per mutation | 1 KiB; stress operators the room left | 16 KiB | the operator inserts less |
+| Document size | `max_document_kib`, 64 | 1024 | the operator is redrawn, `truncate` after six tries |
+| Requests per step; recovery polls per case | 4; 40 | 16; 40 | the poll stops: recovery not seen |
+| Versions kept per document | 64 | 64 | older positions aren't judged, counted |
+| Bytes written to the server | 64 MiB | 256 MiB | no new case starts |
+
+A case starts only when the run has at least the case budget left, so the run deadline never cuts a case short, and a
+request's own deadline is never shortened by a budget except when lspcheck itself overran. Server output stays under
+`--max-output-mib` and `--max-frame-mib`; missing what they exclude makes waits inconclusive as everywhere else. With
+the bytes written capped, a transcript holds at most that plus what the server wrote. None of these bounds is a
+protocol rule: reaching one gives `ERROR` or `N/E` with the bound named, or just a smaller run, never `FAIL`.
+
+### Reports, transcripts and reproduction
+
+The JSON report gains a top-level `"mutation"`: `null`, or the seed, the format, the cases planned and run, and why
+the run stopped early, if it did. The terminal header adds `— mutation seed 20261109, 20 cases`. The schema id is
+unchanged, as when `"profile"` was added.
+
+The scenario's transcript, `mutation.jsonl`, is an ordinary session transcript, so `lspcheck replay mutation.jsonl --
+SERVER` replays it as it is: the workspace line recreates the seed files, and every `didChange`, request and poll is
+re-sent byte for byte. Before each case lspcheck records a meta line, `{"dir":"meta","mutation":{"format":1,"seed":…,
+"case":17,"steps":[{"document":"main.lua","version":5,"edits":[{"operator":"open-string","offset":40,"removed":1,
+"inserted":"","sha256":…}]}]}}`; replay ignores meta lines it doesn't know, so no change to replay is needed.
+Inserted text over 64 characters is summarised by length, prefix and SHA-256, as virgil-lsp does; the full text is in
+the recorded `didChange`.
+
+A whole session can be long, so a later step adds **isolation**: after the run, for each of the first three failing
+or erroring cases, lspcheck runs that case alone in a fresh session (open, settle, baseline, the case's steps, restore,
+probe), from the same seed, and writes `mutation-case-17.jsonl`. The report says whether the failure reproduced. An
+isolation run judges nothing, like `replay`: the verdicts come from the main run alone, so they can't depend on
+whether a flaky reproduction worked. **Minimisation** builds on isolation and is off by default: drop steps, then
+mutations, then requests, keeping an attempt only when the same check fails the same way, at most 16 fresh sessions
+in all, each with the case budget, inside the run deadline. Its result is a transcript and a line of detail, never a
+verdict.
+
+### Stand-in faults and tests
+
+The stand-in gains bracket tracking: it counts unmatched `()[]{}` in each open document, publishes a diagnostic per
+unmatched bracket, and answers `documentSymbol` from its words as now. A test profile in `tests/fixtures/` holds a
+seed with brackets, strings, a comment and non-ASCII text, and uses only `unbalance-bracket` with a fixed seed, so every
+case breaks the balance and restoring it repairs it. The faults react to the text, never to time, so no test depends on
+a window. Lawful faults count replies, not milliseconds.
+
+| Fault | Effect | Test |
+|---|---|---|
+| `exit-on-unbalanced` | exit when a document's brackets become unbalanced | M1 fails |
+| `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails |
+| `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |
+| `errors-after-unbalanced` | once unbalanced, publish an Error diagnostic forever | M3 fails with `no_errors = true` |
+| `method-not-found-while-unbalanced` | answer advertised requests with -32601 while unbalanced | K1 fails from the mutation scenario |
+| `codepoint-positions-after-change` (exists) | count positions in code points after a change | D1 fails from the mutation scenario (with `unicode`) |
+| `diagnostics-own-version` (exists) | label diagnostics with its own counter | D2 fails from the mutation scenario |
+| `slow-recovery` | lawful: answer the first three `documentSymbol` after rebalancing with `[]` | nothing fails; M3 passes |
+| `reworded-diagnostics` | lawful: put a counter in every diagnostic message | nothing fails |
+| `no-diagnostics` (exists) | lawful: never publish diagnostics | nothing fails; pushed diagnostics unused |
+| `content-modified-while-unbalanced` | lawful: answer requests with -32801 while unbalanced | nothing fails; M2 passes |
+| `shuffled-symbols` | lawful: return symbols in a different order each time, with a changing `detail` | nothing fails |
+| `unstable-symbols` | lawful: add a symbol named by a counter to every answer | M3 `N/E`, never `FAIL` |
+
+The clean stand-in passes M1 to M3 and every extended check. Unit tests cover the planner: the same seed gives the same
+plan bytes; a pinned golden case; no edit inside a character or a CRLF; sizes within the caps; incremental changes that
+`apply_change` turns into the planned text in all three encodings, over many seeds; the default and a given lexicon;
+every profile validation error. Each regression test is run against the commit before its fix, as AGENTS.md asks.
+
+### Stock servers
+
+The matrix would add one job per server: the same example profile, with its `[mutation]` section, run with
+`--mutate --mutation-seed <pinned> --mutation-cases 10`, compared against `<server>.mutation.verdicts`. Default runs and
+their `.verdicts` files stay as they are, apart from three `M1 skip` lines. The files gain one line per new check.
+
+Mutation brings timing into play, and the README's rule still holds: alternatives are only for races in the server
+itself. Known risks:
+
+- **Background loading.** rust-analyzer loads the sysroot and gopls the module graph after `initialize`. A baseline
+  taken mid-load is unstable (the probe isn't used) or, worse, stable but early. Settling on work-done progress is the
+  defence; if a server reports no progress, a longer `settle_timeout` in its profile, never an alternative verdict.
+- **Stale diagnostics.** lua-language-server sometimes labels the previous text's diagnostics with the new version
+  (its `D1 fail|pass` and `D3 fail|pass` lines). With dozens of versions this is likelier, and the same race can fail
+  the extended D1 or, after a restoration, M3. That is a server race, allowed as an alternative only once a transcript
+  shows it.
+- **Slow answers on broken source.** M2 fails on a reply later than `--timeout`. The profiles' 30 s keeps that rare;
+  a server that sometimes answers in 31 s is a server race, recorded with its transcript.
+- **lspcheck's own timing.** The recovery poll interval and the settle quiet period are lspcheck's choices. A verdict
+  that flips because of them is a bug in lspcheck, fixed there, not listed.
+
+Run each server's job a few times before recording, as the README asks. The workflow change needs the maintainer's
+merge, and any finding about these servers stays in this repository unless the maintainer decides otherwise.
+
+## Consequences
+
+- Real source reaches the position, version and type checks, so D1, D2, D6 and K2 are exercised on real servers for the
+  first time, not just `N/E`.
+- A `--mutate` run takes minutes, not seconds; it is opt-in, and default runs are unchanged except for three `SKIP`
+  lines, in the terminal, JSON, JUnit and Markdown reports.
+- M3's `ERROR` for a recovery not seen makes a `--mutate` run exit 2 until the profile states an expectation or
+  skips M3. That is deliberate: lspcheck doesn't know, and says so.
+- The planner's generator and draw order become a format lspcheck must version: changing them changes what a seed
+  means, so the format number goes up.
+- No new dependency, no network, no change to `replay`.
+
+## Implementation plan
+
+Each step is one small pull request with its tests, docs and changelog entry where user-visible.
+
+1. **Planner.** `src/mutation.rs`: SplitMix64, the default lexicon and the profile lexicon, the operators, the plan
+   as a pure function, minimal-range incremental changes checked with `text::apply_change`. Unit tests only; nothing
+   runs it yet.
+2. **Profile and flags.** `[mutation]` parsing and validation, `--mutate`, `--mutation-seed`, `--mutation-cases`; M1 to
+   M3 in the catalogue, reporting `SKIP` without `--mutate`. Stock `.verdicts` files gain their `skip` lines.
+3. **Scenario, M1 and M2.** Open, mutate, request, restore (without probes), `leave()`; the transcript meta line; the
+   JSON `"mutation"` field. Stand-in bracket tracking and the M1 and M2 faults.
+4. **Extended checks.** D1, D2, D6 and K1 over the mutation scenario, with the 64-version window, and their faults.
+5. **Recovery, M3.** Settle, stable baselines, projections, polling, `expect` and `no_errors`; the recovery faults,
+   lawful ones included.
+6. **Isolation.** Rerunning failing cases alone and writing their transcripts.
+7. **Stock matrix.** `[mutation]` in the example profiles, a mutation job and `.mutation.verdicts` (a workflow change,
+   so the maintainer merges it).
+8. **Minimisation**, if isolation shows it is wanted.
+
+## Open questions
+
+- Should a recovery not seen without a stated expectation be `ERROR` (this proposal: the result is unknown, and a
+  bound ran out) or `N/E` (quieter, but the run did produce evidence)? `ERROR` makes a `--mutate` run exit 2 on a
+  server whose answers legitimately drift.
+- Should M1 to M3 be listed, as `SKIP`, in runs without `--mutate`, or only appear with it? Listing them keeps the
+  catalogue and reports uniform and shows what wasn't run, at the cost of three lines in every report and verdicts file.
+- Should D1, D2, D6 and K1 be extended, as proposed, or should the mutation scenario get its own position, version and
+  MethodNotFound checks (M4 and on), so their documents-scenario verdicts never depend on `--mutate`?
+- Should `--strict` cover the M checks like other `POLICY` checks? A `POLICY` failure exits 0 without it.
+- Default case count: 20 is a guess at a few minutes on a stock server, not measured; virgil-lsp uses 100 against a
+  server that answers in milliseconds.
+- Should lspcheck ship lexicon presets (`c-like`, `python`, `lua`, `lisp`) as data, rather than every profile spelling
+  one out? They are tables, not real lexers.
+- Servers that take no changes are skipped. They could be mutated by `didClose` and `didOpen` of the new text instead.
+- Should `semanticTokens/full` become a recovery probe, compared through the legend?
