@@ -62,6 +62,8 @@ lspcheck 0.2.0 — basedpyright-langserver --stdio
                      the server advertises no selectionRangeProvider, so lspcheck sends no selectionRange request
   PASS  K1  MUST    An advertised request, sent with valid parameters about an open document, isn't answered with MethodNotFound (-32601)
                      34 request(s) for 16 advertised method(s) were answered, none with MethodNotFound
+  PASS  K2  MUST    What the server sends validates against the LSP 3.17 meta-model: results, and its requests' and notifications' params
+                     74 result(s), 49 server request(s) and 115 notification(s) were of their types
   PASS  R1  POLICY  A well-framed body that isn't JSON gets ParseError (-32700) with id null or is ignored, and the server keeps serving
                      the server returned 1 ParseError (-32700) response(s) with id null and answered a later plain request
   FAIL  R2  POLICY  A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving
@@ -70,7 +72,7 @@ lspcheck 0.2.0 — basedpyright-langserver --stdio
                      answered a plain request after 0.012 s following didOpen of a 4 MiB document
   PASS  R4  POLICY  Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string
                      all 8 requests got responses with their exact ids
-38 checks: 33 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 1 skipped, 0 not exercised, 0 errors
+39 checks: 34 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 1 skipped, 0 not exercised, 0 errors
 ```
 
 lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions,
