@@ -7,6 +7,8 @@
 - Example profiles for clangd, typescript-language-server, bash-language-server, yaml-language-server,
   vscode-json-language-server, marksman, ruff, texlab, zls, jedi-language-server, pylsp, terraform-ls, lemminx and
   taplo in [`examples/profiles/`](examples/profiles/), each with a tiny project and a `[document]`.
+- The [stock-server CI matrix](ci/stock-servers/README.md) also runs pinned releases of clangd, marksman, ruff, texlab
+  and zls, whose verdicts were each the same in three local runs.
 
 ### Changed
 

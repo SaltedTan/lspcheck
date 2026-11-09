@@ -37,6 +37,16 @@ env:
   LUA_LS_SHA256: 93ad326b10f6c00911dd8c450fa098332dbd8f9f45d1052f5636a2d54479b947
   BASEDPYRIGHT_VERSION: 1.40.2
   BASEDPYRIGHT_SHA256: 5d1073a0e61a1adc6b40b2bed4489017aa5c1336aa8e6fdcb7157b9bf26f3fab
+  CLANGD_VERSION: 23.1.0
+  CLANGD_SHA256: e53b1a96196095faedb7642cf64964f7fb9ad4a0c1f00dd2c172a3d9dcbafdfd
+  MARKSMAN_RELEASE: 2026-02-08
+  MARKSMAN_SHA256: be5098e8213219269c47fc0d916a66fa31ce0602ec967475c722260aabf26087
+  RUFF_VERSION: 0.17.4
+  RUFF_SHA256: d1d6ec9ce1ce0c01e23532a157a677077ba1f82f7cd2cde6f0bd75e65f85df93
+  TEXLAB_VERSION: v5.26.0
+  TEXLAB_SHA256: 8697bd5e479d4584b14b7eed5c320c80ec4e1d91ebefbb6801e6bf38e9971300
+  ZLS_VERSION: 0.17.0
+  ZLS_SHA256: dfa4514e1868803fdf2ae56832c88b9d400094d70ea6bb136b57bcc91af10258
 
 jobs:
   check:
@@ -44,7 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        server: [gopls, rust-analyzer, lua-language-server, basedpyright]
+        server: [gopls, rust-analyzer, lua-language-server, basedpyright, clangd, marksman, ruff, texlab, zls]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -108,6 +118,51 @@ jobs:
           tar -xzf "$RUNNER_TEMP/basedpyright.tgz" -C "$RUNNER_TEMP/basedpyright"
           ln -s "$RUNNER_TEMP/basedpyright/package/langserver.index.js" "$RUNNER_TEMP/bin/basedpyright-langserver"
           node --version
+      - name: Install clangd
+        if: matrix.server == 'clangd'
+        run: |
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/clangd.zip" \
+            "https://github.com/clangd/clangd/releases/download/$CLANGD_VERSION/clangd-linux-$CLANGD_VERSION.zip"
+          echo "$CLANGD_SHA256  $RUNNER_TEMP/clangd.zip" | sha256sum --check --strict
+          unzip -q "$RUNNER_TEMP/clangd.zip" -d "$RUNNER_TEMP"
+          ln -s "$RUNNER_TEMP/clangd_$CLANGD_VERSION/bin/clangd" "$RUNNER_TEMP/bin/clangd"
+          clangd --version
+      - name: Install marksman
+        if: matrix.server == 'marksman'
+        run: |
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/bin/marksman" \
+            "https://github.com/artempyanykh/marksman/releases/download/$MARKSMAN_RELEASE/marksman-linux-x64"
+          echo "$MARKSMAN_SHA256  $RUNNER_TEMP/bin/marksman" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/bin/marksman"
+          marksman --version
+      - name: Install ruff
+        if: matrix.server == 'ruff'
+        run: |
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/ruff.tar.gz" \
+            "https://github.com/astral-sh/ruff/releases/download/$RUFF_VERSION/ruff-x86_64-unknown-linux-musl.tar.gz"
+          echo "$RUFF_SHA256  $RUNNER_TEMP/ruff.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/ruff.tar.gz" -C "$RUNNER_TEMP"
+          ln -s "$RUNNER_TEMP/ruff-x86_64-unknown-linux-musl/ruff" "$RUNNER_TEMP/bin/ruff"
+          ruff --version
+      - name: Install texlab
+        if: matrix.server == 'texlab'
+        run: |
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/texlab.tar.gz" \
+            "https://github.com/latex-lsp/texlab/releases/download/$TEXLAB_VERSION/texlab-x86_64-linux.tar.gz"
+          echo "$TEXLAB_SHA256  $RUNNER_TEMP/texlab.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/texlab.tar.gz" -C "$RUNNER_TEMP/bin"
+          texlab --version
+      - name: Install zls
+        if: matrix.server == 'zls'
+        run: |
+          # Without zig on PATH, zls still parses and analyses the profile's file.
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/zls.tar.xz" \
+            "https://github.com/zigtools/zls/releases/download/$ZLS_VERSION/zls-x86_64-linux.tar.xz"
+          echo "$ZLS_SHA256  $RUNNER_TEMP/zls.tar.xz" | sha256sum --check --strict
+          mkdir "$RUNNER_TEMP/zls"
+          tar -xJf "$RUNNER_TEMP/zls.tar.xz" -C "$RUNNER_TEMP/zls"
+          ln -s "$RUNNER_TEMP/zls/zls" "$RUNNER_TEMP/bin/zls"
+          zls --version
 
       - name: Run lspcheck
         env:
