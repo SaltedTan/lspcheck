@@ -5,6 +5,14 @@
 ### Added
 
 - A [stock-server CI matrix](ci/stock-servers/README.md) for regression coverage against real language servers.
+- K2 (`MUST`) checks server message types against the LSP 3.17 meta-model across every scenario; see the
+  [K2 reference](docs/design.md#capabilities-and-robustness) for coverage and verdict rules. The meta-model is
+  [vendored unmodified under CC BY 4.0](vendor/lsp-3.17/README.md).
+
+### Fixed
+
+- K2 verdicts for validation budget exhaustion and huge-exponent zeros; see the
+  [validation rules](docs/design.md#capabilities-and-robustness).
 
 ## 0.2.0 (2026-11-09)
 

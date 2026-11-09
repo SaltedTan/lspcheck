@@ -144,17 +144,33 @@ impl std::fmt::Display for Id {
 }
 
 /// The exact value of a JSON number as `[-]DIGITSeEXP` with no leading or
-/// trailing zeros in DIGITS (zero is `0e0`). `None` if `text` isn't a JSON
-/// number or its exponent doesn't fit in 64 bits.
+/// trailing zeros in DIGITS (zero is `0e0`, regardless of its exponent).
+/// `None` if `text` isn't a JSON number or a nonzero value's exponent can't
+/// be parsed or normalized in 64 bits.
 pub fn canonical_number(text: &str) -> Option<String> {
     let (negative, rest) = match text.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, text),
     };
     let (mantissa, exp) = match rest.find(['e', 'E']) {
-        Some(i) => (&rest[..i], rest[i + 1..].parse::<i64>().ok()?),
-        None => (rest, 0),
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, "0"),
     };
+    // Zero is zero however large its exponent, so recognise it before the
+    // exponent is parsed (which overflows for such numbers).
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let zeros = |t: &str| t.bytes().all(|b| b == b'0');
+    let unsigned = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+    if !int.is_empty()
+        && zeros(int)
+        && zeros(frac)
+        && !(mantissa.contains('.') && frac.is_empty())
+        && !unsigned.is_empty()
+        && unsigned.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Some("0e0".into());
+    }
+    let exp = exp.parse::<i64>().ok()?;
     let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     if int.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -406,6 +422,11 @@ mod tests {
         assert_eq!(integer_value(&n("-32601.0")), Some(-32601));
         assert_eq!(integer_value(&n("-32601.5")), None);
         assert_eq!(integer_value(&n("1e30")), None);
+        // Zero, whatever its exponent; an exponent that big on anything else isn't an integer.
+        for zero in ["0e9223372036854775808", "-0.0e-99999999999999999999", "0E+99999999999999999999"] {
+            assert_eq!(integer_value(&n(zero)), Some(0), "{zero}");
+        }
+        assert_eq!(integer_value(&n("1e9223372036854775808")), None);
     }
 
     #[test]

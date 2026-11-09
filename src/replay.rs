@@ -60,6 +60,7 @@ pub struct Step {
 #[derive(Debug)]
 pub struct RequestOccurrence {
     pub id: Id,
+    pub method: String,
     first_step: usize,
     frame_start: usize,
     complete_step: usize,
@@ -291,11 +292,14 @@ pub fn parse(path: &Path) -> Result<Plan, String> {
                 out_offset = event_end;
                 out_events.push((event_start, event_end, step_index, n));
                 for (chunk, message) in chunks.iter().zip(messages.iter()) {
-                    if let (Chunk::Frame { frame_start, .. }, Some(Message { kind: Kind::Request { id, .. }, .. })) =
-                        (chunk, message)
+                    if let (
+                        Chunk::Frame { frame_start, .. },
+                        Some(Message { kind: Kind::Request { id, method }, .. }),
+                    ) = (chunk, message)
                     {
                         plan.requests.push(RequestOccurrence {
                             id: id.clone(),
+                            method: method.clone(),
                             first_step: 0,
                             frame_start: *frame_start,
                             complete_step: step_index,
@@ -654,8 +658,8 @@ pub async fn replay(
             continue;
         }
         for &request_index in &step.requests {
-            let id = &plan.requests[request_index].id;
-            match session.begin_request(id, Instant::now() + timeout).await {
+            let RequestOccurrence { id, method, .. } = &plan.requests[request_index];
+            match session.begin_request(id, method, Instant::now() + timeout).await {
                 Ok(()) => {
                     registered[request_index] = true;
                 }

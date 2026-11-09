@@ -6,13 +6,14 @@
 //! A scenario is one server process driven through one script. Most checks
 //! belong to one scenario; the cross-cutting ones ([`CROSS_CUTTING`]) are
 //! judged from what every scenario observed. A check that couldn't be reached
-//! gets `error` or `not-exercised`, never `pass`, and a failure seen after
-//! lspcheck hit one of its own inspection limits is reported as an error,
-//! because the missing evidence might explain it.
+//! gets `error` or `not-exercised`, never `pass`. Incomplete evidence makes a
+//! missing reply inconclusive when it could have held that reply; a rule
+//! lspcheck directly saw broken remains a failure.
 
 use crate::capabilities::{self, Judgement, Spot};
 use crate::documents::{self, Change, OpenDoc, Published, Source, SyncKind, Version};
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
+use crate::metamodel::{self, TooLarge};
 use crate::process::{Coverage, ProcInfo, ServerCommand};
 use crate::profile::{self, Skip};
 use crate::session::{
@@ -185,6 +186,13 @@ pub const CATALOGUE: &[CheckInfo] = &[
         "serverCapabilities"
     ),
     check!(
+        "K2",
+        CapabilitiesAndRobustness,
+        Must,
+        "What the server sends validates against the LSP 3.17 meta-model: results, and its requests' and notifications' params",
+        "metaModel"
+    ),
+    check!(
         "R1",
         CapabilitiesAndRobustness,
         Policy,
@@ -215,7 +223,7 @@ pub const CATALOGUE: &[CheckInfo] = &[
 ];
 
 /// Checks judged from every scenario's observations.
-pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "J1", "J2", "J3", "J5", "J7", "L9"];
+pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "J1", "J2", "J3", "J5", "J7", "L9", "K2"];
 
 pub fn info(id: &str) -> &'static CheckInfo {
     CATALOGUE.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("unknown check {id}"))
@@ -362,6 +370,9 @@ pub struct Observations {
     pub unmatched: Vec<Unmatched>,
     /// Requests that were answered, with when their response was read.
     pub answered: Vec<(Duration, Id)>,
+    /// The method of the request each matched response answered, by the
+    /// response's index in `messages`.
+    pub answered_methods: HashMap<usize, String>,
     /// Requests lspcheck sent whole, with when each was registered.
     pub sent: Vec<(Duration, Id)>,
     /// The server's requests, in the order they were read.
@@ -430,6 +441,7 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
         judge_l9(&runs, &cfg.allowed_descendants),
     ]
     .into_iter()
+    .chain(judges("K2").then(|| judge_k2(&runs)))
     .collect();
     runs.push(ScenarioRun { name: "all", results: cross, observed: None, transcript: None });
     for run in &mut runs {
@@ -612,6 +624,7 @@ fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observatio
         j3_exercise,
         unmatched: f.unmatched,
         answered: f.answered,
+        answered_methods: f.answered_methods,
         sent: f.sent,
         server_requests: f.server_requests,
     }
@@ -1126,7 +1139,7 @@ async fn check_j6(ctx: &mut Ctx<'_>, t: Duration) {
     // One deadline covers registering, writing and waiting for all four.
     let deadline = Instant::now() + t;
     for (i, id) in ids.iter().enumerate() {
-        if let Err(e) = ctx.s.begin_request(id, deadline).await {
+        if let Err(e) = ctx.s.begin_request(id, PROBE, deadline).await {
             ids[..i].iter().for_each(|id| ctx.s.abort_request(id));
             return ctx.report("J6", Verdict::Error, format!("lspcheck couldn't register a request: {e}"));
         }
@@ -1995,7 +2008,7 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     let split = bytes.len();
     bytes.extend(frame(&message::notification("$/cancelRequest", Some(json!({"id": r.to_value()})))));
     let deadline = Instant::now() + t;
-    let sent = match ctx.s.begin_request(&r, deadline).await {
+    let sent = match ctx.s.begin_request(&r, method, deadline).await {
         Err(e) => Err(format!("couldn't prepare the request: {e}")),
         Ok(()) => {
             // Anything read before the request was written can't answer it.
@@ -2350,7 +2363,7 @@ async fn ask(
     let deadline = Instant::now() + ctx.cfg.request_timeout;
     let id = ctx.s.fresh_id();
     let bytes = frame(&message::request(&id, method, Some(params.clone())));
-    ctx.s.begin_request(&id, deadline).await?;
+    ctx.s.begin_request(&id, method, deadline).await?;
     let at = ctx.s.elapsed();
     if let Err(e) = ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await {
         ctx.s.abort_request(&id);
@@ -3030,7 +3043,7 @@ fn frame(value: &Value) -> Vec<u8> {
     transport::encode(&serde_json::to_vec(value).expect("JSON values serialize"))
 }
 
-/// Writes `bytes`, which hold the requests `ids`, as separate writes cut at
+/// Writes `bytes`, which hold [`PROBE`] requests with `ids`, as separate writes cut at
 /// `cuts`, and waits for every response, all by one deadline.
 async fn exchange(ctx: &mut Ctx<'_>, ids: &[Id], bytes: &[u8], cuts: &[usize]) -> Probe {
     let since = ctx.s.elapsed();
@@ -3038,7 +3051,7 @@ async fn exchange(ctx: &mut Ctx<'_>, ids: &[Id], bytes: &[u8], cuts: &[usize]) -
     let deadline = Instant::now() + t;
     let started = ctx.s.messages.len();
     for (i, id) in ids.iter().enumerate() {
-        if let Err(e) = ctx.s.begin_request(id, deadline).await {
+        if let Err(e) = ctx.s.begin_request(id, PROBE, deadline).await {
             ids[..i].iter().for_each(|id| ctx.s.abort_request(id));
             return Probe::Unsent(e.to_string());
         }
@@ -3823,6 +3836,148 @@ fn judge_l9(runs: &[ScenarioRun], allowed: &[String]) -> CheckResult {
     r
 }
 
+/// What K2 judges in a message, if anything: its role (`result` or
+/// `params`), the method, and the type the meta-model gives it.
+fn k2_subject<'m>(o: &Observations, index: usize, m: &'m Message) -> Option<K2Subject<'m>> {
+    let model = metamodel::model();
+    match &m.kind {
+        // L4 judges shutdown's result; one bug shouldn't fail two checks.
+        Kind::Response { outcome: Outcome::Result(result), .. } => {
+            let method = o.answered_methods.get(&index).filter(|m| m.as_str() != "shutdown")?;
+            let ty = model.result(method)?;
+            Some(K2Subject { role: K2Role::Result, method: method.clone(), ty, value: Some(result) })
+        }
+        Kind::Request { method, .. } | Kind::Notification { method } => {
+            let request = matches!(m.kind, Kind::Request { .. });
+            let ty = model.server_params(method, request)?;
+            let role = if request { K2Role::Request } else { K2Role::Notification };
+            Some(K2Subject { role, method: method.clone(), ty, value: m.value.get("params") })
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum K2Role {
+    Result,
+    Request,
+    Notification,
+}
+
+struct K2Subject<'m> {
+    role: K2Role,
+    method: String,
+    ty: &'static metamodel::Type,
+    /// `None` when absent, which only params may be.
+    value: Option<&'m Value>,
+}
+
+/// How many violations K2's detail names.
+const K2_NAMED: usize = 5;
+
+/// Why K2 didn't judge a message; lspcheck's limits, never a failure.
+enum Unjudged {
+    TooLarge,
+    RunBudget,
+}
+
+/// K2's coverage and verdict rules: `docs/design.md#capabilities-and-robustness`.
+fn judge_k2(runs: &[ScenarioRun]) -> CheckResult {
+    judge_k2_within(runs, metamodel::RUN_BUDGET)
+}
+
+/// [`judge_k2`], validating at most `run_budget` steps in all.
+fn judge_k2_within(runs: &[ScenarioRun], run_budget: usize) -> CheckResult {
+    let subjects: Vec<(&'static str, Duration, K2Subject)> = observed(runs)
+        .flat_map(|(name, o)| {
+            o.messages.iter().enumerate().filter_map(move |(i, (at, m))| Some((name, *at, k2_subject(o, i, m)?)))
+        })
+        .collect();
+    let judged =
+        metamodel::on_validation_stack(|| {
+            let mut left = run_budget;
+            subjects
+                .iter()
+                .map(|(_, _, s)| {
+                    let root = if s.role == K2Role::Result { "result" } else { "params" };
+                    let Some(value) = s.value else { return Ok(metamodel::missing(s.ty, root)) };
+                    let budget = metamodel::NODE_BUDGET.min(left);
+                    if budget == 0 {
+                        return Err(Unjudged::RunBudget);
+                    }
+                    let (found, spent) = metamodel::validate_spending(s.ty, value, root, budget);
+                    left -= spent;
+                    found.map_err(|TooLarge| {
+                        if budget < metamodel::NODE_BUDGET { Unjudged::RunBudget } else { Unjudged::TooLarge }
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+    let judged = match judged {
+        Ok(judged) => judged,
+        Err(e) => return result("all", "K2", Verdict::Error, format!("lspcheck couldn't start validating: {e}")),
+    };
+    let (mut count, mut named, mut too_large, mut over_run) = (0, Vec::new(), 0, 0);
+    let mut validated = [0usize; 3];
+    for ((name, at, s), found) in subjects.iter().zip(judged) {
+        let found = match found {
+            Ok(found) => found,
+            Err(Unjudged::TooLarge) => {
+                too_large += 1;
+                continue;
+            }
+            Err(Unjudged::RunBudget) => {
+                over_run += 1;
+                continue;
+            }
+        };
+        validated[s.role as usize] += 1;
+        count += found.count;
+        let what = match s.role {
+            K2Role::Result => format!("the result of {}", s.method),
+            K2Role::Request => format!("the server's {} request", s.method),
+            K2Role::Notification => format!("a {} notification", s.method),
+        };
+        // The same violation in the same kind of message is named once.
+        for v in &found.first {
+            let violation = format!("{what}: {v}");
+            if named.len() < K2_NAMED && !named.iter().any(|(_, n)| *n == violation) {
+                named.push((format!("in {name} at {} ms", at.as_millis()), violation));
+            }
+        }
+    }
+    let mut unjudged = String::new();
+    if too_large > 0 {
+        unjudged += &format!(
+            "; {too_large} message(s) not judged, too large to validate within {} steps",
+            metamodel::NODE_BUDGET
+        );
+    }
+    if over_run > 0 {
+        unjudged += &format!("; {over_run} message(s) not judged, after validating took the run's {run_budget} steps");
+    }
+    if count > 0 {
+        let named: Vec<String> = named.into_iter().map(|(at, v)| format!("{at}, {v}")).collect();
+        let more = count - named.len();
+        let tail = if more > 0 { format!("; {more} more, repeating these or not named") } else { String::new() };
+        return result("all", "K2", Verdict::Fail, format!("{count} violation(s): {}{tail}", named.join("; ")));
+    }
+    let [results, requests, notifications] = validated;
+    let detail = format!(
+        "{results} result(s), {requests} server request(s) and {notifications} notification(s) were of their types{unjudged}"
+    );
+    let r = unless_unreadable(runs, cross("K2", runs, Vec::new(), &detail, true));
+    if r.verdict == Verdict::Pass && results + requests + notifications == 0 {
+        return result(
+            "all",
+            "K2",
+            Verdict::NotExercised,
+            format!("the server sent no result, request or notification the meta-model gives a type{unjudged}"),
+        );
+    }
+    r
+}
+
 fn describe_outcome(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Result(v) => format!("result {}", session::preview(v.to_string().as_bytes())),
@@ -4030,6 +4185,7 @@ mod tests {
                 j3_exercise: None,
                 unmatched: Vec::new(),
                 answered: Vec::new(),
+                answered_methods: HashMap::new(),
                 sent: Vec::new(),
                 server_requests: Vec::new(),
             }),
@@ -4255,6 +4411,131 @@ mod tests {
         loose.unsent = true;
         loose.loose = Some(Id::Str("1".into()));
         assert!(!j2_blames(&loose));
+    }
+
+    /// A run in which the server sent `messages`, the responses among them
+    /// answering requests for the methods given by their index.
+    fn k2_run(messages: Vec<Value>, methods: &[(usize, &str)]) -> [ScenarioRun; 1] {
+        let mut run = observed_run("documents", vec![], None);
+        let o = run.observed.as_mut().unwrap();
+        o.messages = messages
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (Duration::from_millis(i as u64), Message::classify(v)))
+            .collect();
+        o.answered_methods = methods.iter().map(|(i, m)| (*i, m.to_string())).collect();
+        [run]
+    }
+
+    #[test]
+    fn k2_judges_results_and_the_servers_params() {
+        let response = |result: Value| json!({"jsonrpc": "2.0", "id": 1, "result": result});
+        let log = |params: Value| json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": params});
+        let good = k2_run(
+            vec![
+                response(json!({"contents": "x"})),
+                log(json!({"type": 3, "message": "x"})),
+                json!({"jsonrpc": "2.0", "id": 7, "method": "window/workDoneProgress/create", "params": {"token": 1}}),
+            ],
+            &[(0, "textDocument/hover")],
+        );
+        let r = judge_k2(&good);
+        assert_eq!(r.verdict, Verdict::Pass, "{}", r.detail);
+        assert_eq!(r.detail, "1 result(s), 1 server request(s) and 1 notification(s) were of their types");
+        // Not judged: shutdown's result (L4's), errors (J5's), a response to
+        // a request whose method lspcheck doesn't know, methods the
+        // meta-model lacks, notifications only a client sends, and requests
+        // without a params type.
+        let unjudged = k2_run(
+            vec![
+                response(json!({})),
+                json!({"jsonrpc": "2.0", "id": 2, "error": {"code": -32601, "message": "x"}}),
+                response(json!(3)),
+                response(json!(3)),
+                json!({"jsonrpc": "2.0", "method": "lspcheck/custom", "params": 3}),
+                json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": 3}),
+                json!({"jsonrpc": "2.0", "id": 8, "method": "workspace/codeLens/refresh"}),
+            ],
+            &[(0, "shutdown"), (1, "textDocument/hover"), (3, "lspcheck/probe")],
+        );
+        let r = judge_k2(&unjudged);
+        assert_eq!(r.verdict, Verdict::NotExercised, "{}", r.detail);
+        // Absent params where the meta-model gives a type are a violation.
+        let r = judge_k2(&k2_run(vec![json!({"jsonrpc": "2.0", "method": "window/showMessage"})], &[]));
+        assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
+        assert_eq!(
+            r.detail,
+            "1 violation(s): in documents at 0 ms, a window/showMessage notification: params is missing; required: \
+             ShowMessageParams"
+        );
+    }
+
+    #[test]
+    fn k2_unreadable_frames_are_inconclusive_even_without_subjects() {
+        let log =
+            |kind| json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": kind, "message": "x"}});
+        for (messages, expected) in
+            [(vec![], Verdict::Error), (vec![log(3)], Verdict::Error), (vec![log(9)], Verdict::Fail)]
+        {
+            let mut runs = k2_run(messages, &[]);
+            runs[0]
+                .observed
+                .as_mut()
+                .unwrap()
+                .problems
+                .push((Duration::ZERO, Problem::NotJson { body: b"?".to_vec(), error: "expected value".into() }));
+            let r = judge_k2(&runs);
+            assert_eq!(r.verdict, expected, "{}", r.detail);
+            assert_eq!(judge_k2_within(&runs, 0).verdict, Verdict::Error);
+        }
+        assert_eq!(judge_k2(&k2_run(vec![], &[])).verdict, Verdict::NotExercised);
+    }
+
+    #[test]
+    fn k2_stops_validating_when_the_runs_budget_is_spent() {
+        let log = |kind: Value| json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": kind, "message": "x"}});
+        // The first message takes the whole budget; the bad second one isn't
+        // judged, which is lspcheck's limit and not a failure.
+        let runs = k2_run(vec![log(json!(3)), log(json!(9))], &[]);
+        assert_eq!(judge_k2(&runs).verdict, Verdict::Fail);
+        let spent = metamodel::validate_spending(
+            metamodel::model().server_params("window/logMessage", false).unwrap(),
+            &json!({"type": 3, "message": "x"}),
+            "params",
+            metamodel::NODE_BUDGET,
+        )
+        .1;
+        let r = judge_k2_within(&runs, spent);
+        assert_eq!(r.verdict, Verdict::Pass, "{}", r.detail);
+        assert!(
+            r.detail.ends_with(&format!("; 1 message(s) not judged, after validating took the run's {spent} steps")),
+            "{}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn k2_names_a_few_distinct_violations_and_counts_them_all() {
+        let symbols = json!([{"kind": 13}, {"name": 1, "kind": 13}]);
+        let messages = (0..7)
+            .map(|i| match i {
+                0..3 => json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 9, "message": "x"}}),
+                _ => json!({"jsonrpc": "2.0", "id": i, "result": symbols}),
+            })
+            .collect();
+        let r = judge_k2(&k2_run(messages, &[(3, "workspace/symbol"), (4, "textDocument/documentSymbol")]));
+        assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
+        // Three log messages, one workspace/symbol result and one
+        // documentSymbol result; each log message is named once.
+        assert!(
+            r.detail.starts_with("5 violation(s): in documents at 0 ms, a window/logMessage notification:"),
+            "{}",
+            r.detail
+        );
+        assert_eq!(r.detail.matches("window/logMessage").count(), 1, "{}", r.detail);
+        assert!(r.detail.contains("in documents at 3 ms, the result of workspace/symbol"), "{}", r.detail);
+        assert!(r.detail.contains("in documents at 4 ms, the result of textDocument/documentSymbol"), "{}", r.detail);
+        assert!(r.detail.ends_with("; 2 more, repeating these or not named"), "{}", r.detail);
     }
 
     #[test]

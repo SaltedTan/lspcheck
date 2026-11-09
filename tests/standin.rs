@@ -236,10 +236,10 @@ fn passes_except(run: &Run, expected: &[(&str, &str)]) {
 }
 
 /// Like [`only_fails`], for a server that sends frames lspcheck can't read
-/// (F1): such a frame might have been a response or message the correlation
-/// and envelope checks judge, so J1, J2, J5 and J7 are inconclusive.
+/// (F1): such a frame might have been a response or message the correlation,
+/// envelope and type checks judge, so J1, J2, J5, J7 and K2 are inconclusive.
 fn only_fails_unread(run: &Run, failing: &[&str]) {
-    only_fails_unread_with(run, failing, &["J1", "J2", "J5", "J7"]);
+    only_fails_unread_with(run, failing, &["J1", "J2", "J5", "J7", "K2"]);
 }
 
 fn only_fails_unread_with(run: &Run, failing: &[&str], inconclusive: &[&str]) {
@@ -293,6 +293,11 @@ fn the_clean_standin_passes_every_check() {
     // D4 passed on evidence: the closed, the never-opened and the plain
     // request were all answered.
     assert!(r.stdout.contains("all three answered"), "{}", r.stdout);
+    // K2 passed on evidence: results, the server's requests and its
+    // diagnostics were validated.
+    let k2 = &r.report["results"].as_array().unwrap().iter().find(|c| c["id"] == "K2").unwrap()["detail"];
+    let counts: Vec<u64> = k2.as_str().unwrap().split(' ').filter_map(|w| w.parse().ok()).collect();
+    assert!(counts.len() == 3 && counts.iter().all(|&n| n > 0), "{k2}");
     // D6 passed on evidence: the selectionRange replies were judged.
     assert!(
         r.stdout.contains("every range contains its position, and every parent contains its child"),
@@ -438,6 +443,8 @@ fn lawful_variations_fail_nothing() {
         "slow-large-document",
         "capability-other-error",
         "echo-positions",
+        "extra-properties",
+        "custom-folding-range-kind",
     ] {
         let r = if name == "slow-large-document" {
             run(&["--fault", name], &["--timeout", "1", "--startup-timeout", "10", "--large-document-mib", "2"])
@@ -472,6 +479,53 @@ fn lawful_variations_fail_nothing() {
         passes_except(&r, &expected);
         assert_eq!(r.status, 0, "{name}\n{}", r.stdout);
     }
+}
+
+#[test]
+fn a_hover_whose_contents_is_a_number_fails_k2() {
+    let r = fault("hover-contents-number");
+    only_fails(&r, &["K2"]);
+    assert!(
+        r.stdout.contains(
+            "the result of textDocument/hover: result is {\"contents\":3}; required: Hover | null (closest: \
+             result.contents is 3; required: MarkupContent | MarkedString | MarkedString[])"
+        ),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn an_invalid_duplicate_hover_result_fails_k2() {
+    for name in ["hover-invalid-second-result", "hover-invalid-result-after-error"] {
+        let r = fault(name);
+        only_fails(&r, &["J2", "K2"]);
+        assert!(
+            r.stdout.contains("the result of textDocument/hover: result is 3; required: Hover | null"),
+            "{}",
+            r.stdout
+        );
+    }
+}
+
+#[test]
+fn a_workspace_symbol_without_a_name_fails_k2() {
+    let r = fault("symbol-missing-name");
+    only_fails(&r, &["K2"]);
+    assert!(r.stdout.contains("the result of workspace/symbol: result is [{\"kind\":13,"), "{}", r.stdout);
+    assert!(r.stdout.contains("required: SymbolInformation[] | WorkspaceSymbol[] | null"), "{}", r.stdout);
+}
+
+#[test]
+fn a_log_message_of_a_type_lsp_doesnt_have_fails_k2() {
+    let r = fault("bad-message-type");
+    only_fails(&r, &["K2"]);
+    assert!(
+        r.stdout
+            .contains("a window/logMessage notification: params.type is 9; required: MessageType: 1 | 2 | 3 | 4 | 5"),
+        "{}",
+        r.stdout
+    );
 }
 
 #[test]
@@ -847,7 +901,7 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
 fn a_content_length_counted_in_characters_fails_f2() {
     let r = fault("char-length");
     // The frame can't be read either, so F1 fails too.
-    only_fails_unread_with(&r, &["F1", "F2"], &["J1", "J2", "J3", "J5", "J7", "R4"]);
+    only_fails_unread_with(&r, &["F1", "F2"], &["J1", "J2", "J3", "J5", "J7", "K2", "R4"]);
     assert!(r.stdout.contains("counts characters, but"), "{}", r.stdout);
     // Also with whitespace after the JSON, or an extension header before the next frame's Content-Length.
     for other in ["newline-after-body", "extension-header", "long-header"] {
@@ -1041,7 +1095,9 @@ fn bad_initialize_results_fail_l2() {
     // doesn't ask for didOpen, so all three are skipped, and it advertises no
     // document request, so D4 skips too. D6 can't clamp in the bad encoding,
     // and skips with no capabilities. K1 can't count its positions in the
-    // bad encoding either, and has no capabilities to read without them.
+    // bad encoding either, and has no capabilities to read without them. An
+    // initialize result without capabilities isn't an InitializeResult, so
+    // K2 fails it too.
     passes_except(
         &fault("bad-encoding"),
         &[
@@ -1066,6 +1122,7 @@ fn bad_initialize_results_fail_l2() {
             ("D6", "skip"),
             ("R2", "not-exercised"),
             ("K1", "not-exercised"),
+            ("K2", "fail"),
         ],
     );
 }

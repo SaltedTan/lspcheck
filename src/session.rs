@@ -342,6 +342,9 @@ pub struct Finish {
     /// Requests that were answered, with when their response was read.
     pub answered: Vec<(Duration, Id)>,
     answers: HashMap<Id, usize>,
+    /// The method of the request each matched response answered, by the
+    /// response's index in `messages`.
+    pub answered_methods: HashMap<usize, String>,
     /// Requests lspcheck sent whole, with when each was registered (just
     /// before it was written).
     pub sent: Vec<(Duration, Id)>,
@@ -427,6 +430,10 @@ pub struct Session {
     pending: HashMap<Id, Duration>,
     /// Requests answered: the index of the response in `messages`.
     answers: HashMap<Id, usize>,
+    methods: HashMap<Id, String>,
+    /// The method of the request each matched response answered, by the
+    /// response's index in `messages`.
+    answered_methods: HashMap<usize, String>,
     /// Every id a request was sent with, and when it was registered.
     used_ids: HashMap<Id, Duration>,
     /// Ids handed out by [`Session::fresh_id`], sent or not.
@@ -516,6 +523,8 @@ impl Session {
             abandoned: None,
             pending: HashMap::new(),
             answers: HashMap::new(),
+            methods: HashMap::new(),
+            answered_methods: HashMap::new(),
             used_ids: HashMap::new(),
             reserved: HashSet::new(),
             aborted: HashSet::new(),
@@ -786,7 +795,7 @@ impl Session {
         params: Option<Value>,
         deadline: Instant,
     ) -> Result<(), WriteError> {
-        self.begin_request(id, deadline).await?;
+        self.begin_request(id, method, deadline).await?;
         let result = self.send_until(&message::request(id, method, params), deadline).await;
         if result.is_err() {
             self.abort_request(id);
@@ -794,10 +803,10 @@ impl Session {
         result
     }
 
-    /// Registers a request about to be written some other way (split, with
-    /// other frames, or with extra headers), so only a later response can
-    /// answer it. If writing it fails, call [`Session::abort_request`].
-    pub async fn begin_request(&mut self, id: &Id, deadline: Instant) -> Result<(), WriteError> {
+    /// Registers a request for `method` about to be written some other way
+    /// (split, with other frames, or with extra headers), so only a later
+    /// response can answer it. If writing it fails, call [`Session::abort_request`].
+    pub async fn begin_request(&mut self, id: &Id, method: &str, deadline: Instant) -> Result<(), WriteError> {
         if self.pending.contains_key(id) {
             return Err(WriteError::DuplicateId(id.to_string()));
         }
@@ -806,15 +815,18 @@ impl Session {
         if Instant::now() >= deadline {
             return Err(WriteError::Timeout);
         }
-        self.used_ids.insert(id.clone(), self.start.elapsed());
+        let sent = self.start.elapsed();
+        self.used_ids.insert(id.clone(), sent);
         self.answers.remove(id);
-        self.pending.insert(id.clone(), self.start.elapsed());
+        self.methods.insert(id.clone(), method.to_string());
+        self.pending.insert(id.clone(), sent);
         Ok(())
     }
 
     /// Forgets a request registered with [`Session::begin_request`] that couldn't be written.
     pub fn abort_request(&mut self, id: &Id) {
         self.pending.remove(id);
+        self.methods.remove(id);
         self.aborted.insert(id.clone());
     }
 
@@ -899,6 +911,11 @@ impl Session {
             });
         }
         let Some(id) = m.response_id() else { return };
+        if self.used_ids.get(id).is_some_and(|sent| at >= *sent)
+            && let Some(method) = self.methods.get(id)
+        {
+            self.answered_methods.insert(self.messages.len() - 1, method.clone());
+        }
         match self.pending.get(id) {
             Some(&sent) if at >= sent => {
                 self.pending.remove(id);
@@ -1227,6 +1244,7 @@ impl Session {
             unmatched,
             answered: std::mem::take(&mut self.answered),
             answers: std::mem::take(&mut self.answers),
+            answered_methods: std::mem::take(&mut self.answered_methods),
             sent: {
                 let mut sent: Vec<(Duration, Id)> = self
                     .used_ids

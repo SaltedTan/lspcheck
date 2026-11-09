@@ -14,6 +14,8 @@ lifecycle, and whether it leaves processes behind. Read the [README](README.md) 
 | `src/process.rs` | Process groups, the Linux child subreaper, and the leftover-process search. |
 | `src/text.rs` | The text model: line splits, position encodings, content changes, where replies carry positions. |
 | `src/capabilities.rs` | K1: the requests advertised capabilities call for, their positions, and K1's verdict. |
+| `src/metamodel.rs` | K2: the vendored LSP 3.17 meta-model, parsed once, and validation of JSON values against its types. |
+| `vendor/lsp-3.17/` | The LSP 3.17 `metaModel.json`, unmodified (CC BY 4.0; attribution in its README). |
 | `src/documents.rs` | The documents lspcheck opens, the texts a position may refer to, and D1's judging. |
 | `src/profile.rs` | `--profile`: reading and validating the TOML, the workspace files, and merging with the flags. |
 | `src/report.rs`, `src/transcript.rs` | Reports; JSON Lines transcripts. |
