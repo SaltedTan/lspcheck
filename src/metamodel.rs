@@ -327,10 +327,7 @@ pub struct Violation<'a> {
     /// What the meta-model requires there.
     pub expected: String,
     found: Option<Found<'a>>,
-    /// A deeper violation for an unmatched union: the deepest one when one
-    /// alternative got deepest, when all the deepest alternatives agree
-    /// according to [`Self::same_place`], or when exactly one of them has
-    /// strictly fewer violations than the others.
+    /// A deeper violation selected for an unmatched union's diagnostic.
     pub closest: Option<Box<Violation<'a>>>,
 }
 
@@ -679,10 +676,9 @@ impl<'a> Validator<'a> {
 
     /// An `or`: one alternative must match. When the budget runs out, the
     /// union fails only if every alternative was established to fail; one
-    /// left undecided leaves it undecided. Its closest violation is the
-    /// deepest one when one alternative got deepest, when the alternatives
-    /// that got deepest agree, or when exactly one of them has strictly fewer
-    /// violations than the others; otherwise it names none.
+    /// left undecided leaves it undecided. Partial counts cannot select the
+    /// fewest-violation alternative: unfinished validation can understate
+    /// how broken an alternative is.
     fn union(&mut self, items: &'a [Type], value: &'a Value, expected: String) -> Checked<'a> {
         // Each alternative established to fail: its deepest violation and how
         // many violations it had.

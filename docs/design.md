@@ -465,8 +465,9 @@ or escaped in full.
   2147483647)`, …) and the value found, shortened without traversing the rest of the value. For an `or` nothing matched,
   it names the alternatives. It also names a failure deeper than the union (through nested `or`s too) when one
   alternative got deepest, when all alternatives tied for deepest agree on the full path, requirement and displayed
-  value, or when exactly one of those tied alternatives has strictly fewer violations than the others. Otherwise it
-  names no closest failure. A violation seen stands even if other frames couldn't be read.
+  value, or when exactly one of those tied alternatives has strictly fewer violations than the others and no
+  alternative's validation exhausted its budget. Partial counts cannot select the fewest-violation alternative.
+  Otherwise it names no closest failure. A violation seen stands even if other frames couldn't be read.
 - **error:** no violation was seen, but a frame couldn't be read anywhere (as for J5: it might have held a message K2
   judges), lspcheck's inspection of the output was cut short, no scenario could start the server, or lspcheck
   couldn't start the thread that validates.
