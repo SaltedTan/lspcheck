@@ -192,7 +192,17 @@ pub fn canonical_number(text: &str) -> Option<String> {
 
 /// A JSON number's value as an `i64`, if it is an integer that fits.
 pub fn integer_value(n: &serde_json::Number) -> Option<i64> {
-    let canon = canonical_number(&n.to_string())?;
+    // Most numbers are plain integers: `as_i64` parses the number's own text,
+    // so when it succeeds that is its value, without the allocations below.
+    if let Some(i) = n.as_i64() {
+        return Some(i);
+    }
+    integer_from_text(&n.to_string())
+}
+
+/// The value of the JSON number `text` as an `i64`, if it is an integer that fits.
+fn integer_from_text(text: &str) -> Option<i64> {
+    let canon = canonical_number(text)?;
     let (mantissa, exp) = canon.rsplit_once('e')?;
     let exp: u32 = exp.parse().ok()?;
     if exp > 18 {
@@ -427,6 +437,42 @@ mod tests {
             assert_eq!(integer_value(&n(zero)), Some(0), "{zero}");
         }
         assert_eq!(integer_value(&n("1e9223372036854775808")), None);
+    }
+
+    #[test]
+    fn integer_values_agree_with_the_canonical_form() {
+        // integer_value takes a shortcut for plain integers; it must give what
+        // the canonical form does for every kind of number.
+        let n = |s: &str| serde_json::from_str::<Value>(s).unwrap().as_number().cloned().unwrap();
+        for text in [
+            "0",
+            "-0",
+            "41",
+            "-41",
+            "2147483647",
+            "-2147483648",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "9223372036854775808",
+            "-9223372036854775809",
+            "18446744073709551615",
+            "41.0",
+            "41.5",
+            "4.1e1",
+            "1e2",
+            "1E2",
+            "-1e+2",
+            "100e-2",
+            "1e-2",
+            "0.0",
+            "-0e5",
+            "1e18",
+            "1e19",
+        ] {
+            assert_eq!(integer_value(&n(text)), integer_from_text(text), "{text}");
+        }
+        assert_eq!(integer_value(&n("-9223372036854775808")), Some(i64::MIN));
+        assert_eq!(integer_value(&n("9223372036854775808")), None);
     }
 
     #[test]
