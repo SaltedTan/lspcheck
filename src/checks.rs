@@ -439,7 +439,7 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
         unless_unreadable(&runs, judge_j5(&runs)),
         unless_unreadable(&runs, judge_j7(&runs)),
         judge_l9(&runs, &cfg.allowed_descendants),
-        unless_unreadable(&runs, judge_k2(&runs)),
+        judge_k2(&runs),
     ]
     .into_iter()
     .collect();
@@ -3968,7 +3968,7 @@ fn judge_k2_within(runs: &[ScenarioRun], run_budget: usize) -> CheckResult {
     let detail = format!(
         "{results} result(s), {requests} server request(s) and {notifications} notification(s) were of their types{unjudged}"
     );
-    let r = cross("K2", runs, Vec::new(), &detail, true);
+    let r = unless_unreadable(runs, cross("K2", runs, Vec::new(), &detail, true));
     if r.verdict == Verdict::Pass && results + requests + notifications == 0 {
         return result(
             "all",
@@ -4470,6 +4470,27 @@ mod tests {
             "1 violation(s): in documents at 0 ms, a window/showMessage notification: params is missing; required: \
              ShowMessageParams"
         );
+    }
+
+    #[test]
+    fn k2_unreadable_frames_are_inconclusive_even_without_subjects() {
+        let log =
+            |kind| json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": kind, "message": "x"}});
+        for (messages, expected) in
+            [(vec![], Verdict::Error), (vec![log(3)], Verdict::Error), (vec![log(9)], Verdict::Fail)]
+        {
+            let mut runs = k2_run(messages, &[]);
+            runs[0]
+                .observed
+                .as_mut()
+                .unwrap()
+                .problems
+                .push((Duration::ZERO, Problem::NotJson { body: b"?".to_vec(), error: "expected value".into() }));
+            let r = judge_k2(&runs);
+            assert_eq!(r.verdict, expected, "{}", r.detail);
+            assert_eq!(judge_k2_within(&runs, 0).verdict, Verdict::Error);
+        }
+        assert_eq!(judge_k2(&k2_run(vec![], &[])).verdict, Verdict::NotExercised);
     }
 
     #[test]

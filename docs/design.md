@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. Unreleased: [K2](#capabilities-and-robustness) validates what the server sends against the vendored LSP 3.17 meta-model, judged across every scenario. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. Unreleased: [K2](#capabilities-and-robustness) validates what the server sends against the vendored LSP 3.17 meta-model, including duplicate results, judged across every scenario. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -408,7 +408,8 @@ for LSP 3.17, vendored unmodified from microsoft/language-server-protocol under 
 [its README](../vendor/lsp-3.17/README.md)) and parsed once. What is judged:
 
 - the `result` of a success response that matches, by exact id, a request lspcheck sent for a method the meta-model
-  defines, against that request's `result` type. Error responses are J5's. `shutdown`'s result is L4's, so one bug
+  defines, against that request's `result` type, including subsequent responses with that id (J2 also judges the
+  duplication). Error responses are J5's. `shutdown`'s result is L4's, so one bug
   doesn't fail two checks;
 - the `params` of a request or notification the server sent whose method the meta-model defines for the server to
   send (direction `serverToClient` or `both`), against its `params` type. Absent `params` where the meta-model gives
@@ -420,9 +421,9 @@ aliases and properties), the replies to lspcheck's unknown-method probes, and fr
 
 A value is of a type when:
 
-- **base types:** `integer` is a JSON number written as an integer (so not `1.0` or `1e2`) from -2^31 to 2^31-1;
-  `uinteger` one from 0 to 2^31-1; `decimal` any number; `string`, `boolean` and `null` as named. `URI`, `DocumentUri`
-  and `RegExp` are strings, whose syntax isn't judged.
+- **base types:** `integer` is a whole-valued JSON number from -2^31 to 2^31-1, including decimal and exponent
+  spellings such as `41.0` and `4.1e1`; `uinteger` one from 0 to 2^31-1; `decimal` any number; `string`, `boolean`
+  and `null` as named. `URI`, `DocumentUri` and `RegExp` are strings, whose syntax isn't judged.
 - **references** name a structure, an enumeration or a type alias (the names are unique across the three).
 - **structures** and structure literals: a JSON object in which every property that isn't optional, including those
   from `extends` and `mixins` (recursively; a structure's own property replaces an inherited one of the same name), is
@@ -444,8 +445,9 @@ for the deepest values the parser accepts in a debug build too (Windows gives it
 - **fail:** at least one violation was seen. The detail gives the count and names the first five that differ, each
   with its scenario and time, the method, whether it is a result or params, a path (`result.contents.kind`), what the
   meta-model requires there (`MarkupKind: "plaintext" | "markdown"`, `Position`, `uinteger (a whole number from 0 to
-  2147483647)`, …) and the value found, shortened. For an `or` nothing matched it names the alternatives and, when one
-  of them got deeper into the value than the others (through nested `or`s too), where that one failed. A violation
+  2147483647)`, …) and the value found, shortened without traversing the rest of the value. For an `or` nothing matched
+  it names the alternatives and, when one of them got deeper into the value than the others (through nested `or`s too),
+  where that one failed. A violation
   seen stands even if other frames couldn't be read.
 - **error:** no violation was seen, but a frame couldn't be read anywhere (as for J5: it might have held a message K2
   judges), lspcheck's inspection of the output was cut short, no scenario could start the server, or lspcheck

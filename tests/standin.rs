@@ -496,6 +496,19 @@ fn a_hover_whose_contents_is_a_number_fails_k2() {
 }
 
 #[test]
+fn an_invalid_duplicate_hover_result_fails_k2() {
+    for name in ["hover-invalid-second-result", "hover-invalid-result-after-error"] {
+        let r = fault(name);
+        only_fails(&r, &["J2", "K2"]);
+        assert!(
+            r.stdout.contains("the result of textDocument/hover: result is 3; required: Hover | null"),
+            "{}",
+            r.stdout
+        );
+    }
+}
+
+#[test]
 fn a_workspace_symbol_without_a_name_fails_k2() {
     let r = fault("symbol-missing-name");
     only_fails(&r, &["K2"]);

@@ -430,7 +430,6 @@ pub struct Session {
     pending: HashMap<Id, Duration>,
     /// Requests answered: the index of the response in `messages`.
     answers: HashMap<Id, usize>,
-    /// The method of each pending request.
     methods: HashMap<Id, String>,
     /// The method of the request each matched response answered, by the
     /// response's index in `messages`.
@@ -816,10 +815,11 @@ impl Session {
         if Instant::now() >= deadline {
             return Err(WriteError::Timeout);
         }
-        self.used_ids.insert(id.clone(), self.start.elapsed());
+        let sent = self.start.elapsed();
+        self.used_ids.insert(id.clone(), sent);
         self.answers.remove(id);
         self.methods.insert(id.clone(), method.to_string());
-        self.pending.insert(id.clone(), self.start.elapsed());
+        self.pending.insert(id.clone(), sent);
         Ok(())
     }
 
@@ -911,13 +911,15 @@ impl Session {
             });
         }
         let Some(id) = m.response_id() else { return };
+        if self.used_ids.get(id).is_some_and(|sent| at >= *sent)
+            && let Some(method) = self.methods.get(id)
+        {
+            self.answered_methods.insert(self.messages.len() - 1, method.clone());
+        }
         match self.pending.get(id) {
             Some(&sent) if at >= sent => {
                 self.pending.remove(id);
                 self.answers.insert(id.clone(), self.messages.len() - 1);
-                if let Some(method) = self.methods.remove(id) {
-                    self.answered_methods.insert(self.messages.len() - 1, method);
-                }
                 self.answered.push((at, id.clone()));
             }
             _ => self.unmatched.push(self.messages.len() - 1),

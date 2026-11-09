@@ -263,6 +263,8 @@ const FAULTS: &[(&str, &str)] = &[
         "with the reply to workspace/symbol, ask for configuration and finish a log notification only after the answer",
     ),
     ("echo-positions", "lawful: say on stderr where each hover request asks, as FILE LINE:CHARACTER"),
+    ("hover-invalid-second-result", "answer hover with null, then with a number"),
+    ("hover-invalid-result-after-error", "answer hover with an error, then with a number"),
     ("hover-contents-number", "answer hover with a Hover whose contents is the number 3"),
     ("symbol-missing-name", "answer workspace/symbol with a symbol that has no name"),
     ("bad-message-type", "on initialized, send a window/logMessage with type 9, which MessageType doesn't have"),
@@ -1254,6 +1256,18 @@ fn main() {
                     }
                     queued.push_back(frame);
                 }
+            }
+            "textDocument/hover"
+                if fault("hover-invalid-second-result") || fault("hover-invalid-result-after-error") =>
+            {
+                let first = if fault("hover-invalid-result-after-error") {
+                    err(&id, -32603, "failed")
+                } else {
+                    ok(&id, Value::Null)
+                };
+                let mut bytes = out.encode(&first);
+                bytes.extend(out.encode(&ok(&id, json!(3))));
+                out.raw(&bytes);
             }
             "textDocument/hover" if fault("hover-contents-number") => out.frame(&ok(&id, json!({"contents": 3}))),
             "workspace/symbol" if fault("symbol-missing-name") => {

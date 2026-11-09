@@ -133,7 +133,7 @@ impl Base {
     fn admits(self, value: &Value) -> bool {
         match self {
             Base::Integer => integer(value).is_some_and(|n| i32::try_from(n).is_ok()),
-            Base::UInteger => integer(value).is_some_and(|n| (0..=i128::from(i32::MAX)).contains(&n)),
+            Base::UInteger => integer(value).is_some_and(|n| (0..=i64::from(i32::MAX)).contains(&n)),
             Base::Decimal => value.is_number(),
             Base::Uri | Base::DocumentUri | Base::RegExp | Base::String => value.is_string(),
             Base::Boolean => value.is_boolean(),
@@ -146,17 +146,8 @@ impl Base {
     }
 }
 
-/// A JSON number written as an integer (`1`, not `1.0` or `1e0`), as an
-/// `i128`; one too long for that saturates, which is out of LSP's ranges anyway.
-fn integer(value: &Value) -> Option<i128> {
-    let Value::Number(n) = value else { return None };
-    // With `arbitrary_precision`, a number keeps its spelling.
-    let text = n.to_string();
-    let digits = text.strip_prefix('-').unwrap_or(&text);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(text.parse().unwrap_or(if text.starts_with('-') { i128::MIN } else { i128::MAX }))
+fn integer(value: &Value) -> Option<i64> {
+    value.as_number().and_then(crate::message::integer_value)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -714,11 +705,56 @@ fn is_identifier(k: &str) -> bool {
 /// A value as JSON, cut short.
 fn shorten(value: &Value) -> String {
     const MAX: usize = 60;
-    let text = value.to_string();
-    match text.char_indices().nth(MAX) {
-        Some((i, _)) => format!("{}…", &text[..i]),
-        None => text,
+    fn push(text: &str, out: &mut String, left: &mut usize) -> Result<(), ()> {
+        for c in text.chars() {
+            *left = left.checked_sub(1).ok_or(())?;
+            out.push(c);
+        }
+        Ok(())
     }
+
+    fn quoted(text: &str, out: &mut String, left: &mut usize) -> Result<(), ()> {
+        let end = text.char_indices().nth(*left + 1).map_or(text.len(), |(i, _)| i);
+        push(&serde_json::to_string(&text[..end]).expect("a string is JSON"), out, left)
+    }
+
+    fn append(value: &Value, out: &mut String, left: &mut usize) -> Result<(), ()> {
+        match value {
+            Value::Null => push("null", out, left),
+            Value::Bool(b) => push(if *b { "true" } else { "false" }, out, left),
+            Value::Number(n) => push(n.as_str(), out, left),
+            Value::String(s) => quoted(s, out, left),
+            Value::Array(items) => {
+                push("[", out, left)?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        push(",", out, left)?;
+                    }
+                    append(item, out, left)?;
+                }
+                push("]", out, left)
+            }
+            Value::Object(entries) => {
+                push("{", out, left)?;
+                for (i, (key, value)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        push(",", out, left)?;
+                    }
+                    quoted(key, out, left)?;
+                    push(":", out, left)?;
+                    append(value, out, left)?;
+                }
+                push("}", out, left)
+            }
+        }
+    }
+
+    let mut out = String::new();
+    let mut left = MAX;
+    if append(value, &mut out, &mut left).is_err() {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -915,7 +951,7 @@ mod tests {
         let negative = invalid(&p, json!({"line": -1, "character": 0}));
         assert_eq!(negative, "result.line is -1; required: uinteger (a whole number from 0 to 2147483647)");
         let float: Value = serde_json::from_str(r#"{"line": 1.0, "character": 0}"#).unwrap();
-        assert!(invalid(&p, float).starts_with("result.line is 1.0;"));
+        valid(&p, float);
         assert_eq!(invalid(&p, json!({"line": 0})), "result.character is missing; required: uinteger");
         assert_eq!(invalid(&p, json!([0, 0])), "result is [0,0]; required: Position");
         assert_eq!(check(&p, json!({})).len(), 2);
@@ -978,6 +1014,9 @@ mod tests {
         let message_type = reference("MessageType");
         valid(&message_type, json!(1));
         valid(&message_type, json!(4));
+        valid(&message_type, serde_json::from_str("4.0").unwrap());
+        valid(&message_type, serde_json::from_str("40e-1").unwrap());
+        invalid(&message_type, serde_json::from_str("4.00000000000000000001").unwrap());
         assert!(invalid(&message_type, json!(9)).starts_with("result is 9; required: MessageType: 1 | 2 | 3 | 4"));
         invalid(&message_type, json!("1"));
         let kind = reference("FoldingRangeKind");
@@ -1004,11 +1043,66 @@ mod tests {
         invalid(&uint, json!(-1));
         invalid(&uint, json!(2147483648_i64));
         let spelled = |s: &str| serde_json::from_str::<Value>(s).unwrap();
-        invalid(&int, spelled("1.0"));
-        invalid(&int, spelled("1e2"));
+        for text in ["1.0", "1e2", "4.1e1", "2147483647.0", "21474836470e-1", "-0.0"] {
+            valid(&int, spelled(text));
+            valid(&uint, spelled(text));
+        }
+        valid(&int, spelled("-2.147483648e9"));
+        for text in ["41.5", "41.00000000000000000001", "1e-999", "2147483647.000000001", "1e999"] {
+            invalid(&int, spelled(text));
+            invalid(&uint, spelled(text));
+        }
+        invalid(&int, spelled("-2147483648.000000001"));
+        invalid(&uint, spelled("-0.000000001"));
         invalid(&int, spelled("123456789012345678901234567890123456789012345"));
         valid(&Type::Base { name: Base::Decimal }, spelled("1.5e3"));
         invalid(&Type::Base { name: Base::Decimal }, json!("1"));
+    }
+
+    #[test]
+    fn diagnostics_versions_use_exact_numeric_values() {
+        let ty = reference("PublishDiagnosticsParams");
+        for version in ["41", "41.0", "4.1e1"] {
+            valid(
+                &ty,
+                serde_json::from_str(&format!(r#"{{"uri":"file:///a","diagnostics":[],"version":{version}}}"#))
+                    .unwrap(),
+            );
+        }
+        invalid(
+            &ty,
+            serde_json::from_str(r#"{"uri":"file:///a","diagnostics":[],"version":41.00000000000000000001}"#).unwrap(),
+        );
+    }
+
+    #[test]
+    fn previews_keep_a_json_prefix() {
+        for size in 0..=65 {
+            for value in [
+                json!("é😀\n\"\\\u{0001}".repeat(size)),
+                json!({"é\n": [true, null, {"key": "x".repeat(size)}]}),
+                json!(vec![0; size]),
+            ] {
+                let json = value.to_string();
+                let expected: String = json.chars().take(60).collect();
+                let tail = if json.chars().count() > 60 { "…" } else { "" };
+                assert_eq!(shorten(&value), format!("{expected}{tail}"));
+            }
+        }
+    }
+
+    #[test]
+    fn previews_of_deep_large_values_are_bounded() {
+        on_validation_stack(|| {
+            let mut value = json!("x".repeat(8 * 1024 * 1024));
+            assert_eq!(shorten(&value), format!("\"{}…", "x".repeat(59)));
+            for _ in 0..100 {
+                value = Value::Array(vec![value]);
+            }
+            assert_eq!(shorten(&value), format!("{}…", "[".repeat(60)));
+            assert!(validate(&reference("LSPAny"), &value, "params").unwrap().is_empty());
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1103,7 +1197,10 @@ mod tests {
     fn literals() {
         let integer: Type = serde_json::from_value(json!({"kind": "integerLiteral", "value": 3})).unwrap();
         valid(&integer, json!(3));
-        invalid(&integer, serde_json::from_str("3.0").unwrap());
+        valid(&integer, serde_json::from_str("3.0").unwrap());
+        valid(&integer, serde_json::from_str("30e-1").unwrap());
+        invalid(&integer, serde_json::from_str("3.00000000000000000001").unwrap());
+        invalid(&integer, json!(4));
         let boolean: Type = serde_json::from_value(json!({"kind": "booleanLiteral", "value": true})).unwrap();
         valid(&boolean, json!(true));
         invalid(&boolean, json!(false));
