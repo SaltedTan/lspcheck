@@ -1,0 +1,2 @@
+# The vendored meta-model is kept byte for byte; its digest is tested.
+vendor/lsp-3.17/metaModel.json -text

@@ -5,6 +5,11 @@
 ### Added
 
 - A [stock-server CI matrix](ci/stock-servers/README.md) for regression coverage against real language servers.
+- K2 (`MUST`) validates what the server sends against the LSP 3.17 meta-model, across every scenario: the result of
+  each request lspcheck sent (except `shutdown`, which L4 judges), and the params of the server's own requests and
+  notifications. Extra properties are lawful; proposed definitions aren't judged. A failure names the path, what the
+  meta-model requires there and the value found. The meta-model is vendored unmodified in `vendor/lsp-3.17/` under
+  CC BY 4.0.
 
 ## 0.2.0 (2026-11-09)
 

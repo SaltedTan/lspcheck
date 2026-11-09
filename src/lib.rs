@@ -11,6 +11,7 @@ pub mod capabilities;
 pub mod checks;
 pub mod documents;
 pub mod message;
+pub mod metamodel;
 pub mod process;
 pub mod profile;
 pub mod replay;

@@ -263,6 +263,18 @@ const FAULTS: &[(&str, &str)] = &[
         "with the reply to workspace/symbol, ask for configuration and finish a log notification only after the answer",
     ),
     ("echo-positions", "lawful: say on stderr where each hover request asks, as FILE LINE:CHARACTER"),
+    ("hover-contents-number", "answer hover with a Hover whose contents is the number 3"),
+    ("symbol-missing-name", "answer workspace/symbol with a symbol that has no name"),
+    ("bad-message-type", "on initialized, send a window/logMessage with type 9, which MessageType doesn't have"),
+    (
+        "extra-properties",
+        "lawful: add a property LSP doesn't define to every result and params object, and to each object in an array \
+         result",
+    ),
+    (
+        "custom-folding-range-kind",
+        "lawful: give folding ranges the kind \"lspcheck.custom\" (custom kinds are allowed)",
+    ),
     ("needs-init-option", "refuse to initialize unless initializationOptions has standin = \"ready\""),
     (
         "needs-workspace-file",
@@ -705,6 +717,9 @@ fn main() {
                     }
                     queued.push_back(frame);
                 }
+            }
+            if method == "initialized" && fault("bad-message-type") {
+                out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 9, "message": "no such type"}}));
             }
             if method == "initialized" && fault("register-other") {
                 // A dynamic registration of a method D3 doesn't depend on;
@@ -1240,6 +1255,12 @@ fn main() {
                     queued.push_back(frame);
                 }
             }
+            "textDocument/hover" if fault("hover-contents-number") => out.frame(&ok(&id, json!({"contents": 3}))),
+            "workspace/symbol" if fault("symbol-missing-name") => {
+                // Otherwise a whole SymbolInformation, in a document lspcheck never opens.
+                let symbol = json!({"kind": 13, "location": {"uri": ELSEWHERE, "range": range(0, 0, 0, 1)}});
+                out.frame(&ok(&id, json!([symbol])));
+            }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
             "textDocument/documentSymbol"
             | "textDocument/foldingRange"
@@ -1528,7 +1549,11 @@ fn document_answer(
             if last == 0 {
                 return json!([]);
             }
-            json!([{"startLine": 0, "startCharacter": units.of(lines[0]), "endLine": last, "endCharacter": units.of(lines[last])}])
+            let mut folding = json!({"startLine": 0, "startCharacter": units.of(lines[0]), "endLine": last, "endCharacter": units.of(lines[last])});
+            if fault("custom-folding-range-kind") {
+                folding["kind"] = json!("lspcheck.custom");
+            }
+            json!([folding])
         }
         "textDocument/documentHighlight" => match word_at(at(&params["position"])) {
             Some((_, _, _, word)) => words
@@ -1852,6 +1877,20 @@ impl<W: Write> Writer<W> {
             && v.get("method").is_none()
         {
             v["id"] = serde_json::from_str(&format!("{n}.0")).unwrap();
+        }
+        if fault("extra-properties") {
+            let extra = |o: &mut Value| {
+                if let Some(o) = o.as_object_mut() {
+                    o.insert("lspcheckExtra".into(), json!({"standin": true}));
+                }
+            };
+            for key in ["result", "params"] {
+                match v.get_mut(key) {
+                    Some(Value::Array(items)) => items.iter_mut().for_each(extra),
+                    Some(o) => extra(o),
+                    None => {}
+                }
+            }
         }
         let mut body = serde_json::to_vec(&v).unwrap();
         if fault("ascii-escape") {

@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 across every scenario whose input is well formed (except the deliberately malformed `not-json` scenario). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. Unreleased: [K2](#capabilities-and-robustness) validates what the server sends against the vendored LSP 3.17 meta-model, judged across every scenario. M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.1.0 release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -312,7 +312,7 @@ a document request is advertised.
 | ID | Basis | Check |
 |---|---|---|
 | K1 | MUST | A request the server advertises, sent with valid parameters about an open document, isn't answered with MethodNotFound (-32601). |
-| K2 | MUST | Replies validate against the LSP 3.17 metaModel (vendored, CC BY 4.0 attribution). Planned; see [milestones](#milestones). |
+| K2 | MUST | What the server sends validates against the LSP 3.17 [meta-model](../vendor/lsp-3.17/README.md): results of requests, and the params of its own requests and notifications. |
 | R1 | POLICY | A well-framed body that isn't JSON gets ParseError `-32700` with id `null` or is ignored, and the server keeps serving. |
 | R2 | POLICY | A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving. |
 | R3 | POLICY | A large document (default 4 MiB, configurable) is accepted or refused without the server failing, and it keeps serving. |
@@ -402,6 +402,58 @@ remaining requests in a single `not sent after that` note.
 
 Responses to K1's requests are judged by J1, J2 and J5 like any other, and the scenario's input is all well formed,
 so it is included in J3. K1 judges only the error code, never a result's content.
+
+K2 is judged across every scenario, like J5, over every message lspcheck read. Its types come from `metaModel.json`
+for LSP 3.17, vendored unmodified from microsoft/language-server-protocol under CC BY 4.0 (see
+[its README](../vendor/lsp-3.17/README.md)) and parsed once. What is judged:
+
+- the `result` of a success response that matches, by exact id, a request lspcheck sent for a method the meta-model
+  defines, against that request's `result` type. Error responses are J5's. `shutdown`'s result is L4's, so one bug
+  doesn't fail two checks;
+- the `params` of a request or notification the server sent whose method the meta-model defines for the server to
+  send (direction `serverToClient` or `both`), against its `params` type. Absent `params` where the meta-model gives
+  them a type are a violation (an absent value isn't of that type); where it gives none, `params` aren't judged.
+
+Not judged: methods the meta-model doesn't have (custom methods, and `$/` methods other than `$/cancelRequest`,
+`$/progress`, `$/logTrace` and `$/setTrace`), definitions marked `proposed` (requests, structures, enumerations, type
+aliases and properties), the replies to lspcheck's unknown-method probes, and frames lspcheck couldn't read (F1's).
+
+A value is of a type when:
+
+- **base types:** `integer` is a JSON number written as an integer (so not `1.0` or `1e2`) from -2^31 to 2^31-1;
+  `uinteger` one from 0 to 2^31-1; `decimal` any number; `string`, `boolean` and `null` as named. `URI`, `DocumentUri`
+  and `RegExp` are strings, whose syntax isn't judged.
+- **references** name a structure, an enumeration or a type alias (the names are unique across the three).
+- **structures** and structure literals: a JSON object in which every property that isn't optional, including those
+  from `extends` and `mixins` (recursively; a structure's own property replaces an inherited one of the same name), is
+  present and of its type. An optional property may be absent, but if present must be of its type, so `null` is a
+  violation unless the type admits `null`. Properties the type doesn't name are lawful (LSP is structurally typed, and
+  servers add extensions).
+- **enumerations:** the value has the enumeration's base type and is one of its values, or any value of that type when
+  the enumeration `supportsCustomValues` (such as `CodeActionKind` and `FoldingRangeKind`).
+- **arrays:** every item is of the element type; **tuples:** exactly as many items as types, each of its type;
+  **maps:** a JSON object whose values are of the value type (keys are JSON strings, so a key is judged only when the
+  key type is a string enumeration); **and:** every type; **or:** at least one; **string, integer and boolean
+  literals:** exactly that value.
+
+The work is bounded: a message that would take more than 5,000,000 (value, type) steps to validate isn't judged, and
+is counted in the detail; that is lspcheck's limit, not a protocol rule, so it never fails K2. Nesting is bounded by the
+JSON parser's limit (values nested 128 deep aren't read), and validation runs on a thread with a 64 MiB stack, enough
+for the deepest values the parser accepts in a debug build too (Windows gives its main thread only 1 MiB).
+
+- **fail:** at least one violation was seen. The detail gives the count and names the first five that differ, each
+  with its scenario and time, the method, whether it is a result or params, a path (`result.contents.kind`), what the
+  meta-model requires there (`MarkupKind: "plaintext" | "markdown"`, `Position`, `uinteger (a whole number from 0 to
+  2147483647)`, …) and the value found, shortened. For an `or` nothing matched it names the alternatives and, when one
+  of them got deeper into the value than the others (through nested `or`s too), where that one failed. A violation
+  seen stands even if other frames couldn't be read.
+- **error:** no violation was seen, but a frame couldn't be read anywhere (as for J5: it might have held a message K2
+  judges), lspcheck's inspection of the output was cut short, no scenario could start the server, or lspcheck
+  couldn't start the thread that validates.
+- **not-exercised:** nothing was judged: the server sent no result, request or notification the meta-model gives a
+  type (the detail counts messages too large to judge).
+- **pass:** otherwise. The detail counts the results, server requests and notifications validated, and any not judged
+  for their size.
 
 R1 runs in `not-json` after initialization. It writes one complete frame whose body is not JSON, then sends a plain
 request. An ignored body is lawful. The body has no id, so only a response with `id: null` can answer it: one
@@ -576,6 +628,8 @@ Single crate, `src/` modules:
   has its own timeouts and a bounded cleanup. After a write stops partway through a frame, lspcheck sends nothing more.
 - `checks`: one module per area; each check declares id, basis, spec link, and a function over a `Session`.
 - `capabilities`: K1's request table, positions and verdict, as pure functions.
+- `metamodel`: the vendored LSP 3.17 meta-model, parsed once into typed structures, and K2's validation of JSON values
+  against its types, as pure functions.
 - `profile`: reads and validates a profile (`toml` with `serde`'s `deny_unknown_fields`), copies its files into each
   scenario's workspace, and merges its command and timeouts with the command line's.
 - `report`, `cli` (clap).
@@ -603,7 +657,8 @@ No network access at runtime.
   maintainer's token.
 - **M4** dogfood in virgil-lsp: a pinned binary download in CI (a dependency + workflow change, so a human merge there).
   Done: virgil-lsp's `lspcheck-linux` job checks its freshly built server with the pinned v0.1.0 release.
-- Later: K2 metaModel validation; language profiles with seeded source mutation and recovery oracles, ported from
+- Unreleased: K2 meta-model validation.
+- Later: language profiles with seeded source mutation and recovery oracles, ported from
   `test/protocol/source_mutations.py`.
 
 ## Open questions

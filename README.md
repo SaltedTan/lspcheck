@@ -3,7 +3,8 @@
 lspcheck starts a language server and checks that it speaks the
 [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) correctly. It checks message
 framing, JSON-RPC replies, the initialize/shutdown/exit lifecycle, document positions, request parameter handling,
-malformed JSON and large-document robustness, unusual request ids, and whether the server leaves processes behind. It
+malformed JSON and large-document robustness, unusual request ids, whether what the server sends has the types the LSP
+meta-model gives it, and whether the server leaves processes behind. It
 works with any server that talks over stdio, whatever language it is written in, and needs no configuration; an
 optional [profile](#profiles) gives a server the project files and settings it needs.
 
@@ -73,9 +74,9 @@ lspcheck 0.2.0 — basedpyright-langserver --stdio
 ```
 
 lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions,
-advertised capabilities, and parameter, malformed-body, large-document and request-id robustness.
-The [capabilities and robustness reference](docs/design.md#capabilities-and-robustness) explains the K1 and R checks'
-verdict rules.
+advertised capabilities, message types, and parameter, malformed-body, large-document and request-id robustness.
+The [capabilities and robustness reference](docs/design.md#capabilities-and-robustness) explains the K1, K2 and R
+checks' verdict rules.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
@@ -160,7 +161,8 @@ transcript references.
 lspcheck runs the server several times, once per scenario, each time with a fresh temporary workspace as its working
 directory: empty, or holding a [profile](#profiles)'s files. A server path with a directory part, such as `./my-server`,
 is resolved before that; a bare name is looked up on `PATH`. The checks on the server's output (F1, F2, F8) and on
-leftover processes (L9) are judged across every scenario, as are the JSON-RPC correlation checks J1, J2, J5 and J7.
+leftover processes (L9) are judged across every scenario, as are the JSON-RPC correlation checks J1, J2, J5 and J7, and
+K2.
 
 The JSON-RPC scenario writes four requests, with numeric and string ids, before reading any reply (J6), and then sends
 unknown notifications followed by probes to show that a notification gets no response (J3). A reply whose id only
@@ -228,6 +230,12 @@ K1 checks that the server handles what it advertises: it opens a document (a pro
 [`[document]`](#profiles), or a plain-text one of lspcheck's own) and probes advertised methods without judging the
 content of their results. See the [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage,
 MethodNotFound failures, late and duplicate replies, and details naming unanswered and undeliverable requests.
+
+K2 checks the types of what the server sends against the LSP 3.17 meta-model: the result of each request lspcheck
+sent (except `shutdown`, which L4 judges) and the params of the server's own requests and notifications. Properties
+the meta-model doesn't name are lawful, and proposed definitions aren't judged. A failure names where the value is
+(`result.contents`), what the meta-model requires there and what was found. See the
+[K2 reference](docs/design.md#capabilities-and-robustness) for the validation rules.
 
 R1 checks continued service after malformed JSON; R3 checks it after opening a large document.
 If a follow-up request fails, both checks wait up to `--exit-timeout` for an unprompted server exit before judging it.
@@ -409,3 +417,7 @@ The [stock-server CI matrix](ci/stock-servers/README.md) adds regression coverag
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+K2 validates against the LSP 3.17 meta-model (`vendor/lsp-3.17/metaModel.json`), © Microsoft Corporation, which is
+licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) and included unmodified; see
+[its README](vendor/lsp-3.17/README.md) for the source.
