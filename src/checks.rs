@@ -6,9 +6,9 @@
 //! A scenario is one server process driven through one script. Most checks
 //! belong to one scenario; the cross-cutting ones ([`CROSS_CUTTING`]) are
 //! judged from what every scenario observed. A check that couldn't be reached
-//! gets `error` or `not-exercised`, never `pass`, and a failure seen after
-//! lspcheck hit one of its own inspection limits is reported as an error,
-//! because the missing evidence might explain it.
+//! gets `error` or `not-exercised`, never `pass`. Incomplete evidence makes a
+//! missing reply inconclusive when it could have held that reply; a rule
+//! lspcheck directly saw broken remains a failure.
 
 use crate::capabilities::{self, Judgement, Spot};
 use crate::documents::{self, Change, OpenDoc, Published, Source, SyncKind, Version};
@@ -3875,15 +3875,13 @@ struct K2Subject<'m> {
 /// How many violations K2's detail names.
 const K2_NAMED: usize = 5;
 
-/// K2: every result of a request lspcheck sent, and the params of every
-/// request and notification the server sent, that the meta-model gives a type
-/// is of that type. Seen violations stand whatever else couldn't be read.
 /// Why K2 didn't judge a message; lspcheck's limits, never a failure.
 enum Unjudged {
     TooLarge,
     RunBudget,
 }
 
+/// K2's coverage and verdict rules: `docs/design.md#capabilities-and-robustness`.
 fn judge_k2(runs: &[ScenarioRun]) -> CheckResult {
     judge_k2_within(runs, metamodel::RUN_BUDGET)
 }

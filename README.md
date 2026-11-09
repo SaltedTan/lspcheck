@@ -78,8 +78,7 @@ lspcheck 0.2.0 — basedpyright-langserver --stdio
 lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions,
 advertised capabilities, message types, and parameter, malformed-body, large-document and request-id robustness.
 The [capabilities and robustness reference](docs/design.md#capabilities-and-robustness) explains the K1, K2 and R
-checks' verdict rules. K2 includes duplicate results, accepts whole-valued numbers such as `41.0`, and reports
-unreadable output as inconclusive when it saw no violation. Diagnostic paths and values use bounded previews.
+checks' verdict rules.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
@@ -234,12 +233,10 @@ K1 checks that the server handles what it advertises: it opens a document (a pro
 content of their results. See the [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage,
 MethodNotFound failures, late and duplicate replies, and details naming unanswered and undeliverable requests.
 
-K2 checks the types of what the server sends against the LSP 3.17 meta-model: the result of each request lspcheck
-sent (except `shutdown`, which L4 judges) and the params of the server's own requests and notifications. Properties
-the meta-model doesn't name are lawful, and proposed definitions aren't judged. A failure names where the value is
-(`result.contents`), what the meta-model requires there and what was found. See the
-[K2 reference](docs/design.md#capabilities-and-robustness) for the validation rules. Validation runs only when K2 is
-selected and not skipped by the profile.
+K2 checks server message types against the LSP 3.17 meta-model: results of known requests lspcheck sent, and params
+of known server-to-client requests and notifications. A failure names where the value is (`result.contents`), what
+the meta-model requires there and what was found. See the [K2 reference](docs/design.md#capabilities-and-robustness)
+for coverage, validation rules and inspection limits.
 
 R1 checks continued service after malformed JSON; R3 checks it after opening a large document.
 If a follow-up request fails, both checks wait up to `--exit-timeout` for an unprompted server exit before judging it.

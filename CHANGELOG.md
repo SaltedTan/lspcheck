@@ -5,13 +5,9 @@
 ### Added
 
 - A [stock-server CI matrix](ci/stock-servers/README.md) for regression coverage against real language servers.
-- K2 (`MUST`) validates what the server sends against the LSP 3.17 meta-model, across every scenario: the result of
-  each request lspcheck sent (except `shutdown`, which L4 judges), and the params of the server's own requests and
-  notifications. Extra properties are lawful; proposed definitions aren't judged. A failure names the path, what the
-  meta-model requires there and the value found. The meta-model is vendored unmodified in `vendor/lsp-3.17/` under
-  CC BY 4.0. Duplicate results are validated too; whole-valued decimal and exponent numbers are accepted. Unreadable
-  frames make K2 inconclusive even when nothing could be validated, and diagnostic paths and value previews use
-  bounded work only when displayed. K2 validation runs only when selected and not skipped by the profile.
+- K2 (`MUST`) checks server message types against the LSP 3.17 meta-model across every scenario; see the
+  [K2 reference](docs/design.md#capabilities-and-robustness) for coverage and verdict rules. The meta-model is
+  [vendored unmodified under CC BY 4.0](vendor/lsp-3.17/README.md).
 
 ## 0.2.0 (2026-11-09)
 

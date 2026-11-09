@@ -416,9 +416,9 @@ for LSP 3.17, vendored unmodified from microsoft/language-server-protocol under 
   send (direction `serverToClient` or `both`), against its `params` type. Absent `params` where the meta-model gives
   them a type are a violation (an absent value isn't of that type); where it gives none, `params` aren't judged.
 
-Not judged: methods the meta-model doesn't have (custom methods, and `$/` methods other than `$/cancelRequest`,
-`$/progress`, `$/logTrace` and `$/setTrace`), definitions marked `proposed` (requests, structures, enumerations, type
-aliases and properties), the replies to lspcheck's unknown-method probes, and frames lspcheck couldn't read (F1's).
+Not judged: methods the meta-model doesn't have (including custom methods), definitions marked `proposed`
+(requests, notifications, structures, enumerations, type aliases and properties), the replies to lspcheck's
+unknown-method probes, and frames lspcheck couldn't read (F1's).
 
 A value is of a type when:
 
@@ -438,12 +438,13 @@ A value is of a type when:
   key type is a string enumeration); **and:** every type; **or:** at least one; **string, integer and boolean
   literals:** exactly that value.
 
-The work is bounded: a message that would take more than 5,000,000 (value, type) steps to validate isn't judged, and
-is counted in the detail; that is lspcheck's limit, not a protocol rule, so it never fails K2. Nesting is bounded by the
+The work is bounded: validation allows 5,000,000 (value, type) steps per message and 50,000,000 across the run. A
+message that exceeds either remaining budget isn't judged; the detail counts per-message and per-run exclusions
+separately. These are lspcheck's limits, not protocol rules, so they never fail K2. Nesting is bounded by the
 JSON parser's limit (values nested 128 deep aren't read), and validation runs on a thread with a 64 MiB stack, enough
 for the deepest values the parser accepts in a debug build too (Windows gives its main thread only 1 MiB).
-Diagnostic paths and values are formatted only when displayed, each as at most 60 characters followed by `…` when
-shortened. Paths inspect bounded key prefixes, so even a large key in a discarded union alternative is never copied
+Diagnostic paths and value previews are each at most 60 characters followed by `…` when shortened. Paths inspect
+bounded key prefixes, so even a large key in a discarded union alternative is never copied
 or escaped in full.
 
 - **fail:** at least one violation was seen. The detail gives the count and names the first five that differ, each
@@ -456,10 +457,10 @@ or escaped in full.
 - **error:** no violation was seen, but a frame couldn't be read anywhere (as for J5: it might have held a message K2
   judges), lspcheck's inspection of the output was cut short, no scenario could start the server, or lspcheck
   couldn't start the thread that validates.
-- **not-exercised:** nothing was judged: the server sent no result, request or notification the meta-model gives a
-  type (the detail counts messages too large to judge).
+- **not-exercised:** nothing was validated: the server sent no in-scope typed value, or every such value exceeded a
+  validation budget (the detail counts these exclusions).
 - **pass:** otherwise. The detail counts the results, server requests and notifications validated, and any not judged
-  for their size.
+  because of a validation budget.
 
 R1 runs in `not-json` after initialization. It writes one complete frame whose body is not JSON, then sends a plain
 request. An ignored body is lawful. The body has no id, so only a response with `id: null` can answer it: one
