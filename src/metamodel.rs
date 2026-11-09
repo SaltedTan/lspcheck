@@ -720,7 +720,7 @@ impl<'a> Validator<'a> {
             // arbitrary.
             if tied.windows(2).all(|pair| pair[0].0.same_place(&pair[1].0)) {
                 v.closest = tied.first().map(|(d, _)| Box::new((*d).clone()));
-            } else if let Some(d) = fewest(&tied) {
+            } else if !exhausted && let Some(d) = fewest(&tied) {
                 v.closest = Some(Box::new(d.clone()));
             }
         }
@@ -1172,6 +1172,29 @@ mod tests {
         };
         let found = invalid(&ty, json!({"a": "x", "b": "y"}));
         assert!(!found.contains("closest:"), "{found}");
+    }
+
+    #[test]
+    fn union_alternatives_with_incomplete_counts_do_not_name_the_fewest() {
+        let params = model().server_params("workspace/applyEdit", true).unwrap();
+        let value = json!({"edit": {"documentChanges": [{"kind": "oops", "uri": true, "options": true}]}});
+        assert_eq!(validate_spending(params, &value, "params", 13), (Err(TooLarge), 13));
+        for budget in [14, 15] {
+            let (found, spent) = validate_spending(params, &value, "params", budget);
+            let found = found.unwrap();
+            assert_eq!(spent, budget);
+            assert_eq!(found.count, 1);
+            assert_eq!(found.first[0].path(), "params.edit.documentChanges[0]");
+            assert!(found.first[0].closest.is_none(), "{}", found.first[0]);
+        }
+        let (found, spent) = validate_spending(params, &value, "params", 16);
+        let found = found.unwrap();
+        assert_eq!(spent, 16);
+        assert_eq!(found.count, 1);
+        assert_eq!(
+            found.first[0].closest.as_ref().unwrap().to_string(),
+            "params.edit.documentChanges[0].textDocument is missing; required: OptionalVersionedTextDocumentIdentifier"
+        );
     }
 
     #[test]
