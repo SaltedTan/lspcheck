@@ -1,11 +1,11 @@
 # Stock-server verdicts
 
 The [stock-servers workflow](../../.github/workflows/stock-servers.yml) builds lspcheck from the commit under test and
-runs it against pinned releases of gopls, rust-analyzer, lua-language-server and basedpyright, each with its
-[example profile](../../examples/profiles/). Each `<server>.verdicts` file here lists the verdicts the workflow allows
-for every check, one `ID verdict` line per check in catalogue order. The comparison succeeds when the verdicts match,
-whatever they are, and fails on any difference, showing it as a diff ([`compare`](compare) does the comparison).
-An unreadable or malformed report also fails the job.
+runs it against pinned releases of gopls, rust-analyzer, lua-language-server, basedpyright, clangd, marksman, ruff,
+texlab, zls, terraform-ls and lemminx, each with its [example profile](../../examples/profiles/). Each
+`<server>.verdicts` file here lists the verdicts the workflow allows for every check, one `ID verdict` line per check
+in catalogue order. The comparison succeeds when the verdicts match, whatever they are, and fails on any difference,
+showing it as a diff ([`compare`](compare) does the comparison). An unreadable or malformed report also fails the job.
 
 Each matrix job first runs [`test_compare.py`](test_compare.py); a test failure stops the job before the comparator
 is used.
