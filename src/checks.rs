@@ -14,6 +14,7 @@ use crate::capabilities::{self, Judgement, Spot};
 use crate::documents::{self, Change, OpenDoc, Published, Source, SyncKind, Version};
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::metamodel::{self, TooLarge};
+use crate::mutation;
 use crate::process::{Coverage, ProcInfo, ServerCommand};
 use crate::profile::{self, Skip};
 use crate::session::{
@@ -347,6 +348,8 @@ pub struct Config {
     pub skip: Vec<Skip>,
     /// The profile's document for K1, instead of lspcheck's own.
     pub document: Option<profile::Document>,
+    /// With `--mutate`, the mutation scenario's settings, its seed chosen.
+    pub mutation: Option<profile::Mutation>,
 }
 
 /// The files lspcheck writes into a scenario's workspace, and the one it
@@ -411,6 +414,22 @@ pub struct ScenarioRun {
     pub observed: Option<Observations>,
     /// Where its transcript was written, if it was.
     pub transcript: Option<PathBuf>,
+    /// What the mutation scenario ran, when this is it.
+    pub mutation: Option<MutationSummary>,
+}
+
+/// What a mutation run did, for the report.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MutationSummary {
+    pub seed: u64,
+    /// The planner's [`mutation::FORMAT`]: a seed reproduces its plan under the same one.
+    pub format: u32,
+    /// The cases asked for.
+    pub cases: u64,
+    /// The cases that started.
+    pub cases_run: u64,
+    /// Why no further case started, when the run stopped before `cases`.
+    pub stopped: Option<String>,
 }
 
 /// A scenario's name and the checks it alone reports.
@@ -439,11 +458,15 @@ pub const SCENARIOS: &[Scenario] = &[
 ];
 
 /// The opt-in scenario that mutates the profile's source
-/// ([design](../docs/source-mutations.md)). It isn't implemented yet, so its
-/// checks are always reported `SKIP`.
+/// ([design](../docs/source-mutations.md)), run only with `--mutate`.
 pub const MUTATION: &str = "mutation";
-/// Why M1 to M3 are skipped.
-pub const MUTATION_OFF: &str = "mutation is off: the scenario that mutates source isn't implemented yet";
+/// Why M1 to M3 are skipped without `--mutate`.
+pub const MUTATION_OFF: &str = "mutation is off; pass --mutate";
+/// Why M1 to M3 are skipped with nothing to mutate.
+pub const NO_SEED_FILE: &str =
+    "no seed file: the profile names none in [mutation].files and has no [document] to mutate";
+/// Why M3 is skipped while recovery isn't judged.
+pub const M3_LATER: &str = "lspcheck doesn't judge recovery yet; M3's probes are a later step";
 
 /// Runs the scenarios needed for `selected` (every check when empty) and
 /// returns them with cross-cutting verdicts appended as a final "all" run.
@@ -458,14 +481,23 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
     let mut runs = Vec::new();
     for s in SCENARIOS {
         if s.name == MUTATION {
-            // Opt-in, so cross-cutting checks never start it.
-            if s.checks.iter().any(|c| judges(c)) {
-                runs.push(ScenarioRun {
+            // Opt-in: without --mutate, cross-cutting checks never start it.
+            let skip = match &cfg.mutation {
+                None => Some(MUTATION_OFF),
+                Some(m) if m.seeds.is_empty() => Some(NO_SEED_FILE),
+                Some(_) => None,
+            };
+            match skip {
+                Some(why) if s.checks.iter().any(|c| judges(c)) => runs.push(ScenarioRun {
                     name: s.name,
-                    results: s.checks.iter().map(|id| result(s.name, id, Verdict::Skip, MUTATION_OFF)).collect(),
+                    results: s.checks.iter().map(|id| result(s.name, id, Verdict::Skip, why)).collect(),
                     observed: None,
                     transcript: None,
-                });
+                    mutation: None,
+                }),
+                Some(_) => {}
+                None if any_cross || s.checks.iter().any(|c| judges(c)) => runs.push(run_scenario(s, cfg).await?),
+                None => {}
             }
         } else if any_cross || s.checks.iter().any(|c| judges(c)) {
             runs.push(run_scenario(s, cfg).await?);
@@ -485,7 +517,7 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
     .into_iter()
     .chain(judges("K2").then(|| judge_k2(&runs)))
     .collect();
-    runs.push(ScenarioRun { name: "all", results: cross, observed: None, transcript: None });
+    runs.push(ScenarioRun { name: "all", results: cross, observed: None, transcript: None, mutation: None });
     for run in &mut runs {
         run.results.retain(|r| wants(r.id));
     }
@@ -500,6 +532,7 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
                 results: vec![result(owner, skip.id, Verdict::Skip, detail)],
                 observed: None,
                 transcript: None,
+                mutation: None,
             }),
         }
     }
@@ -514,6 +547,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         results: scenario.checks.iter().map(|id| result(name, id, Verdict::Error, detail.clone())).collect(),
         observed: None,
         transcript: None,
+        mutation: None,
     };
     let workspace = match tempfile::Builder::new().prefix("lspcheck-").tempdir() {
         Ok(dir) => dir,
@@ -546,8 +580,16 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
             return Ok(unstarted(format!("could not start {}: {e}", cfg.server.display())));
         }
     };
-    let mut ctx =
-        Ctx { s: session, cfg, root, results: Vec::new(), scenario: name, j3_exercise: None, k1_pending: None };
+    let mut ctx = Ctx {
+        s: session,
+        cfg,
+        root,
+        results: Vec::new(),
+        scenario: name,
+        j3_exercise: None,
+        k1_pending: None,
+        mutation: None,
+    };
     // The workspace, so a transcript of this scenario can be replayed in a
     // recreated one (files written later are recorded when they are written),
     // and the settings, so a replay answers the server's questions alike.
@@ -585,9 +627,10 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         }
         "capabilities" => capabilities_scenario(&mut ctx).await,
         "end-of-input" => end_of_input(&mut ctx).await,
+        MUTATION => mutation_scenario(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
-    let Ctx { s, mut results, j3_exercise, k1_pending, .. } = ctx;
+    let Ctx { s, mut results, j3_exercise, k1_pending, mutation, .. } = ctx;
     let finish = s.finish(cfg.leftover_grace).await;
     if let Some(pending) = k1_pending {
         let (verdict, detail) = match judge_k1(pending, &finish) {
@@ -644,7 +687,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
         None => None,
     };
     drop(workspace);
-    Ok(ScenarioRun { name, results, observed: Some(observations(finish, j3_exercise)), transcript })
+    Ok(ScenarioRun { name, results, observed: Some(observations(finish, j3_exercise)), transcript, mutation })
 }
 
 fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observations {
@@ -693,6 +736,8 @@ struct Ctx<'a> {
     /// How the json-rpc scenario's dedicated J3 exercise went.
     j3_exercise: Option<(Verdict, String)>,
     k1_pending: Option<K1Pending>,
+    /// What the mutation scenario ran.
+    mutation: Option<MutationSummary>,
 }
 
 /// Why initialization didn't succeed.
@@ -3413,6 +3458,552 @@ fn opens_documents(reply: &Message) -> bool {
     }
 }
 
+/// The most bytes the mutation scenario writes to the server.
+pub const MUTATION_BYTES: u64 = 64 * 1024 * 1024;
+/// What a case reserves for each request it may send, beyond its document's URI.
+const REQUEST_RESERVE: u64 = 2048;
+/// What a case reserves for `shutdown` and `exit`.
+const SHUTDOWN_RESERVE: u64 = 1024;
+
+/// A seed document as the mutation scenario holds it.
+struct SeedDoc {
+    name: String,
+    uri: String,
+    language_id: String,
+    clean: String,
+    current: String,
+    version: i64,
+}
+
+/// One request the mutation scenario sent after a mutation, and its fate.
+struct StepRequest {
+    method: &'static str,
+    case: u64,
+    /// When lspcheck began writing it, and when its wait ended.
+    at: Duration,
+    waited: Duration,
+    outcome: StepOutcome,
+}
+
+enum StepOutcome {
+    /// A response; the error code, when it was an error.
+    Answered(Option<i64>),
+    /// No response by its deadline.
+    Unanswered,
+    /// Still pending when the server exited or closed its output (M1's).
+    Gone,
+    /// Still pending when lspcheck stopped reading (its output budget).
+    Uninspected(String),
+    /// lspcheck couldn't deliver it.
+    Undelivered(String),
+}
+
+/// How the mutation scenario lost the server, if it did.
+enum Lost {
+    /// The server exited or closed its output: M1's failure.
+    Gone(String),
+    /// lspcheck stopped reading the server's output.
+    Uninspected(String),
+    /// A write lspcheck couldn't finish, with no exit seen.
+    Undelivered(String),
+}
+
+/// What lspcheck saw after a write to the server failed: an exit within
+/// `--exit-timeout` (the server is gone), else a write it couldn't deliver.
+async fn lost_after_write(ctx: &mut Ctx<'_>, what: &str, e: &WriteError) -> Lost {
+    match ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await {
+        Some(status) => Lost::Gone(format!("the server exited with {}", session::describe_status(status))),
+        None => Lost::Undelivered(format!("lspcheck couldn't deliver {what} ({e})")),
+    }
+}
+
+/// What lspcheck saw when the server's output ended: lspcheck stopped
+/// reading it, or the server closed it (with its exit status, if it exits
+/// within `--exit-timeout`).
+async fn lost_output(ctx: &mut Ctx<'_>) -> Lost {
+    if let Some((_, why)) = ctx.s.stopped_reading() {
+        return Lost::Uninspected(why);
+    }
+    match ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await {
+        Some(status) => Lost::Gone(format!("the server exited with {}", session::describe_status(status))),
+        None => Lost::Gone("the server closed its output".into()),
+    }
+}
+
+/// A `didChange` notification's params.
+fn did_change(uri: &str, version: i64, changes: &[ContentChange]) -> Value {
+    let content: Vec<Value> = changes
+        .iter()
+        .map(|c| match c {
+            ContentChange::Full(t) => json!({"text": t}),
+            ContentChange::Text { range, text } => json!({
+                "range": {
+                    "start": {"line": range.start.line, "character": range.start.character},
+                    "end": {"line": range.end.line, "character": range.end.character},
+                },
+                "text": text,
+            }),
+        })
+        .collect();
+    json!({"textDocument": {"uri": uri, "version": version}, "contentChanges": content})
+}
+
+/// The bytes a notification takes on the wire.
+fn notification_bytes(method: &str, params: &Value) -> u64 {
+    frame(&message::notification(method, Some(params.clone()))).len() as u64
+}
+
+/// The params of a step's request: K1's, at `spot`, about the document as
+/// it now is; `workspace/symbol` asks for `query`. `None` when K1 wouldn't
+/// send the method about this document.
+fn step_request(
+    caps: &Value,
+    doc: &SeedDoc,
+    method: &str,
+    spot: Spot,
+    encoding: Encoding,
+    query: &str,
+) -> Option<Value> {
+    let d = capabilities::Document { uri: &doc.uri, language_id: &doc.language_id, text: &doc.current, opened: true };
+    let (requests, _) = capabilities::requests(caps, &d, &[spot], encoding);
+    let mut params = requests.into_iter().find(|r| r.method == method)?.params;
+    if method == "workspace/symbol" {
+        params["query"] = query.into();
+    }
+    Some(params)
+}
+
+/// How a case's mutations are named in M1's detail.
+fn describe_edits(step: &mutation::Step) -> String {
+    let edits: Vec<String> = step.mutations.iter().map(|m| format!("{} at {}", m.operator.name(), m.offset)).collect();
+    edits.join(", ")
+}
+
+/// The mutation scenario ([design](../docs/source-mutations.md#the-scenario)):
+/// open the seed documents, run seeded cases that mutate them step by step
+/// and ask about each mutated text, restore the clean text after each case,
+/// then shut down. M1 judges whether the server survives, M2 whether every
+/// request is answered. Recovery (M3) is a later step.
+async fn mutation_scenario(ctx: &mut Ctx<'_>) {
+    let settings = ctx.cfg.mutation.clone().expect("the mutation scenario runs only with --mutate");
+    let seed = settings.seed.expect("main chooses the seed");
+    let mut summary =
+        MutationSummary { seed, format: mutation::FORMAT, cases: settings.cases, cases_run: 0, stopped: None };
+    ctx.report("M3", Verdict::Skip, M3_LATER);
+    let both = |ctx: &mut Ctx<'_>, verdict: Verdict, detail: String| {
+        ctx.report("M1", verdict, detail.clone());
+        ctx.report("M2", verdict, detail);
+    };
+    let params = capabilities_initialize_params(&ctx.root);
+    let reply = match ctx.initialize_with(params).await {
+        Ok(reply) => reply,
+        Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
+            both(ctx, Verdict::Error, format!("initialize didn't succeed: {why}"));
+            ctx.mutation = Some(summary);
+            return;
+        }
+    };
+    let Some(caps) = initialize_capabilities(&reply).filter(|c| c.is_object()).cloned() else {
+        both(ctx, Verdict::Error, "initialize had no capabilities object (see L2)".into());
+        ctx.mutation = Some(summary);
+        leave(ctx).await;
+        return;
+    };
+    let sync = match documents::sync_kind(&json!({"capabilities": caps})) {
+        SyncKind::Full => mutation::Sync::Full,
+        SyncKind::Incremental => mutation::Sync::Incremental,
+        SyncKind::None => {
+            both(
+                ctx,
+                Verdict::Skip,
+                "the server takes no document changes (textDocumentSync change is absent or 0)".into(),
+            );
+            ctx.mutation = Some(summary);
+            leave(ctx).await;
+            return;
+        }
+    };
+    if !opens_documents(&reply) {
+        both(ctx, Verdict::Skip, "the server doesn't ask for didOpen (textDocumentSync openClose)".into());
+        ctx.mutation = Some(summary);
+        leave(ctx).await;
+        return;
+    }
+    let encoding = match negotiated_encoding(&reply) {
+        Ok(encoding) => encoding,
+        Err(why) => {
+            both(ctx, Verdict::Error, why);
+            ctx.mutation = Some(summary);
+            leave(ctx).await;
+            return;
+        }
+    };
+    // The seed texts as the server finds them on disk: the fixture may have
+    // changed since the profile was read.
+    let mut docs = Vec::new();
+    for seed_file in &settings.seeds {
+        let path: PathBuf =
+            std::iter::once(ctx.root.as_os_str()).chain(seed_file.path.split('/').map(std::ffi::OsStr::new)).collect();
+        let text = match std::fs::read(&path).map(String::from_utf8) {
+            Ok(Ok(text)) if text.len() <= settings.planner.max_document_bytes => Ok(text),
+            Ok(Ok(_)) => Err(format!("{} in the workspace grew past mutation.max_document_kib", seed_file.path)),
+            Ok(Err(_)) => Err(format!("{} in the workspace isn't UTF-8 text", seed_file.path)),
+            Err(e) => Err(format!("couldn't read {} in the workspace: {e}", seed_file.path)),
+        };
+        let text = match text {
+            Ok(text) => text,
+            Err(why) => {
+                both(ctx, Verdict::Error, why);
+                ctx.mutation = Some(summary);
+                leave(ctx).await;
+                return;
+            }
+        };
+        docs.push(SeedDoc {
+            name: seed_file.path.clone(),
+            uri: file_uri(&path),
+            language_id: seed_file.language_id.clone(),
+            current: text.clone(),
+            clean: text,
+            version: 1,
+        });
+    }
+    for doc in &docs {
+        let item = json!({"uri": doc.uri, "languageId": doc.language_id, "version": 1, "text": doc.clean});
+        if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": item}))).await {
+            let why = match lost_after_write(ctx, &format!("didOpen for {}", doc.name), &e).await {
+                Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) => why,
+            };
+            both(ctx, Verdict::Error, format!("before the first mutation: {why}"));
+            ctx.mutation = Some(summary);
+            leave(ctx).await;
+            return;
+        }
+    }
+    // The methods a step asks, in K1's order, as the profile allows.
+    let methods: Vec<&'static str> = {
+        let d = capabilities::Document {
+            uri: &docs[0].uri,
+            language_id: &docs[0].language_id,
+            text: &docs[0].clean,
+            opened: true,
+        };
+        let (requests, _) = capabilities::requests(&caps, &d, &[Spot { line: 0, column: 0 }], encoding);
+        let mut methods: Vec<&'static str> = Vec::new();
+        for r in requests {
+            let allowed = settings.requests.as_ref().is_none_or(|allowed| allowed.contains(&r.method));
+            if allowed && !methods.contains(&r.method) {
+                methods.push(r.method);
+            }
+        }
+        methods
+    };
+    let timeout = ctx.cfg.request_timeout;
+    let case_budget = settings.case_budget(timeout);
+    let run_deadline = Instant::now() + settings.run_timeout;
+    let mut cursor = 0usize;
+    let mut asked: Vec<StepRequest> = Vec::new();
+    let mut first_change: Option<Duration> = None;
+    let mut versions = 0u64;
+    let mut lost: Option<(Lost, String)> = None;
+    let mut cut_short = 0u64;
+    'cases: for k in 0..settings.cases {
+        if Instant::now() + case_budget > run_deadline {
+            summary.stopped = Some(format!(
+                "mutation.run_timeout ({} s) left less than a case's budget ({} s) for case {k}",
+                seconds(settings.run_timeout),
+                seconds(case_budget)
+            ));
+            break;
+        }
+        let clean: Vec<String> = docs.iter().map(|d| d.clean.clone()).collect();
+        let plan = mutation::plan_case(seed, k, &clean, &settings.planner);
+        // Every change of the case, worked out before any is sent: their
+        // exact sizes go into the byte reserve, and lspcheck's own
+        // arithmetic is checked before the server sees any of it.
+        let mut texts = clean.clone();
+        let mut next_version: Vec<i64> = docs.iter().map(|d| d.version).collect();
+        let mut steps = Vec::new();
+        let mut reserve = SHUTDOWN_RESERVE;
+        for step in &plan.steps {
+            let d = step.document;
+            let (changes, after) = match mutation::step_changes(&texts[d], step, encoding, sync) {
+                Ok(changed) => changed,
+                Err(e) => {
+                    both(ctx, Verdict::Error, format!("case {k}: {e}"));
+                    summary.stopped = Some(format!("case {k}: {e}"));
+                    ctx.mutation = Some(summary);
+                    restore_and_leave(ctx, &mut docs, encoding, sync).await;
+                    return;
+                }
+            };
+            next_version[d] += 1;
+            let params = did_change(&docs[d].uri, next_version[d], &changes);
+            reserve += notification_bytes("textDocument/didChange", &params);
+            reserve += settings.requests_per_step as u64 * (REQUEST_RESERVE + 2 * docs[d].uri.len() as u64);
+            texts[d] = after.clone();
+            steps.push((step, params, after, next_version[d]));
+        }
+        for (d, doc) in docs.iter().enumerate() {
+            if texts[d] != doc.clean {
+                // The restoration replaces the whole text with the clean one.
+                reserve += doc.clean.len() as u64 * 2 + doc.uri.len() as u64 + 256;
+            }
+        }
+        if ctx.s.bytes_written() + reserve > MUTATION_BYTES {
+            summary.stopped = Some(format!(
+                "case {k} could write up to {reserve} bytes, past the scenario's cap of {} MiB with {} written",
+                MUTATION_BYTES / (1024 * 1024),
+                ctx.s.bytes_written()
+            ));
+            break;
+        }
+        let record: Vec<Value> = steps
+            .iter()
+            .map(|(step, _, _, version)| {
+                json!({
+                    "document": docs[step.document].name,
+                    "version": version,
+                    "edits": step.mutations.iter().map(mutation::record).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        ctx.s.record_mutation(json!({"format": mutation::FORMAT, "seed": seed, "case": k, "steps": record}));
+        summary.cases_run += 1;
+        let case_deadline = Instant::now() + case_budget;
+        let mut rng = mutation::SplitMix64::stream(seed, k, "requests");
+        for (j, (step, params, after, version)) in steps.iter().enumerate() {
+            if j > 0 && Instant::now() >= case_deadline {
+                cut_short += 1;
+                break;
+            }
+            let d = step.document;
+            let place = format!("case {k}, step {} ({})", j + 1, describe_edits(step));
+            first_change.get_or_insert_with(|| ctx.s.elapsed());
+            if let Err(e) = ctx.s.notify("textDocument/didChange", Some(params.clone())).await {
+                lost = Some((lost_after_write(ctx, "a didChange", &e).await, place));
+                break 'cases;
+            }
+            docs[d].current = after.clone();
+            docs[d].version = *version;
+            versions += 1;
+            // The step's requests, written back to back, then each waited
+            // for until its own deadline.
+            let mut pending = Vec::new();
+            for _ in 0..settings.requests_per_step {
+                if methods.is_empty() {
+                    break;
+                }
+                let method = methods[cursor % methods.len()];
+                cursor += 1;
+                let (line, column) = mutation::request_spot(&mut rng, &docs[d].current, &settings.planner.lexicon);
+                let query = mutation::request_query(&mut rng, &docs[d].current, &settings.planner.lexicon);
+                let Some(params) = step_request(&caps, &docs[d], method, Spot { line, column }, encoding, &query)
+                else {
+                    continue;
+                };
+                let deadline = Instant::now() + timeout;
+                let id = ctx.s.fresh_id();
+                let bytes = frame(&message::request(&id, method, Some(params)));
+                let at = ctx.s.elapsed();
+                let written = match ctx.s.begin_request(&id, method, deadline).await {
+                    Ok(()) => {
+                        let written = ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await;
+                        if written.is_err() {
+                            ctx.s.abort_request(&id);
+                        }
+                        written
+                    }
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = written {
+                    let why = format!("lspcheck couldn't deliver {method} ({e})");
+                    asked.push(StepRequest {
+                        method,
+                        case: k,
+                        at,
+                        waited: ctx.s.elapsed(),
+                        outcome: StepOutcome::Undelivered(why),
+                    });
+                    lost = Some((lost_after_write(ctx, method, &e).await, place));
+                    break 'cases;
+                }
+                pending.push((id, method, at, deadline));
+            }
+            let mut closed = false;
+            for (id, method, at, deadline) in pending {
+                let outcome = match ctx.s.wait_response(&id, deadline).await {
+                    Ok(reply) => StepOutcome::Answered(match &reply.kind {
+                        Kind::Response { outcome: Outcome::Error { code, .. }, .. } => Some(code.unwrap_or(0)),
+                        _ => None,
+                    }),
+                    Err(WaitError::Timeout) => StepOutcome::Unanswered,
+                    Err(WaitError::Closed) => {
+                        closed = true;
+                        match ctx.s.stopped_reading() {
+                            Some((_, why)) => StepOutcome::Uninspected(why),
+                            None => StepOutcome::Gone,
+                        }
+                    }
+                };
+                asked.push(StepRequest { method, case: k, at, waited: ctx.s.elapsed(), outcome });
+            }
+            if closed || !ctx.s.is_alive() {
+                lost = Some((lost_output(ctx).await, place));
+                break 'cases;
+            }
+        }
+        // The restoration is always sent, even when the case's budget ran out.
+        for doc in docs.iter_mut() {
+            if doc.current == doc.clean {
+                continue;
+            }
+            let change = match mutation::restore_change(&doc.current, &doc.clean, encoding, sync) {
+                Ok(change) => change,
+                Err(e) => {
+                    both(ctx, Verdict::Error, format!("restoring case {k}: {e}"));
+                    summary.stopped = Some(format!("restoring case {k}: {e}"));
+                    ctx.mutation = Some(summary);
+                    leave(ctx).await;
+                    return;
+                }
+            };
+            let version = doc.version + 1;
+            let params = did_change(&doc.uri, version, &[change]);
+            if let Err(e) = ctx.s.notify("textDocument/didChange", Some(params)).await {
+                let place = format!("restoring {} after case {k}", doc.name);
+                lost = Some((lost_after_write(ctx, "the restoring didChange", &e).await, place));
+                break 'cases;
+            }
+            doc.current = doc.clean.clone();
+            doc.version = version;
+            versions += 1;
+        }
+        // An exit or the end of output between cases is still M1's.
+        if ctx.s.output_closed().await || !ctx.s.is_alive() {
+            lost = Some((lost_output(ctx).await, format!("after case {k}")));
+            break;
+        }
+    }
+    if cut_short > 0 {
+        ctx.s.note(format!("{cut_short} case(s) ran out of their budget before their last step"));
+    }
+    judge_m1(ctx, &summary, first_change, versions, lost);
+    judge_m2(ctx, &asked);
+    ctx.mutation = Some(summary);
+    leave(ctx).await;
+}
+
+/// Sends each mutated document's clean text back, then leaves. For a run
+/// that stops before its cases are done.
+async fn restore_and_leave(ctx: &mut Ctx<'_>, docs: &mut [SeedDoc], encoding: Encoding, sync: mutation::Sync) {
+    for doc in docs.iter_mut().filter(|d| d.current != d.clean) {
+        let Ok(change) = mutation::restore_change(&doc.current, &doc.clean, encoding, sync) else { break };
+        doc.version += 1;
+        if ctx.s.notify("textDocument/didChange", Some(did_change(&doc.uri, doc.version, &[change]))).await.is_err() {
+            break;
+        }
+        doc.current = doc.clean.clone();
+    }
+    leave(ctx).await;
+}
+
+/// M1: the server neither exited nor closed its output from the first
+/// mutation's `didChange` until `shutdown`.
+fn judge_m1(
+    ctx: &mut Ctx<'_>,
+    summary: &MutationSummary,
+    first_change: Option<Duration>,
+    versions: u64,
+    lost: Option<(Lost, String)>,
+) {
+    let stopped = summary.stopped.as_ref().map(|why| format!("; no further case started: {why}")).unwrap_or_default();
+    match (lost, first_change) {
+        (Some((Lost::Gone(why), place)), Some(_)) => ctx.fail("M1", format!("{why} during {place}")),
+        (Some((Lost::Gone(why), _)), None) => {
+            ctx.report("M1", Verdict::Error, format!("before the first mutation: {why}"));
+        }
+        (Some((Lost::Uninspected(why), place)), _) => ctx.report(
+            "M1",
+            Verdict::Error,
+            format!("lspcheck stopped reading the server's output during {place}, so it can't tell whether the server survived: {why}"),
+        ),
+        (Some((Lost::Undelivered(why), place)), _) => {
+            ctx.report("M1", Verdict::Error, format!("{why} during {place}, and the server didn't exit"));
+        }
+        (None, None) => ctx.report(
+            "M1",
+            Verdict::NotExercised,
+            format!("no case ran{}", summary.stopped.as_ref().map(|w| format!(": {w}")).unwrap_or_default()),
+        ),
+        (None, Some(_)) => ctx.pass_with(
+            "M1",
+            format!(
+                "the server kept running through {} case(s) and {versions} mutated or restored version(s){stopped}",
+                summary.cases_run
+            ),
+        ),
+    }
+}
+
+/// M2: every request delivered after a mutation got a response within
+/// `--timeout`. A request pending when the server exited is M1's.
+fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest]) {
+    let unanswered: Vec<&StepRequest> = asked.iter().filter(|r| matches!(r.outcome, StepOutcome::Unanswered)).collect();
+    if let Some(first) = unanswered.first() {
+        let more = if unanswered.len() > 1 { format!(" and {} more", unanswered.len() - 1) } else { String::new() };
+        ctx.fail_absent_between(
+            "M2",
+            first.at,
+            first.waited,
+            format!(
+                "{} in case {} got no response within {} s (--timeout){more}",
+                first.method,
+                first.case,
+                seconds(ctx.cfg.request_timeout)
+            ),
+        );
+        let windows: Vec<(Duration, Duration)> = unanswered[1..].iter().map(|r| (r.at, r.waited)).collect();
+        ctx.results.last_mut().expect("just reported").absent_at.extend(windows);
+        return;
+    }
+    let trouble = asked.iter().find_map(|r| match &r.outcome {
+        StepOutcome::Undelivered(why) => Some(why.clone()),
+        StepOutcome::Uninspected(why) => {
+            Some(format!("lspcheck stopped reading the server's output while {} waited ({why})", r.method))
+        }
+        _ => None,
+    });
+    if let Some(why) = trouble {
+        return ctx.report("M2", Verdict::Error, why);
+    }
+    let answered: Vec<Option<i64>> = asked
+        .iter()
+        .filter_map(|r| match r.outcome {
+            StepOutcome::Answered(code) => Some(code),
+            _ => None,
+        })
+        .collect();
+    if answered.is_empty() {
+        return ctx.report("M2", Verdict::NotExercised, "no request was answered or left unanswered after a mutation");
+    }
+    let mut codes: Vec<(i64, usize)> = Vec::new();
+    for code in answered.iter().flatten() {
+        match codes.iter_mut().find(|(c, _)| c == code) {
+            Some((_, n)) => *n += 1,
+            None => codes.push((*code, 1)),
+        }
+    }
+    codes.sort();
+    let errors = if codes.is_empty() {
+        "none with an error".to_string()
+    } else {
+        let list: Vec<String> = codes.iter().map(|(c, n)| format!("{c} ×{n}")).collect();
+        format!("errors by code: {}", list.join(", "))
+    };
+    ctx.pass_with("M2", format!("all {} request(s) after a mutation got a response; {errors}", answered.len()));
+}
+
 const OFFERED_ENCODINGS: [&str; 3] = ["utf-8", "utf-32", "utf-16"];
 
 fn judge_l2(ctx: &mut Ctx<'_>, reply: &Message) {
@@ -3615,6 +4206,7 @@ const J3_SCENARIOS: &[&str] = &[
     "capabilities",
     "end-of-input",
     "exit-without-shutdown",
+    MUTATION,
 ];
 
 /// J3 across the scenarios in [`J3_SCENARIOS`]: no response without an id
@@ -4262,6 +4854,7 @@ mod tests {
                 server_requests: Vec::new(),
             }),
             transcript: None,
+            mutation: None,
         }
     }
 

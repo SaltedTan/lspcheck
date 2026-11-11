@@ -1,9 +1,10 @@
 # Seeded source mutation and recovery
 
-**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Steps 1 and 2 of
-the [implementation plan](#implementation-plan) are in place: the planner (`src/mutation.rs`), and the profile's
-`[mutation]` section with M1 to M3 in the catalogue, always `SKIP`. Nothing runs the scenario yet, so `--mutate` and
-its two flags are hidden: they validate the profile and flags, then stop with exit status 2. See the
+**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Steps 1 to 3 of
+the [implementation plan](#implementation-plan) are in place: the planner (`src/mutation.rs`), the profile's
+`[mutation]` section, and the scenario, which judges M1 and M2. `--mutate` and its two flags are experimental and
+hidden from `--help` until recovery (M3) is judged; until then the scenario doesn't settle or take baselines, M3 is
+`SKIP`, and D1, D2, D6 and K1 aren't extended to it. See [what step 3 leaves out](#step-3) and the
 [design status](design.md) for its place in the roadmap.
 
 ## Context
@@ -66,9 +67,8 @@ Existing checks keep being judged on the new scenario's evidence:
   random edit can't make that diagnosis, so D1 judges those positions. D4, the C, L1 to L8 and R checks need their own
   scenarios.
 
-Without `--mutate`, the scenario doesn't run and M1 to M3 report `SKIP`, which doesn't affect the exit status. Once
-the scenario is implemented, their detail will be `mutation is off; pass --mutate`; until then it says the scenario
-isn't implemented yet ([catalogue](design.md#mutation)).
+Without `--mutate`, nothing above changes: the scenario doesn't run and M1 to M3 report `SKIP` (`mutation is off;
+pass --mutate`), which doesn't affect the exit status ([catalogue](design.md#mutation)).
 
 ### The scenario
 
@@ -341,7 +341,8 @@ It also refuses: an empty list where one is given (`files`, `operators`, `reques
 listed twice in any of them, `max_document_kib` outside 1 to 1024, a negative `seed`, a `run_timeout` over `"4h"`
 or `settle_timeout` over `"5m"`, an empty fragment or one longer than the growth bound (1 KiB), an empty keyword, a
 string escape that isn't one character, and seed files without a language id (`language_id`, else `[document]`'s).
-A lexicon key left out keeps the default lexicon's value, so `keywords = [...]` alone adds keywords to the default.
+A lexicon key left out keeps the default lexicon's value, so `keywords = [...]` alone adds keywords to the default;
+a key that is given replaces the default's value, so `identifier_chars = "-"` drops `_` (write `"-_"` to keep it).
 `requests` are asked in K1's order whatever the profile's. Durations use the [profile syntax](../README.md#profiles).
 A seed chosen at random is below 2^53, so it survives any JSON reader and fits a TOML integer.
 
@@ -508,6 +509,25 @@ Each step is one small pull request with its tests, docs and changelog entry whe
 7. **Stock matrix.** `[mutation]` in the example profiles, a mutation job and `.mutation.verdicts` (a workflow change,
    so the maintainer merges it).
 8. **Minimisation**, if isolation shows it is wanted.
+
+### Step 3
+
+Step 3 runs the scenario without the parts later steps add, and says so where it matters:
+
+- No settle or baseline (step 5): the cases start right after the seed documents are opened. M3 is `SKIP` ("lspcheck
+  doesn't judge recovery yet").
+- The case budget and `run_timeout` are as above. Before a case starts, lspcheck checks that the bytes it has written
+  so far plus the case's reserve fit the written-bytes cap; the reserve counts the case's `didChange` notifications at
+  their exact size, 2 KiB plus twice the URI's length for each request, the restoration and 1 KiB for `shutdown` and
+  `exit`. Answers to the server's own requests during a case aren't yet held to what is left of the cap before each
+  write; they count towards the next case's check.
+- Each request's deadline is `--timeout` from when lspcheck began writing it; the step's requests are written back to
+  back and then waited for in order, each until its own deadline.
+- A request K1 wouldn't send about the document (a `documentSelector` that doesn't select it) is skipped, and the
+  round robin moves on.
+- The transcript's meta line records each edit's `operator`, `offset`, `removed`, `sha256` of what it inserted, and
+  `inserted` itself, or `inserted_bytes` and `inserted_prefix` (64 characters) when it is longer than 64 characters,
+  and `fallback: true` for an operator that found nothing to change.
 
 ## Decisions
 

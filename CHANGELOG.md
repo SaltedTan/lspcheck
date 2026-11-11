@@ -5,10 +5,15 @@
 ### Added
 
 - M1 to M3 (`POLICY`) are in the catalogue for [seeded source mutation](docs/source-mutations.md), which is being
-  built. Until its scenario runs they are always `SKIP`, which doesn't affect the exit status, so reports gain three
-  `SKIP` lines and each stock-server `.verdicts` file three `skip` lines.
+  built. Without `--mutate` they are `SKIP`, which doesn't affect the exit status, so reports gain three `SKIP` lines
+  and each stock-server `.verdicts` file three `skip` lines.
 - Profiles accept a `[mutation]` section, [validated](docs/source-mutations.md#profile-schema) with the rest of the
-  profile (a mistake in it is a usage error), and otherwise without effect yet.
+  profile (a mistake in it is a usage error), and used only with `--mutate`.
+- An experimental `--mutate`, hidden from `--help` until recovery (M3) is judged, runs the mutation scenario: seeded
+  edits of the profile's seed files, requests about each broken text, and the clean text restored after each case.
+  It judges M1 (the server survives) and M2 (every request is answered within `--timeout`); `--mutation-seed` and
+  `--mutation-cases` override the profile. The JSON report gains `"mutation"` (`null` without it), the terminal header
+  names the seed, and the scenario's transcript, `mutation.jsonl`, records each case's plan.
 
 ### Changed
 

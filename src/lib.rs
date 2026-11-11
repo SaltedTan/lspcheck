@@ -18,6 +18,7 @@ pub mod profile;
 pub mod replay;
 pub mod report;
 pub mod session;
+pub mod sha256;
 pub mod text;
 pub mod transcript;
 pub mod transport;

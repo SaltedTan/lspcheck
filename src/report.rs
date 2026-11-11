@@ -3,7 +3,7 @@
 
 //! The terminal summary, the JSON report, JUnit XML and a Markdown summary.
 
-use crate::checks::{self, Area, Basis, CheckResult, ScenarioRun, Verdict};
+use crate::checks::{self, Area, Basis, CheckResult, MutationSummary, ScenarioRun, Verdict};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::Path;
@@ -16,6 +16,11 @@ pub fn ordered(runs: &[ScenarioRun]) -> Vec<&CheckResult> {
     let mut all: Vec<&CheckResult> = runs.iter().flat_map(|r| &r.results).collect();
     all.sort_by_key(|r| checks::CATALOGUE.iter().position(|c| c.id == r.id));
     all
+}
+
+/// What the mutation scenario ran, if it ran.
+pub fn mutation(runs: &[ScenarioRun]) -> Option<&MutationSummary> {
+    runs.iter().find_map(|r| r.mutation.as_ref())
 }
 
 /// The process exit status for a run: 1 when a MUST check (or with `strict`,
@@ -62,10 +67,14 @@ pub fn print_terminal(
     profile: Option<&Path>,
     runs: &[ScenarioRun],
 ) -> std::io::Result<()> {
-    match profile {
-        Some(path) => writeln!(out, "lspcheck {} — {server} — profile {}", env!("CARGO_PKG_VERSION"), path.display())?,
-        None => writeln!(out, "lspcheck {} — {server}", env!("CARGO_PKG_VERSION"))?,
+    let mut header = format!("lspcheck {} — {server}", env!("CARGO_PKG_VERSION"));
+    if let Some(path) = profile {
+        header.push_str(&format!(" — profile {}", path.display()));
     }
+    if let Some(m) = mutation(runs) {
+        header.push_str(&format!(" — mutation seed {}, {} cases", m.seed, m.cases));
+    }
+    writeln!(out, "{header}")?;
     let results = ordered(runs);
     for r in &results {
         let c = checks::info(r.id);
@@ -105,6 +114,7 @@ pub fn json_report(server: &[String], profile: Option<&Path>, runs: &[ScenarioRu
         "lspcheck": env!("CARGO_PKG_VERSION"),
         "server": server,
         "profile": profile.map(|p| p.to_string_lossy()),
+        "mutation": mutation(runs),
         "host": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH},
         "results": results,
     })
@@ -368,7 +378,7 @@ mod tests {
     }
 
     fn scenario(results: Vec<CheckResult>) -> ScenarioRun {
-        ScenarioRun { name: "test", results, observed: None, transcript: None }
+        ScenarioRun { name: "test", results, observed: None, transcript: None, mutation: None }
     }
 
     fn server() -> Vec<String> {
@@ -535,20 +545,34 @@ mod tests {
                 let mut aggregate = result("F1", verdict, "in framing: evidence");
                 aggregate.scenario = "all";
                 let runs = [
-                    ScenarioRun { name: "unstarted", results: vec![], observed: None, transcript: None },
+                    ScenarioRun {
+                        name: "unstarted",
+                        results: vec![],
+                        observed: None,
+                        transcript: None,
+                        mutation: None,
+                    },
                     ScenarioRun {
                         name: "framing",
                         results: vec![],
                         observed: None,
                         transcript: recorded.then(|| PathBuf::from("evidence/framing.jsonl")),
+                        mutation: None,
                     },
                     ScenarioRun {
                         name: "lifecycle",
                         results: vec![],
                         observed: None,
                         transcript: recorded.then(|| PathBuf::from("evidence/lifecycle.jsonl")),
+                        mutation: None,
                     },
-                    ScenarioRun { name: "all", results: vec![aggregate], observed: None, transcript: None },
+                    ScenarioRun {
+                        name: "all",
+                        results: vec![aggregate],
+                        observed: None,
+                        transcript: None,
+                        mutation: None,
+                    },
                 ];
                 let expected = recorded && matches!(verdict, Verdict::Fail | Verdict::Error);
                 let mut terminal = Vec::new();

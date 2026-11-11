@@ -70,6 +70,7 @@ fn write_events(file: std::fs::File, events: &[Event]) -> std::io::Result<()> {
             EventKind::Configuration(settings) => {
                 json!({"t_ms": t, "dir": "meta", "configuration": settings})
             }
+            EventKind::Mutation(plan) => json!({"t_ms": t, "dir": "meta", "mutation": plan}),
         };
         serde_json::to_writer(&mut out, &line)?;
         out.write_all(b"\n")?;

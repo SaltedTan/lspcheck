@@ -113,6 +113,9 @@ pub enum EventKind {
     /// The settings `workspace/configuration` is answered from, so a replay
     /// answers the same way.
     Configuration(Value),
+    /// The plan of a mutation case, recorded before it is sent. Replay
+    /// ignores it.
+    Mutation(Value),
 }
 
 /// Something wrong with the server's output stream.
@@ -448,6 +451,8 @@ pub struct Session {
     group: Group,
     exit: Option<ExitStatus>,
     opts: Options,
+    /// Bytes that reached the server's stdin.
+    written: u64,
     _registration: Registration,
 }
 
@@ -534,6 +539,7 @@ impl Session {
             group,
             exit: None,
             opts,
+            written: 0,
             _registration: registration,
         })
     }
@@ -572,6 +578,31 @@ impl Session {
     /// Records the settings `workspace/configuration` is answered from, for [`crate::replay`].
     pub fn record_configuration(&self, settings: Value) {
         record(&self.transcript, self.start.elapsed(), EventKind::Configuration(settings));
+    }
+
+    /// Records the plan of a mutation case.
+    pub fn record_mutation(&self, plan: Value) {
+        record(&self.transcript, self.start.elapsed(), EventKind::Mutation(plan));
+    }
+
+    /// How many bytes have reached the server's stdin, answers to its
+    /// requests included.
+    pub fn bytes_written(&self) -> u64 {
+        self.written
+    }
+
+    /// When and why lspcheck stopped reading the server's stdout (its output
+    /// budget ran out), if it did. Stdout reported closed without this was
+    /// closed by the server.
+    pub fn stopped_reading(&self) -> Option<(Duration, String)> {
+        self.evidence.lock().expect("evidence lock").stopped.clone()
+    }
+
+    /// Takes in what has already been read, answering the server's requests,
+    /// and says whether its stdout has closed (or lspcheck stopped reading it).
+    pub async fn output_closed(&mut self) -> bool {
+        self.absorb(Instant::now() + self.opts.write_timeout).await;
+        self.stdout_closed
     }
 
     /// Why evidence is incomplete so far, if it is: an inspection limit,
@@ -689,6 +720,7 @@ impl Session {
         if written > piece {
             record_began(&self.transcript, piece_at, piece_seq, EventKind::Sent(bytes[piece..written].to_vec()));
         }
+        self.written += written as u64;
         let outcome = match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {

@@ -199,6 +199,17 @@ const FAULTS: &[(&str, &str)] = &[
         "label publishDiagnostics with the stand-in's own counter instead of the document's version",
     ),
     ("future-diagnostics-version", "label publishDiagnostics with the document's version plus one"),
+    ("exit-on-unbalanced", "exit when a didChange leaves a document's brackets unbalanced"),
+    (
+        "flood-while-unbalanced",
+        "lawful: after a didChange that leaves a document's brackets unbalanced, write 2 MiB of log messages, and \
+         keep serving",
+    ),
+    ("ignore-while-unbalanced", "never answer a request about a document whose brackets are unbalanced"),
+    (
+        "content-modified-while-unbalanced",
+        "lawful: answer requests about a document whose brackets are unbalanced with ContentModified (-32801)",
+    ),
     ("ignore-changes", "don't apply didChange, and label the old text's diagnostics with the new version"),
     ("codepoint-changes", "apply incremental change ranges counting code points, and answer correctly otherwise"),
     (
@@ -640,6 +651,17 @@ fn main() {
                     }
                 }
                 *old_version = version;
+                let unbalanced = !unmatched_brackets(text).is_empty();
+                if unbalanced && fault("exit-on-unbalanced") {
+                    eprintln!("standin: exit-on-unbalanced");
+                    std::process::exit(5);
+                }
+                if unbalanced && fault("flood-while-unbalanced") {
+                    let log = json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x".repeat(1000)}});
+                    for _ in 0..2100 {
+                        out.frame(&log);
+                    }
+                }
                 if !fault("no-diagnostics") {
                     let mut label = Some(json!(version));
                     if fault("diagnostics-own-version") {
@@ -814,6 +836,18 @@ fn main() {
             && msg.pointer("/params/textDocument/uri").and_then(Value::as_str).is_some_and(|u| u.ends_with("crlf.txt"))
         {
             no_more_answers = true;
+            continue;
+        }
+        let unbalanced = msg
+            .pointer("/params/textDocument/uri")
+            .and_then(Value::as_str)
+            .and_then(|u| docs.get(u))
+            .is_some_and(|(text, _)| !unmatched_brackets(text).is_empty());
+        if unbalanced && fault("ignore-while-unbalanced") {
+            continue;
+        }
+        if unbalanced && fault("content-modified-while-unbalanced") {
+            out.frame(&err(&id, -32801, "content modified"));
             continue;
         }
         if method == "textDocument/hover" && fault("exit-on-first-hover") {
@@ -1522,6 +1556,48 @@ fn lines(text: &str, split: LineSplit) -> Vec<&str> {
     out
 }
 
+/// The byte offsets of the brackets `()`, `[]` and `{}` in `text` that have
+/// no partner: a closer with no opener before it, or one of another kind,
+/// and openers never closed. Strings and comments aren't told apart.
+fn unmatched_brackets(text: &str) -> Vec<usize> {
+    let mut open: Vec<(usize, u8)> = Vec::new();
+    let mut unmatched = Vec::new();
+    for (at, b) in text.bytes().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => open.push((at, b)),
+            b')' | b']' | b'}' => {
+                let opener = match b {
+                    b')' => b'(',
+                    b']' => b'[',
+                    _ => b'{',
+                };
+                if open.last().is_some_and(|(_, o)| *o == opener) {
+                    open.pop();
+                } else {
+                    unmatched.push(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    unmatched.extend(open.into_iter().map(|(at, _)| at));
+    unmatched.sort();
+    unmatched
+}
+
+/// The line holding byte `at` of `text`, and that line's text before it.
+fn line_and_prefix(text: &str, at: usize, split: LineSplit) -> (usize, &str) {
+    let mut start = 0;
+    for (n, line) in lines(text, split).into_iter().enumerate() {
+        // `lines` borrows from `text`, so its offset there is the line's start.
+        start = line.as_ptr() as usize - text.as_ptr() as usize;
+        if at <= start + line.len() {
+            return (n, &text[start..at]);
+        }
+    }
+    (0, &text[start..at])
+}
+
 /// Each ASCII word (`[A-Za-z]+`): its line, its start and end in `units`,
 /// and its text.
 fn words(text: &str, units: Units, split: LineSplit) -> Vec<(usize, usize, usize, &str)> {
@@ -1690,6 +1766,12 @@ fn publish_diagnostics<W: Write>(
         })
         .collect();
     let lines = lines(text, split);
+    // One diagnostic per unmatched bracket.
+    for at in unmatched_brackets(text) {
+        let (line, before) = line_and_prefix(text, at, split);
+        let (start, end) = (units.of(before), units.of(&text[at - before.len()..at + 1]));
+        diagnostics.push(json!({"range": range(line, start, line, end), "severity": 1, "source": "standin", "message": "unmatched bracket"}));
+    }
     // A position on the first line with non-ASCII text, one character in: on a
     // character boundary with non-ASCII text before it, so informative for D5.
     if let Some(n) = lines.iter().position(|l| !l.is_ascii()) {
