@@ -1,7 +1,9 @@
 # Seeded source mutation and recovery
 
-**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Step 1 of the
-[implementation plan](#implementation-plan), the planner (`src/mutation.rs`), is in place; nothing runs it yet. See the
+**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Steps 1 and 2 of
+the [implementation plan](#implementation-plan) are in place: the planner (`src/mutation.rs`), and the profile's
+`[mutation]` section with M1 to M3 in the catalogue, always `SKIP`. Nothing runs the scenario yet, so `--mutate` and
+its two flags are hidden: they validate the profile and flags, then stop with exit status 2. See the
 [design status](design.md) for its place in the roadmap.
 
 ## Context
@@ -340,10 +342,17 @@ Validation refuses: a seed file the workspace doesn't provide or that isn't UTF-
 `max_document_kib`; no seed file and no `[document]`; an unknown operator, probe or method; a `requests` method that
 isn't in K1's table; `steps`, `cases` or `requests_per_step` out of range; an empty delimiter; a bracket entry that
 isn't two characters; a delimiter or identifier character that is a line end; `expect` other than the two values.
+It also refuses: an empty list where one is given (`files`, `operators`, `requests`, `recovery.probes`), an entry
+listed twice in any of them, `max_document_kib` outside 1 to 1024, a negative `seed`, a `run_timeout` over `"4h"`
+or `settle_timeout` over `"5m"`, an empty fragment or one longer than the growth bound (1 KiB), an empty keyword, a
+string escape that isn't one character, and seed files without a language id (`language_id`, else `[document]`'s).
+A lexicon key left out keeps the default lexicon's value, so `keywords = [...]` alone adds keywords to the default.
+`requests` are asked in K1's order whatever the profile's. Durations may be given in hours (`"1h"`) anywhere in a
+profile. A seed chosen at random is below 2^53, so it survives any JSON reader and fits a TOML integer.
 
 The command line adds `--mutate`, `--mutation-seed N` and `--mutation-cases N`, which override the profile's values.
 `--mutate` with a profile that has a `[document]` but no `[mutation]` mutates that file with the default lexicon and
-defaults; with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--only M1` without `--mutate` reports the same `SKIP` as any run without it.
+defaults (its size is checked against the default 64 KiB then, not when the profile is read); with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--only M1` without `--mutate` reports the same `SKIP` as any run without it.
 
 ### Bounds
 

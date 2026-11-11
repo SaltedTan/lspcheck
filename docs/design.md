@@ -2,7 +2,8 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). v0.4.0 expands the [example profile catalogue](../examples/profiles/README.md) to 18 servers and the [stock-server CI matrix](../ci/stock-servers/README.md) to 11, accepts unknown values of the tag and kind enumerations clients must tolerate in K2, refines [K2's failure detail](#capabilities-and-robustness), and [isolates Content-Type probes](#framing-and-output). M4 is done (see the [integration milestone](#milestones)). Next is [seeded source mutation](source-mutations.md), whose design is accepted; its planner, the first step, is in place, and nothing runs it yet. See the [changelog](../CHANGELOG.md) for changes by release.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). v0.4.0 expands the [example profile catalogue](../examples/profiles/README.md) to 18 servers and the [stock-server CI matrix](../ci/stock-servers/README.md) to 11, accepts unknown values of the tag and kind enumerations clients must tolerate in K2, refines [K2's failure detail](#capabilities-and-robustness), and [isolates Content-Type probes](#framing-and-output). M4 is done (see the [integration milestone](#milestones)). Next is [seeded source mutation](source-mutations.md), whose design is accepted; its planner and the profile's `[mutation]` section, the first two steps, are in place, M1 to M3 are listed as
+`SKIP`, and nothing runs the scenario yet. See the [changelog](../CHANGELOG.md) for changes by release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -531,6 +532,18 @@ before waiting for process exit or cleanup. Initialization or delivery failure i
 After successful initialization, all four robustness scenarios and `capabilities` attempt a bounded
 `shutdown`/`exit` exchange before cleanup. This lets lawful output still in flight finish and lets L9 observe descendants that outlive the server.
 
+### Mutation
+| ID | Basis | Check |
+|---|---|---|
+| M1 | POLICY | The server doesn't exit, or close its output, while its source is mutated or being restored. |
+| M2 | POLICY | Every request about a mutated document gets a response (any result or error) within `--timeout`. |
+| M3 | POLICY | Once the clean text is restored, the server's answers about it return to those it gave before the mutations. |
+
+These belong to the opt-in `mutation` scenario of [seeded source mutation](source-mutations.md), which owns their
+verdict rules. The scenario isn't implemented yet, so they are always `SKIP` ("mutation is off: the scenario that
+mutates source isn't implemented yet"), which doesn't affect the exit status; a profile's `allow.skip` reason replaces
+that detail. Cross-cutting checks never start the scenario.
+
 ## Profiles (optional TOML)
 Profiles are implemented in `src/profile.rs`; the [README](../README.md#profiles) owns the supported profile example,
 command and timeout precedence, path rules, and common usage. This section records implementation details and
@@ -601,6 +614,8 @@ capabilities = "default"       # planned: or a path to a capabilities JSON
   line records the settings, and replay answers `workspace/configuration` from it. `initializationOptions` and the
   `didChangeConfiguration` are in the recorded bytes. Replay's own timeouts are still its flags; it doesn't read
   profiles.
+- **`[mutation]`** is validated as the [mutation design](source-mutations.md#profile-schema) describes, and has no
+  effect yet. Durations anywhere in a profile may also be given in hours (`"1h"`).
 
 ## Report
 - Terminal summary in catalogue order, with counts and a line per check.
