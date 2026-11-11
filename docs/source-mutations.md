@@ -1,7 +1,8 @@
 # Seeded source mutation and recovery
 
-**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Nothing here
-is implemented yet. See the [design status](design.md) for its place in the roadmap.
+**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Step 1 of the
+[implementation plan](#implementation-plan), the planner (`src/mutation.rs`), is in place; nothing runs it yet. See the
+[design status](design.md) for its place in the roadmap.
 
 ## Context
 
@@ -106,17 +107,19 @@ pass --mutate`), which doesn't affect the exit status.
 that says where tokens are. Without one, a default lexicon is used: identifiers are runs of Unicode letters, digits and
 `_`; numbers are runs that start with an ASCII digit; whitespace and line ends are their own tokens; every other
 character is a one-character punctuation token; the brackets are `()`, `[]` and `{}`. With a lexicon, line comments,
-non-nesting block comments, strings with an escape character, extra identifier characters and keywords are recognised;
-an unterminated string or comment runs to the end of its line or of the document.
+non-nesting block comments, strings with an escape character, extra identifier characters and keywords are recognised.
+A string runs to its closing delimiter, across lines if need be; one never closed runs to the end of its line, and a
+block comment never closed to the end of the document. Where several delimiters start at the same place, the longest
+wins.
 
 The lexicon only decides *where* to edit. No oracle depends on it, so a wrong lexicon makes the edits less pointed but
 can't make a verdict wrong. That is why lspcheck can stay ignorant of the language.
 
-**Operators.** Each picks its target with the case's RNG. If it finds nothing to change (`open-string` in text without
-strings), it inserts a token from the document's own tokens instead, and the record says so. A document with no tokens
-(an empty seed, or one a `truncate` emptied) gets the first of the lexicon's brackets, else `(`, inserted at offset 0,
-so the plan stays a total function of the seed. Planner tests cover an empty seed and mutations after a truncation
-to empty.
+**Operators.** Each picks its target with the case's RNG. If it finds nothing to change (including a `swap-tokens` swap
+that leaves identical text), it inserts a token from the document's own tokens instead, and the record says so. If none
+of the document's tokens fits the [growth bound](#bounds) (including an empty seed, or one a `truncate` emptied), the
+fallback inserts the lexicon's first opening bracket, else `(`, at offset 0, so the plan stays a total function of the
+seed. Planner tests cover an empty seed and mutations after a truncation to empty.
 
 | Operator | Edit |
 |---|---|
@@ -125,7 +128,7 @@ to empty.
 | `swap-tokens` | Swap two tokens of the same class (identifier, number, string). |
 | `replace-token` | Replace a token with one drawn from the document's tokens, the brackets and the keywords. |
 | `truncate` | Cut the document at a token boundary. |
-| `delete-line`, `duplicate-line` | Delete or repeat one line with its end. |
+| `delete-line`, `duplicate-line` | Delete or repeat one physical line, including its line end when present. |
 | `unbalance-bracket` | Delete, duplicate or insert one bracket of a lexicon pair. |
 | `open-string`, `open-comment` | Remove a string's or block comment's closing delimiter, or insert a lone opening one (needs a lexicon). |
 | `insert-in-literal` | Insert characters from the fixed set below inside a string or comment, or else inside an identifier. |
@@ -135,6 +138,10 @@ to empty.
 | `fragment` | Insert one of the profile's `fragments` (malformed literals and the like) at a token boundary. |
 | `nest`, `repeat-line` | Stress: nest a bracket pair deeply, or repeat a line many times, up to the room left (off by default). |
 | `control` | Insert a C0 control character or U+0000 (off by default). |
+
+The line operators find `\r\n`, `\n` and lone `\r` directly in the text, including inside multiline strings and block
+comments. `duplicate-line` and `repeat-line` also copy a final line without a line end: each copy gets the document's
+last line end, or `\n` if it has none, and is inserted before the original final line.
 
 The fixed character set is `é` (2 bytes in UTF-8), `中` (3), `😀` and `𝔘` (4, a surrogate pair in UTF-16), a combining
 acute, a ZWJ, U+00A0, U+200B, U+FEFF and U+10FFFF. Every inserted character is a Unicode scalar value. Invalid UTF-8 and
@@ -348,7 +355,7 @@ defaults; with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--onl
 | Settle and baseline | `settle_timeout` | 5 min | proceed; unstable probes aren't used |
 | Cases | 20 | 1000 | usage error above the cap |
 | Mutations per step; steps per case | 1 to 3; `steps` | 3; 3 | — |
-| Inserted text per mutation | 1 KiB; stress operators the room left | 16 KiB | the operator inserts less |
+| Growth per mutation (bytes inserted beyond those removed) | 1 KiB; stress operators the room left | 16 KiB | the operator inserts less |
 | Document size | `max_document_kib`, 64 | 1024 | the operator is redrawn, `truncate` after six tries |
 | Requests per step; recovery polls per case | 4; 40 | 16; 40 | the poll stops: recovery not seen, M3 `ERROR` for that case even with an expectation |
 | Versions kept per document | 64 | 64 | older positions aren't judged, counted |
@@ -366,9 +373,10 @@ cases not run), so no case ever starts on a document lspcheck couldn't restore.
 
 The written-bytes bound is a cap, not a threshold: everything lspcheck writes in the scenario counts (the seed
 `didOpen`s, baseline probes, every `didChange`, request, poll and answer to a server request, and `shutdown` and
-`exit`), and before a case starts lspcheck reserves its worst case, computed from the caps (each step's `didChange` at
-`max_document_kib` per document plus its requests, the restoration, the most polls and the terminal probes), plus the
-shutdown allowance. A case whose worst case doesn't fit doesn't start. Answers to the server's own requests (such as
+`exit`), and before a case starts lspcheck reserves its worst case: the case's `didChange` notifications at their
+exact serialized size, which the plan fixes before the case starts (a step's notification can carry three changes,
+each up to a whole document), plus, computed from the caps, its requests, the restoration, the most polls and the
+terminal probes, and the shutdown allowance. A case whose worst case doesn't fit doesn't start. Answers to the server's own requests (such as
 `workspace/configuration`, which a profile can make large) can't be bounded in advance, so the cap is also enforced
 before every write: answers may use only what isn't reserved for the current case's restoration and the shutdown.
 When that is gone, lspcheck stops the scenario: it sends the restoration and shutdown from their reserve, leaves the
@@ -387,7 +395,8 @@ The scenario's transcript, `mutation.jsonl`, is an ordinary session transcript, 
 SERVER` replays it as it is: the workspace line recreates the seed files, and every `didChange`, request and poll is
 re-sent byte for byte. Before each case lspcheck records a meta line, `{"dir":"meta","mutation":{"format":1,"seed":…,
 "case":17,"steps":[{"document":"main.lua","version":5,"edits":[{"operator":"open-string","offset":40,"removed":1,
-"inserted":"","sha256":…}]}]}}`; replay ignores meta lines it doesn't know, so no change to replay is needed.
+"inserted":"","sha256":…}]}]}}`, with offsets and lengths in UTF-8 bytes of the text before the edit; replay ignores
+meta lines it doesn't know, so no change to replay is needed.
 Inserted text over 64 characters is summarised by length, prefix and SHA-256, as virgil-lsp does; the full text is in
 the recorded `didChange`.
 

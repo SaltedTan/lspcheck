@@ -16,6 +16,7 @@ lifecycle, and whether it leaves processes behind. Read the [README](README.md) 
 | `src/capabilities.rs` | K1: the requests advertised capabilities call for, their positions, and K1's verdict. |
 | `src/metamodel.rs` | K2: the vendored LSP 3.17 meta-model, parsed once, and validation of JSON values against its types. |
 | `vendor/lsp-3.17/` | The LSP 3.17 `metaModel.json`, unmodified (CC BY 4.0; attribution in its README). |
+| `src/mutation.rs` | The seeded mutation planner: SplitMix64, the lexicon, the operators, and the changes that send an edit. |
 | `src/documents.rs` | The documents lspcheck opens, the texts a position may refer to, and D1's judging. |
 | `src/profile.rs` | `--profile`: reading and validating the TOML, the workspace files, and merging with the flags. |
 | `src/report.rs`, `src/transcript.rs` | Reports; JSON Lines transcripts. |
