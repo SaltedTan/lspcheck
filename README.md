@@ -12,7 +12,7 @@ Example output:
 
 ```console
 $ lspcheck -- basedpyright-langserver --stdio
-lspcheck 0.3.0 — basedpyright-langserver --stdio
+lspcheck 0.4.0 — basedpyright-langserver --stdio
   PASS  F1  MUST    Every byte on stdout belongs to a well-formed frame
   PASS  F2  MUST    Content-Length counts the body's bytes, not its characters
   PASS  F3  MUST    Input split across writes, down to single header bytes, is read
@@ -97,7 +97,7 @@ distribution. On Linux or macOS:
 # The subshell stops at the first failure, such as a checksum mismatch, without closing your shell.
 (
   set -eu
-  v=0.3.0 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, x86_64-apple-darwin,
+  v=0.4.0 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, x86_64-apple-darwin,
                                              # aarch64-apple-darwin
   base=https://github.com/SaltedTan/lspcheck/releases/download/v$v
   curl -fsSLO "$base/lspcheck-$v-$target.tar.gz" -O "$base/SHA256SUMS"
@@ -112,12 +112,12 @@ then extract it and put `lspcheck.exe` on your `PATH`.
 
 Each archive also carries build provenance from the release workflow, which the GitHub CLI can check. Run this where
 you downloaded the archive, substituting your platform's archive name:
-`gh attestation verify lspcheck-0.3.0-x86_64-unknown-linux-musl.tar.gz --repo SaltedTan/lspcheck`.
+`gh attestation verify lspcheck-0.4.0-x86_64-unknown-linux-musl.tar.gz --repo SaltedTan/lspcheck`.
 
 To build from source instead, with Rust 1.99 or later:
 
 ```sh
-cargo install --locked --git https://github.com/SaltedTan/lspcheck --tag v0.3.0
+cargo install --locked --git https://github.com/SaltedTan/lspcheck --tag v0.4.0
 ```
 
 ### In CI
@@ -130,7 +130,7 @@ versions, and the [changelog](CHANGELOG.md) says which. The exit status fails th
 ```yaml
 - name: Check the language server with lspcheck
   env:
-    LSPCHECK_VERSION: 0.3.0
+    LSPCHECK_VERSION: 0.4.0
     LSPCHECK_SHA256: <the archive's 64-character SHA-256 digest from SHA256SUMS>
   run: |
     name=lspcheck-$LSPCHECK_VERSION-x86_64-unknown-linux-musl
