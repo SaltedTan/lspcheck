@@ -117,9 +117,9 @@ can't make a verdict wrong. That is why lspcheck can stay ignorant of the langua
 
 **Operators.** Each picks its target with the case's RNG. If it finds nothing to change (`open-string` in text without
 strings), it inserts a token from the document's own tokens instead, and the record says so. If none of the document's
-tokens fits the insertion cap (including an empty seed, or one a `truncate` emptied), the fallback inserts the lexicon's
-first opening bracket, else `(`, at offset 0, so the plan stays a total function of the seed. Planner tests cover an
-empty seed and mutations after a truncation to empty.
+tokens fits the [growth bound](#bounds) (including an empty seed, or one a `truncate` emptied), the fallback inserts
+the lexicon's first opening bracket, else `(`, at offset 0, so the plan stays a total function of the seed. Planner
+tests cover an empty seed and mutations after a truncation to empty.
 
 | Operator | Edit |
 |---|---|
@@ -128,7 +128,7 @@ empty seed and mutations after a truncation to empty.
 | `swap-tokens` | Swap two tokens of the same class (identifier, number, string). |
 | `replace-token` | Replace a token with one drawn from the document's tokens, the brackets and the keywords. |
 | `truncate` | Cut the document at a token boundary. |
-| `delete-line`, `duplicate-line` | Delete or repeat one line with its end. |
+| `delete-line`, `duplicate-line` | Delete or repeat one physical line, including its line end when present. |
 | `unbalance-bracket` | Delete, duplicate or insert one bracket of a lexicon pair. |
 | `open-string`, `open-comment` | Remove a string's or block comment's closing delimiter, or insert a lone opening one (needs a lexicon). |
 | `insert-in-literal` | Insert characters from the fixed set below inside a string or comment, or else inside an identifier. |
@@ -138,6 +138,10 @@ empty seed and mutations after a truncation to empty.
 | `fragment` | Insert one of the profile's `fragments` (malformed literals and the like) at a token boundary. |
 | `nest`, `repeat-line` | Stress: nest a bracket pair deeply, or repeat a line many times, up to the room left (off by default). |
 | `control` | Insert a C0 control character or U+0000 (off by default). |
+
+The line operators find `\r\n`, `\n` and lone `\r` directly in the text, including inside multiline strings and block
+comments. `duplicate-line` and `repeat-line` also copy a final line without a line end: each copy gets the document's
+last line end, or `\n` if it has none, and is inserted before the original final line.
 
 The fixed character set is `é` (2 bytes in UTF-8), `中` (3), `😀` and `𝔘` (4, a surrogate pair in UTF-16), a combining
 acute, a ZWJ, U+00A0, U+200B, U+FEFF and U+10FFFF. Every inserted character is a Unicode scalar value. Invalid UTF-8 and
