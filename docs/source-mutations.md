@@ -1,7 +1,7 @@
 # Seeded source mutation and recovery
 
 **Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Nothing here
-is implemented yet. It is the milestone after v0.3.0 in the [design](design.md#milestones).
+is implemented yet. See the [design status](design.md) for its place in the roadmap.
 
 ## Context
 

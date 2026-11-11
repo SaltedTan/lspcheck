@@ -6,7 +6,7 @@
 
 ### Added
 
-- [Example profiles](https://github.com/SaltedTan/lspcheck/tree/v0.4.0/examples/profiles/) for 14 more servers: clangd, typescript-language-server,
+- [Example profiles](https://github.com/SaltedTan/lspcheck/blob/v0.4.0/examples/profiles/README.md) for 14 more servers: clangd, typescript-language-server,
   bash-language-server, yaml-language-server, vscode-json-language-server, marksman, ruff, texlab, zls,
   jedi-language-server, pylsp, terraform-ls, lemminx and taplo, each with a tiny project and a `[document]`.
 - The [stock-server CI matrix](https://github.com/SaltedTan/lspcheck/blob/v0.4.0/ci/stock-servers/README.md) also runs pinned releases of clangd, marksman,
