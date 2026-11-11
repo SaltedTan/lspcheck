@@ -19,6 +19,8 @@
 
 - Mutation requests use their write-time deadlines, losses are judged through the shutdown boundary, and seed
   openings are preflighted against the written-bytes cap. Case preparation consumes the admitted case's budget.
+- Mutation batches retain every delivered request and settle replies by receive time; later exits preserve earlier
+  timeouts. Case admission reserves restoration space for every intermediate text, including plans that end clean.
 - Profile durations may also be given in hours, such as `"1h"`.
 
 ## 0.4.0 (2026-11-11)

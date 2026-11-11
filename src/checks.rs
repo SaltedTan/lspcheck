@@ -3464,8 +3464,6 @@ pub const MUTATION_BYTES: u64 = 64 * 1024 * 1024;
 const REQUEST_RESERVE: u64 = 2048;
 /// What a case reserves for `shutdown` and `exit`.
 const SHUTDOWN_RESERVE: u64 = 1024;
-/// What a restoration may take beyond the one from the case's final text: its
-/// range's end, from an earlier text, may be longer by a few digits.
 const RESTORE_MARGIN: u64 = 64;
 
 /// A seed document as the mutation scenario holds it.
@@ -3480,14 +3478,17 @@ struct SeedDoc {
 
 /// One request the mutation scenario sent after a mutation, and its fate.
 struct StepRequest {
+    id: Id,
     method: &'static str,
     case: u64,
     /// When lspcheck began writing it, and when its wait ended.
     at: Duration,
+    deadline_at: Duration,
     waited: Duration,
     outcome: StepOutcome,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum StepOutcome {
     /// A response; the error code, when it was an error.
     Answered(Option<i64>),
@@ -3565,6 +3566,54 @@ fn did_change(uri: &str, version: i64, changes: &[ContentChange]) -> Value {
 /// The bytes a notification takes on the wire.
 fn notification_bytes(method: &str, params: &Value) -> u64 {
     frame(&message::notification(method, Some(params.clone()))).len() as u64
+}
+
+fn restoration_reserve<'a>(
+    docs: &[SeedDoc],
+    prefixes: impl Iterator<Item = (usize, &'a str, i64)>,
+    encoding: Encoding,
+    sync: mutation::Sync,
+) -> Result<u64, mutation::InternalError> {
+    let mut reserves = vec![0; docs.len()];
+    for (d, text, version) in prefixes {
+        let doc = &docs[d];
+        if text == doc.clean {
+            continue;
+        }
+        let change = mutation::restore_change(text, &doc.clean, encoding, sync)?;
+        let params = did_change(&doc.uri, version + 1, &[change]);
+        reserves[d] = reserves[d].max(notification_bytes("textDocument/didChange", &params) + RESTORE_MARGIN);
+    }
+    Ok(reserves.into_iter().sum())
+}
+
+fn step_outcome(
+    answer: Option<(Duration, Option<i64>)>,
+    deadline_at: Duration,
+    server_gone: Option<Duration>,
+    stopped_reading: Option<(Duration, String)>,
+) -> StepOutcome {
+    match answer {
+        Some((at, code)) if at <= deadline_at => StepOutcome::Answered(code),
+        Some(_) => StepOutcome::Unanswered,
+        None => match stopped_reading {
+            Some((_, why)) => StepOutcome::Uninspected(why),
+            None if server_gone.is_some() => StepOutcome::Gone,
+            None => StepOutcome::Unanswered,
+        },
+    }
+}
+
+fn settle_step_request(s: &Session, request: &mut StepRequest, server_gone: Option<Duration>) {
+    let answer = s.answered_at(&request.id).map(|at| {
+        let code = match &s.answer_to(&request.id).expect("matched response").kind {
+            Kind::Response { outcome: Outcome::Error { code, .. }, .. } => Some(code.unwrap_or(0)),
+            _ => None,
+        };
+        (at, code)
+    });
+    request.outcome = step_outcome(answer, request.deadline_at, server_gone, s.stopped_reading());
+    request.waited = s.elapsed();
 }
 
 /// The params of a step's request: K1's, at `spot`, about the document as
@@ -3736,7 +3785,6 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     let run_deadline = Instant::now() + settings.run_timeout;
     let mut cursor = 0usize;
     let mut asked: Vec<StepRequest> = Vec::new();
-    let mut last_step_start = 0;
     let mut first_change: Option<Duration> = None;
     let mut versions = 0u64;
     let mut lost: Option<(Lost, String)> = None;
@@ -3780,25 +3828,19 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             texts[d] = after.clone();
             steps.push((step, params, after, next_version[d]));
         }
-        for (d, doc) in docs.iter().enumerate() {
-            if texts[d] == doc.clean {
-                continue;
-            }
-            // The restoration replaces the whole text with the clean one, so
-            // its size is known; a case its budget stops early restores from
-            // an earlier text, whose end position may take a few more digits.
-            match mutation::restore_change(&texts[d], &doc.clean, encoding, sync) {
-                Ok(change) => {
-                    let params = did_change(&doc.uri, next_version[d] + 1, &[change]);
-                    reserve += notification_bytes("textDocument/didChange", &params) + RESTORE_MARGIN;
-                }
-                Err(e) => {
-                    both(ctx, Verdict::Error, format!("case {k}: {e}"));
-                    summary.stopped = Some(format!("case {k}: {e}"));
-                    ctx.mutation = Some(summary);
-                    restore_and_leave(ctx, &mut docs, encoding, sync).await;
-                    return;
-                }
+        match restoration_reserve(
+            &docs,
+            steps.iter().map(|(step, _, after, version)| (step.document, after.as_str(), *version)),
+            encoding,
+            sync,
+        ) {
+            Ok(bytes) => reserve += bytes,
+            Err(e) => {
+                both(ctx, Verdict::Error, format!("case {k}: {e}"));
+                summary.stopped = Some(format!("case {k}: {e}"));
+                ctx.mutation = Some(summary);
+                restore_and_leave(ctx, &mut docs, encoding, sync).await;
+                return;
             }
         }
         if ctx.s.bytes_written() + reserve > MUTATION_BYTES {
@@ -3849,8 +3891,9 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             // The step's requests, written back to back, then each waited
             // for until its own deadline.
             let identifiers = mutation::identifiers(&docs[d].current, &settings.planner.lexicon);
-            last_step_start = asked.len();
-            let mut pending = Vec::new();
+            let step_start = asked.len();
+            let mut deadlines = Vec::new();
+            let mut failed_request = None;
             for _ in 0..settings.requests_per_step {
                 if methods.is_empty() {
                     break;
@@ -3867,6 +3910,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 let bytes = frame(&message::request(&id, method, Some(params)));
                 let registered = ctx.s.begin_request(&id, method, Instant::now() + timeout).await;
                 let at = ctx.s.elapsed();
+                let deadline_at = at + timeout;
                 let deadline = Instant::now() + timeout;
                 let written = match registered {
                     Ok(()) => {
@@ -3886,36 +3930,37 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                         Lost::Uninspected(why) => StepOutcome::Uninspected(why.clone()),
                         _ => StepOutcome::Undelivered(format!("lspcheck couldn't deliver {method} ({e})")),
                     };
-                    asked.push(StepRequest { method, case: k, at, waited: ctx.s.elapsed(), outcome });
-                    lost = Some((how, place));
-                    break 'cases;
+                    failed_request = Some((
+                        StepRequest { id, method, case: k, at, deadline_at, waited: ctx.s.elapsed(), outcome },
+                        how,
+                    ));
+                    break;
                 }
-                pending.push((id, method, at, deadline));
+                asked.push(StepRequest {
+                    id,
+                    method,
+                    case: k,
+                    at,
+                    deadline_at,
+                    waited: at,
+                    outcome: StepOutcome::Unanswered,
+                });
+                deadlines.push(deadline);
             }
-            let mut closed = false;
-            for (id, method, at, deadline) in pending {
-                let outcome = match ctx.s.wait_response(&id, deadline).await {
-                    Ok(_) if ctx.s.answered_at(&id).is_some_and(|received| received > at + timeout) => {
-                        StepOutcome::Unanswered
-                    }
-                    Ok(reply) => StepOutcome::Answered(match &reply.kind {
-                        Kind::Response { outcome: Outcome::Error { code, .. }, .. } => Some(code.unwrap_or(0)),
-                        _ => None,
-                    }),
-                    Err(WaitError::Timeout) => StepOutcome::Unanswered,
-                    Err(WaitError::Closed) => {
-                        closed = true;
-                        match ctx.s.stopped_reading() {
-                            Some((_, why)) => StepOutcome::Uninspected(why),
-                            None => StepOutcome::Gone,
-                        }
-                    }
-                };
-                asked.push(StepRequest { method, case: k, at, waited: ctx.s.elapsed(), outcome });
+            for (request, deadline) in asked[step_start..].iter().zip(deadlines) {
+                let _ = ctx.s.wait_response(&request.id, deadline).await;
             }
+            ctx.s.output_closed().await;
+            let closed = ctx.s.stdout_closed();
             let exited = !ctx.s.is_alive();
-            if exited {
-                exclude_pending_at_exit(&mut asked[last_step_start..]);
+            let server_gone = (exited || (closed && ctx.s.stopped_reading().is_none())).then(|| ctx.s.elapsed());
+            for request in &mut asked[step_start..] {
+                settle_step_request(&ctx.s, request, server_gone);
+            }
+            if let Some((request, how)) = failed_request {
+                asked.push(request);
+                lost = Some((how, place));
+                break 'cases;
             }
             if closed || exited {
                 lost = Some((lost_output(ctx).await, place));
@@ -3957,15 +4002,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     if cut_short > 0 {
         ctx.s.note(format!("{cut_short} case(s) ran out of their budget before their last step"));
     }
-    leave_mutation(ctx, summary, first_change, versions, lost, &mut asked, last_step_start).await;
-}
-
-fn exclude_pending_at_exit(asked: &mut [StepRequest]) {
-    for request in asked {
-        if matches!(request.outcome, StepOutcome::Unanswered) {
-            request.outcome = StepOutcome::Gone;
-        }
-    }
+    leave_mutation(ctx, summary, first_change, versions, lost, &asked).await;
 }
 
 async fn leave_mutation(
@@ -3974,8 +4011,7 @@ async fn leave_mutation(
     first_change: Option<Duration>,
     versions: u64,
     mut lost: Option<(Lost, String)>,
-    asked: &mut [StepRequest],
-    last_step_start: usize,
+    asked: &[StepRequest],
 ) {
     let id = ctx.s.fresh_id();
     let deadline = Instant::now() + ctx.cfg.request_timeout;
@@ -3983,9 +4019,6 @@ async fn leave_mutation(
     let exited = !ctx.s.is_alive();
     if lost.is_none() && (ctx.s.stdout_closed() || exited || ctx.s.stopped_reading().is_some()) {
         lost = Some((lost_output(ctx).await, "before shutdown".into()));
-    }
-    if !ctx.s.is_alive() {
-        exclude_pending_at_exit(&mut asked[last_step_start..]);
     }
     judge_m1(ctx, &summary, first_change, versions, lost);
     judge_m2(ctx, asked);
@@ -4899,19 +4932,117 @@ mod tests {
             let cfg = mutation_test_config("exit 0");
             let mut ctx = mutation_test_ctx(&cfg, 1024).await;
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
-            let mut asked = [StepRequest {
-                method: "textDocument/hover",
-                case: 0,
-                at: Duration::ZERO,
-                waited: Duration::from_secs(1),
-                outcome: StepOutcome::Unanswered,
-            }];
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, first_change, 1, None, &mut asked, 0).await;
+            leave_mutation(&mut ctx, summary, first_change, 1, None, &[]).await;
             assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, expected);
             assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::NotExercised);
-            assert!(matches!(asked[0].outcome, StepOutcome::Gone));
             ctx.s.finish(Duration::from_millis(200)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_shutdown_preserves_requests_settled_before_exit() {
+        let cfg = mutation_test_config("exit 0");
+        let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+        assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
+        let asked = [StepRequest {
+            id: Id::int(1),
+            method: "textDocument/hover",
+            case: 0,
+            at: Duration::ZERO,
+            deadline_at: Duration::from_secs(1),
+            waited: Duration::from_secs(1),
+            outcome: StepOutcome::Unanswered,
+        }];
+        let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
+        leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, None, &asked).await;
+        assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, Verdict::Fail);
+        assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::Fail);
+        assert_eq!(asked[0].outcome, StepOutcome::Unanswered);
+        ctx.s.finish(Duration::from_millis(200)).await;
+    }
+
+    #[test]
+    fn mutation_response_records_determine_step_outcomes() {
+        let deadline = Duration::from_secs(1);
+        let early = Duration::from_millis(500);
+        let late = Duration::from_millis(1001);
+        let gone = Some(Duration::from_secs(2));
+        for (answer, server_gone, expected) in [
+            (Some((early, None)), None, StepOutcome::Answered(None)),
+            (Some((deadline, Some(-32801))), gone, StepOutcome::Answered(Some(-32801))),
+            (Some((late, None)), None, StepOutcome::Unanswered),
+            (Some((late, Some(-32801))), gone, StepOutcome::Unanswered),
+            (None, None, StepOutcome::Unanswered),
+            (None, gone, StepOutcome::Gone),
+        ] {
+            assert_eq!(step_outcome(answer, deadline, server_gone, None), expected);
+        }
+        let stopped = Some((early, "output budget".to_owned()));
+        assert_eq!(step_outcome(None, deadline, gone, stopped), StepOutcome::Uninspected("output budget".into()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_settlement_uses_the_reply_record_after_a_wait_timeout() {
+        let id = Id::int(7);
+        let reply = frame(&message::response(&id, Value::Null));
+        let script = format!("read ignored; printf '%s' '{}'", String::from_utf8(reply).unwrap());
+        let cfg = mutation_test_config(&script);
+        let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+        ctx.s.begin_request(&id, "textDocument/hover", Instant::now() + Duration::from_secs(5)).await.unwrap();
+        let at = ctx.s.elapsed();
+        let mut request = StepRequest {
+            id,
+            method: "textDocument/hover",
+            case: 0,
+            at,
+            deadline_at: at + Duration::from_secs(5),
+            waited: at,
+            outcome: StepOutcome::Unanswered,
+        };
+        assert_eq!(ctx.s.wait_response(&request.id, Instant::now()).await.unwrap_err(), WaitError::Timeout);
+        ctx.s.write_raw(b"go\n").await.unwrap();
+        ctx.s.drain(Instant::now() + Duration::from_secs(5)).await;
+        settle_step_request(&ctx.s, &mut request, Some(ctx.s.elapsed()));
+        assert_eq!(request.outcome, StepOutcome::Answered(None));
+        ctx.s.finish(Duration::from_millis(200)).await;
+    }
+
+    #[test]
+    fn mutation_restoration_reserve_covers_each_prefix_even_when_the_plan_ends_clean() {
+        let doc = |uri: &str, clean: &str| SeedDoc {
+            name: uri.into(),
+            uri: uri.into(),
+            language_id: "plaintext".into(),
+            clean: clean.into(),
+            current: clean.into(),
+            version: 1,
+        };
+        let docs = [doc("file:///a", "a"), doc("file:///b", "😀"), doc("file:///c", "untouched")];
+        let many_lines = "a(\n".repeat(10_000);
+        let prefixes = [(0, many_lines.as_str(), 2), (0, "a(", 3), (0, "a", 4), (1, "😀(", 9), (1, "😀", 10)];
+        for (encoding, end_character) in [(Encoding::Utf8, 5), (Encoding::Utf16, 3), (Encoding::Utf32, 2)] {
+            for sync in [mutation::Sync::Full, mutation::Sync::Incremental] {
+                let content = |text: &str, line: u32, character: u32| match sync {
+                    mutation::Sync::Full => json!({"text": text}),
+                    mutation::Sync::Incremental => json!({
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": line, "character": character}},
+                        "text": text,
+                    }),
+                };
+                let a = json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+                    "textDocument": {"uri": "file:///a", "version": 3},
+                    "contentChanges": [content("a", 10_000, 0)]
+                }});
+                let b = json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+                    "textDocument": {"uri": "file:///b", "version": 10},
+                    "contentChanges": [content("😀", 0, end_character)]
+                }});
+                let expected = frame(&a).len() as u64 + frame(&b).len() as u64 + 128;
+                assert_eq!(restoration_reserve(&docs, prefixes.into_iter(), encoding, sync).unwrap(), expected);
+            }
         }
     }
 

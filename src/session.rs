@@ -613,6 +613,10 @@ impl Session {
         self.answers.get(id).map(|&i| self.messages[i].0)
     }
 
+    pub fn answer_to(&self, id: &Id) -> Option<&Message> {
+        self.answers.get(id).map(|&i| &self.messages[i].1)
+    }
+
     /// Why evidence is incomplete so far, if it is: an inspection limit,
     /// frames that couldn't be read, or lspcheck's own side of the
     /// conversation. Any of these could explain a response that didn't come.
