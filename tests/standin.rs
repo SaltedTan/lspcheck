@@ -2828,6 +2828,28 @@ fn mutation_openings_must_fit_the_byte_cap_before_any_are_sent() {
     assert!(written < lspcheck::checks::MUTATION_BYTES as usize);
 }
 
+#[cfg(unix)]
+#[test]
+fn an_end_of_output_lspcheck_couldnt_read_before_shutdown_makes_m1_an_error() {
+    // The restoration of a 200 KiB document fills the pipe. Partway through
+    // it the server stops reading, sends requests and closes stdout, so the
+    // end of output is queued behind requests lspcheck can't answer before
+    // shutdown. Unread, it is neither a pass nor a failure.
+    let text = format!("hello (world) {}", "a".repeat(200 * 1024));
+    let (path, _dir) = profile(&format!(
+        "[workspace]\nfiles = {{ \"main.txt\" = \"{text}\" }}\n[document]\npath = 'main.txt'\n\
+         language_id = 'plaintext'\n[mutation]\nseed = 20261111\ncases = 1\nsteps = 1\n\
+         operators = ['unbalance-bracket']\nrequests_per_step = 1\nmax_document_kib = 1024\n"
+    ));
+    let (r, _, _keep) = run_with_transcripts(
+        &["--fault", "close-output-mid-restoration"],
+        &["--profile", path.to_str().unwrap(), "--mutate", "--only", "M1,M2", "--timeout", "2", "--exit-timeout", "1"],
+    );
+    expect(&r, "M1", "error");
+    let m1 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M1").unwrap()["detail"];
+    assert!(m1.as_str().unwrap().contains("couldn't finish reading"), "{m1}");
+}
+
 #[test]
 fn mutation_is_skipped_without_a_seed_file_or_document_changes() {
     // No profile: nothing to mutate.

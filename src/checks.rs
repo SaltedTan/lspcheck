@@ -4038,13 +4038,22 @@ async fn leave_mutation(
     mut lost: Option<(Lost, String)>,
     asked: &[StepRequest],
 ) {
+    // Everything already read is taken in before M1 is judged: an end of
+    // output queued behind it would otherwise go unseen.
+    let drained = ctx.s.absorb_all().await;
     let id = ctx.s.fresh_id();
     let deadline = Instant::now() + ctx.cfg.request_timeout;
     let registered = ctx.s.begin_request(&id, "shutdown", deadline).await;
     let exited = !ctx.s.is_alive();
     if ctx.s.stdout_closed() || exited || ctx.s.stopped_reading().is_some() {
-        let place = lost.map(|(_, place)| place).unwrap_or_else(|| "before shutdown".into());
+        let place = lost.map(|(_, place)| place).unwrap_or_else(|| "the cases and their restorations".into());
         lost = Some((lost_output(ctx).await, place));
+    } else if (!drained || registered.is_err()) && !matches!(lost, Some((Lost::Gone(_), _))) {
+        // What lspcheck couldn't read may hold the end of output: neither a
+        // pass nor a failure.
+        let place = lost.map(|(_, place)| place).unwrap_or_else(|| "the cases and their restorations".into());
+        let why = "lspcheck couldn't finish reading what the server had sent before shutdown".to_string();
+        lost = Some((Lost::Uninspected(why), place));
     }
     judge_m1(ctx, &summary, first_change, versions, lost);
     judge_m2(ctx, asked);
@@ -5067,7 +5076,7 @@ mod tests {
             ctx.s.drain(Instant::now() + Duration::from_secs(5)).await;
             assert!(ctx.s.stopped_reading().is_some());
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
-            let place = if lost.is_some() { "case 0, step 1" } else { "before shutdown" };
+            let place = if lost.is_some() { "case 0, step 1" } else { "the cases and their restorations" };
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
             leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost.map(|how| (how, place.into())), &[]).await;
             let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();

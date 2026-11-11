@@ -435,6 +435,7 @@ a window. Lawful faults count replies, not milliseconds.
 |---|---|---|
 | `exit-on-unbalanced` | exit when a document's brackets become unbalanced | M1 fails |
 | `flood-while-unbalanced` | lawful: write diagnostics past `--max-output-mib` while unbalanced, and keep serving | M1 `ERROR` (inspection stopped), never `FAIL` |
+| `close-output-mid-restoration` | partway through reading a large document's restoration, send 20,000 requests and close stdout, then read nothing more after it | M1 `ERROR` (the end of output is queued behind requests lspcheck can't answer before shutdown), never `PASS` |
 | `late-wrong-count` | answer one `selectionRange` with `[]` after more than 64 later versions | D6 fails from the mutation scenario |
 | `recover-before-deadline` | lawful: after rebalancing, answer `documentSymbol` with `[]` until just before `recovery_timeout`, counted in replies to a poll schedule the test fixes, then with the baseline | nothing fails with `expect = "baseline"`: the terminal probe sees the baseline |
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails |
@@ -546,7 +547,9 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
   closed output counts as server loss even if the process remains alive. A stop in lspcheck's inspection remains
   `ERROR`, including when a write fails and the server exits.
   At the shutdown boundary, new exit or EOF evidence supersedes a recorded delivery failure, preserving its location;
-  an inspection stop supersedes either classification.
+  an inspection stop supersedes either classification. Before that boundary lspcheck takes in everything it has
+  already read, within the write timeout, since an end of output may be queued behind it. If it can't (answers to the
+  server's requests that the server doesn't read can block it), M1 is `ERROR` unless a loss was already seen.
 - A request K1 wouldn't send about the document (a `documentSelector` that doesn't select it) is skipped, and the
   round robin moves on.
 - Case plans use the [transcript format above](#reports-transcripts-and-reproduction).

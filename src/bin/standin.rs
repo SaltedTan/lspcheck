@@ -207,6 +207,12 @@ const FAULTS: &[(&str, &str)] = &[
     ),
     ("ignore-while-unbalanced", "never answer a request about a document whose brackets are unbalanced"),
     (
+        "close-output-mid-restoration",
+        "when a second message over 128 KiB begins (the didChange restoring a large opened document), send 20,000 \
+         workspace/configuration requests and close stdout, then read the rest of that message and nothing more, but \
+         keep running (Unix only)",
+    ),
+    (
         "content-modified-while-unbalanced",
         "lawful: answer requests about a document whose brackets are unbalanced with ContentModified (-32801)",
     ),
@@ -357,7 +363,7 @@ fn main() {
     if fault("stdout-banner") {
         out.raw(b"standin starting\n");
     }
-    let mut input = Input { inner: std::io::stdin().lock(), buf: Vec::new(), faults: faults.clone() };
+    let mut input = Input { inner: std::io::stdin().lock(), buf: Vec::new(), faults: faults.clone(), big_frames: 0 };
     let (mut initialized, mut shut_down) = (false, false);
     let mut replay_gate_id: Option<Value> = None;
     // A reply to a notification, held until the next request has been answered.
@@ -412,6 +418,32 @@ fn main() {
             out.release();
         }
         let Some((mut headers, mut body)) = queued.pop_front().or_else(|| input.next()) else { break };
+        if headers.iter().any(|(name, _)| name == STOPPED_MID_BODY) {
+            // lspcheck's restoration can't finish until the rest of it is
+            // read, so these and the end of output are all sent before it
+            // does. Their answers overfill the pipe once nothing reads it, so
+            // the end of output stays queued behind requests lspcheck can't
+            // answer.
+            for n in 0..20_000 {
+                let params = json!({"items": [{"section": "x"}]});
+                out.frame(&json!({"jsonrpc": "2.0", "id": 100_000 + n, "method": "workspace/configuration", "params": params}));
+            }
+            eprintln!("standin: close-output-mid-restoration");
+            // `out` holds a duplicate of stdout: close both.
+            drop(out);
+            #[cfg(unix)]
+            {
+                use std::os::fd::FromRawFd;
+                // SAFETY: fd 1 is this process's stdout, and nothing uses it
+                // after this; dropping the File closes it.
+                drop(unsafe { std::fs::File::from_raw_fd(1) });
+            }
+            // Read the rest of the restoration, without stopping again.
+            input.big_frames += 1;
+            let _ = input.next();
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            std::process::exit(0);
+        }
         // A server that answers only the latest of several concurrent requests:
         // J6's batch is the only one with a six-digit string id, and lspcheck
         // writes all four requests before reading, so waiting for the next
@@ -2128,7 +2160,16 @@ struct Input<R: Read> {
     inner: R,
     buf: Vec<u8>,
     faults: Vec<String>,
+    /// For close-output-mid-restoration: the frames over [`BIG_FRAME`] read.
+    big_frames: u32,
 }
+
+/// What close-output-mid-restoration counts as a large message.
+const BIG_FRAME: usize = 128 * 1024;
+
+/// The headers of the frame [`Input::next`] makes up when
+/// close-output-mid-restoration stops reading in the middle of a body.
+const STOPPED_MID_BODY: &str = "x-standin-stopped-mid-body";
 
 type Frame = (Vec<(String, String)>, Vec<u8>);
 
@@ -2151,18 +2192,39 @@ impl<R: Read> Input<R> {
             match self.parse(&self.buf) {
                 Parsed::Frame(frame, used) => {
                     self.buf.drain(..used);
+                    if frame.1.len() > BIG_FRAME {
+                        self.big_frames += 1;
+                    }
                     return Some(frame);
                 }
                 Parsed::Bad(used) => {
                     self.buf.drain(..used);
                 }
                 Parsed::Incomplete => {
+                    // The didOpen was the first large frame; the second is the
+                    // restoration, and lspcheck is still writing it.
+                    if self.fault("close-output-mid-restoration")
+                        && self.big_frames == 1
+                        && self.pending_length().is_some_and(|n| n > BIG_FRAME)
+                    {
+                        return Some((vec![(STOPPED_MID_BODY.to_string(), String::new())], Vec::new()));
+                    }
                     if !self.fill() {
                         return None;
                     }
                 }
             }
         }
+    }
+
+    /// The Content-Length of a frame whose headers are buffered but not yet
+    /// its whole body.
+    fn pending_length(&self) -> Option<usize> {
+        let end = find(&self.buf, b"\r\n\r\n")?;
+        String::from_utf8_lossy(&self.buf[..end]).split("\r\n").find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok()).flatten()
+        })
     }
 
     /// Whether a whole frame is already buffered.
