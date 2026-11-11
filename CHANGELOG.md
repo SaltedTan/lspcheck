@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- M1 to M3 (`POLICY`) are in the catalogue for [seeded source mutation](docs/source-mutations.md), which is being
+  built. Until its scenario runs they are always `SKIP`, which doesn't affect the exit status, so reports gain three
+  `SKIP` lines and each stock-server `.verdicts` file three `skip` lines.
+- Profiles accept a `[mutation]` section, [validated](docs/source-mutations.md#profile-schema) with the rest of the
+  profile (a mistake in it is a usage error), and otherwise without effect yet.
+
+### Changed
+
+- Profile durations may also be given in hours, such as `"1h"`.
+
 ## 0.4.0 (2026-11-11)
 
 ### Added

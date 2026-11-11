@@ -72,13 +72,20 @@ lspcheck 0.4.0 — basedpyright-langserver --stdio
                      answered a plain request after 0.012 s following didOpen of a 4 MiB document
   PASS  R4  POLICY  Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string
                      all 8 requests got responses with their exact ids
-39 checks: 34 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 1 skipped, 0 not exercised, 0 errors
+  SKIP  M1  POLICY  The server doesn't exit, or close its output, while its source is mutated or being restored
+                     mutation is off: the scenario that mutates source isn't implemented yet
+  SKIP  M2  POLICY  Every request about a mutated document gets a response (any result or error) within --timeout
+                     mutation is off: the scenario that mutates source isn't implemented yet
+  SKIP  M3  POLICY  Once the clean text is restored, the server's answers about it return to those it gave before the mutations
+                     mutation is off: the scenario that mutates source isn't implemented yet
+42 checks: 34 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 4 skipped, 0 not exercised, 0 errors
 ```
 
 lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions,
 advertised capabilities, message types, and parameter, malformed-body, large-document and request-id robustness.
 The [capabilities and robustness reference](docs/design.md#capabilities-and-robustness) explains the K1, K2 and R
-checks' verdict rules.
+checks' verdict rules. M1 to M3 belong to [seeded source mutation](docs/source-mutations.md), which is being
+built: until it runs, they are always `SKIP`, which doesn't affect the exit status.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
@@ -294,7 +301,7 @@ lspcheck --profile go.toml --timeout 30 -- gopls
 
 - **Precedence.** A command after `--` overrides `[server].command`; with neither, lspcheck stops with a usage error.
   A timeout flag on the command line overrides the profile's, which overrides the default (30 s to initialize, 10 s per
-  request, 5 s to exit). Durations are strings: `"500ms"`, `"30s"` or `"2m"`. `--only`, `--strict`, `--json`,
+  request, 5 s to exit). Durations are strings: `"500ms"`, `"30s"`, `"2m"` or `"1h"`. `--only`, `--strict`, `--json`,
   `--transcripts` and the size limits are command-line only.
 - **Paths** are relative to the profile file's directory: `[workspace].path`, and a `[server].command` program with a
   directory part (`bin/server`; a bare name is looked up on `PATH`). The fixture directory may hold only regular files
@@ -324,6 +331,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   on a line the file has, at most one column past the line's last character. Without `positions`, K1
   [chooses positions from the document's text](docs/design.md#capabilities-and-robustness).
   Other checks still use their own documents.
+- **`[mutation]`** configures [seeded source mutation](docs/source-mutations.md#profile-schema), which isn't
+  implemented yet. The section is validated with the rest of the profile, and otherwise has no effect.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
   type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name, an unknown check id, or a
   `[document]` whose file, language id or positions don't fit is a usage error (exit status 2) naming the file and
@@ -380,7 +389,7 @@ deliver gives `ERROR`, never `FAIL`. A header section longer than 1 MiB also sto
 | --- | --- |
 | `PASS` | The rule held. |
 | `FAIL` | The rule was broken; the detail line says how. |
-| `SKIP` | The rule doesn't apply to this server, or the profile skips it with a reason. |
+| `SKIP` | The check is disabled, doesn't apply to this server, or the profile skips it with a reason. |
 | `N/E` | Not exercised: the rule applies, but the run produced no evidence either way. |
 | `ERROR` | The result is unknown: the server couldn't start or refused to initialize, a timeout ran out, or the evidence is incomplete. It says nothing about the rule. |
 

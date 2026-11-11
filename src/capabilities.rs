@@ -172,6 +172,11 @@ fn table() -> Vec<(&'static str, Option<&'static str>, &'static str, Shape)> {
     ]
 }
 
+/// The methods K1 can ask, in the order of its table.
+pub fn methods() -> Vec<&'static str> {
+    table().into_iter().map(|(_, _, method, _)| method).collect()
+}
+
 /// Whether a capability's value advertises support: `true`, or an options
 /// object.
 fn truthy(v: Option<&Value>) -> bool {

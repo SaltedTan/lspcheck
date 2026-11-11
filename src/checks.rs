@@ -60,6 +60,7 @@ pub enum Area {
     Cancellation,
     Documents,
     CapabilitiesAndRobustness,
+    Mutation,
 }
 
 impl Area {
@@ -72,6 +73,7 @@ impl Area {
             Area::Cancellation => "Cancellation",
             Area::Documents => "Documents",
             Area::CapabilitiesAndRobustness => "Capabilities and robustness",
+            Area::Mutation => "Mutation",
         }
     }
 }
@@ -219,6 +221,27 @@ pub const CATALOGUE: &[CheckInfo] = &[
         Policy,
         "Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string",
         "requestMessage"
+    ),
+    check!(
+        "M1",
+        Mutation,
+        Policy,
+        "The server doesn't exit, or close its output, while its source is mutated or being restored",
+        "textDocument_didChange"
+    ),
+    check!(
+        "M2",
+        Mutation,
+        Policy,
+        "Every request about a mutated document gets a response (any result or error) within --timeout",
+        "responseMessage"
+    ),
+    check!(
+        "M3",
+        Mutation,
+        Policy,
+        "Once the clean text is restored, the server's answers about it return to those it gave before the mutations",
+        "textDocument_didChange"
     ),
 ];
 
@@ -412,7 +435,15 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "large-document", checks: &["R3"] },
     Scenario { name: "capabilities", checks: &["K1"] },
     Scenario { name: "end-of-input", checks: &["L8"] },
+    Scenario { name: MUTATION, checks: &["M1", "M2", "M3"] },
 ];
+
+/// The opt-in scenario that mutates the profile's source
+/// ([design](../docs/source-mutations.md)). It isn't implemented yet, so its
+/// checks are always reported `SKIP`.
+pub const MUTATION: &str = "mutation";
+/// Why M1 to M3 are skipped.
+pub const MUTATION_OFF: &str = "mutation is off: the scenario that mutates source isn't implemented yet";
 
 /// Runs the scenarios needed for `selected` (every check when empty) and
 /// returns them with cross-cutting verdicts appended as a final "all" run.
@@ -426,7 +457,17 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
     let any_cross = CROSS_CUTTING.iter().any(|c| judges(c));
     let mut runs = Vec::new();
     for s in SCENARIOS {
-        if any_cross || s.checks.iter().any(|c| judges(c)) {
+        if s.name == MUTATION {
+            // Opt-in, so cross-cutting checks never start it.
+            if s.checks.iter().any(|c| judges(c)) {
+                runs.push(ScenarioRun {
+                    name: s.name,
+                    results: s.checks.iter().map(|id| result(s.name, id, Verdict::Skip, MUTATION_OFF)).collect(),
+                    observed: None,
+                    transcript: None,
+                });
+            }
+        } else if any_cross || s.checks.iter().any(|c| judges(c)) {
             runs.push(run_scenario(s, cfg).await?);
         }
     }

@@ -77,6 +77,19 @@ struct Cli {
     #[arg(long, default_value_t = 256, value_name = "MIB")]
     max_output_mib: usize,
 
+    /// Run the mutation scenario (M1 to M3). Hidden until the scenario
+    /// exists: the profile and flags are validated, then lspcheck stops.
+    #[arg(long, hide = true)]
+    mutate: bool,
+
+    /// The mutation seed, instead of the profile's or a random one.
+    #[arg(long, hide = true, value_name = "N", requires = "mutate")]
+    mutation_seed: Option<u64>,
+
+    /// How many mutation cases to run, instead of the profile's or 20.
+    #[arg(long, hide = true, value_name = "N", requires = "mutate")]
+    mutation_cases: Option<u64>,
+
     /// The server command and its arguments, after `--` (else the profile's command).
     #[arg(last = true, value_name = "SERVER")]
     server: Vec<OsString>,
@@ -192,6 +205,16 @@ fn main() {
             std::process::exit(2);
         }
     }
+    let p = loaded.unwrap_or_default();
+    let request_timeout = profile::timeout(cli.timeout, p.request_timeout, 10);
+    if cli.mutate {
+        if let Err(e) = profile::mutation_settings(&p, cli.mutation_seed, cli.mutation_cases, request_timeout) {
+            eprintln!("lspcheck: {e}");
+            std::process::exit(2);
+        }
+        eprintln!("lspcheck: --mutate: the mutation scenario isn't implemented yet; the profile and flags are valid");
+        std::process::exit(2);
+    }
     if let Some(dir) = &cli.transcripts
         && let Err(e) = std::fs::create_dir_all(dir)
     {
@@ -199,11 +222,10 @@ fn main() {
         std::process::exit(2);
     }
     process::enable_subreaper();
-    let p = loaded.unwrap_or_default();
     let cfg = Config {
         server: ServerCommand::new(&argv),
         sentinel: std::env::current_exe().ok(),
-        request_timeout: profile::timeout(cli.timeout, p.request_timeout, 10),
+        request_timeout,
         startup_timeout: profile::timeout(cli.startup_timeout, p.startup_timeout, 30),
         exit_timeout: profile::timeout(cli.exit_timeout, p.exit_timeout, 5),
         leftover_grace: Duration::from_secs(1),

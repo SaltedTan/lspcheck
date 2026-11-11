@@ -224,13 +224,21 @@ fn only_fails(run: &Run, failing: &[&str]) {
     passes_except(run, &expected);
 }
 
+/// What a check gets when a test expects nothing else of it: `pass`, but
+/// `skip` for the mutation checks, since these runs don't mutate.
+fn unremarkable(id: &str) -> &'static str {
+    if MUTATION_CHECKS.contains(&id) { "skip" } else { "pass" }
+}
+
+const MUTATION_CHECKS: [&str; 3] = ["M1", "M2", "M3"];
+
 /// Every check passes except those listed, which get the verdict given.
 fn passes_except(run: &Run, expected: &[(&str, &str)]) {
     for (id, verdict) in &run.verdicts {
         if id == "L9" && !cfg!(unix) {
             continue;
         }
-        let want = expected.iter().find(|(e, _)| e == id).map_or("pass", |(_, v)| v);
+        let want = expected.iter().find(|(e, _)| e == id).map_or(unremarkable(id), |(_, v)| v);
         assert_eq!(verdict, want, "{id}\n{}", run.stdout);
     }
 }
@@ -252,7 +260,7 @@ fn only_fails_unread_with(run: &Run, failing: &[&str], inconclusive: &[&str]) {
         } else if inconclusive.contains(&id.as_str()) {
             "error"
         } else {
-            "pass"
+            unremarkable(id)
         };
         assert_eq!(verdict, want, "{id}\n{}", run.stdout);
     }
@@ -950,7 +958,7 @@ fn escaped_non_ascii_output_leaves_f2_not_exercised() {
     expect(&r, "F2", "not-exercised");
     for (id, v) in &r.verdicts {
         if id != "F2" && !(id == "L9" && !cfg!(unix)) {
-            assert_eq!(v, "pass", "{id}\n{}", r.stdout);
+            assert_eq!(v, unremarkable(id), "{id}\n{}", r.stdout);
         }
     }
     assert_eq!(r.status, 0, "{}", r.stdout);
@@ -1668,7 +1676,9 @@ fn c3_counts_only_id_less_replies_read_after_the_first_cancel() {
     expect(&r, "C3", "error");
     expect(&r, "J3", "fail");
     assert!(
-        r.verdicts.iter().all(|(id, v)| v == "pass" || id == "C3" || id == "J3" || (id == "L9" && !cfg!(unix))),
+        r.verdicts
+            .iter()
+            .all(|(id, v)| v == unremarkable(id) || id == "C3" || id == "J3" || (id == "L9" && !cfg!(unix))),
         "{}",
         r.stdout
     );
@@ -1759,7 +1769,12 @@ fn only_a_cross_cutting_check_still_runs_every_scenario() {
 fn a_missing_server_is_an_error_not_a_failure() {
     let r = run_command(&[], &["/nonexistent/lspcheck-no-such-server"], None);
     assert_eq!(r.status, 2);
-    assert!(r.verdicts.values().all(|v| v == "error"), "{}", r.stdout);
+    // Every check but the mutation ones, which no run here judges.
+    assert!(
+        r.verdicts.iter().all(|(id, v)| v == if MUTATION_CHECKS.contains(&id.as_str()) { "skip" } else { "error" }),
+        "{}",
+        r.stdout
+    );
 }
 
 #[test]
@@ -2563,6 +2578,84 @@ fn a_bad_profile_is_a_usage_error_before_any_server_starts() {
     assert!(stderr.contains(&path.display().to_string()), "{stderr}");
     assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
     assert!(!transcripts.exists(), "nothing was set up for a run");
+}
+
+/// `lspcheck [args] -- <stand-in>` with a transcripts directory, which
+/// must not exist afterwards when lspcheck stops before any run.
+fn usage_error(args: &[&str]) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let transcripts = dir.path().join("t");
+    let out = Command::new(LSPCHECK)
+        .args(args)
+        .args(["--transcripts", transcripts.to_str().unwrap(), "--", STANDIN])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{args:?}");
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(!transcripts.exists(), "nothing was set up for a run");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+const MUTATION_PROFILE: &str = "[workspace]\nfiles = { \"main.lua\" = \"local x = 1\\n\" }\n\
+                                [document]\npath = \"main.lua\"\nlanguage_id = \"lua\"\n";
+
+#[test]
+fn the_mutation_checks_are_skipped_and_dont_change_the_exit_status() {
+    // A valid [mutation] is inert without --mutate.
+    let (path, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\ncases = 3\n"));
+    let r = run(&[], &["--profile", path.to_str().unwrap(), "--only", "M1,M2,M3"]);
+    assert_eq!(r.verdicts.len(), 3, "{}", r.stdout);
+    for id in MUTATION_CHECKS {
+        expect(&r, id, "skip");
+    }
+    for result in r.report["results"].as_array().unwrap() {
+        assert_eq!(result["detail"], lspcheck::checks::MUTATION_OFF, "{result}");
+        assert_eq!(
+            (&result["area"], &result["basis"], &result["scenario"]),
+            (&"mutation".into(), &"POLICY".into(), &"mutation".into())
+        );
+    }
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    assert!(r.stdout.contains("SKIP  M2  POLICY"), "{}", r.stdout);
+    // Only M checks were wanted, so no server ran.
+    assert!(r.server_stderr.is_empty() && r.report["results"].as_array().unwrap().len() == 3);
+    // A profile's own skip wins, with its reason.
+    let (path, _keep) =
+        profile(&format!("{MUTATION_PROFILE}[allow]\nskip = [{{ id = \"M3\", reason = \"answers drift\" }}]\n"));
+    let r = run(&[], &["--profile", path.to_str().unwrap(), "--only", "M3"]);
+    assert_eq!(r.report["results"][0]["detail"], "skipped by the profile: answers drift");
+}
+
+#[test]
+fn mutate_validates_the_profile_and_flags_then_stops_before_any_server_starts() {
+    let (path, _keep) = profile(MUTATION_PROFILE);
+    let path = path.to_str().unwrap();
+    let stderr = usage_error(&["--profile", path, "--mutate", "--mutation-seed", "5", "--mutation-cases", "1000"]);
+    assert!(
+        stderr.contains("the mutation scenario isn't implemented yet; the profile and flags are valid"),
+        "{stderr}"
+    );
+    // Without a seed file there is nothing to check, but it still stops.
+    assert!(usage_error(&["--mutate"]).contains("isn't implemented yet"));
+    let stderr = usage_error(&["--profile", path, "--mutate", "--mutation-cases", "1001"]);
+    assert!(stderr.contains("--mutation-cases must be from 1 to 1000, not 1001"), "{stderr}");
+    // The flags need --mutate.
+    for flag in ["--mutation-seed", "--mutation-cases"] {
+        let stderr = usage_error(&["--profile", path, flag, "1"]);
+        assert!(stderr.contains("--mutate"), "{flag}: {stderr}");
+    }
+    // A case that can't fit the run, with the request timeout from the command line.
+    let (slow, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\nrun_timeout = \"14m\"\n"));
+    let slow = slow.to_str().unwrap();
+    let stderr = usage_error(&["--profile", slow, "--mutate", "--timeout", "30"]);
+    assert!(stderr.contains("up to 875 s") && stderr.contains("mutation.run_timeout of 840 s"), "{stderr}");
+    assert!(usage_error(&["--profile", slow, "--mutate", "--timeout", "10"]).contains("isn't implemented yet"));
+    // A bad [mutation] is refused with or without --mutate.
+    let (bad, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\noperators = [\"explode\"]\n"));
+    for args in [&["--profile", bad.to_str().unwrap()][..], &["--profile", bad.to_str().unwrap(), "--mutate"]] {
+        let stderr = usage_error(args);
+        assert!(stderr.contains("mutation.operators: \"explode\" isn't an operator"), "{stderr}");
+    }
 }
 
 #[cfg(unix)]

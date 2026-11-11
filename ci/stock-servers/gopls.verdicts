@@ -40,3 +40,6 @@ R1 fail
 R2 pass
 R3 pass
 R4 fail
+M1 skip
+M2 skip
+M3 skip
