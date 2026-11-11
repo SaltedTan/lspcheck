@@ -2761,26 +2761,71 @@ fn content_modified_answers_to_broken_source_are_lawful() {
 }
 
 #[test]
-fn no_case_starts_without_its_whole_budget_left() {
-    // With --timeout 1, a case of two steps of two requests may take 23 s:
-    // 3 × 3 writes and replies, the restoration, a 2 s recovery, three
-    // terminal probes' writes and replies, and 5 s. The first case starts
-    // with 23.5 s left; its unanswered requests take a second, so no other can.
+fn mutation_no_case_starts_without_its_whole_budget_left() {
     let text =
-        std::fs::read_to_string(mutation_profile()).unwrap().replace("seed = ", "run_timeout = \"23500ms\"\nseed = ");
+        std::fs::read_to_string(mutation_profile()).unwrap().replace("seed = ", "run_timeout = \"60500ms\"\nseed = ");
     let (path, _keep) = profile(&text);
     let (r, _, _keep2) = run_with_transcripts(
         &["--fault", "ignore-while-unbalanced"],
-        &["--profile", path.to_str().unwrap(), "--mutate", "--timeout", "1", "--only", "M1,M2"],
+        &["--profile", path.to_str().unwrap(), "--mutate", "--timeout", "3", "--only", "M1,M2"],
     );
     assert_eq!(r.report["mutation"]["cases_run"], 1, "{}", r.report["mutation"]);
     let stopped = r.report["mutation"]["stopped"].as_str().unwrap();
     assert!(
-        stopped.contains("mutation.run_timeout (23.5 s) left less than a case's budget (23 s) for case 1"),
+        stopped.contains("mutation.run_timeout (60.5 s) left less than a case's budget (59 s) for case 1"),
         "{stopped}"
     );
     expect(&r, "M1", "pass");
     expect(&r, "M2", "fail");
+}
+
+#[test]
+fn mutation_openings_must_fit_the_byte_cap_before_any_are_sent() {
+    let (path, keep) = profile("");
+    let fixture = keep.path().join("fixture");
+    std::fs::create_dir(&fixture).unwrap();
+    let names: Vec<String> = (0..11).map(|i| format!("seed{i}.txt")).collect();
+    for name in &names {
+        std::fs::write(fixture.join(name), "\u{1}".repeat(1024 * 1024)).unwrap();
+    }
+    std::fs::write(
+        &path,
+        format!(
+            "[workspace]\npath = 'fixture'\n[mutation]\nfiles = {names:?}\nlanguage_id = 'plaintext'\n\
+             max_document_kib = 1024\nseed = 1\ncases = 1\n"
+        ),
+    )
+    .unwrap();
+    let (r, transcripts, _keep) = run_with_transcripts(
+        &["--fault", "no-diagnostics"],
+        &["--profile", path.to_str().unwrap(), "--mutate", "--only", "M1,M2"],
+    );
+    expect(&r, "M1", "error");
+    expect(&r, "M2", "error");
+    assert_eq!(r.report["mutation"]["cases_run"], 0);
+    assert!(r.report["mutation"]["stopped"].as_str().unwrap().starts_with("opening the seed files would write "));
+    let events = std::fs::read_to_string(transcripts.join("mutation.jsonl")).unwrap();
+    let mut methods = Vec::new();
+    let mut written = 0;
+    let mut reader = FrameReader::default();
+    for line in events.lines() {
+        let event: Value = serde_json::from_str(line).unwrap();
+        if event["dir"] == "out" {
+            let data = event["data"].as_str().unwrap();
+            written += data.len();
+            for chunk in reader.feed(data.as_bytes()) {
+                if let Chunk::Frame { body, .. } = chunk {
+                    let value: Value = serde_json::from_slice(&body).unwrap();
+                    if let Some(method) = value["method"].as_str() {
+                        methods.push(method.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    assert!(!methods.iter().any(|method| method == "textDocument/didOpen"), "{methods:?}");
+    assert!(methods.iter().any(|method| method == "shutdown"), "{methods:?}");
+    assert!(written < lspcheck::checks::MUTATION_BYTES as usize);
 }
 
 #[test]

@@ -516,13 +516,21 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
 
 - No settle or baseline (step 5): the cases start right after the seed documents are opened. M3 is `SKIP` ("lspcheck
   doesn't judge recovery yet").
-- The case budget and `run_timeout` are as above. Before a case starts, lspcheck checks that the bytes it has written
+- Before opening any seed file, lspcheck checks that all serialized `didOpen` notifications, bytes already written,
+  and 1 KiB for shutdown fit the 64 MiB cap; otherwise M1 and M2 are `ERROR` and no seed is opened.
+- The case budget and `run_timeout` are as above; planning, serialization and hashing consume the admitted case's
+  budget. Before a case starts, lspcheck checks that the bytes it has written
   so far plus the case's reserve fit the written-bytes cap; the reserve counts the case's `didChange` notifications at
   their exact size, 2 KiB plus twice the URI's length for each request, the restoration and 1 KiB for `shutdown` and
   `exit`. Answers to the server's own requests during a case aren't yet held to what is left of the cap before each
   write; they count towards the next case's check.
 - Each request's deadline is `--timeout` from when lspcheck began writing it; the step's requests are written back to
-  back and then waited for in order, each until its own deadline.
+  back and then waited for in order, each until its own deadline. Answering queued server requests happens before
+  that window starts, and a cached response counts only if it was received within the window. Requests still pending
+  when the process exits are excluded from M2.
+- M1 checks for an exit or closed output before the first mutation and after the final absorption before shutdown;
+  an exit before the first successful mutation write is `ERROR`. A stop in lspcheck's inspection remains `ERROR`,
+  including when a write fails and the server exits.
 - A request K1 wouldn't send about the document (a `documentSelector` that doesn't select it) is skipped, and the
   round robin moves on.
 - The transcript's meta line records each edit's `operator`, `offset`, `removed`, `sha256` of what it inserted, and

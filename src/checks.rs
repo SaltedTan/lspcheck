@@ -3514,7 +3514,14 @@ enum Lost {
 /// What lspcheck saw after a write to the server failed: an exit within
 /// `--exit-timeout` (the server is gone), else a write it couldn't deliver.
 async fn lost_after_write(ctx: &mut Ctx<'_>, what: &str, e: &WriteError) -> Lost {
-    match ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await {
+    if let Some((_, why)) = ctx.s.stopped_reading() {
+        return Lost::Uninspected(why);
+    }
+    let status = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    if let Some((_, why)) = ctx.s.stopped_reading() {
+        return Lost::Uninspected(why);
+    }
+    match status {
         Some(status) => Lost::Gone(format!("the server exited with {}", session::describe_status(status))),
         None => Lost::Undelivered(format!("lspcheck couldn't deliver {what} ({e})")),
     }
@@ -3527,7 +3534,11 @@ async fn lost_output(ctx: &mut Ctx<'_>) -> Lost {
     if let Some((_, why)) = ctx.s.stopped_reading() {
         return Lost::Uninspected(why);
     }
-    match ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await {
+    let status = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    if let Some((_, why)) = ctx.s.stopped_reading() {
+        return Lost::Uninspected(why);
+    }
+    match status {
         Some(status) => Lost::Gone(format!("the server exited with {}", session::describe_status(status))),
         None => Lost::Gone("the server closed its output".into()),
     }
@@ -3671,9 +3682,28 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             version: 1,
         });
     }
-    for doc in &docs {
-        let item = json!({"uri": doc.uri, "languageId": doc.language_id, "version": 1, "text": doc.clean});
-        if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": item}))).await {
+    let openings: Vec<Value> = docs
+        .iter()
+        .map(|doc| {
+            json!({"textDocument": {
+                "uri": doc.uri, "languageId": doc.language_id, "version": 1, "text": doc.clean
+            }})
+        })
+        .collect();
+    let opening_bytes = ctx.s.bytes_written()
+        + SHUTDOWN_RESERVE
+        + openings.iter().map(|params| notification_bytes("textDocument/didOpen", params)).sum::<u64>();
+    if opening_bytes > MUTATION_BYTES {
+        let why =
+            format!("opening the seed files would write {opening_bytes} bytes, past the scenario's cap of 64 MiB");
+        both(ctx, Verdict::Error, why.clone());
+        summary.stopped = Some(why);
+        ctx.mutation = Some(summary);
+        leave(ctx).await;
+        return;
+    }
+    for (doc, params) in docs.iter().zip(openings) {
+        if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(params)).await {
             let why = match lost_after_write(ctx, &format!("didOpen for {}", doc.name), &e).await {
                 Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) => why,
             };
@@ -3706,12 +3736,15 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     let run_deadline = Instant::now() + settings.run_timeout;
     let mut cursor = 0usize;
     let mut asked: Vec<StepRequest> = Vec::new();
+    let mut last_step_start = 0;
     let mut first_change: Option<Duration> = None;
     let mut versions = 0u64;
     let mut lost: Option<(Lost, String)> = None;
     let mut cut_short = 0u64;
     'cases: for k in 0..settings.cases {
-        if Instant::now() + case_budget > run_deadline {
+        let admitted = Instant::now();
+        let case_deadline = admitted + case_budget;
+        if case_deadline > run_deadline {
             summary.stopped = Some(format!(
                 "mutation.run_timeout ({} s) left less than a case's budget ({} s) for case {k}",
                 seconds(settings.run_timeout),
@@ -3788,26 +3821,35 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             .collect();
         ctx.s.record_mutation(json!({"format": mutation::FORMAT, "seed": seed, "case": k, "steps": record}));
         summary.cases_run += 1;
-        let case_deadline = Instant::now() + case_budget;
         let mut rng = mutation::SplitMix64::stream(seed, k, "requests");
         for (j, (step, params, after, version)) in steps.iter().enumerate() {
-            if j > 0 && Instant::now() >= case_deadline {
+            if Instant::now() >= case_deadline {
                 cut_short += 1;
                 break;
             }
             let d = step.document;
             let place = format!("case {k}, step {} ({})", j + 1, describe_edits(step));
-            first_change.get_or_insert_with(|| ctx.s.elapsed());
+            if first_change.is_none() && (ctx.s.output_closed().await || !ctx.s.is_alive()) {
+                lost = Some((lost_output(ctx).await, place));
+                break 'cases;
+            }
+            if Instant::now() >= case_deadline {
+                cut_short += 1;
+                break;
+            }
+            let change_at = ctx.s.elapsed();
             if let Err(e) = ctx.s.notify("textDocument/didChange", Some(params.clone())).await {
                 lost = Some((lost_after_write(ctx, "a didChange", &e).await, place));
                 break 'cases;
             }
+            first_change.get_or_insert(change_at);
             docs[d].current = after.clone();
             docs[d].version = *version;
             versions += 1;
             // The step's requests, written back to back, then each waited
             // for until its own deadline.
             let identifiers = mutation::identifiers(&docs[d].current, &settings.planner.lexicon);
+            last_step_start = asked.len();
             let mut pending = Vec::new();
             for _ in 0..settings.requests_per_step {
                 if methods.is_empty() {
@@ -3821,11 +3863,12 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 else {
                     continue;
                 };
-                let deadline = Instant::now() + timeout;
                 let id = ctx.s.fresh_id();
                 let bytes = frame(&message::request(&id, method, Some(params)));
+                let registered = ctx.s.begin_request(&id, method, Instant::now() + timeout).await;
                 let at = ctx.s.elapsed();
-                let written = match ctx.s.begin_request(&id, method, deadline).await {
+                let deadline = Instant::now() + timeout;
+                let written = match registered {
                     Ok(()) => {
                         let written = ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await;
                         if written.is_err() {
@@ -3840,6 +3883,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                     // A request the server exited before reading is M1's.
                     let outcome = match &how {
                         Lost::Gone(_) => StepOutcome::Gone,
+                        Lost::Uninspected(why) => StepOutcome::Uninspected(why.clone()),
                         _ => StepOutcome::Undelivered(format!("lspcheck couldn't deliver {method} ({e})")),
                     };
                     asked.push(StepRequest { method, case: k, at, waited: ctx.s.elapsed(), outcome });
@@ -3851,6 +3895,9 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             let mut closed = false;
             for (id, method, at, deadline) in pending {
                 let outcome = match ctx.s.wait_response(&id, deadline).await {
+                    Ok(_) if ctx.s.answered_at(&id).is_some_and(|received| received > at + timeout) => {
+                        StepOutcome::Unanswered
+                    }
                     Ok(reply) => StepOutcome::Answered(match &reply.kind {
                         Kind::Response { outcome: Outcome::Error { code, .. }, .. } => Some(code.unwrap_or(0)),
                         _ => None,
@@ -3866,7 +3913,11 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 };
                 asked.push(StepRequest { method, case: k, at, waited: ctx.s.elapsed(), outcome });
             }
-            if closed || !ctx.s.is_alive() {
+            let exited = !ctx.s.is_alive();
+            if exited {
+                exclude_pending_at_exit(&mut asked[last_step_start..]);
+            }
+            if closed || exited {
                 lost = Some((lost_output(ctx).await, place));
                 break 'cases;
             }
@@ -3906,10 +3957,48 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     if cut_short > 0 {
         ctx.s.note(format!("{cut_short} case(s) ran out of their budget before their last step"));
     }
+    leave_mutation(ctx, summary, first_change, versions, lost, &mut asked, last_step_start).await;
+}
+
+fn exclude_pending_at_exit(asked: &mut [StepRequest]) {
+    for request in asked {
+        if matches!(request.outcome, StepOutcome::Unanswered) {
+            request.outcome = StepOutcome::Gone;
+        }
+    }
+}
+
+async fn leave_mutation(
+    ctx: &mut Ctx<'_>,
+    summary: MutationSummary,
+    first_change: Option<Duration>,
+    versions: u64,
+    mut lost: Option<(Lost, String)>,
+    asked: &mut [StepRequest],
+    last_step_start: usize,
+) {
+    let id = ctx.s.fresh_id();
+    let deadline = Instant::now() + ctx.cfg.request_timeout;
+    let registered = ctx.s.begin_request(&id, "shutdown", deadline).await;
+    let exited = !ctx.s.is_alive();
+    if lost.is_none() && (ctx.s.stdout_closed() || exited || ctx.s.stopped_reading().is_some()) {
+        lost = Some((lost_output(ctx).await, "before shutdown".into()));
+    }
+    if !ctx.s.is_alive() {
+        exclude_pending_at_exit(&mut asked[last_step_start..]);
+    }
     judge_m1(ctx, &summary, first_change, versions, lost);
-    judge_m2(ctx, &asked);
+    judge_m2(ctx, asked);
     ctx.mutation = Some(summary);
-    leave(ctx).await;
+    if registered.is_ok() {
+        let bytes = frame(&message::request(&id, "shutdown", None));
+        if ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await.is_err() {
+            ctx.s.abort_request(&id);
+        } else if ctx.s.wait_response(&id, deadline).await.is_ok() && ctx.s.notify("exit", None).await.is_ok() {
+            let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+        }
+    }
+    ctx.s.take_in();
 }
 
 /// Sends each mutated document's clean text back, then leaves. For a run
@@ -4765,6 +4854,78 @@ pub fn file_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn mutation_test_config(script: &str) -> Config {
+        Config {
+            server: ServerCommand::new(&["sh".into(), "-c".into(), script.into()]),
+            sentinel: None,
+            request_timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_secs(5),
+            exit_timeout: Duration::from_secs(5),
+            leftover_grace: Duration::from_millis(200),
+            large_document_mib: 1,
+            max_body: 1024,
+            max_output: 1024,
+            transcripts: None,
+            workspace: profile::Workspace::default(),
+            initialization_options: None,
+            configuration: None,
+            allowed_descendants: Vec::new(),
+            skip: Vec::new(),
+            document: None,
+            mutation: None,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn mutation_test_ctx(cfg: &Config, max_output: usize) -> Ctx<'_> {
+        Ctx {
+            s: Session::start(&cfg.server, Options { max_output, ..Options::default() }).await.unwrap(),
+            cfg,
+            root: PathBuf::new(),
+            results: Vec::new(),
+            scenario: MUTATION,
+            j3_exercise: None,
+            k1_pending: None,
+            mutation: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_exit_before_shutdown_is_judged_at_both_first_change_boundaries() {
+        for (first_change, expected) in [(None, Verdict::Error), (Some(Duration::ZERO), Verdict::Fail)] {
+            let cfg = mutation_test_config("exit 0");
+            let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+            assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
+            let mut asked = [StepRequest {
+                method: "textDocument/hover",
+                case: 0,
+                at: Duration::ZERO,
+                waited: Duration::from_secs(1),
+                outcome: StepOutcome::Unanswered,
+            }];
+            let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
+            leave_mutation(&mut ctx, summary, first_change, 1, None, &mut asked, 0).await;
+            assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, expected);
+            assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::NotExercised);
+            assert!(matches!(asked[0].outcome, StepOutcome::Gone));
+            ctx.s.finish(Duration::from_millis(200)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_write_failure_after_inspection_stops_is_inconclusive_even_on_exit() {
+        let cfg = mutation_test_config("printf 'xxxxxxxxxxxxxxxx'; exit 0");
+        let mut ctx = mutation_test_ctx(&cfg, 1).await;
+        ctx.s.drain(Instant::now() + Duration::from_secs(5)).await;
+        assert!(ctx.s.stopped_reading().is_some());
+        assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
+        assert!(matches!(lost_after_write(&mut ctx, "didChange", &WriteError::Closed).await, Lost::Uninspected(_)));
+        ctx.s.finish(Duration::from_millis(200)).await;
+    }
 
     #[test]
     fn large_document_has_the_requested_size_and_bounded_lines() {

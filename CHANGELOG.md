@@ -17,6 +17,8 @@
 
 ### Changed
 
+- Mutation requests use their write-time deadlines, losses are judged through the shutdown boundary, and seed
+  openings are preflighted against the written-bytes cap. Case preparation consumes the admitted case's budget.
 - Profile durations may also be given in hours, such as `"1h"`.
 
 ## 0.4.0 (2026-11-11)

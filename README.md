@@ -334,7 +334,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
 - **`[mutation]`** configures [seeded source mutation](docs/source-mutations.md#profile-schema). The section is
   validated with the rest of the profile, and used only with `--mutate`, which is experimental and hidden from
   `--help` until recovery (M3) is judged: `lspcheck --profile p.toml --mutate [--mutation-seed N]
-  [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2.
+  [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2. Requests are timed from their writes;
+  seed openings are checked against the 64 MiB written-bytes cap before any are sent.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
   type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name, an unknown check id, or a
   `[document]` whose file, language id or positions don't fit is a usage error (exit status 2) naming the file and

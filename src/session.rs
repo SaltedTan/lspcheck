@@ -605,6 +605,14 @@ impl Session {
         self.stdout_closed
     }
 
+    pub fn stdout_closed(&self) -> bool {
+        self.stdout_closed
+    }
+
+    pub fn answered_at(&self, id: &Id) -> Option<Duration> {
+        self.answers.get(id).map(|&i| self.messages[i].0)
+    }
+
     /// Why evidence is incomplete so far, if it is: an inspection limit,
     /// frames that couldn't be read, or lspcheck's own side of the
     /// conversation. Any of these could explain a response that didn't come.
