@@ -540,13 +540,18 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
   session's send path, is planned for step 4.
 - Each request's deadline is `--timeout` from when lspcheck began writing it; the step's requests are written back to
   back and then waited for in order, each until its own deadline. Answering queued server requests happens before
-  that window starts. After the waits, including when a batch write fails, lspcheck absorbs queued output and settles
-  each delivered request from its response record: a reply received within the window answers it; a late reply is
-  unanswered; no reply when exit or closed output is observed belongs to M1. A request settled as unanswered while
-  the server was alive keeps that outcome if the server exits or answers later.
+  that window starts. Before later writes, after each wait and before classifying a failed write, lspcheck absorbs
+  queued output and checks the process and its output. A complete observation that finds the server running with
+  output open at or after a request's deadline establishes its timeout when no in-time reply was received. That
+  timeout remains M2's if a later request in the batch sees an exit, closed output or incomplete inspection. At batch
+  settlement, replies are judged by receive timestamp: an in-time reply answers the request; a late reply is
+  unanswered. Without an established timeout or any reply, a request when exit or closed output is observed belongs
+  to M1; observing an exit after a deadline alone does not prove the server survived that deadline. A timeout settled
+  in an earlier step also keeps its outcome if the server exits or answers later.
 - Absorption is bounded by the write timeout. If it cannot drain the queued output, every request without an
-  in-time answer is `ERROR`. Each absence window ends at that request's deadline; an inspection stop after that
-  deadline cannot excuse its timeout. The end-of-session recheck still includes frames spanning the deadline.
+  in-time answer or previously established timeout is `ERROR`. Each absence window ends at that request's deadline;
+  an inspection stop after that deadline cannot excuse its timeout. The end-of-session recheck still includes frames
+  spanning the deadline.
 - M1's window starts once the first mutation's `didChange` is fully written and ends before shutdown. An exit or
   closed output before that boundary, or a failed first mutation write, is `ERROR`. A failed later write with observed
   closed output counts as server loss even if the process remains alive. A stop in lspcheck's inspection remains

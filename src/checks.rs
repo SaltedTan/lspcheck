@@ -3610,7 +3610,8 @@ fn restoration_reserve<'a>(
 fn step_outcome(
     answer: Option<(Duration, Option<i64>)>,
     deadline_at: Duration,
-    server_gone: Option<Duration>,
+    server_gone: bool,
+    alive_at: Option<Duration>,
     stopped_reading: Option<(Duration, String)>,
     absorbed_all: bool,
 ) -> StepOutcome {
@@ -3619,23 +3620,44 @@ fn step_outcome(
     {
         return StepOutcome::Answered(code);
     }
-    if !absorbed_all {
-        return StepOutcome::Uninspected(
-            "lspcheck couldn't finish reading the server's output before judging the request".into(),
-        );
-    }
     if let Some((at, why)) = stopped_reading
         && at <= deadline_at
     {
         return StepOutcome::Uninspected(why);
     }
+    if alive_at.is_some_and(|at| at >= deadline_at) {
+        return StepOutcome::Unanswered;
+    }
+    if !absorbed_all {
+        return StepOutcome::Uninspected(
+            "lspcheck couldn't finish reading the server's output before judging the request".into(),
+        );
+    }
     match (answer, server_gone) {
-        (None, Some(_)) => StepOutcome::Gone,
+        (None, true) => StepOutcome::Gone,
         _ => StepOutcome::Unanswered,
     }
 }
 
-fn settle_step_request(s: &Session, request: &mut StepRequest, server_gone: Option<Duration>, absorbed_all: bool) {
+async fn observe_mutation_batch(s: &mut Session, alive_at: &mut Option<Duration>) -> (bool, bool) {
+    let absorbed_all = s.absorb_all().await;
+    let at = s.elapsed();
+    let closed = s.stdout_closed();
+    let exited = !s.is_alive();
+    let inspected = s.stopped_reading().is_none();
+    if absorbed_all && !closed && !exited && inspected {
+        *alive_at = Some(at);
+    }
+    (absorbed_all, exited || (closed && inspected))
+}
+
+fn settle_step_request(
+    s: &Session,
+    request: &mut StepRequest,
+    server_gone: bool,
+    alive_at: Option<Duration>,
+    absorbed_all: bool,
+) {
     let answer = s.answered_at(&request.id).map(|at| {
         let code = match &s.answer_to(&request.id).expect("matched response").kind {
             Kind::Response { outcome: Outcome::Error { code, .. }, .. } => Some(code.unwrap_or(0)),
@@ -3643,7 +3665,8 @@ fn settle_step_request(s: &Session, request: &mut StepRequest, server_gone: Opti
         };
         (at, code)
     });
-    request.outcome = step_outcome(answer, request.deadline_at, server_gone, s.stopped_reading(), absorbed_all);
+    request.outcome =
+        step_outcome(answer, request.deadline_at, server_gone, alive_at, s.stopped_reading(), absorbed_all);
 }
 
 /// The params of a step's request: K1's, at `spot`, about the document as
@@ -3942,6 +3965,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             let step_start = asked.len();
             let mut deadlines = Vec::new();
             let mut failed_request = None;
+            let mut alive_at = None;
             for _ in 0..settings.requests_per_step {
                 if methods.is_empty() {
                     break;
@@ -3954,6 +3978,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 else {
                     continue;
                 };
+                observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
                 let id = ctx.s.fresh_id();
                 let bytes = frame(&message::request(&id, method, Some(params)));
                 let registered = ctx.s.begin_request(&id, method, Instant::now() + timeout).await;
@@ -3971,6 +3996,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                     Err(e) => Err(e),
                 };
                 if let Err(e) = written {
+                    observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
                     let how = lost_after_write(ctx, method, &e).await;
                     // A request the server exited before reading is M1's.
                     let outcome = match &how {
@@ -3986,20 +4012,18 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             }
             for (request, deadline) in asked[step_start..].iter().zip(deadlines) {
                 let _ = ctx.s.wait_response(&request.id, deadline).await;
+                observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
             }
-            let absorbed_all = ctx.s.absorb_all().await;
-            let closed = ctx.s.stdout_closed();
-            let exited = !ctx.s.is_alive();
-            let server_gone = (exited || (closed && ctx.s.stopped_reading().is_none())).then(|| ctx.s.elapsed());
+            let (absorbed_all, server_gone) = observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
             for request in &mut asked[step_start..] {
-                settle_step_request(&ctx.s, request, server_gone, absorbed_all);
+                settle_step_request(&ctx.s, request, server_gone, alive_at, absorbed_all);
             }
             if let Some((request, how)) = failed_request {
                 asked.push(request);
                 lost = Some((how, place));
                 break 'cases;
             }
-            if closed || exited {
+            if ctx.s.stdout_closed() || server_gone {
                 lost = Some((lost_output(ctx).await, place));
                 break 'cases;
             }
@@ -5216,41 +5240,113 @@ while header := sys.stdin.buffer.readline():
         ctx.s.finish(Duration::from_millis(200)).await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_batch_timeouts_survive_a_handshaken_standin_exit() {
+        let script = r#"import json, sys
+while header := sys.stdin.buffer.readline():
+    length = int(header.split(b':')[1])
+    assert sys.stdin.buffer.readline() == b'\r\n'
+    request = json.loads(sys.stdin.buffer.read(length))
+    if request['method'] == 'lspcheck/exit':
+        sys.exit(5)
+    if request['method'] != 'lspcheck/ready':
+        continue
+    body = json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': None}).encode()
+    sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
+    sys.stdout.buffer.flush()
+"#;
+        for observe_timeout in [false, true] {
+            let mut cfg = mutation_test_config("exit 0");
+            cfg.server = ServerCommand::new(&["python3".into(), "-I".into(), "-c".into(), script.into()]);
+            let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+            let mut asked = Vec::new();
+            for id in [1, 2] {
+                let id = Id::int(id);
+                let method = "textDocument/hover";
+                ctx.s.begin_request(&id, method, Instant::now() + Duration::from_secs(5)).await.unwrap();
+                let at = ctx.s.elapsed();
+                let deadline_at = if asked.is_empty() { at } else { Duration::MAX };
+                ctx.s.write_raw(&frame(&message::request(&id, method, Some(json!({}))))).await.unwrap();
+                asked.push(StepRequest { id, method, case: 0, at, deadline_at, outcome: StepOutcome::Unanswered });
+            }
+            ctx.s.call("lspcheck/ready", None, Duration::from_secs(5)).await.unwrap();
+            assert_eq!(ctx.s.wait_response(&asked[0].id, Instant::now()).await.unwrap_err(), WaitError::Timeout);
+            let mut alive_at = None;
+            if observe_timeout {
+                assert_eq!(observe_mutation_batch(&mut ctx.s, &mut alive_at).await, (true, false));
+                let at = alive_at.unwrap();
+                assert!(at >= asked[0].deadline_at && at < asked[1].deadline_at);
+            }
+            ctx.s.notify("lspcheck/exit", None).await.unwrap();
+            assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
+            let (absorbed_all, server_gone) = observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
+            assert!(absorbed_all && server_gone);
+            for request in &mut asked {
+                settle_step_request(&ctx.s, request, server_gone, alive_at, absorbed_all);
+            }
+            assert_eq!(asked[0].outcome, if observe_timeout { StepOutcome::Unanswered } else { StepOutcome::Gone });
+            assert_eq!(asked[1].outcome, StepOutcome::Gone);
+            judge_m2(&mut ctx, &asked);
+            let m2 = ctx.results.iter().find(|r| r.id == "M2").unwrap();
+            assert_eq!(m2.verdict, if observe_timeout { Verdict::Fail } else { Verdict::NotExercised });
+            if observe_timeout {
+                assert_eq!(m2.absent_at, [(asked[0].at, asked[0].deadline_at)]);
+            }
+            ctx.s.finish(Duration::from_millis(200)).await;
+        }
+    }
+
     #[test]
     fn mutation_response_records_determine_step_outcomes() {
         let deadline = Duration::from_secs(1);
         let early = Duration::from_millis(500);
         let late = Duration::from_millis(1001);
-        let gone = Some(Duration::from_secs(2));
         for (answer, server_gone, expected) in [
-            (Some((early, None)), None, StepOutcome::Answered(None)),
-            (Some((deadline, Some(-32801))), gone, StepOutcome::Answered(Some(-32801))),
-            (Some((late, None)), None, StepOutcome::Unanswered),
-            (Some((late, Some(-32801))), gone, StepOutcome::Unanswered),
-            (None, None, StepOutcome::Unanswered),
-            (None, gone, StepOutcome::Gone),
+            (Some((early, None)), false, StepOutcome::Answered(None)),
+            (Some((deadline, Some(-32801))), true, StepOutcome::Answered(Some(-32801))),
+            (Some((late, None)), false, StepOutcome::Unanswered),
+            (Some((late, Some(-32801))), true, StepOutcome::Unanswered),
+            (None, false, StepOutcome::Unanswered),
+            (None, true, StepOutcome::Gone),
         ] {
-            assert_eq!(step_outcome(answer, deadline, server_gone, None, true), expected);
+            assert_eq!(step_outcome(answer, deadline, server_gone, None, None, true), expected);
         }
+        for alive_at in [deadline, late] {
+            for absorbed_all in [false, true] {
+                assert_eq!(
+                    step_outcome(None, deadline, true, Some(alive_at), None, absorbed_all),
+                    StepOutcome::Unanswered
+                );
+                assert_eq!(
+                    step_outcome(Some((early, None)), deadline, true, Some(alive_at), None, absorbed_all),
+                    StepOutcome::Answered(None)
+                );
+            }
+        }
+        assert_eq!(step_outcome(None, deadline, true, Some(early), None, true), StepOutcome::Gone);
         let stopped = Some((early, "output budget".to_owned()));
-        assert_eq!(step_outcome(None, deadline, gone, stopped, true), StepOutcome::Uninspected("output budget".into()));
+        assert_eq!(
+            step_outcome(None, deadline, true, Some(late), stopped, true),
+            StepOutcome::Uninspected("output budget".into())
+        );
     }
 
     #[test]
     fn mutation_incomplete_absorption_cannot_establish_a_timeout() {
         let deadline = Duration::from_secs(1);
         let late = Duration::from_secs(2);
-        for server_gone in [None, Some(late)] {
+        for server_gone in [false, true] {
             for answer in [None, Some((late, None))] {
                 assert_eq!(
-                    step_outcome(answer, deadline, server_gone, None, false),
+                    step_outcome(answer, deadline, server_gone, None, None, false),
                     StepOutcome::Uninspected(
                         "lspcheck couldn't finish reading the server's output before judging the request".into()
                     )
                 );
             }
             assert_eq!(
-                step_outcome(Some((deadline, Some(-32801))), deadline, server_gone, None, false),
+                step_outcome(Some((deadline, Some(-32801))), deadline, server_gone, None, None, false),
                 StepOutcome::Answered(Some(-32801))
             );
         }
@@ -5261,12 +5357,19 @@ while header := sys.stdin.buffer.readline():
         let deadline = Duration::from_secs(1);
         for at in [Duration::from_millis(500), deadline] {
             assert_eq!(
-                step_outcome(None, deadline, None, Some((at, "output budget".into())), true),
+                step_outcome(None, deadline, false, None, Some((at, "output budget".into())), true),
                 StepOutcome::Uninspected("output budget".into())
             );
         }
         assert_eq!(
-            step_outcome(None, deadline, None, Some((Duration::from_millis(1001), "output budget".into())), true),
+            step_outcome(
+                None,
+                deadline,
+                false,
+                None,
+                Some((Duration::from_millis(1001), "output budget".into())),
+                true
+            ),
             StepOutcome::Unanswered
         );
     }
@@ -5325,7 +5428,7 @@ while header := sys.stdin.buffer.readline():
         assert_eq!(ctx.s.wait_response(&request.id, Instant::now()).await.unwrap_err(), WaitError::Timeout);
         ctx.s.write_raw(b"go\n").await.unwrap();
         ctx.s.drain(Instant::now() + Duration::from_secs(5)).await;
-        settle_step_request(&ctx.s, &mut request, Some(ctx.s.elapsed()), true);
+        settle_step_request(&ctx.s, &mut request, true, None, true);
         assert_eq!(request.outcome, StepOutcome::Answered(None));
         ctx.s.finish(Duration::from_millis(200)).await;
     }

@@ -15,6 +15,7 @@
   `--mutation-cases` override the profile. The JSON report gains `"mutation"` (`null` when the scenario doesn't run),
   the terminal header names the seed, and the scenario's transcript, `mutation.jsonl`, records each case's plan.
   When the scenario stops early, `mutation.stopped` records the reason, including initialization and seed-file errors.
+  M2 preserves observed timeouts when the server exits during a later request in the same batch.
 
 ### Changed
 
