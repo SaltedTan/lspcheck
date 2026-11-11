@@ -3481,10 +3481,8 @@ struct StepRequest {
     id: Id,
     method: &'static str,
     case: u64,
-    /// When lspcheck began writing it, and when its wait ended.
     at: Duration,
     deadline_at: Duration,
-    waited: Duration,
     outcome: StepOutcome,
 }
 
@@ -3592,19 +3590,30 @@ fn step_outcome(
     deadline_at: Duration,
     server_gone: Option<Duration>,
     stopped_reading: Option<(Duration, String)>,
+    absorbed_all: bool,
 ) -> StepOutcome {
-    match answer {
-        Some((at, code)) if at <= deadline_at => StepOutcome::Answered(code),
-        Some(_) => StepOutcome::Unanswered,
-        None => match stopped_reading {
-            Some((_, why)) => StepOutcome::Uninspected(why),
-            None if server_gone.is_some() => StepOutcome::Gone,
-            None => StepOutcome::Unanswered,
-        },
+    if let Some((at, code)) = answer
+        && at <= deadline_at
+    {
+        return StepOutcome::Answered(code);
+    }
+    if !absorbed_all {
+        return StepOutcome::Uninspected(
+            "lspcheck couldn't finish reading the server's output before judging the request".into(),
+        );
+    }
+    if let Some((at, why)) = stopped_reading
+        && at <= deadline_at
+    {
+        return StepOutcome::Uninspected(why);
+    }
+    match (answer, server_gone) {
+        (None, Some(_)) => StepOutcome::Gone,
+        _ => StepOutcome::Unanswered,
     }
 }
 
-fn settle_step_request(s: &Session, request: &mut StepRequest, server_gone: Option<Duration>) {
+fn settle_step_request(s: &Session, request: &mut StepRequest, server_gone: Option<Duration>, absorbed_all: bool) {
     let answer = s.answered_at(&request.id).map(|at| {
         let code = match &s.answer_to(&request.id).expect("matched response").kind {
             Kind::Response { outcome: Outcome::Error { code, .. }, .. } => Some(code.unwrap_or(0)),
@@ -3612,8 +3621,7 @@ fn settle_step_request(s: &Session, request: &mut StepRequest, server_gone: Opti
         };
         (at, code)
     });
-    request.outcome = step_outcome(answer, request.deadline_at, server_gone, s.stopped_reading());
-    request.waited = s.elapsed();
+    request.outcome = step_outcome(answer, request.deadline_at, server_gone, s.stopped_reading(), absorbed_all);
 }
 
 /// The params of a step's request: K1's, at `spot`, about the document as
@@ -3930,32 +3938,21 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                         Lost::Uninspected(why) => StepOutcome::Uninspected(why.clone()),
                         _ => StepOutcome::Undelivered(format!("lspcheck couldn't deliver {method} ({e})")),
                     };
-                    failed_request = Some((
-                        StepRequest { id, method, case: k, at, deadline_at, waited: ctx.s.elapsed(), outcome },
-                        how,
-                    ));
+                    failed_request = Some((StepRequest { id, method, case: k, at, deadline_at, outcome }, how));
                     break;
                 }
-                asked.push(StepRequest {
-                    id,
-                    method,
-                    case: k,
-                    at,
-                    deadline_at,
-                    waited: at,
-                    outcome: StepOutcome::Unanswered,
-                });
+                asked.push(StepRequest { id, method, case: k, at, deadline_at, outcome: StepOutcome::Unanswered });
                 deadlines.push(deadline);
             }
             for (request, deadline) in asked[step_start..].iter().zip(deadlines) {
                 let _ = ctx.s.wait_response(&request.id, deadline).await;
             }
-            ctx.s.output_closed().await;
+            let absorbed_all = ctx.s.absorb_all().await;
             let closed = ctx.s.stdout_closed();
             let exited = !ctx.s.is_alive();
             let server_gone = (exited || (closed && ctx.s.stopped_reading().is_none())).then(|| ctx.s.elapsed());
             for request in &mut asked[step_start..] {
-                settle_step_request(&ctx.s, request, server_gone);
+                settle_step_request(&ctx.s, request, server_gone, absorbed_all);
             }
             if let Some((request, how)) = failed_request {
                 asked.push(request);
@@ -4095,7 +4092,7 @@ fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest]) {
         ctx.fail_absent_between(
             "M2",
             first.at,
-            first.waited,
+            first.deadline_at,
             format!(
                 "{} in case {} got no response within {} s (--timeout){more}",
                 first.method,
@@ -4103,14 +4100,14 @@ fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest]) {
                 seconds(ctx.cfg.request_timeout)
             ),
         );
-        let windows: Vec<(Duration, Duration)> = unanswered[1..].iter().map(|r| (r.at, r.waited)).collect();
+        let windows: Vec<(Duration, Duration)> = unanswered[1..].iter().map(|r| (r.at, r.deadline_at)).collect();
         ctx.results.last_mut().expect("just reported").absent_at.extend(windows);
         return;
     }
     let trouble = asked.iter().find_map(|r| match &r.outcome {
         StepOutcome::Undelivered(why) => Some(why.clone()),
         StepOutcome::Uninspected(why) => {
-            Some(format!("lspcheck stopped reading the server's output while {} waited ({why})", r.method))
+            Some(format!("lspcheck couldn't inspect every response to {} ({why})", r.method))
         }
         _ => None,
     });
@@ -4952,7 +4949,6 @@ mod tests {
             case: 0,
             at: Duration::ZERO,
             deadline_at: Duration::from_secs(1),
-            waited: Duration::from_secs(1),
             outcome: StepOutcome::Unanswered,
         }];
         let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
@@ -4977,10 +4973,78 @@ mod tests {
             (None, None, StepOutcome::Unanswered),
             (None, gone, StepOutcome::Gone),
         ] {
-            assert_eq!(step_outcome(answer, deadline, server_gone, None), expected);
+            assert_eq!(step_outcome(answer, deadline, server_gone, None, true), expected);
         }
         let stopped = Some((early, "output budget".to_owned()));
-        assert_eq!(step_outcome(None, deadline, gone, stopped), StepOutcome::Uninspected("output budget".into()));
+        assert_eq!(step_outcome(None, deadline, gone, stopped, true), StepOutcome::Uninspected("output budget".into()));
+    }
+
+    #[test]
+    fn mutation_incomplete_absorption_cannot_establish_a_timeout() {
+        let deadline = Duration::from_secs(1);
+        let late = Duration::from_secs(2);
+        for server_gone in [None, Some(late)] {
+            for answer in [None, Some((late, None))] {
+                assert_eq!(
+                    step_outcome(answer, deadline, server_gone, None, false),
+                    StepOutcome::Uninspected(
+                        "lspcheck couldn't finish reading the server's output before judging the request".into()
+                    )
+                );
+            }
+            assert_eq!(
+                step_outcome(Some((deadline, Some(-32801))), deadline, server_gone, None, false),
+                StepOutcome::Answered(Some(-32801))
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_inspection_stops_affect_only_windows_they_overlap() {
+        let deadline = Duration::from_secs(1);
+        for at in [Duration::from_millis(500), deadline] {
+            assert_eq!(
+                step_outcome(None, deadline, None, Some((at, "output budget".into())), true),
+                StepOutcome::Uninspected("output budget".into())
+            );
+        }
+        assert_eq!(
+            step_outcome(None, deadline, None, Some((Duration::from_millis(1001), "output budget".into())), true),
+            StepOutcome::Unanswered
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_absence_windows_end_at_each_request_deadline() {
+        let cfg = mutation_test_config("exit 0");
+        let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+        let asked = [
+            StepRequest {
+                id: Id::int(1),
+                method: "textDocument/hover",
+                case: 0,
+                at: Duration::from_millis(10),
+                deadline_at: Duration::from_secs(1),
+                outcome: StepOutcome::Unanswered,
+            },
+            StepRequest {
+                id: Id::int(2),
+                method: "textDocument/hover",
+                case: 0,
+                at: Duration::from_millis(20),
+                deadline_at: Duration::from_secs(2),
+                outcome: StepOutcome::Unanswered,
+            },
+        ];
+        judge_m2(&mut ctx, &asked);
+        let result = ctx.results.iter().find(|r| r.id == "M2").unwrap();
+        assert_eq!(result.verdict, Verdict::Fail);
+        assert_eq!(
+            result.absent_at,
+            [(Duration::from_millis(10), Duration::from_secs(1)), (Duration::from_millis(20), Duration::from_secs(2))]
+        );
+        ctx.s.finish(Duration::from_millis(200)).await;
     }
 
     #[cfg(unix)]
@@ -4999,13 +5063,12 @@ mod tests {
             case: 0,
             at,
             deadline_at: at + Duration::from_secs(5),
-            waited: at,
             outcome: StepOutcome::Unanswered,
         };
         assert_eq!(ctx.s.wait_response(&request.id, Instant::now()).await.unwrap_err(), WaitError::Timeout);
         ctx.s.write_raw(b"go\n").await.unwrap();
         ctx.s.drain(Instant::now() + Duration::from_secs(5)).await;
-        settle_step_request(&ctx.s, &mut request, Some(ctx.s.elapsed()));
+        settle_step_request(&ctx.s, &mut request, Some(ctx.s.elapsed()), true);
         assert_eq!(request.outcome, StepOutcome::Answered(None));
         ctx.s.finish(Duration::from_millis(200)).await;
     }

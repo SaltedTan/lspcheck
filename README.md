@@ -336,7 +336,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   `--help` until recovery (M3) is judged: `lspcheck --profile p.toml --mutate [--mutation-seed N]
   [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2. Requests are timed from their writes;
   queued replies count by receive time, and each step's outcomes are settled once. Seed openings and restoration
-  from any intermediate text are reserved against the 64 MiB written-bytes cap.
+  from any intermediate text are reserved against the 64 MiB written-bytes cap. An incomplete drain of queued output
+  makes missing responses `ERROR`; inspection gaps are checked within each request's own deadline.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
   type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name, an unknown check id, or a
   `[document]` whose file, language id or positions don't fit is a usage error (exit status 2) naming the file and

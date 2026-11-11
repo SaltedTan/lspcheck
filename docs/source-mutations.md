@@ -531,6 +531,9 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
   each delivered request from its response record: a reply received within the window answers it; a late reply is
   unanswered; no reply when exit or closed output is observed belongs to M1. A request settled as unanswered while
   the server was alive keeps that outcome if the server exits or answers later.
+- Absorption is bounded by the write timeout. If it cannot drain the queued output, every request without an
+  in-time answer is `ERROR`. Each absence window ends at that request's deadline; an inspection stop after that
+  deadline cannot excuse its timeout. The end-of-session recheck still includes frames spanning the deadline.
 - M1 checks for an exit or closed output before the first mutation and after the final absorption before shutdown;
   an exit before the first successful mutation write is `ERROR`. A stop in lspcheck's inspection remains `ERROR`,
   including when a write fails and the server exits.

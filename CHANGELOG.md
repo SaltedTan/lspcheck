@@ -21,6 +21,8 @@
   openings are preflighted against the written-bytes cap. Case preparation consumes the admitted case's budget.
 - Mutation batches retain every delivered request and settle replies by receive time; later exits preserve earlier
   timeouts. Case admission reserves restoration space for every intermediate text, including plans that end clean.
+- Mutation timeouts become inconclusive when queued output cannot be fully inspected; absence windows end at each
+  request's deadline, so later inspection stops do not excuse established timeouts.
 - Profile durations may also be given in hours, such as `"1h"`.
 
 ## 0.4.0 (2026-11-11)

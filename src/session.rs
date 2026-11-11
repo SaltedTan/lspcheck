@@ -601,8 +601,12 @@ impl Session {
     /// Takes in what has already been read, answering the server's requests,
     /// and says whether its stdout has closed (or lspcheck stopped reading it).
     pub async fn output_closed(&mut self) -> bool {
-        self.absorb(Instant::now() + self.opts.write_timeout).await;
+        self.absorb_all().await;
         self.stdout_closed
+    }
+
+    pub async fn absorb_all(&mut self) -> bool {
+        self.absorb(Instant::now() + self.opts.write_timeout).await
     }
 
     pub fn stdout_closed(&self) -> bool {
@@ -887,7 +891,7 @@ impl Session {
 
     /// Takes in what has already been read, without waiting for more and
     /// without going past `deadline`. What it doesn't reach is handled later.
-    async fn absorb(&mut self, deadline: Instant) {
+    async fn absorb(&mut self, deadline: Instant) -> bool {
         tokio::task::yield_now().await;
         let mut n = 0u32;
         while !self.stdout_closed && Instant::now() < deadline {
@@ -895,13 +899,14 @@ impl Session {
                 Ok((at, inbound)) => {
                     let _ = self.handle(at, inbound, deadline).await;
                 }
-                Err(_) => break,
+                Err(_) => return true,
             }
             n += 1;
             if n.is_multiple_of(256) {
                 tokio::task::yield_now().await;
             }
         }
+        self.stdout_closed || self.rx.is_empty()
     }
 
     /// Receives the next message or stream problem, answering server requests
@@ -1556,6 +1561,30 @@ pub fn describe_status(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_absorption_reports_a_backlog_when_its_deadline_expires() {
+        let cmd = ServerCommand::new(&["sleep".into(), "30".into()]);
+        let opts = Options { write_timeout: Duration::ZERO, ..Options::default() };
+        let mut s = Session::start(&cmd, opts).await.unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        s.rx = rx;
+        let notification =
+            Message::parse(br#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":4,"message":"queued"}}"#)
+                .unwrap();
+        assert!(tx.send((Duration::ZERO, Inbound::Message(notification))).is_ok());
+        assert!(!s.absorb_all().await);
+        assert!(s.messages.is_empty());
+        s.opts.write_timeout = Duration::from_secs(5);
+        assert!(s.absorb_all().await);
+        assert_eq!(s.messages.len(), 1);
+        assert!(s.absorb_all().await);
+        assert!(tx.send((Duration::ZERO, Inbound::Closed)).is_ok());
+        assert!(s.absorb_all().await);
+        assert!(s.stdout_closed());
+        s.finish(Duration::from_millis(200)).await;
+    }
 
     #[test]
     fn configuration_items_are_looked_up_by_dotted_section() {
