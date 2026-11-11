@@ -116,11 +116,10 @@ The lexicon only decides *where* to edit. No oracle depends on it, so a wrong le
 can't make a verdict wrong. That is why lspcheck can stay ignorant of the language.
 
 **Operators.** Each picks its target with the case's RNG. If it finds nothing to change (`open-string` in text without
-strings), it inserts a token from the document's own tokens instead, and the record says so. A document with no tokens
-that fits the insertion cap (an empty seed, or one a `truncate` emptied) gets the first of the lexicon's brackets, else
-`(`, inserted at offset 0,
-so the plan stays a total function of the seed. Planner tests cover an empty seed and mutations after a truncation
-to empty.
+strings), it inserts a token from the document's own tokens instead, and the record says so. If none of the document's
+tokens fits the insertion cap (including an empty seed, or one a `truncate` emptied), the fallback inserts the lexicon's
+first opening bracket, else `(`, at offset 0, so the plan stays a total function of the seed. Planner tests cover an
+empty seed and mutations after a truncation to empty.
 
 | Operator | Edit |
 |---|---|
