@@ -1,9 +1,10 @@
 # Seeded source mutation and recovery
 
-**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Steps 1 and 2 of
-the [implementation plan](#implementation-plan) are in place: the planner (`src/mutation.rs`), and the profile's
-`[mutation]` section with M1 to M3 in the catalogue, always `SKIP`. Nothing runs the scenario yet, so `--mutate` and
-its two flags are hidden: they validate the profile and flags, then stop with exit status 2. See the
+**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Steps 1 to 3 of
+the [implementation plan](#implementation-plan) are in place: the planner (`src/mutation.rs`), the profile's
+`[mutation]` section, and the scenario, which judges M1 and M2. `--mutate` and its two flags are experimental and
+hidden from `--help` until recovery (M3) is judged; until then the scenario doesn't settle or take baselines, M3 is
+`SKIP`, and D1, D2, D6 and K1 aren't extended to it. See [what step 3 leaves out](#step-3) and the
 [design status](design.md) for its place in the roadmap.
 
 ## Context
@@ -66,9 +67,10 @@ Existing checks keep being judged on the new scenario's evidence:
   random edit can't make that diagnosis, so D1 judges those positions. D4, the C, L1 to L8 and R checks need their own
   scenarios.
 
-Without `--mutate`, the scenario doesn't run and M1 to M3 report `SKIP`, which doesn't affect the exit status. Once
-the scenario is implemented, their detail will be `mutation is off; pass --mutate`; until then it says the scenario
-isn't implemented yet ([catalogue](design.md#mutation)).
+Without `--mutate`, nothing above changes: the scenario doesn't run and M1 to M3 report `SKIP` (`mutation is off;
+pass --mutate`), which doesn't affect the exit status ([catalogue](design.md#mutation)).
+With `--mutate` and a seed file, the scenario runs when an M check or a cross-cutting check is selected and not
+skipped by the profile.
 
 ### The scenario
 
@@ -171,9 +173,9 @@ Each step sends `requests_per_step` requests, round robin over the advertised me
 `requests` allows (default: all of them), with a cursor that runs across cases so every method is exercised. Their
 params are K1's. Positions are drawn from the current text: half inside an identifier, a tenth at the end of the
 document, the rest at any character boundary, never inside a character and never between `\r` and `\n`, counted in
-the negotiated encoding. `workspace/symbol` queries an identifier from the text. Rename and formatting edits are never
-applied. The requests of one step are written back to back and waited for together, each with its own deadline from
-when its write began.
+the negotiated encoding. `workspace/symbol` queries up to 64 characters of an identifier from the text, or an empty
+string when there is none. Rename and formatting edits are never applied. The requests of one step are written back
+to back and waited for together, each with its own deadline from when its write began.
 
 ### Recovery
 
@@ -240,14 +242,15 @@ end-of-scenario recheck, and every missing reply through `fail_absent_between`.
 
 **M1.**
 - *skip:* `--mutate` not given, no seed file, no `didOpen`, or no change sync.
-- *fail:* the process exited, or lspcheck read end of file on its stdout, after the first mutation's `didChange` began
-  and before lspcheck sent `shutdown`. Only an exit or an end of file lspcheck saw counts: today's session API reports
+- *fail:* the process exited, or lspcheck read end of file on its stdout, once the first mutation's `didChange` was
+  fully written and before lspcheck sent `shutdown`. Only an exit or an end of file lspcheck saw counts: today's session API reports
   both end of file and lspcheck stopping its own reading (output over `--max-output-mib`) as `Recv::Closed`, so it must
   tell the two apart first, and stopped inspection makes M1 `ERROR`, never `FAIL`. The detail gives the exit status, the case and step, its operators and their offsets. After a write
-  lspcheck couldn't finish, it waits up to `--exit-timeout` for an exit before judging, as R1 does.
-- *error:* the server exited before the first mutation (during settle or baseline, which says nothing about broken
-  source); `initialize` failed; a `didChange` couldn't be delivered and no exit was seen.
-- *not-exercised:* no case ran (the run budget was spent on settling).
+  lspcheck couldn't finish, it waits up to `--exit-timeout` for an exit and checks for closed output before judging.
+- *error:* the server exited or closed output before the first mutation was fully written (during settle or baseline,
+  which says nothing about broken source); the first mutation write failed; `initialize` failed; a later `didChange`
+  couldn't be delivered and neither an exit nor closed output was seen.
+- *not-exercised:* no mutation was sent, for example because the remaining run budget couldn't admit a case.
 - *pass:* otherwise, with the number of cases and versions sent.
 
 **M2.** Judges every delivered request of the scenario after the first mutation: the step requests and the recovery
@@ -341,14 +344,15 @@ It also refuses: an empty list where one is given (`files`, `operators`, `reques
 listed twice in any of them, `max_document_kib` outside 1 to 1024, a negative `seed`, a `run_timeout` over `"4h"`
 or `settle_timeout` over `"5m"`, an empty fragment or one longer than the growth bound (1 KiB), an empty keyword, a
 string escape that isn't one character, and seed files without a language id (`language_id`, else `[document]`'s).
-A lexicon key left out keeps the default lexicon's value, so `keywords = [...]` alone adds keywords to the default.
+A lexicon key left out keeps the default lexicon's value, so `keywords = [...]` alone adds keywords to the default;
+a key that is given replaces the default's value, so `identifier_chars = "-"` drops `_` (write `"-_"` to keep it).
 `requests` are asked in K1's order whatever the profile's. Durations use the [profile syntax](../README.md#profiles).
 A seed chosen at random is below 2^53, so it survives any JSON reader and fits a TOML integer.
 
 `--mutation-seed N` and `--mutation-cases N` require `--mutate` and override the profile's values. `--mutate` resolves
 the `[mutation]` settings; with a `[document]` but no `[mutation]`, it selects that file with the default lexicon and
 defaults (its size is checked against the default 64 KiB then, not when the profile is read). With no seed file it
-resolves an empty seed list; once the scenario is implemented, that will make M1 to M3 `SKIP` ("no seed file").
+resolves an empty seed list and M1 to M3 report `SKIP` ("no seed file").
 
 ### Bounds
 
@@ -394,11 +398,14 @@ server's request unanswered, and M3 and the cases not run are `ERROR` (lspcheck'
 the bytes written capped, a transcript holds at most that plus what the server wrote. None of these bounds is a
 protocol rule: reaching one gives `ERROR` or `N/E` with the bound named, or just a smaller run, never `FAIL`.
 
+These are the complete design's bounds; [step 3](#step-3) currently leaves answers to server requests uncapped
+throughout the scenario. Enforcement in the session's send path is planned for step 4.
+
 ### Reports, transcripts and reproduction
 
-The JSON report gains a top-level `"mutation"`: `null`, or the seed, the format, the cases planned and run, and why
-the run stopped early, if it did. The terminal header adds `— mutation seed 20261109, 20 cases`. The schema id is
-unchanged, as when `"profile"` was added.
+The JSON report gains a top-level `"mutation"`: `null` when the scenario didn't run, or the seed, the format, the
+cases planned and run, and why the run stopped early, if it did. The terminal header adds
+`— mutation seed 20261109, 20 cases`. The schema id is unchanged, as when `"profile"` was added.
 
 The scenario's transcript, `mutation.jsonl`, is an ordinary session transcript, so `lspcheck replay mutation.jsonl --
 SERVER` replays it as it is: the workspace line recreates the seed files, and every `didChange`, request and poll is
@@ -406,8 +413,9 @@ re-sent byte for byte. Before each case lspcheck records a meta line, `{"dir":"m
 "case":17,"steps":[{"document":"main.lua","version":5,"edits":[{"operator":"open-string","offset":40,"removed":1,
 "inserted":"","sha256":…}]}]}}`, with offsets and lengths in UTF-8 bytes of the text before the edit; replay ignores
 meta lines it doesn't know, so no change to replay is needed.
-Inserted text over 64 characters is summarised by length, prefix and SHA-256, as virgil-lsp does; the full text is in
-the recorded `didChange`.
+Each edit records the SHA-256 of its inserted text, with `fallback: true` when its operator found nothing to change.
+Inserted text up to 64 characters is recorded in `inserted`; longer text uses its UTF-8 byte count in `inserted_bytes`
+and its first 64 characters in `inserted_prefix`. The full text is in the recorded `didChange`.
 
 A whole session can be long, so a later step adds **isolation**: after the run, for each of the first three failing
 or erroring cases, lspcheck runs that case alone in a fresh session (open, settle, baseline, the case's steps, restore,
@@ -429,7 +437,8 @@ a window. Lawful faults count replies, not milliseconds.
 | Fault | Effect | Test |
 |---|---|---|
 | `exit-on-unbalanced` | exit when a document's brackets become unbalanced | M1 fails |
-| `flood-while-unbalanced` | lawful: write diagnostics past `--max-output-mib` while unbalanced, and keep serving | M1 `ERROR` (inspection stopped), never `FAIL` |
+| `flood-while-unbalanced` | lawful: after a change leaves brackets unbalanced, write 2 MiB of log messages, and keep serving | With `--max-output-mib 1`, M1 `ERROR` (inspection stopped), never `FAIL` |
+| `close-output-mid-restoration` | Unix only: partway through reading a large document's restoration, send 20,000 requests and close stdout, then read nothing more after it | M1 `ERROR` (the end of output is queued behind requests lspcheck can't answer before shutdown), never `PASS` |
 | `late-wrong-count` | answer one `selectionRange` with `[]` after more than 64 later versions | D6 fails from the mutation scenario |
 | `recover-before-deadline` | lawful: after rebalancing, answer `documentSymbol` with `[]` until just before `recovery_timeout`, counted in replies to a poll schedule the test fixes, then with the baseline | nothing fails with `expect = "baseline"`: the terminal probe sees the baseline |
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails |
@@ -508,6 +517,53 @@ Each step is one small pull request with its tests, docs and changelog entry whe
 7. **Stock matrix.** `[mutation]` in the example profiles, a mutation job and `.mutation.verdicts` (a workflow change,
    so the maintainer merges it).
 8. **Minimisation**, if isolation shows it is wanted.
+
+### Step 3
+
+Step 3 runs the scenario without the parts later steps add, and says so where it matters:
+
+- No settle or baseline (step 5): the cases start right after the seed documents are opened. M3 is `SKIP` ("lspcheck
+  doesn't judge recovery yet").
+- Before sending `initialize`, lspcheck checks its exact serialized request (including the profile's
+  `initializationOptions`), `initialized`, optional `workspace/didChangeConfiguration`, and 1 KiB for shutdown against
+  the 64 MiB cap. If they do not fit, M1 and M2 are `ERROR` and the scenario writes nothing.
+- Before opening any seed file, lspcheck checks that all serialized `didOpen` notifications, bytes already written,
+  and 1 KiB for shutdown fit the 64 MiB cap; otherwise M1 and M2 are `ERROR` and no seed is opened.
+- The case budget and `run_timeout` are as above; planning, serialization and hashing consume the admitted case's
+  budget. Before a case starts, lspcheck checks that the bytes it has written
+  so far plus the case's reserve fit the written-bytes cap; the reserve counts the case's `didChange` notifications at
+  their exact size, 2 KiB plus twice the URI's length for each request, and 1 KiB for `shutdown` and `exit`. For each
+  document, the restoration reserve is the largest restoration notification over every step's resulting text and
+  version, plus a small margin, even if the plan ends with the clean text. Answers to the server's own requests
+  anywhere in the mutation scenario (startup, cases, early leave and shutdown) aren't yet held to the 64 MiB cap
+  before each write; they count towards the next case's check, if any. Enforcing the cap on answers once, in the
+  session's send path, is planned for step 4.
+- Each request's deadline is `--timeout` from when lspcheck began writing it; the step's requests are written back to
+  back and then waited for in order, each until its own deadline. Answering queued server requests happens before
+  that window starts. Before later writes, after each wait and before classifying a failed write, lspcheck absorbs
+  queued output and checks the process and its output. A complete observation that finds the server running with
+  output open at or after a request's deadline establishes its timeout when no in-time reply was received. That
+  timeout remains M2's if a later request in the batch sees an exit, closed output or incomplete inspection. At batch
+  settlement, replies are judged by receive timestamp: an in-time reply answers the request; a late reply is
+  unanswered. Without an established timeout or any reply, a request when exit or closed output is observed belongs
+  to M1; observing an exit after a deadline alone does not prove the server survived that deadline. A timeout settled
+  in an earlier step also keeps its outcome if the server exits or answers later.
+- Absorption is bounded by the write timeout. If it cannot drain the queued output, every request without an
+  in-time answer or previously established timeout is `ERROR`. Each absence window ends at that request's deadline;
+  an inspection stop after that deadline cannot excuse its timeout. The end-of-session recheck still includes frames
+  spanning the deadline. An unfinished client write, including an automatic answer, makes overlapping request
+  windows inconclusive from when that write began, rather than when its failure became known.
+- M1's window starts once the first mutation's `didChange` is fully written and ends before shutdown. An exit or
+  closed output before that boundary, or a failed first mutation write, is `ERROR`. A failed later write with observed
+  closed output counts as server loss even if the process remains alive. A stop in lspcheck's inspection remains
+  `ERROR`, including when a write fails and the server exits.
+  At the shutdown boundary, new exit or EOF evidence supersedes a recorded delivery failure, preserving its location;
+  an inspection stop supersedes either classification. Before that boundary lspcheck takes in everything it has
+  already read, within the write timeout, since an end of output may be queued behind it. If it can't (answers to the
+  server's requests that the server doesn't read can block it), M1 is `ERROR` unless a loss was already seen.
+- A request K1 wouldn't send about the document (a `documentSelector` that doesn't select it) is skipped, and the
+  round robin moves on.
+- Case plans use the [transcript format above](#reports-transcripts-and-reproduction).
 
 ## Decisions
 

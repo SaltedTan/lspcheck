@@ -2627,16 +2627,9 @@ fn the_mutation_checks_are_skipped_and_dont_change_the_exit_status() {
 }
 
 #[test]
-fn mutate_validates_the_profile_and_flags_then_stops_before_any_server_starts() {
+fn a_bad_mutation_setting_is_a_usage_error_before_any_server_starts() {
     let (path, _keep) = profile(MUTATION_PROFILE);
     let path = path.to_str().unwrap();
-    let stderr = usage_error(&["--profile", path, "--mutate", "--mutation-seed", "5", "--mutation-cases", "1000"]);
-    assert!(
-        stderr.contains("the mutation scenario isn't implemented yet; the profile and flags are valid"),
-        "{stderr}"
-    );
-    // Without a seed file there is nothing to check, but it still stops.
-    assert!(usage_error(&["--mutate"]).contains("isn't implemented yet"));
     let stderr = usage_error(&["--profile", path, "--mutate", "--mutation-cases", "1001"]);
     assert!(stderr.contains("--mutation-cases must be from 1 to 1000, not 1001"), "{stderr}");
     // The flags need --mutate.
@@ -2646,16 +2639,239 @@ fn mutate_validates_the_profile_and_flags_then_stops_before_any_server_starts() 
     }
     // A case that can't fit the run, with the request timeout from the command line.
     let (slow, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\nrun_timeout = \"14m\"\n"));
-    let slow = slow.to_str().unwrap();
-    let stderr = usage_error(&["--profile", slow, "--mutate", "--timeout", "30"]);
+    let stderr = usage_error(&["--profile", slow.to_str().unwrap(), "--mutate", "--timeout", "30"]);
     assert!(stderr.contains("up to 875 s") && stderr.contains("mutation.run_timeout of 840 s"), "{stderr}");
-    assert!(usage_error(&["--profile", slow, "--mutate", "--timeout", "10"]).contains("isn't implemented yet"));
     // A bad [mutation] is refused with or without --mutate.
     let (bad, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\noperators = [\"explode\"]\n"));
     for args in [&["--profile", bad.to_str().unwrap()][..], &["--profile", bad.to_str().unwrap(), "--mutate"]] {
         let stderr = usage_error(args);
         assert!(stderr.contains("mutation.operators: \"explode\" isn't an operator"), "{stderr}");
     }
+}
+
+/// The stand-in's mutation profile: one seed document, mutated only by
+/// `unbalance-bracket`, four cases of up to two steps.
+fn mutation_profile() -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/standin-mutation.toml").display().to_string()
+}
+
+/// The stand-in with `faults`, checked under `--mutate` with its mutation
+/// profile and `args`, keeping the transcripts.
+fn mutated(faults: &[&str], args: &[&str]) -> (Run, std::path::PathBuf, tempfile::TempDir) {
+    let standin: Vec<&str> = faults.iter().flat_map(|f| ["--fault", f]).collect();
+    let profile = mutation_profile();
+    let mut lspcheck = vec!["--profile", profile.as_str(), "--mutate"];
+    lspcheck.extend_from_slice(args);
+    run_with_transcripts(&standin, &lspcheck)
+}
+
+/// The mutation plans a run recorded, without their times.
+fn recorded_plans(transcripts: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(transcripts.join("mutation.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter_map(|v| v.get("mutation").cloned())
+        .collect()
+}
+
+#[test]
+fn the_clean_standin_survives_mutation() {
+    let (r, t, _keep) = mutated(&[], &[]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "skip")]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    assert_eq!(
+        r.report["mutation"],
+        serde_json::json!({"seed": 20261111, "format": 1, "cases": 4, "cases_run": 4, "stopped": null})
+    );
+    assert!(r.stdout.lines().next().unwrap().ends_with("— mutation seed 20261111, 4 cases"), "{}", r.stdout);
+    let m2 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M2").unwrap()["detail"];
+    assert!(m2.as_str().unwrap().contains("got a response; none with an error"), "{m2}");
+    assert_eq!(
+        r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M3").unwrap()["detail"],
+        lspcheck::checks::M3_LATER
+    );
+    // One plan per case, before it is sent, with the versions the steps sent.
+    let plans = recorded_plans(&t);
+    assert_eq!(plans.iter().map(|p| p["case"].as_u64().unwrap()).collect::<Vec<_>>(), [0, 1, 2, 3]);
+    for plan in &plans {
+        assert_eq!((&plan["format"], &plan["seed"]), (&1.into(), &20261111.into()));
+        for step in plan["steps"].as_array().unwrap() {
+            assert_eq!(step["document"], "main.lua");
+            for edit in step["edits"].as_array().unwrap() {
+                assert_eq!(edit["operator"], "unbalance-bracket", "{edit}");
+            }
+        }
+    }
+    // The same seed plans the same cases.
+    let (_, again, _keep) = mutated(&[], &[]);
+    assert_eq!(recorded_plans(&again), plans);
+    // A transcript of the scenario replays as it is.
+    let out = replay(&t.join("mutation.jsonl"), &[], &[STANDIN]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn the_seed_and_case_flags_override_the_profile() {
+    let (r, t, _keep) = mutated(&[], &["--mutation-seed", "7", "--mutation-cases", "1", "--only", "M1,M2,M3"]);
+    assert_eq!(
+        r.report["mutation"],
+        serde_json::json!({"seed": 7, "format": 1, "cases": 1, "cases_run": 1, "stopped": null})
+    );
+    expect(&r, "M1", "pass");
+    let plans = recorded_plans(&t);
+    assert_eq!((plans.len(), &plans[0]["seed"]), (1, &7.into()));
+}
+
+#[test]
+fn mutation_server_exit_records_early_stop_and_fails_m1() {
+    let (r, _, _keep) = mutated(&["exit-on-unbalanced"], &[]);
+    expect(&r, "M1", "fail");
+    let m1 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M1").unwrap()["detail"];
+    let m1 = m1.as_str().unwrap();
+    assert!(m1.starts_with("the server exited with status 5 during case 0, step 1 (unbalance-bracket at "), "{m1}");
+    assert_eq!(r.report["mutation"]["cases_run"], 1);
+    assert_eq!(r.report["mutation"]["stopped"].as_str(), Some(m1));
+    // A request pending when it exited, or that it exited before reading,
+    // is M1's, not M2's: nothing was answered after a mutation.
+    expect(&r, "M2", "not-exercised");
+}
+
+#[test]
+fn output_past_the_budget_while_mutated_makes_m1_an_error_not_a_failure() {
+    let (r, _, _keep) = mutated(&["flood-while-unbalanced"], &["--max-output-mib", "1"]);
+    expect(&r, "M1", "error");
+    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+    assert_eq!(r.status, 2, "{}", r.stdout);
+}
+
+#[test]
+fn a_request_left_unanswered_after_a_mutation_fails_m2() {
+    let (r, _, _keep) = mutated(&["ignore-while-unbalanced"], &["--timeout", "2", "--only", "M1,M2"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "fail");
+    let m2 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M2").unwrap()["detail"];
+    assert!(m2.as_str().unwrap().contains("in case 0 got no response within 2 s (--timeout)"), "{m2}");
+}
+
+#[test]
+fn content_modified_answers_to_broken_source_are_lawful() {
+    let (r, _, _keep) = mutated(&["content-modified-while-unbalanced"], &[]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "skip")]);
+    let m2 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M2").unwrap()["detail"];
+    assert!(m2.as_str().unwrap().contains("errors by code: -32801 ×"), "{m2}");
+}
+
+#[test]
+fn mutation_openings_must_fit_the_byte_cap_before_any_are_sent() {
+    let (path, keep) = profile("");
+    let fixture = keep.path().join("fixture");
+    std::fs::create_dir(&fixture).unwrap();
+    let names: Vec<String> = (0..11).map(|i| format!("seed{i}.txt")).collect();
+    for name in &names {
+        std::fs::write(fixture.join(name), "\u{1}".repeat(1024 * 1024)).unwrap();
+    }
+    std::fs::write(
+        &path,
+        format!(
+            "[workspace]\npath = 'fixture'\n[mutation]\nfiles = {names:?}\nlanguage_id = 'plaintext'\n\
+             max_document_kib = 1024\nseed = 1\ncases = 1\n"
+        ),
+    )
+    .unwrap();
+    let (r, transcripts, _keep) = run_with_transcripts(
+        &["--fault", "no-diagnostics"],
+        &["--profile", path.to_str().unwrap(), "--mutate", "--only", "M1,M2"],
+    );
+    expect(&r, "M1", "error");
+    expect(&r, "M2", "error");
+    assert_eq!(r.report["mutation"]["cases_run"], 0);
+    assert!(r.report["mutation"]["stopped"].as_str().unwrap().starts_with("opening the seed files would write "));
+    let events = std::fs::read_to_string(transcripts.join("mutation.jsonl")).unwrap();
+    let mut methods = Vec::new();
+    let mut written = 0;
+    let mut reader = FrameReader::default();
+    for line in events.lines() {
+        let event: Value = serde_json::from_str(line).unwrap();
+        if event["dir"] == "out" {
+            let data = event["data"].as_str().unwrap();
+            written += data.len();
+            for chunk in reader.feed(data.as_bytes()) {
+                if let Chunk::Frame { body, .. } = chunk {
+                    let value: Value = serde_json::from_slice(&body).unwrap();
+                    if let Some(method) = value["method"].as_str() {
+                        methods.push(method.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    assert!(!methods.iter().any(|method| method == "textDocument/didOpen"), "{methods:?}");
+    assert!(methods.iter().any(|method| method == "shutdown"), "{methods:?}");
+    assert!(written < lspcheck::checks::MUTATION_BYTES as usize);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_end_of_output_lspcheck_couldnt_read_before_shutdown_makes_m1_an_error() {
+    // The restoration of a 200 KiB document fills the pipe. Partway through
+    // it the server stops reading, sends requests and closes stdout, so the
+    // end of output is queued behind requests lspcheck can't answer before
+    // shutdown. Unread, it is neither a pass nor a failure.
+    let text = format!("hello (world) {}", "a".repeat(200 * 1024));
+    let (path, _dir) = profile(&format!(
+        "[workspace]\nfiles = {{ \"main.txt\" = \"{text}\" }}\n[document]\npath = 'main.txt'\n\
+         language_id = 'plaintext'\n[mutation]\nseed = 20261111\ncases = 1\nsteps = 1\n\
+         operators = ['unbalance-bracket']\nrequests_per_step = 1\nmax_document_kib = 1024\n"
+    ));
+    let (r, _, _keep) = run_with_transcripts(
+        &["--fault", "close-output-mid-restoration"],
+        &["--profile", path.to_str().unwrap(), "--mutate", "--only", "M1,M2", "--timeout", "2", "--exit-timeout", "1"],
+    );
+    expect(&r, "M1", "error");
+    let m1 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M1").unwrap()["detail"];
+    assert!(m1.as_str().unwrap().contains("couldn't finish reading"), "{m1}");
+}
+
+#[test]
+fn mutation_early_initialize_errors_record_their_stop_reasons() {
+    for (fault, expected) in [
+        ("init-error", "initialize didn't succeed: the server refused to initialize"),
+        ("no-capabilities", "initialize had no capabilities object (see L2)"),
+        ("bad-encoding", "not judged: the server chose positionEncoding"),
+    ] {
+        let (r, _, _keep) = mutated(&[fault], &["--only", "M1,M2"]);
+        assert_eq!(r.report["mutation"]["cases_run"], 0);
+        let stopped = r.report["mutation"]["stopped"].as_str().unwrap();
+        assert!(stopped.starts_with(expected), "{fault}: {stopped}");
+        for id in ["M1", "M2"] {
+            expect(&r, id, "error");
+            let result = r.report["results"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap();
+            assert_eq!(result["detail"], stopped);
+        }
+        assert_eq!(r.status, 2, "{}", r.stdout);
+    }
+}
+
+#[test]
+fn mutation_is_skipped_without_a_seed_file_or_document_changes() {
+    // No profile: nothing to mutate.
+    let r = run(&[], &["--mutate", "--only", "M1,M2,M3"]);
+    for id in MUTATION_CHECKS {
+        expect(&r, id, "skip");
+    }
+    assert_eq!(r.report["results"][0]["detail"], lspcheck::checks::NO_SEED_FILE);
+    assert_eq!(r.report["mutation"], Value::Null);
+    // A server that takes no changes.
+    let (r, _, _keep) = mutated(&["no-change-sync"], &["--only", "M1,M2"]);
+    expect(&r, "M1", "skip");
+    expect(&r, "M2", "skip");
+    assert_eq!(r.report["mutation"]["cases_run"], 0);
+    assert_eq!(
+        r.report["mutation"]["stopped"],
+        "the server takes no document changes (textDocumentSync change is absent or 0)"
+    );
+    assert_eq!(r.status, 0, "{}", r.stdout);
 }
 
 #[cfg(unix)]

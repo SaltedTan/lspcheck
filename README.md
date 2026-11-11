@@ -73,11 +73,11 @@ lspcheck 0.4.0 — basedpyright-langserver --stdio
   PASS  R4  POLICY  Unusual but valid request ids round-trip exactly: 0, negative, the 32-bit extremes, an empty string, a long string, a non-ASCII string
                      all 8 requests got responses with their exact ids
   SKIP  M1  POLICY  The server doesn't exit, or close its output, while its source is mutated or being restored
-                     mutation is off: the scenario that mutates source isn't implemented yet
+                     mutation is off; pass --mutate
   SKIP  M2  POLICY  Every request about a mutated document gets a response (any result or error) within --timeout
-                     mutation is off: the scenario that mutates source isn't implemented yet
+                     mutation is off; pass --mutate
   SKIP  M3  POLICY  Once the clean text is restored, the server's answers about it return to those it gave before the mutations
-                     mutation is off: the scenario that mutates source isn't implemented yet
+                     mutation is off; pass --mutate
 42 checks: 34 pass, 4 fail (0 MUST, 2 SHOULD, 2 POLICY), 4 skipped, 0 not exercised, 0 errors
 ```
 
@@ -85,7 +85,7 @@ lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle
 advertised capabilities, message types, and parameter, malformed-body, large-document and request-id robustness.
 The [capabilities and robustness reference](docs/design.md#capabilities-and-robustness) explains the K1, K2 and R
 checks' verdict rules. M1 to M3 belong to [seeded source mutation](docs/source-mutations.md), which is being
-built: until it runs, they are always `SKIP`, which doesn't affect the exit status.
+built: without `--mutate` they are `SKIP`, which doesn't affect the exit status.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
@@ -262,7 +262,7 @@ answers even when the client's pipe flush finishes later.
 ### Profiles
 
 Many servers refuse to initialize, or check little, without a project or settings. A profile is a TOML file that
-gives lspcheck what a server needs, and says what its maintainers accept. The five sections and their top-level keys
+gives lspcheck what a server needs, and says what its maintainers accept. The sections and their top-level keys
 are optional, except that `[document]` needs `path` and `language_id`; each `allow.skip` entry requires both `id`
 and `reason`.
 The example below uses supported fields; [planned profile fields](docs/design.md#profiles-optional-toml) are not
@@ -330,9 +330,16 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   chose. `path` must name a file of `[workspace]` (from `path` or `files`) holding UTF-8 text; each position must be
   on a line the file has, at most one column past the line's last character. Without `positions`, K1
   [chooses positions from the document's text](docs/design.md#capabilities-and-robustness).
-  Other checks still use their own documents.
-- **`[mutation]`** configures [seeded source mutation](docs/source-mutations.md#profile-schema), which isn't
-  implemented yet. The section is validated with the rest of the profile, and otherwise has no effect.
+  See the [mutation reference](docs/source-mutations.md#profile-schema) for mutation seed selection.
+- **`[mutation]`** configures [seeded source mutation](docs/source-mutations.md#profile-schema). The section is
+  validated with the rest of the profile, and used only with `--mutate`, which is experimental and hidden from
+  `--help` until recovery (M3) is judged: `lspcheck --profile p.toml --mutate [--mutation-seed N]
+  [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2. See the
+  [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
+  [step 3's limits](docs/source-mutations.md#step-3) for what is implemented so far. The JSON `mutation.stopped`
+  field records why the scenario stopped early, including initialization and seed-file errors.
+  An observed request timeout still fails M2 if the server exits later in the same batch.
+  Reply windows interrupted by an unfinished client write are `ERROR`.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
   type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name, an unknown check id, or a
   `[document]` whose file, language id or positions don't fit is a usage error (exit status 2) naming the file and

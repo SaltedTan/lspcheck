@@ -77,8 +77,8 @@ struct Cli {
     #[arg(long, default_value_t = 256, value_name = "MIB")]
     max_output_mib: usize,
 
-    /// Run the mutation scenario (M1 to M3). Hidden until the scenario
-    /// exists: the profile and flags are validated, then lspcheck stops.
+    /// Run the mutation scenario (M1 to M3). Hidden while it is
+    /// experimental: recovery (M3) isn't judged yet.
     #[arg(long, hide = true)]
     mutate: bool,
 
@@ -207,14 +207,20 @@ fn main() {
     }
     let p = loaded.unwrap_or_default();
     let request_timeout = profile::timeout(cli.timeout, p.request_timeout, 10);
-    if cli.mutate {
-        if let Err(e) = profile::mutation_settings(&p, cli.mutation_seed, cli.mutation_cases, request_timeout) {
-            eprintln!("lspcheck: {e}");
-            std::process::exit(2);
+    let mutation = if cli.mutate {
+        match profile::mutation_settings(&p, cli.mutation_seed, cli.mutation_cases, request_timeout) {
+            Ok(mut settings) => {
+                settings.seed.get_or_insert_with(profile::random_seed);
+                Some(settings)
+            }
+            Err(e) => {
+                eprintln!("lspcheck: {e}");
+                std::process::exit(2);
+            }
         }
-        eprintln!("lspcheck: --mutate: the mutation scenario isn't implemented yet; the profile and flags are valid");
-        std::process::exit(2);
-    }
+    } else {
+        None
+    };
     if let Some(dir) = &cli.transcripts
         && let Err(e) = std::fs::create_dir_all(dir)
     {
@@ -239,6 +245,7 @@ fn main() {
         allowed_descendants: p.allowed_descendants,
         skip: p.skip,
         document: p.document,
+        mutation,
     };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     let runs = match rt.block_on(checks::run(&cfg, &cli.only)) {

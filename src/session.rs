@@ -113,6 +113,9 @@ pub enum EventKind {
     /// The settings `workspace/configuration` is answered from, so a replay
     /// answers the same way.
     Configuration(Value),
+    /// The plan of a mutation case, recorded before it is sent. Replay
+    /// ignores it.
+    Mutation(Value),
 }
 
 /// Something wrong with the server's output stream.
@@ -448,6 +451,8 @@ pub struct Session {
     group: Group,
     exit: Option<ExitStatus>,
     opts: Options,
+    /// Bytes that reached the server's stdin.
+    written: u64,
     _registration: Registration,
 }
 
@@ -534,6 +539,7 @@ impl Session {
             group,
             exit: None,
             opts,
+            written: 0,
             _registration: registration,
         })
     }
@@ -572,6 +578,49 @@ impl Session {
     /// Records the settings `workspace/configuration` is answered from, for [`crate::replay`].
     pub fn record_configuration(&self, settings: Value) {
         record(&self.transcript, self.start.elapsed(), EventKind::Configuration(settings));
+    }
+
+    /// Records the plan of a mutation case.
+    pub fn record_mutation(&self, plan: Value) {
+        record(&self.transcript, self.start.elapsed(), EventKind::Mutation(plan));
+    }
+
+    /// How many bytes have reached the server's stdin, answers to its
+    /// requests included.
+    pub fn bytes_written(&self) -> u64 {
+        self.written
+    }
+
+    /// When and why lspcheck stopped reading the server's stdout (its output
+    /// budget ran out), if it did. Stdout reported closed without this was
+    /// closed by the server.
+    pub fn stopped_reading(&self) -> Option<(Duration, String)> {
+        self.evidence.lock().expect("evidence lock").stopped.clone()
+    }
+
+    /// Takes in what has already been read, answering the server's requests,
+    /// and says whether its stdout has closed (or lspcheck stopped reading it).
+    pub async fn output_closed(&mut self) -> bool {
+        self.absorb_all().await;
+        self.stdout_closed
+    }
+
+    /// Drains already-read output within the write timeout. False means
+    /// queued output remains, so a missing response is not established.
+    pub async fn absorb_all(&mut self) -> bool {
+        self.absorb(Instant::now() + self.opts.write_timeout).await
+    }
+
+    pub fn stdout_closed(&self) -> bool {
+        self.stdout_closed
+    }
+
+    pub fn answered_at(&self, id: &Id) -> Option<Duration> {
+        self.answers.get(id).map(|&i| self.messages[i].0)
+    }
+
+    pub fn answer_to(&self, id: &Id) -> Option<&Message> {
+        self.answers.get(id).map(|&i| &self.messages[i].1)
     }
 
     /// Why evidence is incomplete so far, if it is: an inspection limit,
@@ -616,7 +665,7 @@ impl Session {
                     // what it would have sent next.
                     if mark_requests
                         && let Kind::Request { method, .. } = &m.kind
-                        && self.own_limit.is_none()
+                        && self.own_limit.as_ref().is_none_or(|(began, _)| at < *began)
                     {
                         self.own_limit = Some((at, format!("lspcheck didn't answer the server's {method} request")));
                     }
@@ -689,6 +738,7 @@ impl Session {
         if written > piece {
             record_began(&self.transcript, piece_at, piece_seq, EventKind::Sent(bytes[piece..written].to_vec()));
         }
+        self.written += written as u64;
         let outcome = match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
@@ -702,19 +752,22 @@ impl Session {
             self.note(format!("write stopped after {written} of {} bytes: {e}", bytes.len()));
             if written > 0 && written < bytes.len() && self.stdin.is_some() {
                 self.abandoned = Some(began);
-                self.limit_self(format!(
-                    "lspcheck's write stopped partway through a frame ({e}), so it sent nothing more"
-                ));
+                self.limit_self(
+                    began,
+                    format!("lspcheck's write stopped partway through a frame ({e}), so it sent nothing more"),
+                );
+            } else if *e != WriteError::Closed {
+                self.limit_self(began, format!("lspcheck couldn't finish its write ({e})"));
             }
         }
         outcome
     }
 
     /// Records that lspcheck's own side of the conversation is incomplete.
-    fn limit_self(&mut self, why: String) {
+    fn limit_self(&mut self, began: Duration, why: String) {
         self.note(why.clone());
-        if self.own_limit.is_none() {
-            self.own_limit = Some((self.start.elapsed(), why));
+        if self.own_limit.as_ref().is_none_or(|(at, _)| began < *at) {
+            self.own_limit = Some((began, why));
         }
     }
 
@@ -843,7 +896,7 @@ impl Session {
 
     /// Takes in what has already been read, without waiting for more and
     /// without going past `deadline`. What it doesn't reach is handled later.
-    async fn absorb(&mut self, deadline: Instant) {
+    async fn absorb(&mut self, deadline: Instant) -> bool {
         tokio::task::yield_now().await;
         let mut n = 0u32;
         while !self.stdout_closed && Instant::now() < deadline {
@@ -851,13 +904,14 @@ impl Session {
                 Ok((at, inbound)) => {
                     let _ = self.handle(at, inbound, deadline).await;
                 }
-                Err(_) => break,
+                Err(_) => return true,
             }
             n += 1;
             if n.is_multiple_of(256) {
                 tokio::task::yield_now().await;
             }
         }
+        self.stdout_closed || self.rx.is_empty()
     }
 
     /// Receives the next message or stream problem, answering server requests
@@ -953,7 +1007,8 @@ impl Session {
         };
         // `accept` has just recorded this request.
         let i = self.server_requests.len() - 1;
-        self.server_requests[i].answer_began = Some(self.start.elapsed());
+        let began = self.start.elapsed();
+        self.server_requests[i].answer_began = Some(began);
         let written = self.send_until(&reply, deadline).await;
         if written.is_ok() {
             self.server_requests[i].answered_at = Some(self.start.elapsed());
@@ -964,7 +1019,7 @@ impl Session {
             // The server may be waiting for this answer, so what follows can't
             // be blamed on it. (A closed stdin means the server is exiting or
             // closed it itself; nothing more is expected of it.)
-            self.limit_self(format!("lspcheck couldn't answer the server's {method} request ({e})"));
+            self.limit_self(began, format!("lspcheck couldn't answer the server's {method} request ({e})"));
         }
     }
 
@@ -1512,6 +1567,85 @@ pub fn describe_status(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_writes_make_evidence_incomplete_from_their_start() {
+        let id = Id::Str("configuration".into());
+        let request = message::request(&id, "workspace/configuration", Some(json!({"items": [{}]})));
+        let request = transport::encode(&serde_json::to_vec(&request).unwrap());
+        let request = String::from_utf8(request).unwrap().replace('\'', "'\\''");
+        let script = format!("printf '%s' '{request}'; sleep 30");
+        for automatic_answer in [true, false] {
+            let cmd = ServerCommand::new(&["sh".into(), "-c".into(), script.clone().into()]);
+            let opts = Options {
+                auto_respond: false,
+                configuration: Some(json!({"payload": "x".repeat(4 * 1024 * 1024)})),
+                ..Options::default()
+            };
+            let mut s = Session::start(&cmd, opts).await.unwrap();
+            let Recv::Message(request) = s.recv(Instant::now() + Duration::from_secs(5)).await else {
+                panic!("the stand-in didn't signal it was ready");
+            };
+            assert_eq!(request.value["method"], "workspace/configuration");
+            let since = s.elapsed();
+            let expected_began = if automatic_answer {
+                s.answer(&id, "workspace/configuration", &request.value, Instant::now()).await;
+                let server_request = &s.server_requests[0];
+                assert!(server_request.answered_at.is_none());
+                server_request.answer_began
+            } else {
+                let id = Id::int(7);
+                s.begin_request(&id, "lspcheck/large", Instant::now() + Duration::from_secs(5)).await.unwrap();
+                let request =
+                    message::request(&id, "lspcheck/large", Some(json!({"payload": "x".repeat(4 * 1024 * 1024)})));
+                let request = transport::encode(&serde_json::to_vec(&request).unwrap());
+                let error = s.write_split(&request, &[], Duration::ZERO, Instant::now()).await.unwrap_err();
+                s.abort_request(&id);
+                assert_eq!(error, WriteError::Timeout);
+                if s.abandoned.is_none() {
+                    assert_eq!(s.bytes_written(), 0);
+                }
+                s.abandoned
+            };
+            let began = s.own_limit.as_ref().unwrap().0;
+            let incomplete = s.incomplete_within(since, began);
+            let before = began.checked_sub(Duration::from_nanos(1)).unwrap();
+            let earlier = s.incomplete_within(Duration::ZERO, before);
+            let finish = s.finish(Duration::from_millis(200)).await;
+            if let Some(expected) = expected_began {
+                assert_eq!(began, expected);
+            }
+            assert!(incomplete.is_some());
+            assert!(earlier.is_none());
+            assert!(finish.incomplete_within(since, began).is_some());
+            assert!(finish.incomplete_within(Duration::ZERO, before).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_absorption_reports_a_backlog_when_its_deadline_expires() {
+        let cmd = ServerCommand::new(&["sleep".into(), "30".into()]);
+        let opts = Options { write_timeout: Duration::ZERO, ..Options::default() };
+        let mut s = Session::start(&cmd, opts).await.unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        s.rx = rx;
+        let notification =
+            Message::parse(br#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":4,"message":"queued"}}"#)
+                .unwrap();
+        assert!(tx.send((Duration::ZERO, Inbound::Message(notification))).is_ok());
+        assert!(!s.absorb_all().await);
+        assert!(s.messages.is_empty());
+        s.opts.write_timeout = Duration::from_secs(5);
+        assert!(s.absorb_all().await);
+        assert_eq!(s.messages.len(), 1);
+        assert!(s.absorb_all().await);
+        assert!(tx.send((Duration::ZERO, Inbound::Closed)).is_ok());
+        assert!(s.absorb_all().await);
+        assert!(s.stdout_closed());
+        s.finish(Duration::from_millis(200)).await;
+    }
 
     #[test]
     fn configuration_items_are_looked_up_by_dotted_section() {

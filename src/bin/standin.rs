@@ -199,6 +199,23 @@ const FAULTS: &[(&str, &str)] = &[
         "label publishDiagnostics with the stand-in's own counter instead of the document's version",
     ),
     ("future-diagnostics-version", "label publishDiagnostics with the document's version plus one"),
+    ("exit-on-unbalanced", "exit when a didChange leaves a document's brackets unbalanced"),
+    (
+        "flood-while-unbalanced",
+        "lawful: after a didChange that leaves a document's brackets unbalanced, write 2 MiB of log messages, and \
+         keep serving",
+    ),
+    ("ignore-while-unbalanced", "never answer a request about a document whose brackets are unbalanced"),
+    (
+        "close-output-mid-restoration",
+        "when a second message over 128 KiB begins (the didChange restoring a large opened document), send 20,000 \
+         workspace/configuration requests and close stdout, then read the rest of that message and nothing more, but \
+         keep running (Unix only)",
+    ),
+    (
+        "content-modified-while-unbalanced",
+        "lawful: answer requests about a document whose brackets are unbalanced with ContentModified (-32801)",
+    ),
     ("ignore-changes", "don't apply didChange, and label the old text's diagnostics with the new version"),
     ("codepoint-changes", "apply incremental change ranges counting code points, and answer correctly otherwise"),
     (
@@ -346,7 +363,7 @@ fn main() {
     if fault("stdout-banner") {
         out.raw(b"standin starting\n");
     }
-    let mut input = Input { inner: std::io::stdin().lock(), buf: Vec::new(), faults: faults.clone() };
+    let mut input = Input { inner: std::io::stdin().lock(), buf: Vec::new(), faults: faults.clone(), big_frames: 0 };
     let (mut initialized, mut shut_down) = (false, false);
     let mut replay_gate_id: Option<Value> = None;
     // A reply to a notification, held until the next request has been answered.
@@ -401,6 +418,32 @@ fn main() {
             out.release();
         }
         let Some((mut headers, mut body)) = queued.pop_front().or_else(|| input.next()) else { break };
+        if headers.iter().any(|(name, _)| name == STOPPED_MID_BODY) {
+            // lspcheck's restoration can't finish until the rest of it is
+            // read, so these and the end of output are all sent before it
+            // does. Their answers overfill the pipe once nothing reads it, so
+            // the end of output stays queued behind requests lspcheck can't
+            // answer.
+            for n in 0..20_000 {
+                let params = json!({"items": [{"section": "x"}]});
+                out.frame(&json!({"jsonrpc": "2.0", "id": 100_000 + n, "method": "workspace/configuration", "params": params}));
+            }
+            eprintln!("standin: close-output-mid-restoration");
+            // `out` holds a duplicate of stdout: close both.
+            drop(out);
+            #[cfg(unix)]
+            {
+                use std::os::fd::FromRawFd;
+                // SAFETY: fd 1 is this process's stdout, and nothing uses it
+                // after this; dropping the File closes it.
+                drop(unsafe { std::fs::File::from_raw_fd(1) });
+            }
+            // Read the rest of the restoration, without stopping again.
+            input.big_frames += 1;
+            let _ = input.next();
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            std::process::exit(0);
+        }
         // A server that answers only the latest of several concurrent requests:
         // J6's batch is the only one with a six-digit string id, and lspcheck
         // writes all four requests before reading, so waiting for the next
@@ -640,6 +683,17 @@ fn main() {
                     }
                 }
                 *old_version = version;
+                let unbalanced = !unmatched_brackets(text, units, split).is_empty();
+                if unbalanced && fault("exit-on-unbalanced") {
+                    eprintln!("standin: exit-on-unbalanced");
+                    std::process::exit(5);
+                }
+                if unbalanced && fault("flood-while-unbalanced") {
+                    let log = json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": "x".repeat(1000)}});
+                    for _ in 0..2100 {
+                        out.frame(&log);
+                    }
+                }
                 if !fault("no-diagnostics") {
                     let mut label = Some(json!(version));
                     if fault("diagnostics-own-version") {
@@ -814,6 +868,18 @@ fn main() {
             && msg.pointer("/params/textDocument/uri").and_then(Value::as_str).is_some_and(|u| u.ends_with("crlf.txt"))
         {
             no_more_answers = true;
+            continue;
+        }
+        let unbalanced = msg
+            .pointer("/params/textDocument/uri")
+            .and_then(Value::as_str)
+            .and_then(|u| docs.get(u))
+            .is_some_and(|(text, _)| !unmatched_brackets(text, units, split).is_empty());
+        if unbalanced && fault("ignore-while-unbalanced") {
+            continue;
+        }
+        if unbalanced && fault("content-modified-while-unbalanced") {
+            out.frame(&err(&id, -32801, "content modified"));
             continue;
         }
         if method == "textDocument/hover" && fault("exit-on-first-hover") {
@@ -1522,6 +1588,55 @@ fn lines(text: &str, split: LineSplit) -> Vec<&str> {
     out
 }
 
+/// The line and column of the brackets `()`, `[]` and `{}` in `text` that have
+/// no partner: a closer with no opener before it, or one of another kind,
+/// and openers never closed. Strings and comments aren't told apart.
+fn unmatched_brackets(text: &str, units: Units, split: LineSplit) -> Vec<(usize, usize)> {
+    let mut open = Vec::new();
+    let mut unmatched = Vec::new();
+    let mut chars = text.chars().peekable();
+    let (mut line, mut column) = (0, 0);
+    while let Some(c) = chars.next() {
+        let is_break = match split {
+            LineSplit::Spec | LineSplit::CrLfTwo => c == '\n' || c == '\r',
+            LineSplit::LfOnly => c == '\n',
+            LineSplit::NoLoneCr => c == '\n' || (c == '\r' && chars.peek() == Some(&'\n')),
+        };
+        if is_break {
+            if c == '\r' && chars.peek() == Some(&'\n') && split != LineSplit::CrLfTwo {
+                chars.next();
+            }
+            line += 1;
+            column = 0;
+            continue;
+        }
+        match c {
+            '(' | '[' | '{' => open.push(((line, column), c)),
+            ')' | ']' | '}' => {
+                let opener = match c {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                if open.last().is_some_and(|(_, o)| *o == opener) {
+                    open.pop();
+                } else {
+                    unmatched.push((line, column));
+                }
+            }
+            _ => {}
+        }
+        column += match units {
+            Units::Bytes => c.len_utf8(),
+            Units::Utf16 => c.len_utf16(),
+            Units::CodePoints => 1,
+        };
+    }
+    unmatched.extend(open.into_iter().map(|(at, _)| at));
+    unmatched.sort_unstable();
+    unmatched
+}
+
 /// Each ASCII word (`[A-Za-z]+`): its line, its start and end in `units`,
 /// and its text.
 fn words(text: &str, units: Units, split: LineSplit) -> Vec<(usize, usize, usize, &str)> {
@@ -1690,6 +1805,10 @@ fn publish_diagnostics<W: Write>(
         })
         .collect();
     let lines = lines(text, split);
+    // One diagnostic per unmatched bracket.
+    for (line, column) in unmatched_brackets(text, units, split) {
+        diagnostics.push(json!({"range": range(line, column, line, column + 1), "severity": 1, "source": "standin", "message": "unmatched bracket"}));
+    }
     // A position on the first line with non-ASCII text, one character in: on a
     // character boundary with non-ASCII text before it, so informative for D5.
     if let Some(n) = lines.iter().position(|l| !l.is_ascii()) {
@@ -2041,7 +2160,16 @@ struct Input<R: Read> {
     inner: R,
     buf: Vec<u8>,
     faults: Vec<String>,
+    /// For close-output-mid-restoration: the frames over [`BIG_FRAME`] read.
+    big_frames: u32,
 }
+
+/// What close-output-mid-restoration counts as a large message.
+const BIG_FRAME: usize = 128 * 1024;
+
+/// The headers of the frame [`Input::next`] makes up when
+/// close-output-mid-restoration stops reading in the middle of a body.
+const STOPPED_MID_BODY: &str = "x-standin-stopped-mid-body";
 
 type Frame = (Vec<(String, String)>, Vec<u8>);
 
@@ -2064,18 +2192,39 @@ impl<R: Read> Input<R> {
             match self.parse(&self.buf) {
                 Parsed::Frame(frame, used) => {
                     self.buf.drain(..used);
+                    if frame.1.len() > BIG_FRAME {
+                        self.big_frames += 1;
+                    }
                     return Some(frame);
                 }
                 Parsed::Bad(used) => {
                     self.buf.drain(..used);
                 }
                 Parsed::Incomplete => {
+                    // The didOpen was the first large frame; the second is the
+                    // restoration, and lspcheck is still writing it.
+                    if self.fault("close-output-mid-restoration")
+                        && self.big_frames == 1
+                        && self.pending_length().is_some_and(|n| n > BIG_FRAME)
+                    {
+                        return Some((vec![(STOPPED_MID_BODY.to_string(), String::new())], Vec::new()));
+                    }
                     if !self.fill() {
                         return None;
                     }
                 }
             }
         }
+    }
+
+    /// The Content-Length of a frame whose headers are buffered but not yet
+    /// its whole body.
+    fn pending_length(&self) -> Option<usize> {
+        let end = find(&self.buf, b"\r\n\r\n")?;
+        String::from_utf8_lossy(&self.buf[..end]).split("\r\n").find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok()).flatten()
+        })
     }
 
     /// Whether a whole frame is already buffered.
@@ -2180,4 +2329,62 @@ fn is_digit_string_request(body: &[u8]) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutation_bracket_diagnostics_keep_positions_in_every_encoding_and_line_split() {
+        for (units, emoji, accent) in [(Units::Bytes, 4, 2), (Units::Utf16, 2, 1), (Units::CodePoints, 1, 1)] {
+            for (faults, positions) in [
+                (vec![], vec![(0, emoji), (1, accent), (2, 0), (3, 0), (3, 1), (4, 0)]),
+                (vec!["lf-only-lines"], vec![(0, emoji), (1, accent), (1, accent + 2), (2, 0), (2, 1), (3, 0)]),
+                (vec!["no-lone-cr"], vec![(0, emoji), (1, accent), (1, accent + 2), (2, 0), (2, 1), (3, 0)]),
+                (vec!["crlf-two-breaks"], vec![(0, emoji), (2, accent), (3, 0), (4, 0), (4, 1), (6, 0)]),
+            ] {
+                let faults: Vec<String> = faults.into_iter().map(String::from).collect();
+                let mut out = Writer { out: Vec::new(), faults: faults.clone(), holding: false, held: Vec::new() };
+                publish_diagnostics(
+                    &mut out,
+                    &faults,
+                    units,
+                    "file:///brackets",
+                    "😀(\r\né]\r{\n[)\r\n}",
+                    Some(json!(2)),
+                );
+                let body = out.out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let published: Value = serde_json::from_slice(&out.out[body..]).unwrap();
+                assert_eq!(published["method"], "textDocument/publishDiagnostics");
+                assert_eq!(published["params"]["uri"], "file:///brackets");
+                assert_eq!(published["params"]["version"], 2);
+                let actual: Vec<_> = published["params"]["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|d| d["message"] == "unmatched bracket")
+                    .cloned()
+                    .collect();
+                let expected: Vec<_> = positions
+                    .into_iter()
+                    .map(|(line, column)| json!({
+                        "range": {"start": {"line": line, "character": column}, "end": {"line": line, "character": column + 1}},
+                        "severity": 1, "source": "standin", "message": "unmatched bracket"
+                    }))
+                    .collect();
+                assert_eq!(actual, expected, "{faults:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mutation_brackets_preserve_stack_matching_and_text_order() {
+        assert_eq!(unmatched_brackets("([)]{}", Units::Utf16, LineSplit::Spec), [(0, 0), (0, 2)]);
+        assert!(unmatched_brackets("{\r\n[😀(é)]\r}", Units::Utf16, LineSplit::Spec).is_empty());
+        let count = 256 * 1024;
+        let positions = unmatched_brackets(&"(\n".repeat(count), Units::Utf16, LineSplit::Spec);
+        assert_eq!(positions.len(), count);
+        assert!(positions.into_iter().enumerate().all(|(line, position)| position == (line, 0)));
+    }
 }

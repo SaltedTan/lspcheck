@@ -6,8 +6,8 @@
 //! plan of a case as a pure function of the seed and the clean texts, and the
 //! content changes that send a planned edit to a server.
 //!
-//! Pure functions only: no I/O, no session. Nothing runs a plan yet; the
-//! `mutation` scenario that will is a later step.
+//! Pure functions only: no I/O, no session. The `mutation` scenario in
+//! [`crate::checks`] runs the plans.
 //!
 //! The generator, the order of its draws and what each operator does are a
 //! [`FORMAT`]: the same seed, case, texts and configuration give the same
@@ -1120,6 +1120,80 @@ pub fn restore_change(
     check(current, clean, encoding, change)
 }
 
+/// The identifiers of `text`, for [`request_spot`] and [`request_query`]:
+/// lexed once per text, however many requests are asked about it.
+pub fn identifiers(text: &str, lexicon: &Lexicon) -> Vec<Token> {
+    lexicon.tokens(text).into_iter().filter(|t| t.kind == TokenKind::Identifier).collect()
+}
+
+/// Where a step's request is asked, as a line and a column in characters,
+/// both from 0, of `text`, whose [`identifiers`] are given: half the time
+/// inside an identifier (when the text has one), a tenth of the time at the
+/// end of the text, otherwise at any character boundary. Never inside a
+/// character or between a `\r` and a `\n`.
+pub fn request_spot(rng: &mut SplitMix64, text: &str, identifiers: &[Token]) -> (usize, usize) {
+    let draw = rng.below(10);
+    let at = if draw < 5 {
+        if identifiers.is_empty() {
+            any_boundary(rng, text)
+        } else {
+            let token = rng.pick(identifiers);
+            let chars: Vec<usize> = token.text(text).char_indices().map(|(i, _)| token.start + i).collect();
+            // One character in when there is room, so the position is inside it.
+            if chars.len() > 1 { chars[rng.between(1, chars.len() - 1)] } else { chars[0] }
+        }
+    } else if draw == 5 {
+        text.len()
+    } else {
+        any_boundary(rng, text)
+    };
+    let p = position_of(text, at, Encoding::Utf32).expect("a drawn spot is a character boundary outside a CR LF");
+    (p.line, p.character)
+}
+
+/// A character boundary of `text`, drawn uniformly, moved off the inside of
+/// a CR LF.
+fn any_boundary(rng: &mut SplitMix64, text: &str) -> usize {
+    let boundaries: Vec<usize> = text.char_indices().map(|(i, _)| i).chain([text.len()]).collect();
+    let at = *rng.pick(&boundaries);
+    if inside_crlf(text, at) { at - 1 } else { at }
+}
+
+/// One of `text`'s [`identifiers`] for `workspace/symbol` to ask about, at
+/// most 64 characters of it; empty when the text has none.
+pub fn request_query(rng: &mut SplitMix64, text: &str, identifiers: &[Token]) -> String {
+    if identifiers.is_empty() {
+        return String::new();
+    }
+    rng.pick(identifiers).text(text).chars().take(64).collect()
+}
+
+/// Inserted text longer than this many characters is recorded by its
+/// length, a prefix of this many characters and its SHA-256.
+pub const RECORDED_INSERT: usize = 64;
+
+/// How a mutation is recorded in a transcript: its operator, whether it fell
+/// back, its offset and the bytes it removed (in UTF-8 bytes of the text
+/// before it), and what it inserted, summarised when long.
+pub fn record(m: &Mutation) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "operator": m.operator.name(),
+        "offset": m.offset,
+        "removed": m.removed,
+        "sha256": crate::sha256::hex(m.inserted.as_bytes()),
+    });
+    if m.fallback {
+        v["fallback"] = true.into();
+    }
+    if m.inserted.chars().count() > RECORDED_INSERT {
+        v["inserted_bytes"] = m.inserted.len().into();
+        v["inserted_prefix"] = m.inserted.chars().take(RECORDED_INSERT).collect::<String>().into();
+    } else {
+        v["inserted"] = m.inserted.clone().into();
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1686,5 +1760,80 @@ mod tests {
         assert_eq!(position_of("a\r\nb", 3, Encoding::Utf16), Some(pos(1, 0)));
         assert_eq!(position_of("a\rb\nc", 4, Encoding::Utf16), Some(pos(2, 0)));
         assert_eq!(position_of("a\r", 2, Encoding::Utf16), Some(pos(1, 0)));
+    }
+
+    #[test]
+    fn request_spots_are_boundaries_outside_crlf_and_reproducible() {
+        let lexicon = lua();
+        for text in [LUA, "", "\r\n", "x\r\ny", "😀a\r\n\r\nb", "local é = 1"] {
+            let mut first = Vec::new();
+            for case in 0..50 {
+                let mut rng = SplitMix64::stream(9, case, "requests");
+                let ids = identifiers(text, &lexicon);
+                let (line, column) = request_spot(&mut rng, text, &ids);
+                let lines = text::split_lines(text);
+                assert!(line < lines.len() && column <= lines[line].chars().count(), "{text:?}: {line}:{column}");
+                first.push((line, column, request_query(&mut rng, text, &ids)));
+            }
+            let again: Vec<_> = (0..50)
+                .map(|case| {
+                    let mut rng = SplitMix64::stream(9, case, "requests");
+                    let ids = identifiers(text, &lexicon);
+                    let (line, column) = request_spot(&mut rng, text, &ids);
+                    (line, column, request_query(&mut rng, text, &ids))
+                })
+                .collect();
+            assert_eq!(first, again);
+        }
+        // Half are drawn inside an identifier and a tenth at the end; the rest
+        // at any boundary, 11 of whose 18 here are inside an identifier and one
+        // at the end. So about 74% land inside one and 12% at the end.
+        let (mut inside, mut end) = (0, 0);
+        for case in 0..2000 {
+            let mut rng = SplitMix64::stream(1, case, "requests");
+            let text = "alpha beta\ngamma\n";
+            let (line, column) = request_spot(&mut rng, text, &identifiers(text, &Lexicon::default()));
+            match (line, column) {
+                (2, 0) => end += 1,
+                (0, 1..=4) | (0, 7..=9) | (1, 1..=4) => inside += 1,
+                _ => {}
+            }
+        }
+        assert!((1350..1600).contains(&inside) && (180..320).contains(&end), "{inside} inside, {end} at the end");
+    }
+
+    #[test]
+    fn a_query_is_an_identifier_of_the_text() {
+        let mut rng = SplitMix64::new(3);
+        let query =
+            |rng: &mut SplitMix64, text: &str| request_query(rng, text, &identifiers(text, &Lexicon::default()));
+        assert_eq!(query(&mut rng, "(1 + 2)"), "");
+        assert_eq!(query(&mut rng, &"x".repeat(100)), "x".repeat(64));
+        assert!(["alpha", "beta"].contains(&query(&mut rng, "alpha+beta").as_str()));
+    }
+
+    #[test]
+    fn a_long_insertion_is_recorded_by_length_prefix_and_digest() {
+        let m = |inserted: &str| Mutation {
+            operator: Operator::Nest,
+            fallback: false,
+            offset: 3,
+            removed: 1,
+            inserted: inserted.into(),
+        };
+        let short = record(&m("é(("));
+        assert_eq!(
+            short,
+            serde_json::json!({"operator": "nest", "offset": 3, "removed": 1, "inserted": "é((",
+                               "sha256": crate::sha256::hex("é((".as_bytes())})
+        );
+        let long = "é".repeat(65);
+        let summary = record(&Mutation { fallback: true, ..m(&long) });
+        assert_eq!(summary["inserted_bytes"], 130);
+        assert_eq!(summary["inserted_prefix"], "é".repeat(64));
+        assert_eq!(summary["sha256"], crate::sha256::hex(long.as_bytes()));
+        assert_eq!((summary.get("inserted"), &summary["fallback"]), (None, &true.into()));
+        // Exactly 64 characters are recorded whole.
+        assert_eq!(record(&m(&"é".repeat(64)))["inserted"], "é".repeat(64));
     }
 }

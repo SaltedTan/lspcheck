@@ -1,0 +1,29 @@
+# The stand-in's mutation profile: a seed with brackets, strings, a comment and
+# non-ASCII text, mutated only by unbalance-bracket from a fixed seed, so the
+# cases unbalance its brackets and each restoration balances them again.
+# Used by tests/standin.rs with `--mutate`.
+
+[workspace]
+files = { "main.lua" = """
+-- brackets, strings, a comment and non-ASCII text
+local greeting = "héllo, 世界 😀"
+local function add(a, b)
+  return { sum = a + b, list = { "x", 'y' } }
+end
+print(add(1, 2)[1], greeting)
+""" }
+
+[document]
+path = "main.lua"
+language_id = "lua"
+
+[mutation]
+seed = 20261111
+cases = 4
+steps = 2
+operators = ["unbalance-bracket"]
+requests_per_step = 2
+
+[mutation.lexicon]
+line_comments = ["--"]
+strings = [{ open = '"', close = '"', escape = '\' }, { open = "'", close = "'", escape = '\' }]
