@@ -1,7 +1,8 @@
 # Seeded source mutation and recovery
 
-**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Nothing here
-is implemented yet. See the [design status](design.md) for its place in the roadmap.
+**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Step 1 of the
+[implementation plan](#implementation-plan), the planner (`src/mutation.rs`), is in place; nothing runs it yet. See the
+[design status](design.md) for its place in the roadmap.
 
 ## Context
 
@@ -106,15 +107,18 @@ pass --mutate`), which doesn't affect the exit status.
 that says where tokens are. Without one, a default lexicon is used: identifiers are runs of Unicode letters, digits and
 `_`; numbers are runs that start with an ASCII digit; whitespace and line ends are their own tokens; every other
 character is a one-character punctuation token; the brackets are `()`, `[]` and `{}`. With a lexicon, line comments,
-non-nesting block comments, strings with an escape character, extra identifier characters and keywords are recognised;
-an unterminated string or comment runs to the end of its line or of the document.
+non-nesting block comments, strings with an escape character, extra identifier characters and keywords are recognised.
+A string runs to its closing delimiter, across lines if need be; one never closed runs to the end of its line, and a
+block comment never closed to the end of the document. Where several delimiters start at the same place, the longest
+wins.
 
 The lexicon only decides *where* to edit. No oracle depends on it, so a wrong lexicon makes the edits less pointed but
 can't make a verdict wrong. That is why lspcheck can stay ignorant of the language.
 
 **Operators.** Each picks its target with the case's RNG. If it finds nothing to change (`open-string` in text without
 strings), it inserts a token from the document's own tokens instead, and the record says so. A document with no tokens
-(an empty seed, or one a `truncate` emptied) gets the first of the lexicon's brackets, else `(`, inserted at offset 0,
+that fits the insertion cap (an empty seed, or one a `truncate` emptied) gets the first of the lexicon's brackets, else
+`(`, inserted at offset 0,
 so the plan stays a total function of the seed. Planner tests cover an empty seed and mutations after a truncation
 to empty.
 
@@ -387,7 +391,8 @@ The scenario's transcript, `mutation.jsonl`, is an ordinary session transcript, 
 SERVER` replays it as it is: the workspace line recreates the seed files, and every `didChange`, request and poll is
 re-sent byte for byte. Before each case lspcheck records a meta line, `{"dir":"meta","mutation":{"format":1,"seed":…,
 "case":17,"steps":[{"document":"main.lua","version":5,"edits":[{"operator":"open-string","offset":40,"removed":1,
-"inserted":"","sha256":…}]}]}}`; replay ignores meta lines it doesn't know, so no change to replay is needed.
+"inserted":"","sha256":…}]}]}}`, with offsets and lengths in UTF-8 bytes of the text before the edit; replay ignores
+meta lines it doesn't know, so no change to replay is needed.
 Inserted text over 64 characters is summarised by length, prefix and SHA-256, as virgil-lsp does; the full text is in
 the recorded `didChange`.
 
