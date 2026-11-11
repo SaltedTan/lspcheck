@@ -2,26 +2,30 @@
 
 ## Unreleased
 
+## 0.4.0 (2026-11-11)
+
 ### Added
 
-- Example profiles for clangd, typescript-language-server, bash-language-server, yaml-language-server,
-  vscode-json-language-server, marksman, ruff, texlab, zls, jedi-language-server, pylsp, terraform-ls, lemminx and
-  taplo in [`examples/profiles/`](examples/profiles/), each with a tiny project and a `[document]`.
-- The [stock-server CI matrix](ci/stock-servers/README.md) also runs pinned releases of clangd, marksman, ruff,
-  texlab, zls, terraform-ls and lemminx, whose verdicts were each the same in repeated local runs.
+- [Example profiles](https://github.com/SaltedTan/lspcheck/blob/v0.4.0/examples/profiles/README.md) for 14 more servers: clangd, typescript-language-server,
+  bash-language-server, yaml-language-server, vscode-json-language-server, marksman, ruff, texlab, zls,
+  jedi-language-server, pylsp, terraform-ls, lemminx and taplo, each with a tiny project and a `[document]`.
+- The [stock-server CI matrix](https://github.com/SaltedTan/lspcheck/blob/v0.4.0/ci/stock-servers/README.md) also runs pinned releases of clangd, marksman,
+  ruff, texlab, zls, terraform-ls and lemminx (11 servers in all), whose verdicts were each the same in repeated runs.
 
 ### Changed
 
+- K2 accepts unknown values of the tag and kind enumerations the specification tells clients to tolerate
+  (`SymbolKind`, `SymbolTag`, `CompletionItemKind`, `CompletionItemTag` and `DiagnosticTag`), so clangd's extension
+  symbol tags (8 and up) no longer fail K2. A `null`, a string, or a negative or fractional number there still fails,
+  and every other closed enumeration stays strict ([K2 rules](https://github.com/SaltedTan/lspcheck/blob/v0.4.0/docs/design.md#capabilities-and-robustness)).
 - F6 and F7 (a request with a `Content-Type` header) run in a scenario of their own, `content-type`, with a fresh
-  server. A server that exits on that optional header (terraform-ls 0.39.1 exits on F7's legacy `charset=utf8`) no
-  longer leaves F3 and F5 `error`, and one thrown out of step by F3 or F5 no longer leaves F6 and F7 `error`.
-- D6's containment failure details now include [line-split hints](docs/design.md#documents-and-positions).
-- K2's failure detail now explains more union alternatives that tie; see the
-  [diagnostic rules](docs/design.md#capabilities-and-robustness). The set and count of violations, budget behaviour and
-  every verdict are unchanged.
-- K2 now accepts unknown values of the tag and kind enumerations clients must tolerate, so clangd's extension symbol
-  tags (8 and up) no longer fail K2. See the [K2 rules](docs/design.md#capabilities-and-robustness) for the enumerations
-  covered and their type constraints.
+  server, and `--transcripts` writes `content-type.jsonl` for it. A server that exits on that optional header
+  (terraform-ls 0.39.1 exits on F7's legacy `charset=utf8`) no longer leaves F3 and F5 `error` and the run's exit
+  status 2, and one thrown out of step by F3 or F5 no longer leaves F6 and F7 `error`.
+- Failure details say more, with no change to any verdict: D6's containment failures include
+  [line-split hints](https://github.com/SaltedTan/lspcheck/blob/v0.4.0/docs/design.md#documents-and-positions), and when no alternative of a K2 union matches,
+  the detail names the closest alternative in more cases
+  ([diagnostic rules](https://github.com/SaltedTan/lspcheck/blob/v0.4.0/docs/design.md#capabilities-and-robustness)).
 
 ## 0.3.0 (2026-11-09)
 
