@@ -351,7 +351,7 @@ defaults; with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--onl
 | Settle and baseline | `settle_timeout` | 5 min | proceed; unstable probes aren't used |
 | Cases | 20 | 1000 | usage error above the cap |
 | Mutations per step; steps per case | 1 to 3; `steps` | 3; 3 | — |
-| Inserted text per mutation | 1 KiB; stress operators the room left | 16 KiB | the operator inserts less |
+| Growth per mutation (bytes inserted beyond those removed) | 1 KiB; stress operators the room left | 16 KiB | the operator inserts less |
 | Document size | `max_document_kib`, 64 | 1024 | the operator is redrawn, `truncate` after six tries |
 | Requests per step; recovery polls per case | 4; 40 | 16; 40 | the poll stops: recovery not seen, M3 `ERROR` for that case even with an expectation |
 | Versions kept per document | 64 | 64 | older positions aren't judged, counted |

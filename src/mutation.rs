@@ -223,7 +223,20 @@ fn line_content_end(text: &str, from: usize) -> usize {
 
 /// The end of a string opened at `body`: just past its closing delimiter, or
 /// the end of its line when it is never closed, with the closing length.
-fn string_end(text: &str, body: usize, delimiters: &StringDelimiters) -> (usize, usize) {
+///
+/// `unclosed_from` is where an earlier search for the same delimiter ran to
+/// the end of the text without a close; a string opened after it is taken as
+/// never closed without searching again, which keeps lexing linear when many
+/// strings are left open.
+fn string_end(
+    text: &str,
+    body: usize,
+    delimiters: &StringDelimiters,
+    unclosed_from: &mut Option<usize>,
+) -> (usize, usize) {
+    if unclosed_from.is_some_and(|from| from <= body) {
+        return (line_content_end(text, body), 0);
+    }
     let mut i = body;
     while i < text.len() {
         if text[i..].starts_with(&delimiters.close) {
@@ -235,6 +248,7 @@ fn string_end(text: &str, body: usize, delimiters: &StringDelimiters) -> (usize,
             i += text[i..].chars().next().expect("char boundary").len_utf8();
         }
     }
+    *unclosed_from = Some(body);
     (line_content_end(text, body), 0)
 }
 
@@ -250,16 +264,17 @@ impl Lexicon {
     /// Splits a text into tokens that cover it, in order, with no gaps.
     pub fn tokens(&self, text: &str) -> Vec<Token> {
         let mut tokens = Vec::new();
+        let mut unclosed_from = vec![None; self.strings.len()];
         let mut i = 0;
         while i < text.len() {
-            let (kind, end) = self.token_at(text, i);
+            let (kind, end) = self.token_at(text, i, &mut unclosed_from);
             tokens.push(Token { kind, start: i, end });
             i = end;
         }
         tokens
     }
 
-    fn token_at(&self, text: &str, i: usize) -> (TokenKind, usize) {
+    fn token_at(&self, text: &str, i: usize, unclosed_from: &mut [Option<usize>]) -> (TokenKind, usize) {
         let rest = &text[i..];
         // The longest delimiter that starts here; equal lengths prefer a
         // block comment (0), then a line comment (1), then a string (2).
@@ -298,7 +313,7 @@ impl Lexicon {
                 return (TokenKind::Comment { block: false, open, close: 0 }, line_content_end(text, i));
             }
             Some((open, _, n)) => {
-                let (end, close) = string_end(text, i + open, &self.strings[n]);
+                let (end, close) = string_end(text, i + open, &self.strings[n], &mut unclosed_from[n]);
                 return (TokenKind::String { open, close }, end);
             }
             None => {}
@@ -757,25 +772,30 @@ impl Context<'_> {
         line_ends(self.text).last().map_or("\n", |&(start, end)| &self.text[start..end])
     }
 
-    fn duplicate_line(&self, rng: &mut SplitMix64) -> Option<Splice> {
-        let copies: Vec<Splice> = self
-            .lines()
+    /// Where a copy of each line goes, and the copy: after a line with its
+    /// end, or before the last line, with a line end added, when it has none.
+    fn line_copies(&self, longest: usize) -> Vec<(usize, String)> {
+        self.lines()
             .into_iter()
             .map(|(start, end)| {
                 let line = &self.text[start..end];
                 if line.ends_with(['\r', '\n']) {
-                    (end, 0, line.to_owned())
+                    (end, line.to_owned())
                 } else {
-                    // The last line has no end: put the copy, with one, before it.
-                    (start, 0, format!("{line}{}", self.some_line_end()))
+                    (start, format!("{line}{}", self.some_line_end()))
                 }
             })
-            .filter(|(_, _, copy)| copy.len() <= self.cap())
-            .collect();
+            .filter(|(_, copy)| copy.len() <= longest)
+            .collect()
+    }
+
+    fn duplicate_line(&self, rng: &mut SplitMix64) -> Option<Splice> {
+        let copies = self.line_copies(self.cap());
         if copies.is_empty() {
             return None;
         }
-        Some(rng.pick(&copies).clone())
+        let (at, copy) = rng.pick(&copies).clone();
+        Some((at, 0, copy))
     }
 
     fn unbalance_bracket(&self, rng: &mut SplitMix64) -> Option<Splice> {
@@ -966,17 +986,13 @@ impl Context<'_> {
 
     fn repeat_line(&self, rng: &mut SplitMix64) -> Option<Splice> {
         let budget = self.stress_budget();
-        let lines: Vec<(usize, usize)> = self
-            .lines()
-            .into_iter()
-            .filter(|&(s, e)| self.text[s..e].ends_with(['\r', '\n']) && e - s <= budget)
-            .collect();
-        if lines.is_empty() {
+        let copies = self.line_copies(budget);
+        if copies.is_empty() {
             return None;
         }
-        let (start, end) = *rng.pick(&lines);
-        let times = rng.between(1, budget / (end - start));
-        Some((end, 0, self.text[start..end].repeat(times)))
+        let (at, copy) = rng.pick(&copies).clone();
+        let times = rng.between(1, budget / copy.len());
+        Some((at, 0, copy.repeat(times)))
     }
 }
 
@@ -1234,6 +1250,14 @@ mod tests {
         assert_eq!(kinds(&lex, "--[[ a\nb")[0], (Comment { block: true, open: 4, close: 0 }, "--[[ a\nb".to_owned()));
         assert_eq!(kinds(&lex, "'a\nb'")[0], (String { open: 1, close: 1 }, "'a\nb'".to_owned()));
         assert_eq!(kinds(&lex, "\"a\nb")[0], (String { open: 1, close: 0 }, "\"a".to_owned()));
+        // Strings left open one after another each run to their line's end.
+        let open = "[[\n".repeat(3);
+        assert_eq!(
+            kinds(&lex, &open).iter().filter(|(k, _)| *k == String { open: 2, close: 0 }).count(),
+            3,
+            "{:?}",
+            kinds(&lex, &open)
+        );
     }
 
     #[test]
@@ -1445,12 +1469,18 @@ mod tests {
                     Operator::DuplicateLine => assert!([(4, 0, "/*a\n"), (4, 0, "b*/\n")].contains(&edit), "{m:?}"),
                     Operator::RepeatLine => {
                         assert_eq!((m.offset, m.removed), (4, 0));
-                        assert_eq!(m.inserted, "/*a\n".repeat(m.inserted.len() / 4), "{m:?}");
+                        let line = &m.inserted[..4];
+                        assert!(["/*a\n", "b*/\n"].contains(&line), "{m:?}");
+                        assert_eq!(m.inserted, line.repeat(m.inserted.len() / 4), "{m:?}");
                     }
                     _ => assert!([(3, 1, "\r\n"), (3, 1, "\r")].contains(&edit), "{m:?}"),
                 }
             }
         }
+        // A last line without a line end is repeated too, with one added.
+        let config = Config { steps: 1, operators: vec![Operator::RepeatLine], ..Config::default() };
+        let m = &plan_case(0, 0, &texts("x = 1"), &config).steps[0].mutations[0];
+        assert!(!m.fallback && m.offset == 0 && m.inserted == "x = 1\n".repeat(m.inserted.len() / 6), "{m:?}");
         // A string over two lines, likewise.
         let config = Config { steps: 1, operators: vec![Operator::LineEnds], lexicon: lua(), ..Config::default() };
         let m = &plan_case(0, 0, &texts("x = 'a\r\nb'"), &config).steps[0].mutations[0];
@@ -1519,7 +1549,11 @@ mod tests {
     #[test]
     fn only_listed_characters_are_inserted_by_unicode_and_control() {
         for (operator, allowed) in [
-            (Operator::Unicode, UNICODE_SET.to_vec()),
+            // The design's fixed set, spelled out rather than taken from UNICODE_SET.
+            (
+                Operator::Unicode,
+                vec!['é', '中', '😀', '𝔘', '\u{301}', '\u{200D}', '\u{A0}', '\u{200B}', '\u{FEFF}', '\u{10FFFF}'],
+            ),
             (Operator::Control, ('\0'..='\u{1F}').filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect()),
         ] {
             let config = Config { operators: vec![operator], ..Config::default() };
