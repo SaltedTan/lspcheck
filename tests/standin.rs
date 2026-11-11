@@ -2834,6 +2834,26 @@ fn an_end_of_output_lspcheck_couldnt_read_before_shutdown_makes_m1_an_error() {
 }
 
 #[test]
+fn mutation_early_initialize_errors_record_their_stop_reasons() {
+    for (fault, expected) in [
+        ("init-error", "initialize didn't succeed: the server refused to initialize"),
+        ("no-capabilities", "initialize had no capabilities object (see L2)"),
+        ("bad-encoding", "not judged: the server chose positionEncoding"),
+    ] {
+        let (r, _, _keep) = mutated(&[fault], &["--only", "M1,M2"]);
+        assert_eq!(r.report["mutation"]["cases_run"], 0);
+        let stopped = r.report["mutation"]["stopped"].as_str().unwrap();
+        assert!(stopped.starts_with(expected), "{fault}: {stopped}");
+        for id in ["M1", "M2"] {
+            expect(&r, id, "error");
+            let result = r.report["results"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap();
+            assert_eq!(result["detail"], stopped);
+        }
+        assert_eq!(r.status, 2, "{}", r.stdout);
+    }
+}
+
+#[test]
 fn mutation_is_skipped_without_a_seed_file_or_document_changes() {
     // No profile: nothing to mutate.
     let r = run(&[], &["--mutate", "--only", "M1,M2,M3"]);
@@ -2846,6 +2866,11 @@ fn mutation_is_skipped_without_a_seed_file_or_document_changes() {
     let (r, _, _keep) = mutated(&["no-change-sync"], &["--only", "M1,M2"]);
     expect(&r, "M1", "skip");
     expect(&r, "M2", "skip");
+    assert_eq!(r.report["mutation"]["cases_run"], 0);
+    assert_eq!(
+        r.report["mutation"]["stopped"],
+        "the server takes no document changes (textDocumentSync change is absent or 0)"
+    );
     assert_eq!(r.status, 0, "{}", r.stdout);
 }
 

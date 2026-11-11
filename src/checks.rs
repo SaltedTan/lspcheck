@@ -3702,13 +3702,17 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     let reply = match ctx.initialize_prepared(&id, params).await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
-            both(ctx, Verdict::Error, format!("initialize didn't succeed: {why}"));
+            let why = format!("initialize didn't succeed: {why}");
+            both(ctx, Verdict::Error, why.clone());
+            summary.stopped = Some(why);
             ctx.mutation = Some(summary);
             return;
         }
     };
     let Some(caps) = initialize_capabilities(&reply).filter(|c| c.is_object()).cloned() else {
-        both(ctx, Verdict::Error, "initialize had no capabilities object (see L2)".into());
+        let why = "initialize had no capabilities object (see L2)".to_string();
+        both(ctx, Verdict::Error, why.clone());
+        summary.stopped = Some(why);
         ctx.mutation = Some(summary);
         leave(ctx).await;
         return;
@@ -3717,18 +3721,18 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         SyncKind::Full => mutation::Sync::Full,
         SyncKind::Incremental => mutation::Sync::Incremental,
         SyncKind::None => {
-            both(
-                ctx,
-                Verdict::Skip,
-                "the server takes no document changes (textDocumentSync change is absent or 0)".into(),
-            );
+            let why = "the server takes no document changes (textDocumentSync change is absent or 0)".to_string();
+            both(ctx, Verdict::Skip, why.clone());
+            summary.stopped = Some(why);
             ctx.mutation = Some(summary);
             leave(ctx).await;
             return;
         }
     };
     if !opens_documents(&reply) {
-        both(ctx, Verdict::Skip, "the server doesn't ask for didOpen (textDocumentSync openClose)".into());
+        let why = "the server doesn't ask for didOpen (textDocumentSync openClose)".to_string();
+        both(ctx, Verdict::Skip, why.clone());
+        summary.stopped = Some(why);
         ctx.mutation = Some(summary);
         leave(ctx).await;
         return;
@@ -3736,7 +3740,8 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     let encoding = match negotiated_encoding(&reply) {
         Ok(encoding) => encoding,
         Err(why) => {
-            both(ctx, Verdict::Error, why);
+            both(ctx, Verdict::Error, why.clone());
+            summary.stopped = Some(why);
             ctx.mutation = Some(summary);
             leave(ctx).await;
             return;
@@ -3757,7 +3762,8 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         let text = match text {
             Ok(text) => text,
             Err(why) => {
-                both(ctx, Verdict::Error, why);
+                both(ctx, Verdict::Error, why.clone());
+                summary.stopped = Some(why);
                 ctx.mutation = Some(summary);
                 leave(ctx).await;
                 return;
@@ -5010,6 +5016,72 @@ mod tests {
             j3_exercise: None,
             k1_pending: None,
             mutation: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_early_initialize_exit_records_its_stop_reason() {
+        let mut cfg = mutation_test_config("exit 0");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/standin-mutation.toml");
+        cfg.mutation = profile::load(&fixture).unwrap().mutation;
+        let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+        mutation_scenario(&mut ctx).await;
+        let summary = ctx.mutation.as_ref().unwrap();
+        assert_eq!(summary.cases_run, 0);
+        let stopped = summary.stopped.as_deref().unwrap();
+        assert!(stopped.starts_with("initialize didn't succeed: "), "{stopped}");
+        for id in ["M1", "M2"] {
+            let result = ctx.results.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(result.verdict, Verdict::Error);
+            assert_eq!(result.detail, stopped);
+        }
+        ctx.s.finish(Duration::from_millis(200)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_early_seed_errors_record_their_stop_reasons() {
+        let script = r#"import json, sys
+while header := sys.stdin.buffer.readline():
+    length = int(header.split(b':')[1])
+    assert sys.stdin.buffer.readline() == b'\r\n'
+    request = json.loads(sys.stdin.buffer.read(length))
+    if request['method'] == 'exit':
+        break
+    if 'id' not in request:
+        continue
+    result = {'capabilities': {'textDocumentSync': {'openClose': True, 'change': 2}}} if request['method'] == 'initialize' else None
+    body = json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}).encode()
+    sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
+    sys.stdout.buffer.flush()
+"#;
+        for (text, expected) in [
+            (None, "couldn't read main.lua in the workspace: "),
+            (Some(vec![0xff]), "main.lua in the workspace isn't UTF-8 text"),
+            (Some(vec![b'x'; 65 * 1024]), "main.lua in the workspace grew past mutation.max_document_kib"),
+        ] {
+            let mut cfg = mutation_test_config("exit 0");
+            cfg.server = ServerCommand::new(&["python3".into(), "-I".into(), "-c".into(), script.into()]);
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/standin-mutation.toml");
+            cfg.mutation = profile::load(&fixture).unwrap().mutation;
+            let workspace = tempfile::tempdir().unwrap();
+            if let Some(text) = text {
+                std::fs::write(workspace.path().join("main.lua"), text).unwrap();
+            }
+            let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+            ctx.root = workspace.path().to_path_buf();
+            mutation_scenario(&mut ctx).await;
+            let summary = ctx.mutation.as_ref().unwrap();
+            assert_eq!(summary.cases_run, 0);
+            let stopped = summary.stopped.as_deref().unwrap();
+            assert!(stopped.starts_with(expected), "{stopped}");
+            for id in ["M1", "M2"] {
+                let result = ctx.results.iter().find(|r| r.id == id).unwrap();
+                assert_eq!(result.verdict, Verdict::Error);
+                assert_eq!(result.detail, stopped);
+            }
+            ctx.s.finish(Duration::from_millis(200)).await;
         }
     }
 
