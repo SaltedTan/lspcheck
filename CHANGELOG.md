@@ -23,6 +23,8 @@
   timeouts. Case admission reserves restoration space for every intermediate text, including plans that end clean.
 - Mutation timeouts become inconclusive when queued output cannot be fully inspected; absence windows end at each
   request's deadline, so later inspection stops do not excuse established timeouts.
+- Mutation startup messages are preflighted against the byte cap before initialization, and failed writes recognize
+  closed output while the server process is still alive. M1's window starts after the first mutation is fully written.
 - Profile durations may also be given in hours, such as `"1h"`.
 
 ## 0.4.0 (2026-11-11)

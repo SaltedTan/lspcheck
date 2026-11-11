@@ -240,13 +240,14 @@ end-of-scenario recheck, and every missing reply through `fail_absent_between`.
 
 **M1.**
 - *skip:* `--mutate` not given, no seed file, no `didOpen`, or no change sync.
-- *fail:* the process exited, or lspcheck read end of file on its stdout, after the first mutation's `didChange` began
-  and before lspcheck sent `shutdown`. Only an exit or an end of file lspcheck saw counts: today's session API reports
+- *fail:* the process exited, or lspcheck read end of file on its stdout, once the first mutation's `didChange` was
+  fully written and before lspcheck sent `shutdown`. Only an exit or an end of file lspcheck saw counts: today's session API reports
   both end of file and lspcheck stopping its own reading (output over `--max-output-mib`) as `Recv::Closed`, so it must
   tell the two apart first, and stopped inspection makes M1 `ERROR`, never `FAIL`. The detail gives the exit status, the case and step, its operators and their offsets. After a write
-  lspcheck couldn't finish, it waits up to `--exit-timeout` for an exit before judging, as R1 does.
-- *error:* the server exited before the first mutation (during settle or baseline, which says nothing about broken
-  source); `initialize` failed; a `didChange` couldn't be delivered and no exit was seen.
+  lspcheck couldn't finish, it waits up to `--exit-timeout` for an exit and checks for closed output before judging.
+- *error:* the server exited or closed output before the first mutation was fully written (during settle or baseline,
+  which says nothing about broken source); the first mutation write failed; `initialize` failed; a later `didChange`
+  couldn't be delivered and neither an exit nor closed output was seen.
 - *not-exercised:* no case ran (the run budget was spent on settling).
 - *pass:* otherwise, with the number of cases and versions sent.
 
@@ -516,6 +517,9 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
 
 - No settle or baseline (step 5): the cases start right after the seed documents are opened. M3 is `SKIP` ("lspcheck
   doesn't judge recovery yet").
+- Before sending `initialize`, lspcheck checks its exact serialized request (including the profile's
+  `initializationOptions`), `initialized`, optional `workspace/didChangeConfiguration`, and 1 KiB for shutdown against
+  the 64 MiB cap. If they do not fit, M1 and M2 are `ERROR` and the scenario writes nothing.
 - Before opening any seed file, lspcheck checks that all serialized `didOpen` notifications, bytes already written,
   and 1 KiB for shutdown fit the 64 MiB cap; otherwise M1 and M2 are `ERROR` and no seed is opened.
 - The case budget and `run_timeout` are as above; planning, serialization and hashing consume the admitted case's
@@ -534,9 +538,10 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
 - Absorption is bounded by the write timeout. If it cannot drain the queued output, every request without an
   in-time answer is `ERROR`. Each absence window ends at that request's deadline; an inspection stop after that
   deadline cannot excuse its timeout. The end-of-session recheck still includes frames spanning the deadline.
-- M1 checks for an exit or closed output before the first mutation and after the final absorption before shutdown;
-  an exit before the first successful mutation write is `ERROR`. A stop in lspcheck's inspection remains `ERROR`,
-  including when a write fails and the server exits.
+- M1's window starts once the first mutation's `didChange` is fully written and ends before shutdown. An exit or
+  closed output before that boundary, or a failed first mutation write, is `ERROR`. A failed later write with observed
+  closed output counts as server loss even if the process remains alive. A stop in lspcheck's inspection remains
+  `ERROR`, including when a write fails and the server exits.
 - A request K1 wouldn't send about the document (a `documentSelector` that doesn't select it) is skipped, and the
   round robin moves on.
 - The transcript's meta line records each edit's `operator`, `offset`, `removed`, `sha256` of what it inserted, and

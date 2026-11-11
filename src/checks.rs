@@ -850,9 +850,14 @@ impl Ctx<'_> {
 
     /// Initializes the server with these params and sends `initialized`.
     async fn initialize_with(&mut self, params: Value) -> Result<Message, InitFailure> {
-        let t = self.cfg.startup_timeout;
         let params = self.with_options(params);
-        let reply = match self.s.call("initialize", Some(params), t).await {
+        let id = self.s.fresh_id();
+        self.initialize_prepared(&id, params).await
+    }
+
+    async fn initialize_prepared(&mut self, id: &Id, params: Value) -> Result<Message, InitFailure> {
+        let t = self.cfg.startup_timeout;
+        let reply = match self.s.call_with_id(id, "initialize", Some(params), t).await {
             Ok(reply) => reply,
             Err(CallError::Wait(WaitError::Timeout)) => {
                 return Err(InitFailure::Blocked(format!(
@@ -3517,11 +3522,13 @@ async fn lost_after_write(ctx: &mut Ctx<'_>, what: &str, e: &WriteError) -> Lost
         return Lost::Uninspected(why);
     }
     let status = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    ctx.s.absorb_all().await;
     if let Some((_, why)) = ctx.s.stopped_reading() {
         return Lost::Uninspected(why);
     }
     match status {
         Some(status) => Lost::Gone(format!("the server exited with {}", session::describe_status(status))),
+        None if ctx.s.stdout_closed() => Lost::Gone("the server closed its output".into()),
         None => Lost::Undelivered(format!("lspcheck couldn't deliver {what} ({e})")),
     }
 }
@@ -3564,6 +3571,15 @@ fn did_change(uri: &str, version: i64, changes: &[ContentChange]) -> Value {
 /// The bytes a notification takes on the wire.
 fn notification_bytes(method: &str, params: &Value) -> u64 {
     frame(&message::notification(method, Some(params.clone()))).len() as u64
+}
+
+fn mutation_startup_bytes(id: &Id, params: &Value, configuration: Option<&Value>) -> u64 {
+    let initialize = frame(&message::request(id, "initialize", Some(params.clone()))).len() as u64;
+    let initialized = notification_bytes("initialized", &json!({}));
+    let configured = configuration
+        .map(|settings| notification_bytes("workspace/didChangeConfiguration", &json!({"settings": settings})))
+        .unwrap_or(0);
+    initialize + initialized + configured + SHUTDOWN_RESERVE
 }
 
 fn restoration_reserve<'a>(
@@ -3665,8 +3681,19 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         ctx.report("M1", verdict, detail.clone());
         ctx.report("M2", verdict, detail);
     };
-    let params = capabilities_initialize_params(&ctx.root);
-    let reply = match ctx.initialize_with(params).await {
+    let params = ctx.with_options(capabilities_initialize_params(&ctx.root));
+    let id = ctx.s.fresh_id();
+    let startup_bytes = mutation_startup_bytes(&id, &params, ctx.cfg.configuration.as_ref());
+    if startup_bytes > MUTATION_BYTES {
+        let why = format!(
+            "the profile's initializationOptions and settings would write {startup_bytes} bytes before any mutation, past the scenario's cap of 64 MiB"
+        );
+        both(ctx, Verdict::Error, why.clone());
+        summary.stopped = Some(why);
+        ctx.mutation = Some(summary);
+        return;
+    }
+    let reply = match ctx.initialize_prepared(&id, params).await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
             both(ctx, Verdict::Error, format!("initialize didn't succeed: {why}"));
@@ -4885,6 +4912,33 @@ pub fn file_uri(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mutation_startup_reserve_counts_all_profile_messages_on_the_wire() {
+        for number in [1, i32::MAX] {
+            let id = Id::int(number as i64);
+            let params = json!({"capabilities": {}, "initializationOptions": {"data": "é\u{1}\n\""}});
+            let settings = json!({"data": "😀\u{2}\n\\"});
+            for configuration in [None, Some(&settings)] {
+                let mut messages = vec![
+                    json!({"jsonrpc": "2.0", "id": number, "method": "initialize", "params": params}),
+                    json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+                ];
+                if let Some(settings) = configuration {
+                    messages.push(json!({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration", "params": {"settings": settings}}));
+                }
+                let expected = 1024
+                    + messages
+                        .iter()
+                        .map(|message| {
+                            let body = serde_json::to_vec(message).unwrap();
+                            body.len() as u64 + format!("Content-Length: {}\r\n\r\n", body.len()).len() as u64
+                        })
+                        .sum::<u64>();
+                assert_eq!(mutation_startup_bytes(&id, &params, configuration), expected);
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn mutation_test_config(script: &str) -> Config {
         Config {
@@ -4920,6 +4974,43 @@ mod tests {
             k1_pending: None,
             mutation: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_startup_over_cap_sends_nothing() {
+        let mut cfg = mutation_test_config("cat >/dev/null");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/standin-mutation.toml");
+        cfg.mutation = profile::load(&fixture).unwrap().mutation;
+        cfg.initialization_options = Some(json!({"payload": "\u{1}".repeat(6 * 1024 * 1024)}));
+        cfg.configuration = Some(json!({"payload": "\u{1}".repeat(6 * 1024 * 1024)}));
+        let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+        mutation_scenario(&mut ctx).await;
+        assert_eq!(ctx.s.bytes_written(), 0);
+        for id in ["M1", "M2"] {
+            assert_eq!(ctx.results.iter().find(|r| r.id == id).unwrap().verdict, Verdict::Error);
+        }
+        let stopped = ctx.mutation.as_ref().unwrap().stopped.as_ref().unwrap();
+        assert!(stopped.starts_with("the profile's initializationOptions and settings would write "), "{stopped}");
+        assert!(stopped.ends_with("past the scenario's cap of 64 MiB"), "{stopped}");
+        let finish = ctx.s.finish(Duration::from_millis(200)).await;
+        assert!(!finish.transcript.iter().any(|event| matches!(event.kind, session::EventKind::Sent(_))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_failed_write_with_closed_output_is_gone_while_the_server_lives() {
+        let mut cfg = mutation_test_config("exec 0<&- 1>&-; sleep 30");
+        cfg.exit_timeout = Duration::ZERO;
+        let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+        ctx.s.drain(Instant::now() + Duration::from_secs(5)).await;
+        assert!(ctx.s.stdout_closed());
+        assert!(ctx.s.is_alive());
+        let error = ctx.s.notify("textDocument/didChange", Some(json!({}))).await.unwrap_err();
+        assert!(matches!(lost_after_write(&mut ctx, "didChange", &error).await,
+            Lost::Gone(why) if why == "the server closed its output"));
+        assert!(ctx.s.is_alive());
+        ctx.s.finish(Duration::from_millis(200)).await;
     }
 
     #[cfg(unix)]
