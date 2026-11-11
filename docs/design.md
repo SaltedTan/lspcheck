@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). Unreleased expands the [example profile catalogue](../examples/profiles/README.md) and the [stock-server CI matrix](../ci/stock-servers/README.md), refines [K2's failure detail](#capabilities-and-robustness), and [isolates Content-Type probes](#framing-and-output). M4 is done: virgil-lsp's CI checks its freshly built server with the pinned v0.2.0 release. See the [Unreleased changelog](../CHANGELOG.md#unreleased) for changes since v0.3.0.
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). Unreleased expands the [example profile catalogue](../examples/profiles/README.md) and the [stock-server CI matrix](../ci/stock-servers/README.md), refines [K2's failure detail](#capabilities-and-robustness), accepts unknown values of the tag and kind enumerations clients must tolerate, and [isolates Content-Type probes](#framing-and-output). M4 is done (see the [integration milestone](#milestones)). See the [Unreleased changelog](../CHANGELOG.md#unreleased) for changes since v0.3.0.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -441,7 +441,12 @@ A value is of a type when:
   violation unless the type admits `null`. Properties the type doesn't name are lawful (LSP is structurally typed, and
   servers add extensions).
 - **enumerations:** the value has the enumeration's base type and is one of its values, or any value of that type when
-  the enumeration `supportsCustomValues` (such as `CodeActionKind` and `FoldingRangeKind`).
+  the enumeration `supportsCustomValues` (such as `CodeActionKind` and `FoldingRangeKind`). `SymbolKind`, `SymbolTag`,
+  `CompletionItemKind`, `CompletionItemTag` and `DiagnosticTag` are treated the same way, although the meta-model
+  doesn't mark them: the specification tells clients to handle unknown tags gracefully and to fall back to a default for
+  a kind outside their `valueSet`, and servers send later versions' values and their own (clangd's symbol tags 8 and
+  up). These five still require `uinteger` as defined above: `null`, strings, negative and fractional numbers still
+  fail. Every other closed enumeration, including `MessageType` and `DiagnosticSeverity`, stays strict.
 - **arrays:** every item is of the element type; **tuples:** exactly as many items as types, each of its type;
   **maps:** a JSON object whose values are of the value type (keys are JSON strings, so a key is judged only when the
   key type is a string enumeration); **and:** every type; **or:** at least one; **string, integer and boolean
@@ -677,7 +682,7 @@ No network access at runtime.
   binaries (Linux x86_64/aarch64 static, macOS arm64/x86_64, Windows x86_64) and checksums. crates.io publishing needs the
   maintainer's token.
 - **M4** dogfood in virgil-lsp: a pinned binary download in CI (a dependency + workflow change, so a human merge there).
-  Done: virgil-lsp's `lspcheck-linux` job checks its freshly built server with the pinned v0.2.0 release.
+  Done: virgil-lsp's `lspcheck-linux` job checks its freshly built server with the pinned v0.3.0 release.
 - K2 meta-model validation (released in v0.3.0).
 - Later: language profiles with seeded source mutation and recovery oracles, ported from
   `test/protocol/source_mutations.py`. [Accepted design](source-mutations.md): an opt-in `--mutate` scenario with

@@ -8,7 +8,8 @@
 //! structural, as LSP's types are: a property a structure doesn't name is
 //! lawful (servers add extensions), and definitions marked `proposed` aren't
 //! judged. The syntax of `URI`, `DocumentUri` and `RegExp` strings isn't
-//! judged either. Pure functions only; the judge is in [`crate::checks`].
+//! judged either. The enumerations in [`TOLERATED`] take any value of their
+//! base type. Pure functions only; the judge is in [`crate::checks`].
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -38,6 +39,16 @@ const KEPT: usize = 8;
 
 /// How many of an enumeration's values a description lists.
 const LISTED_VALUES: usize = 8;
+
+/// Enumerations the meta-model doesn't mark `supportsCustomValues`, but whose
+/// unknown values the specification tells clients to handle: "Clients
+/// supporting tags have to handle unknown tags gracefully" (the `tagSupport`
+/// capabilities), and a client with a kind `valueSet` "will handle values
+/// outside its set gracefully and falls back to a default value when unknown".
+/// Servers send values from later LSP versions and their own (clangd's symbol
+/// tags 8 and up), so a value outside the 3.17 list isn't a type violation
+/// here; one that isn't an LSP `uinteger` still is.
+const TOLERATED: [&str; 5] = ["SymbolKind", "SymbolTag", "CompletionItemKind", "CompletionItemTag", "DiagnosticTag"];
 
 /// A type of the meta-model.
 #[derive(Debug, Clone, Deserialize)]
@@ -273,7 +284,14 @@ impl Model {
             notifications: raw.notifications.into_iter().map(|n| (n.method.clone(), n)).collect(),
             structures,
             properties,
-            enumerations: raw.enumerations.into_iter().map(|e| (e.name.clone(), e)).collect(),
+            enumerations: raw
+                .enumerations
+                .into_iter()
+                .map(|mut e| {
+                    e.supports_custom_values |= TOLERATED.contains(&e.name.as_str());
+                    (e.name.clone(), e)
+                })
+                .collect(),
             aliases: raw.type_aliases.into_iter().map(|a| (a.name.clone(), a)).collect(),
         })
     }
@@ -1116,16 +1134,19 @@ mod tests {
 
     #[test]
     fn union_alternatives_that_tie_in_the_same_place_name_it() {
-        // clangd 23.1.0 sent this for textDocument/documentSymbol: an
-        // out-of-range SymbolTag. SymbolInformation[] and DocumentSymbol[]
-        // both fail at result[0].tags[0], so naming it helps the server author.
+        // A SymbolTag that isn't an integer (clangd 23.1.0 found this case with
+        // its extension tags, which K2 now accepts). SymbolInformation[] and
+        // DocumentSymbol[] both fail at result[0].tags[0], so naming it helps
+        // the server author.
         let result = model().result("textDocument/documentSymbol").unwrap();
         let range = json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}});
-        let symbol = json!({"name": "greet", "kind": 12, "range": range, "selectionRange": range, "tags": [8]});
+        let symbol =
+            json!({"name": "greet", "kind": 12, "range": range, "selectionRange": range, "tags": ["deprecated"]});
         assert_eq!(
             invalid(result, json!([symbol])),
             "result is [{\"name\":\"greet\",\"kind\":12,\"range\":{\"start\":{\"line\":0,\"chara…; required: \
-             SymbolInformation[] | DocumentSymbol[] | null (closest: result[0].tags[0] is 8; required: SymbolTag: 1)"
+             SymbolInformation[] | DocumentSymbol[] | null (closest: result[0].tags[0] is \"deprecated\"; required: \
+             SymbolTag (any uinteger))"
         );
     }
 
@@ -1219,8 +1240,42 @@ mod tests {
         let action = reference("CodeActionKind");
         valid(&action, json!("lspcheck.custom"));
         // A long enumeration is listed in part.
-        let symbol = invalid(&reference("SymbolKind"), json!(0));
-        assert!(symbol.ends_with("| 8 | … (26 values)"), "{symbol}");
+        let long = Enumeration {
+            name: "Long".into(),
+            ty: Type::Base { name: Base::UInteger },
+            values: (1..=9).map(|v| EnumerationValue { name: format!("V{v}"), value: json!(v) }).collect(),
+            supports_custom_values: false,
+            proposed: false,
+        };
+        assert_eq!(describe_enumeration(&long), "Long: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | … (9 values)");
+    }
+
+    #[test]
+    fn tags_and_kinds_clients_must_tolerate_take_any_unsigned_integer() {
+        for name in TOLERATED {
+            let e = &model().enumerations[name];
+            assert!(e.supports_custom_values, "{name}");
+            assert!(matches!(e.ty, Type::Base { name: Base::UInteger }), "{name}");
+            let t = reference(name);
+            valid(&t, json!(1));
+            // clangd's extension symbol tags, and kinds past 3.17's lists.
+            valid(&t, json!(18));
+            valid(&t, json!(0));
+            assert_eq!(invalid(&t, json!(-1)), format!("result is -1; required: {name} (any uinteger)"));
+            invalid(&t, json!("deprecated"));
+            invalid(&t, json!(1.5));
+        }
+        // A document symbol with clangd's tags and a kind past the list.
+        let symbols = model().result("textDocument/documentSymbol").unwrap();
+        valid(
+            symbols,
+            json!([{"name": "f", "kind": 27, "tags": [8, 18, 19, 20],
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                    "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]),
+        );
+        // Every other closed enumeration stays strict.
+        invalid(&reference("DiagnosticSeverity"), json!(5));
+        invalid(&reference("InsertTextFormat"), json!(3));
     }
 
     #[test]

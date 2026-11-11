@@ -445,6 +445,7 @@ fn lawful_variations_fail_nothing() {
         "echo-positions",
         "extra-properties",
         "custom-folding-range-kind",
+        "unknown-kinds-and-tags",
     ] {
         let r = if name == "slow-large-document" {
             run(&["--fault", name], &["--timeout", "1", "--startup-timeout", "10", "--large-document-mib", "2"])
