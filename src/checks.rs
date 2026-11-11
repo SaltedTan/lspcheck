@@ -3463,7 +3463,8 @@ fn opens_documents(reply: &Message) -> bool {
     }
 }
 
-/// The most bytes the mutation scenario writes to the server.
+/// The mutation scenario's byte-admission cap; automatic answers can exceed
+/// it for now ([step 3's limits](../docs/source-mutations.md#step-3)).
 pub const MUTATION_BYTES: u64 = 64 * 1024 * 1024;
 /// What a case reserves for each request it may send, beyond its document's URI.
 const REQUEST_RESERVE: u64 = 2048;

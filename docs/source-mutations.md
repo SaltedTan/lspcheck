@@ -352,7 +352,7 @@ A seed chosen at random is below 2^53, so it survives any JSON reader and fits a
 `--mutation-seed N` and `--mutation-cases N` require `--mutate` and override the profile's values. `--mutate` resolves
 the `[mutation]` settings; with a `[document]` but no `[mutation]`, it selects that file with the default lexicon and
 defaults (its size is checked against the default 64 KiB then, not when the profile is read). With no seed file it
-resolves an empty seed list; once the scenario is implemented, that will make M1 to M3 `SKIP` ("no seed file").
+resolves an empty seed list and M1 to M3 report `SKIP` ("no seed file").
 
 ### Bounds
 
@@ -437,8 +437,8 @@ a window. Lawful faults count replies, not milliseconds.
 | Fault | Effect | Test |
 |---|---|---|
 | `exit-on-unbalanced` | exit when a document's brackets become unbalanced | M1 fails |
-| `flood-while-unbalanced` | lawful: write diagnostics past `--max-output-mib` while unbalanced, and keep serving | M1 `ERROR` (inspection stopped), never `FAIL` |
-| `close-output-mid-restoration` | partway through reading a large document's restoration, send 20,000 requests and close stdout, then read nothing more after it | M1 `ERROR` (the end of output is queued behind requests lspcheck can't answer before shutdown), never `PASS` |
+| `flood-while-unbalanced` | lawful: after a change leaves brackets unbalanced, write 2 MiB of log messages, and keep serving | With `--max-output-mib 1`, M1 `ERROR` (inspection stopped), never `FAIL` |
+| `close-output-mid-restoration` | Unix only: partway through reading a large document's restoration, send 20,000 requests and close stdout, then read nothing more after it | M1 `ERROR` (the end of output is queued behind requests lspcheck can't answer before shutdown), never `PASS` |
 | `late-wrong-count` | answer one `selectionRange` with `[]` after more than 64 later versions | D6 fails from the mutation scenario |
 | `recover-before-deadline` | lawful: after rebalancing, answer `documentSymbol` with `[]` until just before `recovery_timeout`, counted in replies to a poll schedule the test fixes, then with the baseline | nothing fails with `expect = "baseline"`: the terminal probe sees the baseline |
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails |
