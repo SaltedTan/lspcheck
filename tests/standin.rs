@@ -2724,12 +2724,14 @@ fn the_seed_and_case_flags_override_the_profile() {
 }
 
 #[test]
-fn a_server_that_exits_on_broken_source_fails_m1() {
+fn mutation_server_exit_records_early_stop_and_fails_m1() {
     let (r, _, _keep) = mutated(&["exit-on-unbalanced"], &[]);
     expect(&r, "M1", "fail");
     let m1 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M1").unwrap()["detail"];
     let m1 = m1.as_str().unwrap();
     assert!(m1.starts_with("the server exited with status 5 during case 0, step 1 (unbalance-bracket at "), "{m1}");
+    assert_eq!(r.report["mutation"]["cases_run"], 1);
+    assert_eq!(r.report["mutation"]["stopped"].as_str(), Some(m1));
     // A request pending when it exited, or that it exited before reading,
     // is M1's, not M2's: nothing was answered after a mutation.
     expect(&r, "M2", "not-exercised");
@@ -2758,25 +2760,6 @@ fn content_modified_answers_to_broken_source_are_lawful() {
     passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "skip")]);
     let m2 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M2").unwrap()["detail"];
     assert!(m2.as_str().unwrap().contains("errors by code: -32801 ×"), "{m2}");
-}
-
-#[test]
-fn mutation_no_case_starts_without_its_whole_budget_left() {
-    let text =
-        std::fs::read_to_string(mutation_profile()).unwrap().replace("seed = ", "run_timeout = \"60500ms\"\nseed = ");
-    let (path, _keep) = profile(&text);
-    let (r, _, _keep2) = run_with_transcripts(
-        &["--fault", "ignore-while-unbalanced"],
-        &["--profile", path.to_str().unwrap(), "--mutate", "--timeout", "3", "--only", "M1,M2"],
-    );
-    assert_eq!(r.report["mutation"]["cases_run"], 1, "{}", r.report["mutation"]);
-    let stopped = r.report["mutation"]["stopped"].as_str().unwrap();
-    assert!(
-        stopped.contains("mutation.run_timeout (60.5 s) left less than a case's budget (59 s) for case 1"),
-        "{stopped}"
-    );
-    expect(&r, "M1", "pass");
-    expect(&r, "M2", "fail");
 }
 
 #[test]

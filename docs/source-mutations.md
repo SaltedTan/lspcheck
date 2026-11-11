@@ -398,6 +398,9 @@ server's request unanswered, and M3 and the cases not run are `ERROR` (lspcheck'
 the bytes written capped, a transcript holds at most that plus what the server wrote. None of these bounds is a
 protocol rule: reaching one gives `ERROR` or `N/E` with the bound named, or just a smaller run, never `FAIL`.
 
+These are the complete design's bounds; [step 3](#step-3) currently leaves answers to server requests uncapped
+throughout the scenario. Enforcement in the session's send path is planned for step 4.
+
 ### Reports, transcripts and reproduction
 
 The JSON report gains a top-level `"mutation"`: `null` when the scenario didn't run, or the seed, the format, the
@@ -531,8 +534,10 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
   so far plus the case's reserve fit the written-bytes cap; the reserve counts the case's `didChange` notifications at
   their exact size, 2 KiB plus twice the URI's length for each request, and 1 KiB for `shutdown` and `exit`. For each
   document, the restoration reserve is the largest restoration notification over every step's resulting text and
-  version, plus a small margin, even if the plan ends with the clean text. Answers to the server's own requests during
-  a case aren't yet held to what is left of the cap before each write; they count towards the next case's check.
+  version, plus a small margin, even if the plan ends with the clean text. Answers to the server's own requests
+  anywhere in the mutation scenario (startup, cases, early leave and shutdown) aren't yet held to the 64 MiB cap
+  before each write; they count towards the next case's check, if any. Enforcing the cap on answers once, in the
+  session's send path, is planned for step 4.
 - Each request's deadline is `--timeout` from when lspcheck began writing it; the step's requests are written back to
   back and then waited for in order, each until its own deadline. Answering queued server requests happens before
   that window starts. After the waits, including when a batch write fails, lspcheck absorbs queued output and settles

@@ -14,6 +14,7 @@
   It judges M1 (the server survives) and M2 (every request is answered within `--timeout`); `--mutation-seed` and
   `--mutation-cases` override the profile. The JSON report gains `"mutation"` (`null` when the scenario doesn't run),
   the terminal header names the seed, and the scenario's transcript, `mutation.jsonl`, records each case's plan.
+  When server loss stops the scenario, `mutation.stopped` records its reason and location.
 
 ### Changed
 

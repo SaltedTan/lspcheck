@@ -3471,6 +3471,11 @@ const REQUEST_RESERVE: u64 = 2048;
 const SHUTDOWN_RESERVE: u64 = 1024;
 const RESTORE_MARGIN: u64 = 64;
 
+fn mutation_case_deadline(now: Instant, run_deadline: Instant, case_budget: Duration) -> Option<Instant> {
+    let deadline = now + case_budget;
+    (deadline <= run_deadline).then_some(deadline)
+}
+
 /// A seed document as the mutation scenario holds it.
 struct SeedDoc {
     name: String,
@@ -3792,7 +3797,9 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             let why = match lost_after_write(ctx, &format!("didOpen for {}", doc.name), &e).await {
                 Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) => why,
             };
-            both(ctx, Verdict::Error, format!("before the first mutation: {why}"));
+            let why = format!("before the first mutation: {why}");
+            both(ctx, Verdict::Error, why.clone());
+            summary.stopped = Some(why);
             ctx.mutation = Some(summary);
             leave(ctx).await;
             return;
@@ -3827,15 +3834,14 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     let mut cut_short = 0u64;
     'cases: for k in 0..settings.cases {
         let admitted = Instant::now();
-        let case_deadline = admitted + case_budget;
-        if case_deadline > run_deadline {
+        let Some(case_deadline) = mutation_case_deadline(admitted, run_deadline, case_budget) else {
             summary.stopped = Some(format!(
                 "mutation.run_timeout ({} s) left less than a case's budget ({} s) for case {k}",
                 seconds(settings.run_timeout),
                 seconds(case_budget)
             ));
             break;
-        }
+        };
         let clean: Vec<String> = docs.iter().map(|d| d.clean.clone()).collect();
         let plan = mutation::plan_case(seed, k, &clean, &settings.planner);
         // Every change of the case, worked out before any is sent: their
@@ -4032,7 +4038,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
 
 async fn leave_mutation(
     ctx: &mut Ctx<'_>,
-    summary: MutationSummary,
+    mut summary: MutationSummary,
     first_change: Option<Duration>,
     versions: u64,
     mut lost: Option<(Lost, String)>,
@@ -4054,6 +4060,9 @@ async fn leave_mutation(
         let place = lost.map(|(_, place)| place).unwrap_or_else(|| "the cases and their restorations".into());
         let why = "lspcheck couldn't finish reading what the server had sent before shutdown".to_string();
         lost = Some((Lost::Uninspected(why), place));
+    }
+    if let Some((Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why), place)) = &lost {
+        summary.stopped = Some(format!("{why} during {place}"));
     }
     judge_m1(ctx, &summary, first_change, versions, lost);
     judge_m2(ctx, asked);
@@ -4924,6 +4933,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mutation_no_case_starts_without_its_whole_budget_left() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/standin-mutation.toml");
+        let settings = profile::load(&fixture).unwrap().mutation.unwrap();
+        let budget = settings.case_budget(Duration::from_secs(3));
+        assert_eq!(budget, Duration::from_secs(59));
+        let start = Instant::now();
+        let run_deadline = start + Duration::from_millis(60_500);
+        let case_deadline = mutation_case_deadline(start, run_deadline, budget).unwrap();
+        assert_eq!(case_deadline, start + Duration::from_secs(59));
+        assert!(mutation_case_deadline(start + Duration::from_secs(3), run_deadline, budget).is_none());
+        let last_start = start + Duration::from_millis(1500);
+        assert_eq!(mutation_case_deadline(last_start, run_deadline, budget), Some(run_deadline));
+        assert!(mutation_case_deadline(last_start + Duration::from_nanos(1), run_deadline, budget).is_none());
+        assert!(mutation_case_deadline(run_deadline + Duration::from_secs(1), run_deadline, budget).is_none());
+    }
+
+    #[test]
     fn mutation_startup_reserve_counts_all_profile_messages_on_the_wire() {
         for number in [1, i32::MAX] {
             let id = Id::int(number as i64);
@@ -5062,6 +5088,9 @@ mod tests {
                 if first_change.is_some() {
                     assert!(m1.detail.ends_with("during restoring case 0"), "{}", m1.detail);
                 }
+                let stopped = ctx.mutation.as_ref().unwrap().stopped.as_deref().unwrap();
+                assert!(stopped.starts_with("the server "), "{stopped}");
+                assert!(stopped.ends_with("during restoring case 0"), "{stopped}");
                 ctx.s.finish(Duration::from_millis(200)).await;
             }
         }
@@ -5086,6 +5115,9 @@ mod tests {
                 "{}",
                 m1.detail
             );
+            let stopped = ctx.mutation.as_ref().unwrap().stopped.as_deref().unwrap();
+            assert!(stopped.ends_with(&format!("during {place}")), "{stopped}");
+            assert!(!stopped.starts_with("exit") && !stopped.starts_with("failed write"), "{stopped}");
             ctx.s.finish(Duration::from_millis(200)).await;
         }
     }

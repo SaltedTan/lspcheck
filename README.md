@@ -336,7 +336,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   `--help` until recovery (M3) is judged: `lspcheck --profile p.toml --mutate [--mutation-seed N]
   [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2. See the
   [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
-  [step 3's limits](docs/source-mutations.md#step-3) for what is implemented so far.
+  [step 3's limits](docs/source-mutations.md#step-3) for what is implemented so far. The JSON `mutation.stopped`
+  field records the reason and location when server loss stops the scenario.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
   type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name, an unknown check id, or a
   `[document]` whose file, language id or positions don't fit is a usage error (exit status 2) naming the file and
