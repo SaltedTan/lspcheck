@@ -16,6 +16,7 @@
   the terminal header names the seed, and the scenario's transcript, `mutation.jsonl`, records each case's plan.
   When the scenario stops early, `mutation.stopped` records the reason, including initialization and seed-file errors.
   M2 preserves observed timeouts when the server exits during a later request in the same batch.
+  Unfinished client writes make overlapping reply windows inconclusive from the write's start.
 
 ### Changed
 

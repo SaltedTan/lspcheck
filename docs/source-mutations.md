@@ -551,7 +551,8 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
 - Absorption is bounded by the write timeout. If it cannot drain the queued output, every request without an
   in-time answer or previously established timeout is `ERROR`. Each absence window ends at that request's deadline;
   an inspection stop after that deadline cannot excuse its timeout. The end-of-session recheck still includes frames
-  spanning the deadline.
+  spanning the deadline. An unfinished client write, including an automatic answer, makes overlapping request
+  windows inconclusive from when that write began, rather than when its failure became known.
 - M1's window starts once the first mutation's `didChange` is fully written and ends before shutdown. An exit or
   closed output before that boundary, or a failed first mutation write, is `ERROR`. A failed later write with observed
   closed output counts as server loss even if the process remains alive. A stop in lspcheck's inspection remains
