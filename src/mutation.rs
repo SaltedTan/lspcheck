@@ -24,6 +24,9 @@ pub const FORMAT: u32 = 1;
 pub const MAX_MUTATIONS_PER_STEP: usize = 3;
 /// Most steps in one case.
 pub const MAX_STEPS: usize = 3;
+/// The smallest `max_document_bytes`: room for any one character, so that
+/// the last resort, a bracket inserted into an emptied document, always fits.
+pub const MIN_DOCUMENT_BYTES: usize = 4;
 /// Most bytes a mutation other than a stress one may add to a document.
 pub const INSERT_CAP: usize = 1024;
 /// Most bytes a stress mutation may add to a document.
@@ -426,7 +429,8 @@ pub struct Config {
     pub operators: Vec<Operator>,
     /// What `fragment` inserts.
     pub fragments: Vec<String>,
-    /// Most bytes a mutated document may hold.
+    /// Most bytes a mutated document may hold, at least
+    /// [`MIN_DOCUMENT_BYTES`]. A seed within it stays within it.
     pub max_document_bytes: usize,
     pub lexicon: Lexicon,
 }
@@ -493,6 +497,7 @@ pub struct Case {
 pub fn plan_case(seed: u64, index: u64, texts: &[String], config: &Config) -> Case {
     assert!(!texts.is_empty(), "no seed documents");
     assert!(!config.operators.is_empty(), "no operators");
+    assert!(config.max_document_bytes >= MIN_DOCUMENT_BYTES, "max_document_bytes below {MIN_DOCUMENT_BYTES}");
     let mut rng = SplitMix64::stream(seed, index, "edits");
     let mut current: Vec<String> = texts.to_vec();
     let steps = rng.between(1, config.steps.clamp(1, MAX_STEPS));
@@ -575,6 +580,28 @@ struct Context<'a> {
     lexicon: &'a Lexicon,
     /// Bytes the document may still grow by.
     room: usize,
+}
+
+/// The byte range of every line end of `text`, `\r\n`, `\n` or `\r`, in order,
+/// wherever it is: between tokens or inside a string or block comment.
+fn line_ends(text: &str) -> Vec<(usize, usize)> {
+    let b = text.as_bytes();
+    let mut ends = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\r' if b.get(i + 1) == Some(&b'\n') => {
+                ends.push((i, i + 2));
+                i += 2;
+            }
+            b'\r' | b'\n' => {
+                ends.push((i, i + 1));
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    ends
 }
 
 /// Whether byte `i` of `text` falls between a `\r` and a `\n`.
@@ -701,13 +728,14 @@ impl Context<'_> {
         Some((at, self.text.len() - at, String::new()))
     }
 
-    /// Each line's byte range with its line end.
+    /// Each line's byte range with its line end. Lines come from the text,
+    /// not the tokens: a string or block comment may hold line ends.
     fn lines(&self) -> Vec<(usize, usize)> {
         let mut lines = Vec::new();
         let mut start = 0;
-        for t in self.tokens.iter().filter(|t| t.kind == TokenKind::LineEnd) {
-            lines.push((start, t.end));
-            start = t.end;
+        for (_, end) in line_ends(self.text) {
+            lines.push((start, end));
+            start = end;
         }
         if start < self.text.len() {
             lines.push((start, self.text.len()));
@@ -726,7 +754,7 @@ impl Context<'_> {
 
     /// The line end a copied last line gets: the document's last, else `\n`.
     fn some_line_end(&self) -> &str {
-        self.tokens.iter().rev().find(|t| t.kind == TokenKind::LineEnd).map_or("\n", |t| t.text(self.text))
+        line_ends(self.text).last().map_or("\n", |&(start, end)| &self.text[start..end])
     }
 
     fn duplicate_line(&self, rng: &mut SplitMix64) -> Option<Splice> {
@@ -847,7 +875,7 @@ impl Context<'_> {
 
     /// Makes one line end, or every one, `\r\n` or a lone `\r`.
     fn line_ends(&self, rng: &mut SplitMix64) -> Option<Splice> {
-        let ends: Vec<&Token> = self.tokens.iter().filter(|t| t.kind == TokenKind::LineEnd).collect();
+        let ends = line_ends(self.text);
         if ends.is_empty() {
             return None;
         }
@@ -855,21 +883,22 @@ impl Context<'_> {
         let first_target = rng.below(2);
         let every = rng.below(2) == 1;
         for target in [targets[first_target], targets[1 - first_target]] {
-            let differing: Vec<&Token> = ends.iter().copied().filter(|t| t.text(self.text) != target).collect();
+            let differing: Vec<(usize, usize)> =
+                ends.iter().copied().filter(|&(start, end)| &self.text[start..end] != target).collect();
             // A CR LF grows the document by one byte for each line end it replaces.
             if differing.is_empty() || (target.len() > 1 && self.cap() == 0) {
                 continue;
             }
             let growth = differing.len() * (target.len() - 1);
-            let chosen: Vec<&Token> =
+            let chosen: Vec<(usize, usize)> =
                 if every && growth <= self.cap() { differing } else { vec![*rng.pick(&differing)] };
-            let (start, end) = (chosen[0].start, chosen[chosen.len() - 1].end);
+            let (start, end) = (chosen[0].0, chosen[chosen.len() - 1].1);
             let mut replaced = String::new();
             let mut at = start;
-            for t in chosen {
-                replaced.push_str(&self.text[at..t.start]);
+            for (line_end_start, line_end_end) in chosen {
+                replaced.push_str(&self.text[at..line_end_start]);
                 replaced.push_str(target);
-                at = t.end;
+                at = line_end_end;
             }
             return Some((start, end - start, replaced));
         }
@@ -1369,13 +1398,63 @@ mod tests {
 
     #[test]
     fn a_small_document_limit_holds() {
-        let config = Config { max_document_bytes: LUA.len() + 8, ..all_operators(lua()) };
-        for index in 0..200 {
-            let case = plan_case(5, index, &texts(LUA), &config);
-            for after in replay(&texts(LUA), &case).iter().flatten() {
-                assert!(after.len() <= config.max_document_bytes, "case {index}: {} bytes", after.len());
+        // Brackets of four bytes each: the last resort's bracket only just fits.
+        let wide = Lexicon { brackets: vec![('\u{1F600}', '\u{1F601}')], ..lua() };
+        for lexicon in [lua(), wide] {
+            for seed in seeds() {
+                for slack in [0, 1, 8] {
+                    let max_document_bytes = seed.len().max(MIN_DOCUMENT_BYTES) + slack;
+                    let config = Config { max_document_bytes, ..all_operators(lexicon.clone()) };
+                    for index in 0..60 {
+                        let case = plan_case(5, index, &texts(&seed), &config);
+                        for after in replay(&texts(&seed), &case).iter().flatten() {
+                            assert!(after.len() <= max_document_bytes, "{seed:?} case {index}: {after:?}");
+                        }
+                    }
+                }
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "max_document_bytes below 4")]
+    fn a_document_limit_too_small_for_a_character_is_refused() {
+        // An emptied document gets a bracket, which may take four bytes.
+        let config = Config {
+            operators: vec![Operator::DeleteTokens],
+            max_document_bytes: 1,
+            lexicon: Lexicon { brackets: vec![('\u{4E2D}', '\u{6587}')], ..Lexicon::default() },
+            ..Config::default()
+        };
+        plan_case(0, 0, &texts(""), &config);
+    }
+
+    #[test]
+    fn line_operators_see_line_ends_inside_comments_and_strings() {
+        // A block comment over two lines is one token, but still two lines.
+        let lexicon = Lexicon { block_comments: vec![("/*".into(), "*/".into())], ..lua() };
+        let seed = "/*a\nb*/";
+        for operator in [Operator::DeleteLine, Operator::DuplicateLine, Operator::RepeatLine, Operator::LineEnds] {
+            let config = Config { steps: 1, operators: vec![operator], lexicon: lexicon.clone(), ..Config::default() };
+            for index in 0..20 {
+                let m = &plan_case(0, index, &texts(seed), &config).steps[0].mutations[0];
+                assert!(!m.fallback, "{m:?}");
+                let edit = (m.offset, m.removed, m.inserted.as_str());
+                match operator {
+                    Operator::DeleteLine => assert!([(0, 4, ""), (4, 3, "")].contains(&edit), "{m:?}"),
+                    Operator::DuplicateLine => assert!([(4, 0, "/*a\n"), (4, 0, "b*/\n")].contains(&edit), "{m:?}"),
+                    Operator::RepeatLine => {
+                        assert_eq!((m.offset, m.removed), (4, 0));
+                        assert_eq!(m.inserted, "/*a\n".repeat(m.inserted.len() / 4), "{m:?}");
+                    }
+                    _ => assert!([(3, 1, "\r\n"), (3, 1, "\r")].contains(&edit), "{m:?}"),
+                }
+            }
+        }
+        // A string over two lines, likewise.
+        let config = Config { steps: 1, operators: vec![Operator::LineEnds], lexicon: lua(), ..Config::default() };
+        let m = &plan_case(0, 0, &texts("x = 'a\r\nb'"), &config).steps[0].mutations[0];
+        assert_eq!((m.fallback, m.offset, m.removed, m.inserted.as_str()), (false, 6, 2, "\r"));
     }
 
     #[test]
