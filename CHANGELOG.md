@@ -17,6 +17,8 @@
 
 ### Changed
 
+- M1 reconciles recorded losses with exit and inspection-stop evidence at shutdown; stand-in bracket diagnostics
+  calculate positions in one traversal of the text.
 - Mutation requests use their write-time deadlines, losses are judged through the shutdown boundary, and seed
   openings are preflighted against the written-bytes cap. Case preparation consumes the admitted case's budget.
 - Mutation batches retain every delivered request and settle replies by receive time; later exits preserve earlier

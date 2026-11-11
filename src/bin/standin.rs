@@ -651,7 +651,7 @@ fn main() {
                     }
                 }
                 *old_version = version;
-                let unbalanced = !unmatched_brackets(text).is_empty();
+                let unbalanced = !unmatched_brackets(text, units, split).is_empty();
                 if unbalanced && fault("exit-on-unbalanced") {
                     eprintln!("standin: exit-on-unbalanced");
                     std::process::exit(5);
@@ -842,7 +842,7 @@ fn main() {
             .pointer("/params/textDocument/uri")
             .and_then(Value::as_str)
             .and_then(|u| docs.get(u))
-            .is_some_and(|(text, _)| !unmatched_brackets(text).is_empty());
+            .is_some_and(|(text, _)| !unmatched_brackets(text, units, split).is_empty());
         if unbalanced && fault("ignore-while-unbalanced") {
             continue;
         }
@@ -1556,46 +1556,53 @@ fn lines(text: &str, split: LineSplit) -> Vec<&str> {
     out
 }
 
-/// The byte offsets of the brackets `()`, `[]` and `{}` in `text` that have
+/// The line and column of the brackets `()`, `[]` and `{}` in `text` that have
 /// no partner: a closer with no opener before it, or one of another kind,
 /// and openers never closed. Strings and comments aren't told apart.
-fn unmatched_brackets(text: &str) -> Vec<usize> {
-    let mut open: Vec<(usize, u8)> = Vec::new();
+fn unmatched_brackets(text: &str, units: Units, split: LineSplit) -> Vec<(usize, usize)> {
+    let mut open = Vec::new();
     let mut unmatched = Vec::new();
-    for (at, b) in text.bytes().enumerate() {
-        match b {
-            b'(' | b'[' | b'{' => open.push((at, b)),
-            b')' | b']' | b'}' => {
-                let opener = match b {
-                    b')' => b'(',
-                    b']' => b'[',
-                    _ => b'{',
+    let mut chars = text.chars().peekable();
+    let (mut line, mut column) = (0, 0);
+    while let Some(c) = chars.next() {
+        let is_break = match split {
+            LineSplit::Spec | LineSplit::CrLfTwo => c == '\n' || c == '\r',
+            LineSplit::LfOnly => c == '\n',
+            LineSplit::NoLoneCr => c == '\n' || (c == '\r' && chars.peek() == Some(&'\n')),
+        };
+        if is_break {
+            if c == '\r' && chars.peek() == Some(&'\n') && split != LineSplit::CrLfTwo {
+                chars.next();
+            }
+            line += 1;
+            column = 0;
+            continue;
+        }
+        match c {
+            '(' | '[' | '{' => open.push(((line, column), c)),
+            ')' | ']' | '}' => {
+                let opener = match c {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
                 };
                 if open.last().is_some_and(|(_, o)| *o == opener) {
                     open.pop();
                 } else {
-                    unmatched.push(at);
+                    unmatched.push((line, column));
                 }
             }
             _ => {}
         }
+        column += match units {
+            Units::Bytes => c.len_utf8(),
+            Units::Utf16 => c.len_utf16(),
+            Units::CodePoints => 1,
+        };
     }
     unmatched.extend(open.into_iter().map(|(at, _)| at));
-    unmatched.sort();
+    unmatched.sort_unstable();
     unmatched
-}
-
-/// The line holding byte `at` of `text`, and that line's text before it.
-fn line_and_prefix(text: &str, at: usize, split: LineSplit) -> (usize, &str) {
-    let mut start = 0;
-    for (n, line) in lines(text, split).into_iter().enumerate() {
-        // `lines` borrows from `text`, so its offset there is the line's start.
-        start = line.as_ptr() as usize - text.as_ptr() as usize;
-        if at <= start + line.len() {
-            return (n, &text[start..at]);
-        }
-    }
-    (0, &text[start..at])
 }
 
 /// Each ASCII word (`[A-Za-z]+`): its line, its start and end in `units`,
@@ -1767,10 +1774,8 @@ fn publish_diagnostics<W: Write>(
         .collect();
     let lines = lines(text, split);
     // One diagnostic per unmatched bracket.
-    for at in unmatched_brackets(text) {
-        let (line, before) = line_and_prefix(text, at, split);
-        let (start, end) = (units.of(before), units.of(&text[at - before.len()..at + 1]));
-        diagnostics.push(json!({"range": range(line, start, line, end), "severity": 1, "source": "standin", "message": "unmatched bracket"}));
+    for (line, column) in unmatched_brackets(text, units, split) {
+        diagnostics.push(json!({"range": range(line, column, line, column + 1), "severity": 1, "source": "standin", "message": "unmatched bracket"}));
     }
     // A position on the first line with non-ASCII text, one character in: on a
     // character boundary with non-ASCII text before it, so informative for D5.
@@ -2262,4 +2267,62 @@ fn is_digit_string_request(body: &[u8]) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutation_bracket_diagnostics_keep_positions_in_every_encoding_and_line_split() {
+        for (units, emoji, accent) in [(Units::Bytes, 4, 2), (Units::Utf16, 2, 1), (Units::CodePoints, 1, 1)] {
+            for (faults, positions) in [
+                (vec![], vec![(0, emoji), (1, accent), (2, 0), (3, 0), (3, 1), (4, 0)]),
+                (vec!["lf-only-lines"], vec![(0, emoji), (1, accent), (1, accent + 2), (2, 0), (2, 1), (3, 0)]),
+                (vec!["no-lone-cr"], vec![(0, emoji), (1, accent), (1, accent + 2), (2, 0), (2, 1), (3, 0)]),
+                (vec!["crlf-two-breaks"], vec![(0, emoji), (2, accent), (3, 0), (4, 0), (4, 1), (6, 0)]),
+            ] {
+                let faults: Vec<String> = faults.into_iter().map(String::from).collect();
+                let mut out = Writer { out: Vec::new(), faults: faults.clone(), holding: false, held: Vec::new() };
+                publish_diagnostics(
+                    &mut out,
+                    &faults,
+                    units,
+                    "file:///brackets",
+                    "😀(\r\né]\r{\n[)\r\n}",
+                    Some(json!(2)),
+                );
+                let body = out.out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let published: Value = serde_json::from_slice(&out.out[body..]).unwrap();
+                assert_eq!(published["method"], "textDocument/publishDiagnostics");
+                assert_eq!(published["params"]["uri"], "file:///brackets");
+                assert_eq!(published["params"]["version"], 2);
+                let actual: Vec<_> = published["params"]["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|d| d["message"] == "unmatched bracket")
+                    .cloned()
+                    .collect();
+                let expected: Vec<_> = positions
+                    .into_iter()
+                    .map(|(line, column)| json!({
+                        "range": {"start": {"line": line, "character": column}, "end": {"line": line, "character": column + 1}},
+                        "severity": 1, "source": "standin", "message": "unmatched bracket"
+                    }))
+                    .collect();
+                assert_eq!(actual, expected, "{faults:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mutation_brackets_preserve_stack_matching_and_text_order() {
+        assert_eq!(unmatched_brackets("([)]{}", Units::Utf16, LineSplit::Spec), [(0, 0), (0, 2)]);
+        assert!(unmatched_brackets("{\r\n[😀(é)]\r}", Units::Utf16, LineSplit::Spec).is_empty());
+        let count = 256 * 1024;
+        let positions = unmatched_brackets(&"(\n".repeat(count), Units::Utf16, LineSplit::Spec);
+        assert_eq!(positions.len(), count);
+        assert!(positions.into_iter().enumerate().all(|(line, position)| position == (line, 0)));
+    }
 }

@@ -4041,8 +4041,9 @@ async fn leave_mutation(
     let deadline = Instant::now() + ctx.cfg.request_timeout;
     let registered = ctx.s.begin_request(&id, "shutdown", deadline).await;
     let exited = !ctx.s.is_alive();
-    if lost.is_none() && (ctx.s.stdout_closed() || exited || ctx.s.stopped_reading().is_some()) {
-        lost = Some((lost_output(ctx).await, "before shutdown".into()));
+    if ctx.s.stdout_closed() || exited || ctx.s.stopped_reading().is_some() {
+        let place = lost.map(|(_, place)| place).unwrap_or_else(|| "before shutdown".into());
+        lost = Some((lost_output(ctx).await, place));
     }
     judge_m1(ctx, &summary, first_change, versions, lost);
     judge_m2(ctx, asked);
@@ -5024,6 +5025,57 @@ mod tests {
             leave_mutation(&mut ctx, summary, first_change, 1, None, &[]).await;
             assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, expected);
             assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::NotExercised);
+            ctx.s.finish(Duration::from_millis(200)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_shutdown_reconciles_recorded_loss_with_exit_and_eof() {
+        for script in ["exit 0", "exec 0<&- 1>&-; sleep 30"] {
+            for (first_change, expected) in [(None, Verdict::Error), (Some(Duration::ZERO), Verdict::Fail)] {
+                let mut cfg = mutation_test_config(script);
+                cfg.exit_timeout = Duration::ZERO;
+                let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+                ctx.s.drain(Instant::now() + Duration::from_secs(5)).await;
+                assert!(ctx.s.stdout_closed());
+                if script == "exit 0" {
+                    assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
+                } else {
+                    assert!(ctx.s.is_alive());
+                }
+                let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
+                let lost = Some((Lost::Undelivered("failed write".into()), "restoring case 0".into()));
+                leave_mutation(&mut ctx, summary, first_change, 1, lost, &[]).await;
+                let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
+                assert_eq!(m1.verdict, expected, "{}", m1.detail);
+                if first_change.is_some() {
+                    assert!(m1.detail.ends_with("during restoring case 0"), "{}", m1.detail);
+                }
+                ctx.s.finish(Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_shutdown_inspection_stop_overrides_every_recorded_loss() {
+        for lost in [None, Some(Lost::Gone("exit".into())), Some(Lost::Undelivered("failed write".into()))] {
+            let cfg = mutation_test_config("printf 'xxxxxxxxxxxxxxxx'; exit 0");
+            let mut ctx = mutation_test_ctx(&cfg, 1).await;
+            ctx.s.drain(Instant::now() + Duration::from_secs(5)).await;
+            assert!(ctx.s.stopped_reading().is_some());
+            assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
+            let place = if lost.is_some() { "case 0, step 1" } else { "before shutdown" };
+            let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
+            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost.map(|how| (how, place.into())), &[]).await;
+            let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
+            assert_eq!(m1.verdict, Verdict::Error, "{}", m1.detail);
+            assert!(
+                m1.detail.contains(&format!("stopped reading the server's output during {place}")),
+                "{}",
+                m1.detail
+            );
             ctx.s.finish(Duration::from_millis(200)).await;
         }
     }

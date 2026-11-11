@@ -339,6 +339,7 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   and restoration from any intermediate text are reserved against the 64 MiB written-bytes cap. An incomplete drain of queued output
   makes missing responses `ERROR`; inspection gaps are checked within each request's own deadline.
   Closed output after a failed write counts as server loss even while the process is still running.
+  At shutdown, M1 reconciles earlier delivery failures with exit or EOF evidence; inspection stops take precedence.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
   type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name, an unknown check id, or a
   `[document]` whose file, language id or positions don't fit is a usage error (exit status 2) naming the file and

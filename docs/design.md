@@ -7,7 +7,8 @@ hidden `--mutate` judges M1 and M2 with write-time request deadlines, loss evide
 startup messages and seed openings; failed writes recognize closed output while the process lives. M1's window
 starts after the first mutation is fully written; request outcomes are settled once per step from response records,
 restoration reserves cover every intermediate text, and case preparation consumes its admitted budget. Incomplete output absorption makes request
-absence inconclusive, and absence windows end at each request's deadline. M3 is next. See the [changelog](../CHANGELOG.md) for changes by release.
+absence inconclusive, and absence windows end at each request's deadline. M1 reconciles recorded losses at shutdown,
+with inspection stops taking precedence over exit or EOF evidence. M3 is next. See the [changelog](../CHANGELOG.md) for changes by release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol

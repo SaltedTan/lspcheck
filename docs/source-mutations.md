@@ -542,6 +542,8 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
   closed output before that boundary, or a failed first mutation write, is `ERROR`. A failed later write with observed
   closed output counts as server loss even if the process remains alive. A stop in lspcheck's inspection remains
   `ERROR`, including when a write fails and the server exits.
+  At the shutdown boundary, new exit or EOF evidence supersedes a recorded delivery failure, preserving its location;
+  an inspection stop supersedes either classification.
 - A request K1 wouldn't send about the document (a `documentSelector` that doesn't select it) is skipped, and the
   round robin moves on.
 - The transcript's meta line records each edit's `operator`, `offset`, `removed`, `sha256` of what it inserted, and
