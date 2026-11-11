@@ -47,7 +47,7 @@ const LISTED_VALUES: usize = 8;
 /// outside its set gracefully and falls back to a default value when unknown".
 /// Servers send values from later LSP versions and their own (clangd's symbol
 /// tags 8 and up), so a value outside the 3.17 list isn't a type violation
-/// here; one that isn't an unsigned integer still is.
+/// here; one that isn't an LSP `uinteger` still is.
 const TOLERATED: [&str; 5] = ["SymbolKind", "SymbolTag", "CompletionItemKind", "CompletionItemTag", "DiagnosticTag"];
 
 /// A type of the meta-model.

@@ -19,10 +19,9 @@
 - K2's failure detail now explains more union alternatives that tie; see the
   [diagnostic rules](docs/design.md#capabilities-and-robustness). The set and count of violations, budget behaviour and
   every verdict are unchanged.
-- K2 accepts any unsigned integer for `SymbolKind`, `SymbolTag`, `CompletionItemKind`, `CompletionItemTag` and
-  `DiagnosticTag`, as for enumerations that support custom values: the specification tells clients to handle values
-  outside these lists. clangd's extension symbol tags (8 and up) no longer fail K2. A `null` or a string there still
-  fails. See the [K2 rules](docs/design.md#capabilities-and-robustness).
+- K2 now accepts unknown values of the tag and kind enumerations clients must tolerate, so clangd's extension symbol
+  tags (8 and up) no longer fail K2. See the [K2 rules](docs/design.md#capabilities-and-robustness) for the enumerations
+  covered and their type constraints.
 
 ## 0.3.0 (2026-11-09)
 
