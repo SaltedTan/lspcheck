@@ -596,8 +596,9 @@ capabilities = "default"       # planned: or a path to a capabilities JSON
   leftover not on the list fails as before, and the detail of that failure names the allowed ones too.
 - **`allow.skip`.** Each entry needs an `id` in the catalogue and a non-empty `reason`; an id listed twice is an
   error. A skipped check reports `SKIP` with `skipped by the profile: <reason>` and doesn't affect the exit status. A
-  scenario runs when one of its checks, or a cross-cutting check, is wanted (by `--only`) and not skipped, and then
-  runs whole, as without the skips, so no other verdict changes; a skipped check's verdict is replaced at the end. A
+  scenario other than [mutation](#mutation) runs when one of its checks, or a cross-cutting check, is wanted (by
+  `--only`) and not skipped, and then runs whole, as without the skips, so no other verdict changes; a skipped
+  check's verdict is replaced at the end. A
   scenario whose checks are all skipped or unselected doesn't run (when no cross-cutting check needs it), and its
   skipped checks are still reported.
 - **Reports.** The JSON report gains a top-level `"profile"` (the path as given, or `null`); the schema id is
@@ -615,7 +616,7 @@ capabilities = "default"       # planned: or a path to a capabilities JSON
   `didChangeConfiguration` are in the recorded bytes. Replay's own timeouts are still its flags; it doesn't read
   profiles.
 - **`[mutation]`** is validated as the [mutation design](source-mutations.md#profile-schema) describes, and has no
-  effect yet. Durations anywhere in a profile may also be given in hours (`"1h"`).
+  effect yet.
 
 ## Report
 - Terminal summary in catalogue order, with counts and a line per check.

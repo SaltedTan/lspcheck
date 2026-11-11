@@ -389,7 +389,7 @@ deliver gives `ERROR`, never `FAIL`. A header section longer than 1 MiB also sto
 | --- | --- |
 | `PASS` | The rule held. |
 | `FAIL` | The rule was broken; the detail line says how. |
-| `SKIP` | The rule doesn't apply to this server, or the profile skips it with a reason. |
+| `SKIP` | The check is disabled, doesn't apply to this server, or the profile skips it with a reason. |
 | `N/E` | Not exercised: the rule applies, but the run produced no evidence either way. |
 | `ERROR` | The result is unknown: the server couldn't start or refused to initialize, a timeout ran out, or the evidence is incomplete. It says nothing about the rule. |
 

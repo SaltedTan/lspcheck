@@ -43,13 +43,7 @@ protocol rules are judged by checks that already exist, which gain evidence from
 
 ### What is checked
 
-New checks:
-
-| ID | Basis | Check |
-|---|---|---|
-| M1 | POLICY | The server doesn't exit, or close its output, while its source is mutated or being restored. |
-| M2 | POLICY | Every request about a mutated document gets a response (any result or error) within `--timeout`. |
-| M3 | POLICY | Once the clean text is restored, the server's answers about it return to those it gave before the mutations. |
+M1 to M3 are listed in the [check catalogue](design.md#mutation).
 
 Spec references, in the style of the catalogue: M1 and M3 rest on
 [`textDocument/didChange`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_didChange),
@@ -72,8 +66,7 @@ Existing checks keep being judged on the new scenario's evidence:
   random edit can't make that diagnosis, so D1 judges those positions. D4, the C, L1 to L8 and R checks need their own
   scenarios.
 
-Without `--mutate`, nothing above changes: the scenario doesn't run and M1 to M3 report `SKIP` (`mutation is off;
-pass --mutate`), which doesn't affect the exit status.
+Without `--mutate`, the scenario doesn't run; M1 to M3 follow the [catalogue's skip rules](design.md#mutation).
 
 ### The scenario
 
@@ -347,12 +340,13 @@ listed twice in any of them, `max_document_kib` outside 1 to 1024, a negative `s
 or `settle_timeout` over `"5m"`, an empty fragment or one longer than the growth bound (1 KiB), an empty keyword, a
 string escape that isn't one character, and seed files without a language id (`language_id`, else `[document]`'s).
 A lexicon key left out keeps the default lexicon's value, so `keywords = [...]` alone adds keywords to the default.
-`requests` are asked in K1's order whatever the profile's. Durations may be given in hours (`"1h"`) anywhere in a
-profile. A seed chosen at random is below 2^53, so it survives any JSON reader and fits a TOML integer.
+`requests` are asked in K1's order whatever the profile's. Durations use the [profile syntax](../README.md#profiles).
+A seed chosen at random is below 2^53, so it survives any JSON reader and fits a TOML integer.
 
-The command line adds `--mutate`, `--mutation-seed N` and `--mutation-cases N`, which override the profile's values.
-`--mutate` with a profile that has a `[document]` but no `[mutation]` mutates that file with the default lexicon and
-defaults (its size is checked against the default 64 KiB then, not when the profile is read); with no seed file at all, M1 to M3 are `SKIP` ("no seed file"). `--only M1` without `--mutate` reports the same `SKIP` as any run without it.
+`--mutation-seed N` and `--mutation-cases N` require `--mutate` and override the profile's values. `--mutate` resolves
+the `[mutation]` settings; with a `[document]` but no `[mutation]`, it selects that file with the default lexicon and
+defaults (its size is checked against the default 64 KiB then, not when the profile is read). With no seed file it
+resolves an empty seed list; once the scenario is implemented, that will make M1 to M3 `SKIP` ("no seed file").
 
 ### Bounds
 
@@ -370,14 +364,18 @@ defaults (its size is checked against the default 64 KiB then, not when the prof
 | Versions kept per document | 64 | 64 | older positions aren't judged, counted |
 | Bytes written to the server | 64 MiB | 256 MiB | no new case starts unless its worst case fits (below) |
 
+In the case budget, `probes` counts only request probes: pushed diagnostics need no terminal request. Before the
+server starts, an omitted `recovery.probes` counts all three request probes, regardless of what it may advertise.
+
 A case starts only when the run has at least the case budget left, so the run deadline never cuts a case short, and a
 request's own deadline is never shortened by a budget except when lspcheck itself overran. The case budget counts
 every delivery as taking its full write deadline, so a server slow to read (backpressure) uses up deadlines the budget
 already reserved, not the run's. The budget is a worst case: with the example profiles' 30 s request timeout it is
 over ten minutes per case, though a case usually takes seconds, which is why `run_timeout` defaults to an hour. A
-configuration whose case budget exceeds `run_timeout` is a usage error naming both (exit status 2), checked before the
-server starts, so a run never silently admits no case; each stock mutation profile is checked by a test. If a case's budget runs out anyway, no further step starts, but the restoration is
-still sent, with its own write deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the
+configuration whose case budget exceeds `run_timeout` is a usage error naming both (exit status 2), checked under
+`--mutate` when there is a seed file, before the server starts, so a run never silently admits no case. The planned
+stock mutation profiles will each be checked by a test. If a case's budget runs out anyway, no further step starts,
+but the restoration is still sent, with its own write deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the
 cases not run), so no case ever starts on a document lspcheck couldn't restore.
 
 The written-bytes bound is a cap, not a threshold: everything lspcheck writes in the scenario counts (the seed
