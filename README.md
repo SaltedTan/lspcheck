@@ -235,7 +235,9 @@ MethodNotFound failures, late and duplicate replies, and details naming unanswer
 
 K2 checks server message types against the LSP 3.17 meta-model: results of known requests lspcheck sent, and params
 of known server-to-client requests and notifications. A failure names where the value is (`result.contents`), what
-the meta-model requires there and what was found. See the [K2 reference](docs/design.md#capabilities-and-robustness)
+the meta-model requires there and what was found. Like the enumerations that allow custom values, the tag and kind
+enumerations clients must tolerate (`SymbolTag`, `SymbolKind` and their completion and diagnostic counterparts) accept
+values the meta-model doesn't list. See the [K2 reference](docs/design.md#capabilities-and-robustness)
 for coverage, validation rules and inspection limits.
 
 R1 checks continued service after malformed JSON; R3 checks it after opening a large document.

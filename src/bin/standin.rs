@@ -278,6 +278,11 @@ const FAULTS: &[(&str, &str)] = &[
         "custom-folding-range-kind",
         "lawful: give folding ranges the kind \"lspcheck.custom\" (custom kinds are allowed)",
     ),
+    (
+        "unknown-kinds-and-tags",
+        "lawful: give document symbols kind 27 and tags 8 and 18, and diagnostics tag 9, values LSP 3.17 doesn't list \
+         (clients must handle unknown ones)",
+    ),
     ("needs-init-option", "refuse to initialize unless initializationOptions has standin = \"ready\""),
     (
         "needs-workspace-file",
@@ -1559,7 +1564,14 @@ fn document_answer(
     match method {
         "textDocument/documentSymbol" => words
             .iter()
-            .map(|(l, s, e, w)| json!({"name": w, "kind": 13, "range": range(*l, *s, *l, *e), "selectionRange": range(*l, *s, *l, *e)}))
+            .map(|(l, s, e, w)| {
+                let mut symbol = json!({"name": w, "kind": 13, "range": range(*l, *s, *l, *e), "selectionRange": range(*l, *s, *l, *e)});
+                if fault("unknown-kinds-and-tags") {
+                    symbol["kind"] = json!(27);
+                    symbol["tags"] = json!([8, 18]);
+                }
+                symbol
+            })
             .collect(),
         "textDocument/foldingRange" => {
             // From the end of the first line to the end of the last with text.
@@ -1696,6 +1708,11 @@ fn publish_diagnostics<W: Write>(
         let start = units.of(&lines[n][..at]);
         let end = units.of(&lines[n][..at + '\u{301}'.len_utf8()]);
         diagnostics.push(json!({"range": range(n, start, n, end), "severity": 3, "message": "a lone combining mark"}));
+    }
+    if fault("unknown-kinds-and-tags") {
+        for d in &mut diagnostics {
+            d["tags"] = json!([9]);
+        }
     }
     if fault("positions-in-data") {
         for d in &mut diagnostics {
