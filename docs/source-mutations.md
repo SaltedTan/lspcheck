@@ -373,9 +373,10 @@ cases not run), so no case ever starts on a document lspcheck couldn't restore.
 
 The written-bytes bound is a cap, not a threshold: everything lspcheck writes in the scenario counts (the seed
 `didOpen`s, baseline probes, every `didChange`, request, poll and answer to a server request, and `shutdown` and
-`exit`), and before a case starts lspcheck reserves its worst case, computed from the caps (each step's `didChange` at
-`max_document_kib` per document plus its requests, the restoration, the most polls and the terminal probes), plus the
-shutdown allowance. A case whose worst case doesn't fit doesn't start. Answers to the server's own requests (such as
+`exit`), and before a case starts lspcheck reserves its worst case: the case's `didChange` notifications at their
+exact serialized size, which the plan fixes before the case starts (a step's notification can carry three changes,
+each up to a whole document), plus, computed from the caps, its requests, the restoration, the most polls and the
+terminal probes, and the shutdown allowance. A case whose worst case doesn't fit doesn't start. Answers to the server's own requests (such as
 `workspace/configuration`, which a profile can make large) can't be bounded in advance, so the cap is also enforced
 before every write: answers may use only what isn't reserved for the current case's restoration and the shutdown.
 When that is gone, lspcheck stops the scenario: it sends the restoration and shutdown from their reserve, leaves the

@@ -711,6 +711,10 @@ impl Context<'_> {
         let (first, second) = if a.start < b.start { (a, b) } else { (b, a) };
         let swapped =
             format!("{}{}{}", second.text(self.text), &self.text[first.end..second.start], first.text(self.text));
+        // Adjacent tokens can swap into the same text: `''` and `'` in `'''`.
+        if swapped == self.text[first.start..second.end] {
+            return None;
+        }
         Some((first.start, second.end - first.start, swapped))
     }
 
@@ -1261,6 +1265,19 @@ mod tests {
     }
 
     #[test]
+    fn a_string_known_to_be_unclosed_is_not_searched_again() {
+        let quote = StringDelimiters { open: "'".into(), close: "'".into(), escape: None };
+        let mut unclosed_from = None;
+        assert_eq!(string_end("a\nb", 0, &quote, &mut unclosed_from), (1, 0));
+        assert_eq!(unclosed_from, Some(0));
+        // Past that point the search isn't repeated: a search would find the
+        // close at 3, but the string is taken as unclosed at once. Repeating
+        // it for every open string made lexing quadratic.
+        assert_eq!(string_end("a\nb'", 2, &quote, &mut unclosed_from), (4, 0));
+        assert_eq!(string_end("a\nb'", 2, &quote, &mut None), (4, 1));
+    }
+
+    #[test]
     fn tokens_cover_the_text_without_gaps() {
         for lexicon in [Lexicon::default(), lua()] {
             for seed in seeds() {
@@ -1544,6 +1561,22 @@ mod tests {
             }
         }
         assert!(removed > 0 && inserted > 0);
+    }
+
+    #[test]
+    fn a_swap_that_changes_nothing_falls_back() {
+        // `'''` is the string `''` then the unclosed string `'`; swapping them
+        // gives `'''` again.
+        let quote = StringDelimiters { open: "'".into(), close: "'".into(), escape: None };
+        let config = Config {
+            operators: vec![Operator::SwapTokens],
+            lexicon: Lexicon { strings: vec![quote], ..Lexicon::default() },
+            ..Config::default()
+        };
+        let case = plan_case(0, 0, &texts("'''"), &config);
+        let first = &case.steps[0].mutations[0];
+        assert!(first.fallback, "{first:?}");
+        assert_ne!(first.apply("'''"), "'''");
     }
 
     #[test]
