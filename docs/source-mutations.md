@@ -77,8 +77,8 @@ pass --mutate`), which doesn't affect the exit status.
 1. Initialize with K1's client capabilities plus `window.workDoneProgress` and versioned `publishDiagnostics`. If the
    server doesn't ask for `didOpen`, or takes no changes (`textDocumentSync` absent or `0`), M1 to M3 are `SKIP`.
 2. Open each seed file at version 1 with the profile's language id. The files stay as they are on disk: lspcheck never
-   writes mutated text, and `didOpen` hands the document's content to the client, so the server must not read it from
-   disk while it is open.
+   writes mutated text, and `didOpen` puts the document's content under client ownership, so the server must not read
+   it from disk while it is open.
 3. **Settle**: wait until no work-done progress the server began is unfinished and no `publishDiagnostics` or
    `$/progress` has arrived for 1 s, bounded by `settle_timeout`. A server that never settles is noted in the detail;
    the baseline's stability rule below still protects M3.
@@ -439,7 +439,7 @@ minimal diffs would split a CR LF without the widening. Each regression test is 
 
 The matrix would add one job per server: the same example profile, with its `[mutation]` section, run with
 `--mutate --mutation-seed <pinned> --mutation-cases 10`, compared against `<server>.mutation.verdicts`. Default runs and
-their `.verdicts` files stay as they are, apart from three `M1 skip` lines. The files gain one line per new check.
+their `.verdicts` files gain only the [disabled-mutation `SKIP`s](#what-is-checked).
 
 Mutation brings timing into play, and the README's rule still holds: alternatives are only for races in the server
 itself. Known risks:
@@ -461,8 +461,7 @@ merge, and any finding about these servers stays in this repository unless the m
 
 ## Consequences
 
-- Real source reaches the position, version and type checks, so D1, D2, D6 and K2 are exercised on real servers for the
-  first time, not just `N/E`.
+- Real source supplies evidence for D1, D2 and D6; K2 also sees replies and diagnostics across many mutated versions.
 - A `--mutate` run takes minutes, not seconds; it is opt-in, and default runs are unchanged except for three `SKIP`
   lines, in the terminal, JSON, JUnit and Markdown reports.
 - M3's `ERROR` for a recovery not seen makes a `--mutate` run exit 2 until the profile states an expectation or
