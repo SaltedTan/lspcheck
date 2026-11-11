@@ -3,12 +3,8 @@
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
 **Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). v0.4.0 expands the [example profile catalogue](../examples/profiles/README.md) to 18 servers and the [stock-server CI matrix](../ci/stock-servers/README.md) to 11, accepts unknown values of the tag and kind enumerations clients must tolerate in K2, refines [K2's failure detail](#capabilities-and-robustness), and [isolates Content-Type probes](#framing-and-output). M4 is done (see the [integration milestone](#milestones)). Next is [seeded source mutation](source-mutations.md), whose design is accepted; its planner, the profile's `[mutation]` section and the scenario, the first three steps, are in place: an experimental,
-hidden `--mutate` judges M1 and M2 with write-time request deadlines, loss evidence through shutdown and preflighted
-startup messages and seed openings; failed writes recognize closed output while the process lives. M1's window
-starts after the first mutation is fully written; request outcomes are settled once per step from response records,
-restoration reserves cover every intermediate text, and case preparation consumes its admitted budget. Incomplete output absorption makes request
-absence inconclusive, and absence windows end at each request's deadline. M1 reconciles recorded losses at shutdown,
-with inspection stops taking precedence over exit or EOF evidence. M3 is next. See the [changelog](../CHANGELOG.md) for changes by release.
+hidden `--mutate` judges M1 and M2. See [step 3's limits](source-mutations.md#step-3); M3 is next.
+See the [changelog](../CHANGELOG.md) for changes by release.
 
 ## Purpose
 A command-line tool that starts **any** language server binary over stdio and checks that it speaks the protocol
@@ -545,16 +541,14 @@ After successful initialization, all four robustness scenarios and `capabilities
 | M3 | POLICY | Once the clean text is restored, the server's answers about it return to those it gave before the mutations. |
 
 These belong to the opt-in `mutation` scenario of [seeded source mutation](source-mutations.md), which owns their
-verdict rules. It runs only with `--mutate`, which is experimental and hidden from `--help` while M3 isn't judged.
-Without it they are `SKIP` ("mutation is off; pass --mutate"), which doesn't affect the exit status, and so are they
-with nothing to mutate; a profile's `allow.skip` reason replaces that detail. Cross-cutting checks don't start the
-scenario without `--mutate`; with it, the scenario's evidence is judged by them like any other scenario's.
+verdict rules, scenario selection and implementation status. See the [README](../README.md#profiles) for usage.
 
 ## Profiles (optional TOML)
 Profiles are implemented in `src/profile.rs`; the [README](../README.md#profiles) owns the supported profile example,
 command and timeout precedence, path rules, and common usage. This section records implementation details and
 planned extensions. The documents scenario still uses its [plain-text probe documents](#documents-and-positions);
-only K1 uses `[document]`. The [example profile catalogue](../examples/profiles/README.md) lists the available
+mutation seed selection is defined in the [mutation schema](source-mutations.md#profile-schema).
+The [example profile catalogue](../examples/profiles/README.md) lists the available
 servers and their prerequisites; the [stock-server matrix](../ci/stock-servers/README.md) documents which it runs.
 
 This field is planned, and refused for now:
@@ -608,7 +602,7 @@ capabilities = "default"       # planned: or a path to a capabilities JSON
   scenario whose checks are all skipped or unselected doesn't run (when no cross-cutting check needs it), and its
   skipped checks are still reported.
 - **Reports.** The JSON report gains a top-level `"profile"` (the path as given, or `null`); the schema id is
-  unchanged. The terminal header line ends with `— profile PATH` when one is used.
+  unchanged. The terminal header line includes `— profile PATH` when one is used.
 - **Replay.** A transcript's workspace line records the files at the workspace's top (as before) and every file the
   profile put there, nested ones named with `/`. Text files remain JSON strings; binary files are objects with
   `"encoding":"base64"` and a `"data"` string in the standard base64 alphabet. An optional `"directories"` array
@@ -621,8 +615,8 @@ capabilities = "default"       # planned: or a path to a capabilities JSON
   line records the settings, and replay answers `workspace/configuration` from it. `initializationOptions` and the
   `didChangeConfiguration` are in the recorded bytes. Replay's own timeouts are still its flags; it doesn't read
   profiles.
-- **`[mutation]`** is validated as the [mutation design](source-mutations.md#profile-schema) describes, and has no
-  effect yet.
+- **`[mutation]`**: see the [README](../README.md#profiles) for usage and the
+  [mutation reference](source-mutations.md#profile-schema) for validation.
 
 ## Report
 - Terminal summary in catalogue order, with counts and a line per check.
@@ -689,7 +683,7 @@ No network access at runtime.
   `--fault stdout-banner`, `char-length`, `string-id-to-number`, `reply-twice`, `reply-unsent-id`,
   `reply-to-notification`, `no-jsonrpc-field`, `result-and-error`, `wrong-unknown-error`, `exit-on-shutdown`,
   `exit-status`, `ignore-eof`, `orphan-child`, `bad-encoding`, … **Every check has a test that fails it on its fault and
-  passes the clean stand-in.** That guards against false greens.
+  passes the clean stand-in, except M3, which isn't judged yet.** That guards against false greens.
 - Self-tests for the harness: partial frames, stderr floods, a server that stops reading stdin, a hung server, signals
   during spawn, cleanup after a crash.
 - The [stock-server CI matrix](../ci/stock-servers/README.md) documents its baseline contract and update procedure.

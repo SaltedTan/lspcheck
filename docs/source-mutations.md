@@ -69,6 +69,8 @@ Existing checks keep being judged on the new scenario's evidence:
 
 Without `--mutate`, nothing above changes: the scenario doesn't run and M1 to M3 report `SKIP` (`mutation is off;
 pass --mutate`), which doesn't affect the exit status ([catalogue](design.md#mutation)).
+With `--mutate` and a seed file, the scenario runs when an M check or a cross-cutting check is selected and not
+skipped by the profile.
 
 ### The scenario
 
@@ -171,9 +173,9 @@ Each step sends `requests_per_step` requests, round robin over the advertised me
 `requests` allows (default: all of them), with a cursor that runs across cases so every method is exercised. Their
 params are K1's. Positions are drawn from the current text: half inside an identifier, a tenth at the end of the
 document, the rest at any character boundary, never inside a character and never between `\r` and `\n`, counted in
-the negotiated encoding. `workspace/symbol` queries an identifier from the text. Rename and formatting edits are never
-applied. The requests of one step are written back to back and waited for together, each with its own deadline from
-when its write began.
+the negotiated encoding. `workspace/symbol` queries up to 64 characters of an identifier from the text, or an empty
+string when there is none. Rename and formatting edits are never applied. The requests of one step are written back
+to back and waited for together, each with its own deadline from when its write began.
 
 ### Recovery
 
@@ -248,7 +250,7 @@ end-of-scenario recheck, and every missing reply through `fail_absent_between`.
 - *error:* the server exited or closed output before the first mutation was fully written (during settle or baseline,
   which says nothing about broken source); the first mutation write failed; `initialize` failed; a later `didChange`
   couldn't be delivered and neither an exit nor closed output was seen.
-- *not-exercised:* no case ran (the run budget was spent on settling).
+- *not-exercised:* no mutation was sent, for example because the remaining run budget couldn't admit a case.
 - *pass:* otherwise, with the number of cases and versions sent.
 
 **M2.** Judges every delivered request of the scenario after the first mutation: the step requests and the recovery
@@ -398,9 +400,9 @@ protocol rule: reaching one gives `ERROR` or `N/E` with the bound named, or just
 
 ### Reports, transcripts and reproduction
 
-The JSON report gains a top-level `"mutation"`: `null`, or the seed, the format, the cases planned and run, and why
-the run stopped early, if it did. The terminal header adds `— mutation seed 20261109, 20 cases`. The schema id is
-unchanged, as when `"profile"` was added.
+The JSON report gains a top-level `"mutation"`: `null` when the scenario didn't run, or the seed, the format, the
+cases planned and run, and why the run stopped early, if it did. The terminal header adds
+`— mutation seed 20261109, 20 cases`. The schema id is unchanged, as when `"profile"` was added.
 
 The scenario's transcript, `mutation.jsonl`, is an ordinary session transcript, so `lspcheck replay mutation.jsonl --
 SERVER` replays it as it is: the workspace line recreates the seed files, and every `didChange`, request and poll is
@@ -408,8 +410,9 @@ re-sent byte for byte. Before each case lspcheck records a meta line, `{"dir":"m
 "case":17,"steps":[{"document":"main.lua","version":5,"edits":[{"operator":"open-string","offset":40,"removed":1,
 "inserted":"","sha256":…}]}]}}`, with offsets and lengths in UTF-8 bytes of the text before the edit; replay ignores
 meta lines it doesn't know, so no change to replay is needed.
-Inserted text over 64 characters is summarised by length, prefix and SHA-256, as virgil-lsp does; the full text is in
-the recorded `didChange`.
+Each edit records the SHA-256 of its inserted text, with `fallback: true` when its operator found nothing to change.
+Inserted text up to 64 characters is recorded in `inserted`; longer text uses its UTF-8 byte count in `inserted_bytes`
+and its first 64 characters in `inserted_prefix`. The full text is in the recorded `didChange`.
 
 A whole session can be long, so a later step adds **isolation**: after the run, for each of the first three failing
 or erroring cases, lspcheck runs that case alone in a fresh session (open, settle, baseline, the case's steps, restore,
@@ -546,9 +549,7 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
   an inspection stop supersedes either classification.
 - A request K1 wouldn't send about the document (a `documentSelector` that doesn't select it) is skipped, and the
   round robin moves on.
-- The transcript's meta line records each edit's `operator`, `offset`, `removed`, `sha256` of what it inserted, and
-  `inserted` itself, or `inserted_bytes` and `inserted_prefix` (64 characters) when it is longer than 64 characters,
-  and `fallback: true` for an operator that found nothing to change.
+- Case plans use the [transcript format above](#reports-transcripts-and-reproduction).
 
 ## Decisions
 

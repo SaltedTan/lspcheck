@@ -12,21 +12,11 @@
 - An experimental `--mutate`, hidden from `--help` until recovery (M3) is judged, runs the mutation scenario: seeded
   edits of the profile's seed files, requests about each broken text, and the clean text restored after each case.
   It judges M1 (the server survives) and M2 (every request is answered within `--timeout`); `--mutation-seed` and
-  `--mutation-cases` override the profile. The JSON report gains `"mutation"` (`null` without it), the terminal header
-  names the seed, and the scenario's transcript, `mutation.jsonl`, records each case's plan.
+  `--mutation-cases` override the profile. The JSON report gains `"mutation"` (`null` when the scenario doesn't run),
+  the terminal header names the seed, and the scenario's transcript, `mutation.jsonl`, records each case's plan.
 
 ### Changed
 
-- M1 reconciles recorded losses with exit and inspection-stop evidence at shutdown; stand-in bracket diagnostics
-  calculate positions in one traversal of the text.
-- Mutation requests use their write-time deadlines, losses are judged through the shutdown boundary, and seed
-  openings are preflighted against the written-bytes cap. Case preparation consumes the admitted case's budget.
-- Mutation batches retain every delivered request and settle replies by receive time; later exits preserve earlier
-  timeouts. Case admission reserves restoration space for every intermediate text, including plans that end clean.
-- Mutation timeouts become inconclusive when queued output cannot be fully inspected; absence windows end at each
-  request's deadline, so later inspection stops do not excuse established timeouts.
-- Mutation startup messages are preflighted against the byte cap before initialization, and failed writes recognize
-  closed output while the server process is still alive. M1's window starts after the first mutation is fully written.
 - Profile durations may also be given in hours, such as `"1h"`.
 
 ## 0.4.0 (2026-11-11)

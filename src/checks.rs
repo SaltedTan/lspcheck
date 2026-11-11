@@ -3499,7 +3499,7 @@ enum StepOutcome {
     Unanswered,
     /// Still pending when the server exited or closed its output (M1's).
     Gone,
-    /// Still pending when lspcheck stopped reading (its output budget).
+    /// Output inspection stopped or queued output couldn't be fully drained.
     Uninspected(String),
     /// lspcheck couldn't deliver it.
     Undelivered(String),
@@ -3515,8 +3515,9 @@ enum Lost {
     Undelivered(String),
 }
 
-/// What lspcheck saw after a write to the server failed: an exit within
-/// `--exit-timeout` (the server is gone), else a write it couldn't deliver.
+/// Classifies a failed write after waiting up to `--exit-timeout`: stopped
+/// inspection takes precedence over exit or EOF evidence, and without
+/// either the write is undelivered.
 async fn lost_after_write(ctx: &mut Ctx<'_>, what: &str, e: &WriteError) -> Lost {
     if let Some((_, why)) = ctx.s.stopped_reading() {
         return Lost::Uninspected(why);
@@ -4073,8 +4074,8 @@ async fn restore_and_leave(ctx: &mut Ctx<'_>, docs: &mut [SeedDoc], encoding: En
     leave(ctx).await;
 }
 
-/// M1: the server neither exited nor closed its output from the first
-/// mutation's `didChange` until `shutdown`.
+/// M1: the server neither exited nor closed its output after the first
+/// mutation's `didChange` was fully written and before `shutdown`.
 fn judge_m1(
     ctx: &mut Ctx<'_>,
     summary: &MutationSummary,

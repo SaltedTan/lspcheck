@@ -605,6 +605,8 @@ impl Session {
         self.stdout_closed
     }
 
+    /// Drains already-read output within the write timeout. False means
+    /// queued output remains, so a missing response is not established.
     pub async fn absorb_all(&mut self) -> bool {
         self.absorb(Instant::now() + self.opts.write_timeout).await
     }

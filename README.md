@@ -262,7 +262,7 @@ answers even when the client's pipe flush finishes later.
 ### Profiles
 
 Many servers refuse to initialize, or check little, without a project or settings. A profile is a TOML file that
-gives lspcheck what a server needs, and says what its maintainers accept. The five sections and their top-level keys
+gives lspcheck what a server needs, and says what its maintainers accept. The sections and their top-level keys
 are optional, except that `[document]` needs `path` and `language_id`; each `allow.skip` entry requires both `id`
 and `reason`.
 The example below uses supported fields; [planned profile fields](docs/design.md#profiles-optional-toml) are not
@@ -330,16 +330,13 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   chose. `path` must name a file of `[workspace]` (from `path` or `files`) holding UTF-8 text; each position must be
   on a line the file has, at most one column past the line's last character. Without `positions`, K1
   [chooses positions from the document's text](docs/design.md#capabilities-and-robustness).
-  Other checks still use their own documents.
+  See the [mutation reference](docs/source-mutations.md#profile-schema) for mutation seed selection.
 - **`[mutation]`** configures [seeded source mutation](docs/source-mutations.md#profile-schema). The section is
   validated with the rest of the profile, and used only with `--mutate`, which is experimental and hidden from
   `--help` until recovery (M3) is judged: `lspcheck --profile p.toml --mutate [--mutation-seed N]
-  [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2. Requests are timed from their writes;
-  queued replies count by receive time, and each step's outcomes are settled once. Startup messages, seed openings
-  and restoration from any intermediate text are reserved against the 64 MiB written-bytes cap. An incomplete drain of queued output
-  makes missing responses `ERROR`; inspection gaps are checked within each request's own deadline.
-  Closed output after a failed write counts as server loss even while the process is still running.
-  At shutdown, M1 reconciles earlier delivery failures with exit or EOF evidence; inspection stops take precedence.
+  [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2. See the
+  [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
+  [step 3's limits](docs/source-mutations.md#step-3) for what is implemented so far.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong
   type, a bad duration, a missing fixture, a symbolic link in it, an unsafe file name, an unknown check id, or a
   `[document]` whose file, language id or positions don't fit is a usage error (exit status 2) naming the file and

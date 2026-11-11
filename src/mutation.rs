@@ -6,8 +6,8 @@
 //! plan of a case as a pure function of the seed and the clean texts, and the
 //! content changes that send a planned edit to a server.
 //!
-//! Pure functions only: no I/O, no session. Nothing runs a plan yet; the
-//! `mutation` scenario that will is a later step.
+//! Pure functions only: no I/O, no session. The `mutation` scenario in
+//! [`crate::checks`] runs the plans.
 //!
 //! The generator, the order of its draws and what each operator does are a
 //! [`FORMAT`]: the same seed, case, texts and configuration give the same
