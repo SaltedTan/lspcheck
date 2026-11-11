@@ -1,7 +1,7 @@
 # Seeded source mutation and recovery
 
-**Status:** Proposed, 2026-11-09. Nothing here is implemented. It is the milestone after v0.3.0 in the
-[design](design.md#milestones).
+**Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Nothing here
+is implemented yet. It is the milestone after v0.3.0 in the [design](design.md#milestones).
 
 ## Context
 
@@ -492,19 +492,27 @@ Each step is one small pull request with its tests, docs and changelog entry whe
    so the maintainer merges it).
 8. **Minimisation**, if isolation shows it is wanted.
 
-## Open questions
+## Decisions
 
-- Should a recovery not seen without a stated expectation be `ERROR` (this proposal: the result is unknown, and a
-  bound ran out) or `N/E` (quieter, but the run did produce evidence)? `ERROR` makes a `--mutate` run exit 2 on a
-  server whose answers legitimately drift.
-- Should M1 to M3 be listed, as `SKIP`, in runs without `--mutate`, or only appear with it? Listing them keeps the
-  catalogue and reports uniform and shows what wasn't run, at the cost of three lines in every report and verdicts file.
-- Should D1, D2, D6 and K1 be extended, as proposed, or should the mutation scenario get its own position, version and
-  MethodNotFound checks (M4 and on), so their documents-scenario verdicts never depend on `--mutate`?
-- Should `--strict` cover the M checks like other `POLICY` checks? A `POLICY` failure exits 0 without it.
-- Default case count: 20 is a guess at a few minutes on a stock server, not measured; virgil-lsp uses 100 against a
-  server that answers in milliseconds.
-- Should lspcheck ship lexicon presets (`c-like`, `python`, `lua`, `lisp`) as data, rather than every profile spelling
-  one out? They are tables, not real lexers.
-- Servers that take no changes are skipped. They could be mutated by `didClose` and `didOpen` of the new text instead.
-- Should `semanticTokens/full` become a recovery probe, compared through the legend?
+The proposal left these questions open; the maintainer settled them on 2026-11-11.
+
+- **A recovery not seen, without a stated expectation, is `ERROR`, not `N/E`.** lspcheck's verdicts define `ERROR` as
+  "the result is unknown: … a timeout ran out", which is exactly this case, and `N/E` as a run that produced no
+  evidence, which this one did. `N/E` would also hide a server that never recovers. A server whose answers lawfully
+  drift exits 2 under `--mutate` until its profile states an expectation, narrows `recovery.probes`, or skips M3 with
+  a reason; the detail says which.
+- **M1 to M3 are listed as `SKIP` without `--mutate`.** Every report and verdicts file keeps the whole catalogue, as it
+  does for checks that don't apply to a server, and shows what wasn't run. `SKIP` doesn't affect the exit status.
+- **D1, D2, D6 and K1 are extended, as proposed, not duplicated as new checks.** A check names a rule, and the rule
+  doesn't change with the text; the cross-cutting checks already gather evidence from every scenario. The detail names
+  the scenario and case, so a failure found only under `--mutate` is clear, and default runs (and the stock baselines)
+  don't change.
+- **`--strict` covers the M checks** like every other `POLICY` check: no exception to explain.
+- **The default case count stays 20** for now. Step 7 measures it on the stock servers and sets the default (and the
+  matrix's count) from those timings before a release ships `--mutate`.
+- **No lexicon presets yet.** Profiles spell out their lexicon. If the stock profiles in step 7 repeat the same tables,
+  presets can be added then, as data.
+- **Servers that take no changes stay skipped.** Mutating them by `didClose` and `didOpen` would test a different thing
+  (reopening, not editing), and none of the servers tried so far needs it.
+- **`semanticTokens/full` isn't a recovery probe** in the first version. Comparing it through its legend can come later
+  if the other probes prove too few.

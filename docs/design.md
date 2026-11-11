@@ -680,7 +680,7 @@ No network access at runtime.
   Done: virgil-lsp's `lspcheck-linux` job checks its freshly built server with the pinned v0.2.0 release.
 - K2 meta-model validation (released in v0.3.0).
 - Later: language profiles with seeded source mutation and recovery oracles, ported from
-  `test/protocol/source_mutations.py`. [Proposed design](source-mutations.md): an opt-in `--mutate` scenario with
+  `test/protocol/source_mutations.py`. [Accepted design](source-mutations.md): an opt-in `--mutate` scenario with
   checks M1 to M3, which also extends D1, D2, D6 and K1 to real source.
 
 ## Open questions
