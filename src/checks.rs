@@ -3464,6 +3464,9 @@ pub const MUTATION_BYTES: u64 = 64 * 1024 * 1024;
 const REQUEST_RESERVE: u64 = 2048;
 /// What a case reserves for `shutdown` and `exit`.
 const SHUTDOWN_RESERVE: u64 = 1024;
+/// What a restoration may take beyond the one from the case's final text: its
+/// range's end, from an earlier text, may be longer by a few digits.
+const RESTORE_MARGIN: u64 = 64;
 
 /// A seed document as the mutation scenario holds it.
 struct SeedDoc {
@@ -3745,9 +3748,24 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             steps.push((step, params, after, next_version[d]));
         }
         for (d, doc) in docs.iter().enumerate() {
-            if texts[d] != doc.clean {
-                // The restoration replaces the whole text with the clean one.
-                reserve += doc.clean.len() as u64 * 2 + doc.uri.len() as u64 + 256;
+            if texts[d] == doc.clean {
+                continue;
+            }
+            // The restoration replaces the whole text with the clean one, so
+            // its size is known; a case its budget stops early restores from
+            // an earlier text, whose end position may take a few more digits.
+            match mutation::restore_change(&texts[d], &doc.clean, encoding, sync) {
+                Ok(change) => {
+                    let params = did_change(&doc.uri, next_version[d] + 1, &[change]);
+                    reserve += notification_bytes("textDocument/didChange", &params) + RESTORE_MARGIN;
+                }
+                Err(e) => {
+                    both(ctx, Verdict::Error, format!("case {k}: {e}"));
+                    summary.stopped = Some(format!("case {k}: {e}"));
+                    ctx.mutation = Some(summary);
+                    restore_and_leave(ctx, &mut docs, encoding, sync).await;
+                    return;
+                }
             }
         }
         if ctx.s.bytes_written() + reserve > MUTATION_BYTES {
@@ -3789,6 +3807,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             versions += 1;
             // The step's requests, written back to back, then each waited
             // for until its own deadline.
+            let identifiers = mutation::identifiers(&docs[d].current, &settings.planner.lexicon);
             let mut pending = Vec::new();
             for _ in 0..settings.requests_per_step {
                 if methods.is_empty() {
@@ -3796,8 +3815,8 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 }
                 let method = methods[cursor % methods.len()];
                 cursor += 1;
-                let (line, column) = mutation::request_spot(&mut rng, &docs[d].current, &settings.planner.lexicon);
-                let query = mutation::request_query(&mut rng, &docs[d].current, &settings.planner.lexicon);
+                let (line, column) = mutation::request_spot(&mut rng, &docs[d].current, &identifiers);
+                let query = mutation::request_query(&mut rng, &docs[d].current, &identifiers);
                 let Some(params) = step_request(&caps, &docs[d], method, Spot { line, column }, encoding, &query)
                 else {
                     continue;
@@ -3817,15 +3836,14 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                     Err(e) => Err(e),
                 };
                 if let Err(e) = written {
-                    let why = format!("lspcheck couldn't deliver {method} ({e})");
-                    asked.push(StepRequest {
-                        method,
-                        case: k,
-                        at,
-                        waited: ctx.s.elapsed(),
-                        outcome: StepOutcome::Undelivered(why),
-                    });
-                    lost = Some((lost_after_write(ctx, method, &e).await, place));
+                    let how = lost_after_write(ctx, method, &e).await;
+                    // A request the server exited before reading is M1's.
+                    let outcome = match &how {
+                        Lost::Gone(_) => StepOutcome::Gone,
+                        _ => StepOutcome::Undelivered(format!("lspcheck couldn't deliver {method} ({e})")),
+                    };
+                    asked.push(StepRequest { method, case: k, at, waited: ctx.s.elapsed(), outcome });
+                    lost = Some((how, place));
                     break 'cases;
                 }
                 pending.push((id, method, at, deadline));

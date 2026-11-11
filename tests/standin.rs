@@ -2730,8 +2730,9 @@ fn a_server_that_exits_on_broken_source_fails_m1() {
     let m1 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M1").unwrap()["detail"];
     let m1 = m1.as_str().unwrap();
     assert!(m1.starts_with("the server exited with status 5 during case 0, step 1 (unbalance-bracket at "), "{m1}");
-    // A request pending when it exited is M1's, not M2's.
-    assert_ne!(r.verdicts["M2"], "fail", "{}", r.stdout);
+    // A request pending when it exited, or that it exited before reading,
+    // is M1's, not M2's: nothing was answered after a mutation.
+    expect(&r, "M2", "not-exercised");
 }
 
 #[test]

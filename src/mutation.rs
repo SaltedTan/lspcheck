@@ -1120,19 +1120,24 @@ pub fn restore_change(
     check(current, clean, encoding, change)
 }
 
+/// The identifiers of `text`, for [`request_spot`] and [`request_query`]:
+/// lexed once per text, however many requests are asked about it.
+pub fn identifiers(text: &str, lexicon: &Lexicon) -> Vec<Token> {
+    lexicon.tokens(text).into_iter().filter(|t| t.kind == TokenKind::Identifier).collect()
+}
+
 /// Where a step's request is asked, as a line and a column in characters,
-/// both from 0, of `text`: half the time inside an identifier (when the text
-/// has one), a tenth of the time at the end of the text, otherwise at any
-/// character boundary. Never inside a character or between a `\r` and a `\n`.
-pub fn request_spot(rng: &mut SplitMix64, text: &str, lexicon: &Lexicon) -> (usize, usize) {
+/// both from 0, of `text`, whose [`identifiers`] are given: half the time
+/// inside an identifier (when the text has one), a tenth of the time at the
+/// end of the text, otherwise at any character boundary. Never inside a
+/// character or between a `\r` and a `\n`.
+pub fn request_spot(rng: &mut SplitMix64, text: &str, identifiers: &[Token]) -> (usize, usize) {
     let draw = rng.below(10);
     let at = if draw < 5 {
-        let identifiers: Vec<Token> =
-            lexicon.tokens(text).into_iter().filter(|t| t.kind == TokenKind::Identifier).collect();
         if identifiers.is_empty() {
             any_boundary(rng, text)
         } else {
-            let token = rng.pick(&identifiers);
+            let token = rng.pick(identifiers);
             let chars: Vec<usize> = token.text(text).char_indices().map(|(i, _)| token.start + i).collect();
             // One character in when there is room, so the position is inside it.
             if chars.len() > 1 { chars[rng.between(1, chars.len() - 1)] } else { chars[0] }
@@ -1154,15 +1159,13 @@ fn any_boundary(rng: &mut SplitMix64, text: &str) -> usize {
     if inside_crlf(text, at) { at - 1 } else { at }
 }
 
-/// An identifier of `text` for `workspace/symbol` to ask about, at most 64
-/// characters of it; empty when the text has none.
-pub fn request_query(rng: &mut SplitMix64, text: &str, lexicon: &Lexicon) -> String {
-    let identifiers: Vec<Token> =
-        lexicon.tokens(text).into_iter().filter(|t| t.kind == TokenKind::Identifier).collect();
+/// One of `text`'s [`identifiers`] for `workspace/symbol` to ask about, at
+/// most 64 characters of it; empty when the text has none.
+pub fn request_query(rng: &mut SplitMix64, text: &str, identifiers: &[Token]) -> String {
     if identifiers.is_empty() {
         return String::new();
     }
-    rng.pick(&identifiers).text(text).chars().take(64).collect()
+    rng.pick(identifiers).text(text).chars().take(64).collect()
 }
 
 /// Inserted text longer than this many characters is recorded by its
@@ -1766,16 +1769,18 @@ mod tests {
             let mut first = Vec::new();
             for case in 0..50 {
                 let mut rng = SplitMix64::stream(9, case, "requests");
-                let (line, column) = request_spot(&mut rng, text, &lexicon);
+                let ids = identifiers(text, &lexicon);
+                let (line, column) = request_spot(&mut rng, text, &ids);
                 let lines = text::split_lines(text);
                 assert!(line < lines.len() && column <= lines[line].chars().count(), "{text:?}: {line}:{column}");
-                first.push((line, column, request_query(&mut rng, text, &lexicon)));
+                first.push((line, column, request_query(&mut rng, text, &ids)));
             }
             let again: Vec<_> = (0..50)
                 .map(|case| {
                     let mut rng = SplitMix64::stream(9, case, "requests");
-                    let (line, column) = request_spot(&mut rng, text, &lexicon);
-                    (line, column, request_query(&mut rng, text, &lexicon))
+                    let ids = identifiers(text, &lexicon);
+                    let (line, column) = request_spot(&mut rng, text, &ids);
+                    (line, column, request_query(&mut rng, text, &ids))
                 })
                 .collect();
             assert_eq!(first, again);
@@ -1786,7 +1791,8 @@ mod tests {
         let (mut inside, mut end) = (0, 0);
         for case in 0..2000 {
             let mut rng = SplitMix64::stream(1, case, "requests");
-            let (line, column) = request_spot(&mut rng, "alpha beta\ngamma\n", &Lexicon::default());
+            let text = "alpha beta\ngamma\n";
+            let (line, column) = request_spot(&mut rng, text, &identifiers(text, &Lexicon::default()));
             match (line, column) {
                 (2, 0) => end += 1,
                 (0, 1..=4) | (0, 7..=9) | (1, 1..=4) => inside += 1,
@@ -1799,10 +1805,11 @@ mod tests {
     #[test]
     fn a_query_is_an_identifier_of_the_text() {
         let mut rng = SplitMix64::new(3);
-        assert_eq!(request_query(&mut rng, "(1 + 2)", &Lexicon::default()), "");
-        let long = "x".repeat(100);
-        assert_eq!(request_query(&mut rng, &long, &Lexicon::default()), "x".repeat(64));
-        assert!(["alpha", "beta"].contains(&request_query(&mut rng, "alpha+beta", &Lexicon::default()).as_str()));
+        let query =
+            |rng: &mut SplitMix64, text: &str| request_query(rng, text, &identifiers(text, &Lexicon::default()));
+        assert_eq!(query(&mut rng, "(1 + 2)"), "");
+        assert_eq!(query(&mut rng, &"x".repeat(100)), "x".repeat(64));
+        assert!(["alpha", "beta"].contains(&query(&mut rng, "alpha+beta").as_str()));
     }
 
     #[test]
