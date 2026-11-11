@@ -66,7 +66,9 @@ Existing checks keep being judged on the new scenario's evidence:
   random edit can't make that diagnosis, so D1 judges those positions. D4, the C, L1 to L8 and R checks need their own
   scenarios.
 
-Without `--mutate`, the scenario doesn't run; M1 to M3 follow the [catalogue's skip rules](design.md#mutation).
+Without `--mutate`, the scenario doesn't run and M1 to M3 report `SKIP`, which doesn't affect the exit status. Once
+the scenario is implemented, their detail will be `mutation is off; pass --mutate`; until then it says the scenario
+isn't implemented yet ([catalogue](design.md#mutation)).
 
 ### The scenario
 
@@ -324,7 +326,7 @@ keywords = ["local", "function", "end", "return", "if", "then", "else"]
 
 [mutation.recovery]
 probes = ["textDocument/documentSymbol", "publishDiagnostics"]   # default: every advertised probe
-settle_timeout = "30s"         # default: the startup timeout
+settle_timeout = "30s"         # default: the startup timeout, at most "5m"
 recovery_timeout = "20s"       # default: twice the request timeout
 expect = "observe"             # or "baseline"
 no_errors = true               # default false

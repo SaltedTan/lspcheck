@@ -249,7 +249,7 @@ pub struct SeedFile {
 pub struct Recovery {
     /// The probes M3 may use; every advertised one when `None`.
     pub probes: Option<Vec<Probe>>,
-    /// The startup timeout when `None`.
+    /// The startup timeout, at most 5 minutes, when `None`.
     pub settle_timeout: Option<Duration>,
     /// Twice the request timeout when `None`.
     pub recovery_timeout: Option<Duration>,
@@ -312,8 +312,12 @@ impl Mutation {
         }
     }
 
+    /// How long to wait for the server to settle and its probes to give a
+    /// stable baseline: the profile's `settle_timeout`, else the startup
+    /// timeout, at most [`MAX_SETTLE_TIMEOUT`]. A profile can't name more,
+    /// but the startup timeout it inherits can be longer.
     pub fn settle_timeout(&self, startup_timeout: Duration) -> Duration {
-        self.recovery.settle_timeout.unwrap_or(startup_timeout)
+        self.recovery.settle_timeout.unwrap_or(startup_timeout).min(MAX_SETTLE_TIMEOUT)
     }
 
     pub fn recovery_timeout(&self, request_timeout: Duration) -> Duration {
@@ -1840,6 +1844,18 @@ mod tests {
         assert!(mutation_settings(&p, None, None, Duration::from_secs(10)).is_ok());
         let e = mutation_settings(&p, None, None, Duration::from_millis(29_500)).unwrap_err();
         assert!(e.contains("of 29.500 s"), "{e}");
+    }
+
+    #[test]
+    fn an_inherited_settle_timeout_is_capped() {
+        let secs = Duration::from_secs;
+        let p = parse_here(&format!("[server]\nstartup_timeout = \"6m\"\n{LUA}[mutation]\n")).unwrap();
+        let m = mutation_settings(&p, None, None, secs(10)).unwrap();
+        // The startup timeout is the server's to choose; settling is capped at 5 minutes anyway.
+        assert_eq!(m.settle_timeout(p.startup_timeout.unwrap()), MAX_SETTLE_TIMEOUT);
+        assert_eq!(m.settle_timeout(secs(30)), secs(30));
+        let p = parse_here(&format!("{LUA}[mutation.recovery]\nsettle_timeout = \"5m\"\n")).unwrap();
+        assert_eq!(p.mutation.unwrap().settle_timeout(secs(3600)), MAX_SETTLE_TIMEOUT);
     }
 
     #[test]
