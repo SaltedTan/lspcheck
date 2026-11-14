@@ -4,9 +4,10 @@
 the [implementation plan](#implementation-plan) are in place: the planner (`src/mutation.rs`), the profile's
 `[mutation]` section, and the scenario, which judges M1 and M2. Step 4 is in place too: D1, D2, D6 and K1 are
 [extended](#verdict-rules) to the scenario, and answers to the server's own requests are held to the
-[written-bytes cap](#bounds). `--mutate` and its two flags are experimental and hidden from `--help` until recovery
-(M3) is judged; until then the scenario doesn't settle or take baselines, and M3 is `SKIP`. See
-[what step 3 leaves out](#step-3) and the [design status](design.md) for its place in the roadmap.
+[written-bytes cap](#bounds). Step 5 is in place: the scenario settles, takes the [recovery probes'](#recovery)
+baselines, polls them after each restoration and judges M3, with `expect` and `no_errors`. `--mutate` and its two
+flags are experimental and hidden from `--help`. See [how steps 3 and 5 are built](#step-3) and the
+[design status](design.md) for its place in the roadmap.
 
 ## Context
 
@@ -414,8 +415,8 @@ of output first seen after the answer was withheld makes M1 `ERROR`. The scenari
 the same way), sends the current case's restoration and shutdown, and `mutation.stopped` says that answers to the
 server's requests reached the cap. When the run stops early this way, M1 and M2 can still fail on what lspcheck saw,
 but not pass: the cases not run make them `ERROR`. An answer withheld after M1 and M2 are judged, while waiting for the
-reply to shutdown, changes neither: their windows end before shutdown. The transcript notes it. Until step 5, M3 stays
-`SKIP`; its planned verdict for a cap stop is `ERROR`.
+reply to shutdown, changes neither: their windows end before shutdown. The transcript notes it. M3 likewise can fail
+on the cases it judged, but not pass: a cap stop makes it `ERROR`.
 
 ### Reports, transcripts and reproduction
 
@@ -531,8 +532,8 @@ Each step is one small pull request with its tests, docs and changelog entry whe
    JSON `"mutation"` field. Stand-in bracket tracking and the M1 and M2 faults.
 4. **Answer cap and extended checks.** Implemented: the [automatic-answer cap](#bounds) and
    [extended checks](#verdict-rules), with their [stand-in faults](#stand-in-faults-and-tests).
-5. **Recovery, M3.** Settle, stable baselines, projections, polling, `expect` and `no_errors`; the recovery faults,
-   lawful ones included.
+5. **Recovery, M3.** Implemented: settle, stable baselines, projections, polling, `expect` and `no_errors`
+   ([step 5](#step-5)); the recovery faults, lawful ones included.
 6. **Isolation.** Rerunning failing cases alone and writing their transcripts.
 7. **Stock matrix.** `[mutation]` in the example profiles, a mutation job and `.mutation.verdicts` (a workflow change,
    so the maintainer merges it).
@@ -542,8 +543,7 @@ Each step is one small pull request with its tests, docs and changelog entry whe
 
 Step 3 runs the scenario without the parts later steps add, and says so where it matters:
 
-- No settle or baseline (step 5): the cases start right after the seed documents are opened. M3 is `SKIP` ("lspcheck
-  doesn't judge recovery yet").
+- Step 3 sent no settle or baseline, and M3 was `SKIP`; [step 5](#step-5) adds them and judges M3.
 - Before sending `initialize`, lspcheck checks its exact serialized request (including the profile's
   `initializationOptions`), `initialized`, optional `workspace/didChangeConfiguration`, and 1 KiB for shutdown against
   the 64 MiB cap. If they do not fit, M1 and M2 are `ERROR` and the scenario writes nothing.
@@ -552,7 +552,8 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
 - The case budget and `run_timeout` are as above; planning, serialization and hashing consume the admitted case's
   budget. Before a case starts, lspcheck checks that the bytes it has written
   so far plus the case's reserve fit the written-bytes cap; the reserve counts the case's `didChange` notifications at
-  their exact size, 2 KiB plus twice the URI's length for each request, and 1 KiB for `shutdown` and `exit`. For each
+  their exact size, 2 KiB plus twice the URI's length for each request (step 5 adds 41 such requests per stable
+  request probe: the most polls and the terminal probe), and 1 KiB for `shutdown` and `exit`. For each
   document, the restoration reserve is the largest restoration notification over every step's resulting text and
   version, plus a small margin, even if the plan ends with the clean text. Answers to the server's own requests also
   count towards the next case's check; see [Bounds](#bounds) for their admission rule (added in step 4).
@@ -582,6 +583,28 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
 - A request K1 wouldn't send about the document (a `documentSelector` that doesn't select it) is skipped, and the
   round robin moves on.
 - Case plans use the [transcript format above](#reports-transcripts-and-reproduction).
+
+### Step 5
+
+Step 5 builds [Recovery](#recovery) and M3 as above. Where the rules leave a choice, it makes these:
+
+- Settle and baseline each have their own `settle_timeout`, and `run_timeout` counts from the end of the baseline.
+  The baseline's requests come before the first mutation, so M2 doesn't judge them; D1 and K1 do.
+- The request probes are sent with K1's params for each document. An error, a malformed response or a report that
+  isn't a full one breaks a probe's run of equal answers: it is asked again, and used only if two answers in a row
+  are then equal (a server may answer with an error while it loads).
+- `no_errors = true` without `expect` makes "recovered" mean "no Error diagnostic" for the diagnostics probes, so a
+  lingering Warning passes; with `expect = "baseline"` both must hold. `documentSymbol` and `foldingRange` are
+  compared with their baseline either way.
+- A pushed-diagnostics probe recovers on the first publish labelled with the restored version whose projection equals
+  the baseline (for an unmutated document, the latest one read before the restoration counts). With `no_errors`, its
+  publishes are read to the end of `recovery_timeout`, and the last decides, so each case takes the whole bound.
+- Terminal probes are sent with or without an expectation; an answer equal to the baseline counts as recovered. An
+  error answer to a terminal probe, or one in a frame lspcheck couldn't read, is `ERROR`, never `FAIL`.
+- Polls are sent when due, never two at once: poll *n* + 1 waits for poll *n*'s replies, then for the gap. A poll still
+  waiting when `recovery_timeout` ends keeps its own `--timeout` deadline.
+- A stop during a case (an exit, closed output, a write that couldn't be delivered, or the written-bytes cap) leaves
+  that case's recovery unjudged, so M3 is `ERROR` unless a judged case failed.
 
 ## Decisions
 

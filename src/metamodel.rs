@@ -830,6 +830,11 @@ fn is_identifier(k: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
+/// A value as JSON, cut short as K2's details show it.
+pub fn shorten_value(value: &Value) -> String {
+    shorten(Found::Value(value))
+}
+
 /// A value as JSON, cut short.
 fn shorten(value: Found<'_>) -> String {
     const MAX: usize = 60;

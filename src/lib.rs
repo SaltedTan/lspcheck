@@ -15,6 +15,7 @@ pub mod metamodel;
 pub mod mutation;
 pub mod process;
 pub mod profile;
+pub mod recovery;
 pub mod replay;
 pub mod report;
 pub mod session;
