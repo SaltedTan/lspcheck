@@ -2,11 +2,11 @@
 
 **Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Steps 1 to 3 of
 the [implementation plan](#implementation-plan) are in place: the planner (`src/mutation.rs`), the profile's
-`[mutation]` section, and the scenario, which judges M1 and M2; from step 4, answers to the server's own requests are
-held to the [written-bytes cap](#bounds). `--mutate` and its two flags are experimental and
-hidden from `--help` until recovery (M3) is judged; until then the scenario doesn't settle or take baselines, M3 is
-`SKIP`, and D1, D2, D6 and K1 aren't extended to it. See [what step 3 leaves out](#step-3) and the
-[design status](design.md) for its place in the roadmap.
+`[mutation]` section, and the scenario, which judges M1 and M2. Step 4 is in place too: D1, D2, D6 and K1 are
+[extended](#verdict-rules) to the scenario, and answers to the server's own requests are held to the
+[written-bytes cap](#bounds). `--mutate` and its two flags are experimental and hidden from `--help` until recovery
+(M3) is judged; until then the scenario doesn't settle or take baselines, and M3 is `SKIP`. See
+[what step 3 leaves out](#step-3) and the [design status](design.md) for its place in the roadmap.
 
 ## Context
 
@@ -70,8 +70,8 @@ Existing checks keep being judged on the new scenario's evidence:
 
 Without `--mutate`, nothing above changes: the scenario doesn't run and M1 to M3 report `SKIP` (`mutation is off;
 pass --mutate`), which doesn't affect the exit status ([catalogue](design.md#mutation)).
-With `--mutate` and a seed file, the scenario runs when an M check or a cross-cutting check is selected and not
-skipped by the profile.
+With `--mutate` and a seed file, the scenario runs when an M check, a cross-cutting check, or one of the checks it
+extends is selected and not skipped by the profile.
 
 ### The scenario
 
@@ -287,7 +287,17 @@ sent before it was read; a labelled publish to its version; an unlabelled one to
 lspcheck keeps the last 64 versions of each document. A position whose candidate texts reach further back isn't judged
 and is counted, so a long run's memory stays bounded and no position is judged against a text lspcheck no longer has.
 D2 judges every labelled publish against the versions sent before it was read; D6 every `selectionRange` reply; K1
-every MethodNotFound to an advertised request about a seed document.
+every MethodNotFound to an advertised request about a seed document (so not `workspace/symbol`), read at any time
+after the request was sent. lspcheck judges what the server sent as it goes, before recording each version it sends,
+so a text is dropped only after everything read while it was kept has been judged against it; what may refer to a
+dropped text is counted in the detail (`that may refer to a version older than the 64 whose texts lspcheck keeps,
+not judged`). A request left unanswered or undelivered is M1's or M2's: it makes none of the four `ERROR`, though
+missed evidence in the window from the first `didOpen` to shutdown does, as in their own scenarios. D1 and D2 are
+judged once a seed document was opened, D6 once a `selectionRange` was sent, and K1 only when it fails; the scenario
+contributes nothing to them when it stops before opening a document. In the combined detail, each scenario's part
+starts with its verdict and name (`FAIL in the mutation scenario: …; PASS in the documents scenario: …`), the
+winning one first, and each position, publish or reply the mutation scenario names says its case: a reply its
+request's, a publish the case in progress when it was read.
 
 Two of the existing judges need changes before they can be reused here, because the documents scenario sends few
 versions and evicts none:
@@ -449,7 +459,7 @@ a window. Lawful faults count replies, not milliseconds.
 | `exit-on-unbalanced` | exit when a document's brackets become unbalanced | M1 fails |
 | `flood-while-unbalanced` | lawful: after a change leaves brackets unbalanced, write 2 MiB of log messages, and keep serving | With `--max-output-mib 1`, M1 `ERROR` (inspection stopped), never `FAIL` |
 | `close-output-mid-restoration` | Unix only: partway through reading a large document's restoration, send 20,000 requests and close stdout, then read nothing more after it | M1 `ERROR` (the end of output is queued behind requests lspcheck can't answer before shutdown), never `PASS` |
-| `late-wrong-count` | answer one `selectionRange` with `[]` after more than 64 later versions | D6 fails from the mutation scenario |
+| `late-wrong-count` | answer one `selectionRange` with `[]` after more than 64 later versions | D6 fails from the mutation scenario, on the entry count alone (M2 fails too, as for `selection-from-later-text`) |
 | `recover-before-deadline` | lawful: after rebalancing, answer `documentSymbol` with `[]` until just before `recovery_timeout`, counted in replies to a poll schedule the test fixes, then with the baseline | nothing fails with `expect = "baseline"`: the terminal probe sees the baseline |
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails |
 | `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |
@@ -457,8 +467,10 @@ a window. Lawful faults count replies, not milliseconds.
 | `errors-after-unbalanced` | once unbalanced, publish an Error diagnostic forever | M3 fails with `no_errors = true` |
 | `warning-after-unbalanced` | once unbalanced, publish an extra Warning forever | M3 fails with `expect = "baseline"` and pushed diagnostics as the only probe; passes with `no_errors = true` alone |
 | `method-not-found-while-unbalanced` | answer advertised requests with -32601 while unbalanced | K1 fails from the mutation scenario |
+| `selection-from-later-text` | lawful: hold one `selectionRange` until a later change leaves its position past the end of its line, then answer from that text | D6 passes (M2 fails: the reply is necessarily later than `--timeout`, since the next version is sent only after the request's wait) |
+| `old-version-diagnostics` | lawful: 65 versions after a document's first change, publish that change's diagnostics again, labelled with its version | D2 passes; D1 counts the positions as not judged |
 | `codepoint-positions-after-change` (exists) | count positions in code points after a change | D1 fails from the mutation scenario (with `unicode`) |
-| `diagnostics-own-version` (exists) | label diagnostics with its own counter | D2 fails from the mutation scenario |
+| `diagnostics-own-version` (exists) | label diagnostics with its own counter | D2 fails from the mutation scenario (with two seed files, so the counter runs ahead of each) |
 | `slow-recovery` | lawful: answer the first three `documentSymbol` after rebalancing with `[]` | nothing fails; M3 passes |
 | `reworded-diagnostics` | lawful: put a counter in every diagnostic message | nothing fails |
 | `no-diagnostics` (exists) | lawful: never publish diagnostics | nothing fails; pushed diagnostics unused |

@@ -3,8 +3,9 @@
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
 **Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). v0.4.0 expands the [example profile catalogue](../examples/profiles/README.md) to 18 servers and the [stock-server CI matrix](../ci/stock-servers/README.md) to 11, accepts unknown values of the tag and kind enumerations clients must tolerate in K2, refines [K2's failure detail](#capabilities-and-robustness), and [isolates Content-Type probes](#framing-and-output). M4 is done (see the [integration milestone](#milestones)). Next is [seeded source mutation](source-mutations.md), whose design is accepted; its planner, the profile's `[mutation]` section and the scenario, the first three steps, are in place: an experimental,
-hidden `--mutate` judges M1 and M2. The [answer cap](source-mutations.md#bounds) is also enforced. See the
-[mutation implementation status](source-mutations.md) for current behavior and the
+hidden `--mutate` judges M1 and M2, and extends D1, D2, D6 and K1 to the mutated documents. The
+[answer cap](source-mutations.md#bounds) is also enforced. See the [mutation implementation status](source-mutations.md)
+for current behavior and the
 [implementation plan](source-mutations.md#implementation-plan) for the remaining steps.
 See the [changelog](../CHANGELOG.md) for changes by release.
 
@@ -322,6 +323,10 @@ Most language servers ignore a plain-text document, so expect D1 to be `N/E` for
 only one versioned publish for the document, so it is exercised wherever diagnostics are labelled. D4 runs wherever
 a document request is advertised.
 
+With `--mutate`, the [mutation scenario](source-mutations.md#verdict-rules) also judges D1, D2 and D6 about its seed
+documents, as the profile's real source is mutated, and each check's two verdicts combine: a failure in either fails
+it, and the detail names the scenario and case.
+
 ### Capabilities and robustness
 | ID | Basis | Check |
 |---|---|---|
@@ -415,7 +420,8 @@ remaining requests in a single `not sent after that` note.
   got them.
 
 Responses to K1's requests are judged by J1, J2 and J5 like any other, and the scenario's input is all well formed,
-so it is included in J3. K1 judges only the error code, never a result's content.
+so it is included in J3. K1 judges only the error code, never a result's content. With `--mutate`, a MethodNotFound
+to a request about a mutated document also [fails K1](source-mutations.md#verdict-rules).
 
 K2 is judged across every scenario, like J5, over every message lspcheck read. Its validator runs only when K2 is
 selected and not skipped by the profile. Its types come from `metaModel.json`

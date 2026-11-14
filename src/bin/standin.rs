@@ -222,6 +222,25 @@ const FAULTS: &[(&str, &str)] = &[
         "content-modified-while-unbalanced",
         "lawful: answer requests about a document whose brackets are unbalanced with ContentModified (-32801)",
     ),
+    (
+        "method-not-found-while-unbalanced",
+        "answer requests about a document whose brackets are unbalanced with MethodNotFound (-32601)",
+    ),
+    (
+        "late-wrong-count",
+        "hold the first selectionRange request about a document whose brackets are unbalanced, and answer it with [] \
+         once 65 later versions of the document have been read",
+    ),
+    (
+        "selection-from-later-text",
+        "lawful: hold the first selectionRange request about a document whose brackets are unbalanced until a later \
+         didChange leaves one of its positions past the end of its line, then answer it from that text",
+    ),
+    (
+        "old-version-diagnostics",
+        "lawful: once 65 versions of a document have been read after its first didChange, publish that change's \
+         diagnostics again, labelled with its version",
+    ),
     ("ignore-changes", "don't apply didChange, and label the old text's diagnostics with the new version"),
     ("codepoint-changes", "apply incremental change ranges counting code points, and answer correctly otherwise"),
     (
@@ -418,6 +437,14 @@ fn main() {
     let mut negotiated_units = Units::Utf16;
     // For diagnostics-own-version: the stand-in's own diagnostics counter.
     let mut own_version = 0i64;
+    // For late-wrong-count and selection-from-later-text: the selectionRange
+    // request held (its id, params, document and that document's version),
+    // and whether one was.
+    let mut held_selection: Option<(Value, Value, String, i64)> = None;
+    let mut held_one = false;
+    // For old-version-diagnostics: each document's first changed version and
+    // text, and whether they were published again.
+    let mut first_change: HashMap<String, (i64, String, bool)> = HashMap::new();
     loop {
         if queued.is_empty() && !input.ready() {
             // About to wait for input: send what was held back, newest first.
@@ -742,7 +769,7 @@ fn main() {
                     // ignore-changes and mislabelled-diagnostics publish the
                     // previous text, labelled with the new version.
                     let publish_text =
-                        if fault("ignore-changes") || fault("mislabelled-diagnostics") { &old_text } else { text };
+                        if fault("ignore-changes") || fault("mislabelled-diagnostics") { &old_text } else { &*text };
                     if fault("unversioned-diagnostics") || fault("stale-unversioned-diagnostics") {
                         label = None;
                     }
@@ -761,6 +788,39 @@ fn main() {
                     out.frame(
                         &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
                     );
+                }
+                // A held selectionRange is answered once enough versions of
+                // its document have been read: ordered by what the stand-in
+                // reads, never by time.
+                if let Some((id, params, held_uri, held_version)) = &held_selection
+                    && held_uri == uri
+                {
+                    let lines = lines(text, split);
+                    let past_end = params["positions"].as_array().into_iter().flatten().any(|p| {
+                        let (line, character) = (p["line"].as_u64().unwrap_or(0), p["character"].as_u64().unwrap_or(0));
+                        lines.get(line as usize).is_some_and(|l| (units.of(l) as u64) < character)
+                    });
+                    let answer = if fault("late-wrong-count") {
+                        (version >= held_version + 65).then(|| json!([]))
+                    } else {
+                        past_end.then(|| {
+                            document_answer("textDocument/selectionRange", params, text, units, split, &faults)
+                        })
+                    };
+                    if let Some(answer) = answer {
+                        eprintln!("standin: answered the held selectionRange at version {version}");
+                        out.frame(&ok(id, answer));
+                        held_selection = None;
+                    }
+                }
+                if fault("old-version-diagnostics") {
+                    let (first, first_text, again) =
+                        first_change.entry(uri.to_string()).or_insert_with(|| (version, text.clone(), false));
+                    if !*again && version >= *first + 65 {
+                        *again = true;
+                        eprintln!("standin: published version {first} again at version {version}");
+                        publish_diagnostics(&mut out, &faults, units, uri, first_text, Some(json!(*first)));
+                    }
                 }
             }
             if method == "initialized" && fault("register-sync") {
@@ -910,6 +970,22 @@ fn main() {
         }
         if unbalanced && fault("content-modified-while-unbalanced") {
             out.frame(&err(&id, -32801, "content modified"));
+            continue;
+        }
+        if unbalanced && fault("method-not-found-while-unbalanced") {
+            out.frame(&err(&id, -32601, "method not found"));
+            continue;
+        }
+        if unbalanced
+            && method == "textDocument/selectionRange"
+            && !held_one
+            && (fault("late-wrong-count") || fault("selection-from-later-text"))
+            && let Some(uri) = msg.pointer("/params/textDocument/uri").and_then(Value::as_str)
+            && let Some((_, version)) = docs.get(uri)
+        {
+            held_one = true;
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            held_selection = Some((id, params, uri.to_string(), *version));
             continue;
         }
         if method == "textDocument/hover" && fault("exit-on-first-hover") {
