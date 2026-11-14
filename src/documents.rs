@@ -1115,25 +1115,14 @@ fn judge_chain(
 }
 
 /// Judges one `textDocument/selectionRange` reply's array result against the
-/// request's `positions`, in `text` counted in `encoding`. The array length
-/// must equal the number of positions; each entry's range must contain its
-/// position, and every parent's range must contain its child's, all the way
-/// up the chain. `None` when the result isn't an array (a type error for a
-/// later check, not judged here).
-pub fn judge_selection_reply(
-    text: &str,
-    encoding: Encoding,
-    version: i64,
-    positions: &[Position],
-    result: &Value,
-) -> Option<SelectionReply> {
-    judge_selection(Some(&[text]), encoding, &version.to_string(), positions, result)
-}
-
-/// [`judge_selection_reply`] with D1's candidate rule: `texts` are the
-/// versions the reply may describe ([`candidates_for`]), and a containment
-/// fails only when it fails in every one, each with its own clamping (a reply
-/// may lawfully describe a later, shorter text). With `None`, one of them is
+/// request's `positions`, counted in `encoding`, with D1's candidate rule:
+/// `texts` are the versions the reply may describe ([`candidates_for`]). The
+/// array length must equal the number of positions; each entry's range must
+/// contain its position, and every parent's range must contain its child's,
+/// all the way up the chain. A containment fails only when it fails in every
+/// candidate text, each with its own clamping (a reply may lawfully describe
+/// a later, shorter text). `None` when the result isn't an array (a type
+/// error for a later check, not judged here). With `None`, one of them is
 /// a text lspcheck no longer keeps: only the entry count is judged, since one
 /// entry per position doesn't depend on the text. `version` names the
 /// request's version in that case.
@@ -1383,6 +1372,17 @@ pub fn judge_d2(docs: &[OpenDoc], published: &[Published], incomplete: Option<&s
 mod tests {
 
     use super::*;
+
+    /// D6's judgement of a reply about the single text `text`, at `version`.
+    fn judge_selection_reply(
+        text: &str,
+        encoding: Encoding,
+        version: i64,
+        positions: &[Position],
+        result: &Value,
+    ) -> Option<SelectionReply> {
+        judge_selection(Some(&[text]), encoding, &version.to_string(), positions, result)
+    }
 
     const URI: &str = "file:///w/doc.txt";
 

@@ -27,6 +27,11 @@
 
 - Profile durations may also be given in hours, such as `"1h"`.
 
+### Fixed
+
+- D6 in the documents scenario judges a `selectionRange` reply against every text it may describe (D1's candidate
+  rule), as the mutation scenario does, so a late reply about the changed, shorter text no longer fails.
+
 ## 0.4.0 (2026-11-11)
 
 ### Added

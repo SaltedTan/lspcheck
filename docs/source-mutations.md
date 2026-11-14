@@ -300,14 +300,11 @@ starts with its verdict and name (`FAIL in the mutation scenario: …; PASS in t
 winning one first, and each position, publish or reply the mutation scenario names says its case: a reply its
 request's, a publish the case in progress when it was read.
 
-The mutation scenario adapts two existing judges, because the documents scenario sends few versions and evicts none:
+Two existing judges take care in the mutation scenario, which sends many versions and evicts old texts:
 
-- **D6** clamps positions against the text current when the request was sent (`judge_selection_reply`). A reply may
-  lawfully describe a later text: a request names column 9 of a ten-character line, a later edit shortens it to three,
-  and a range ending at column 3 contains the position as clamped against that later text. In the mutation scenario D6
-  uses D1's candidate rule: an entry or parent fails only when containment fails against every candidate text, each
-  with its own clamping. A reply whose candidates include an evicted text has its containment left unjudged, and
-  counted; its entry count is still judged, since one entry per position doesn't depend on the text.
+- **D6** follows the shared [selection-range rules](design.md#documents-and-positions). In the mutation scenario,
+  a reply whose candidates include an evicted text has its containment left unjudged, and counted; its entry count
+  is still judged, since one entry per position doesn't depend on the text.
 - **D2** retains every version number sent, with when lspcheck began writing it, for the whole session
   (`OpenDoc::sent`, at most `cases × (steps + 1) + 1` per document). Evicting a text snapshot leaves that history
   intact, so a lawful publish labelled with an old version still passes.
@@ -457,6 +454,8 @@ a window. Lawful faults count replies, not milliseconds.
 |---|---|---|
 | `exit-on-unbalanced` | exit when a document's brackets become unbalanced | M1 fails |
 | `flood-while-unbalanced` | lawful: after a change leaves brackets unbalanced, write 2 MiB of log messages, and keep serving | With `--max-output-mib 1`, M1 `ERROR` (inspection stopped), never `FAIL` |
+| `configure-while-unbalanced` | lawful: after a change leaves brackets unbalanced, ask `workspace/configuration` for 100 items of section `big`, and keep serving without waiting for the answer | With a large `[client.configuration].big`, the answers reach the 64 MiB written-bytes cap: M1 and M2 `ERROR`, nothing fails, and restoration and `shutdown` are still sent |
+| `configure-on-shutdown` | before the `shutdown` reply, ask `workspace/configuration` for 256 items of section `big` | M1 and M2 pass: the withheld answer changes no M verdict, and `exit` follows `shutdown` |
 | `close-output-mid-restoration` | Unix only: partway through reading a large document's restoration, send 20,000 requests and close stdout, then read nothing more after it | M1 `ERROR` (the end of output is queued behind requests lspcheck can't answer before shutdown), never `PASS` |
 | `late-wrong-count` | answer one `selectionRange` with `[]` after more than 64 later versions | D6 fails from the mutation scenario, on the entry count alone (M2 fails too, as for `selection-from-later-text`) |
 | `recover-before-deadline` | lawful: after rebalancing, answer `documentSymbol` with `[]` until just before `recovery_timeout`, counted in replies to a poll schedule the test fixes, then with the baseline | nothing fails with `expect = "baseline"`: the terminal probe sees the baseline |
@@ -467,6 +466,7 @@ a window. Lawful faults count replies, not milliseconds.
 | `warning-after-unbalanced` | once unbalanced, publish an extra Warning forever | M3 fails with `expect = "baseline"` and pushed diagnostics as the only probe; passes with `no_errors = true` alone |
 | `method-not-found-while-unbalanced` | answer advertised requests with -32601 while unbalanced | K1 fails from the mutation scenario |
 | `selection-from-later-text` | lawful: hold one `selectionRange` until a later change leaves its position past the end of its line, then answer from that text | D6 passes (M2 fails: the reply is necessarily later than `--timeout`, since the next version is sent only after the request's wait) |
+| `selection-from-changed-text` | lawful: as `selection-from-later-text`, for the first `selectionRange` about any document | with `utf8-encoding`, D6 passes in the documents scenario, whose version 42 leaves `name`'s end past its line (K1 `ERROR`: its own `selectionRange` is never answered) |
 | `old-version-diagnostics` | lawful: 65 versions after a document's first change, publish that change's diagnostics again, labelled with its version | D2 passes; D1 counts the positions as not judged |
 | `codepoint-positions-after-change` (exists) | count positions in code points after a change | D1 fails from the mutation scenario (with `unicode`) |
 | `diagnostics-own-version` (exists) | label diagnostics with its own counter | D2 fails from the mutation scenario (with two seed files, so the counter runs ahead of each) |

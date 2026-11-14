@@ -5,6 +5,7 @@ Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 **Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). v0.4.0 expands the [example profile catalogue](../examples/profiles/README.md) to 18 servers and the [stock-server CI matrix](../ci/stock-servers/README.md) to 11, accepts unknown values of the tag and kind enumerations clients must tolerate in K2, refines [K2's failure detail](#capabilities-and-robustness), and [isolates Content-Type probes](#framing-and-output). M4 is done (see the [integration milestone](#milestones)). Next is [seeded source mutation](source-mutations.md), whose design is accepted; steps 1 to 4 are implemented. See the
 [mutation implementation status](source-mutations.md) for current behavior and the
 [implementation plan](source-mutations.md#implementation-plan) for the remaining steps.
+D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios.
 See the [changelog](../CHANGELOG.md) for changes by release.
 
 ## Purpose
@@ -295,14 +296,18 @@ The design's original rule (a), "D1's positions in LF-only document A were infor
 for the reason D3 dropped its own: valid positions elsewhere never prove the server splits B's lines correctly.
 
 D6 judges the `selectionRange` replies to the requests lspcheck sent about the open documents (A at 41 or 42, B at
-7), read while each was open (the same windows D1 uses). The text a reply refers to is the version current when its
-request was sent; it is used only to clamp. For each reply with an array result, compared against the request's own
-`positions`:
+7), read while each was open (the same windows D1 uses). A reply may describe any text D1's candidate rule allows: the
+version current when its request was sent, or one sent before the reply was read, should a change have overtaken it.
+The documents scenario keeps every text, so no candidate is evicted. The texts are used only to clamp. For example,
+a request names column 9 of a ten-character line, a later edit shortens it to three, and a range ending at column 3
+contains the position as clamped against that later text. For each reply with an array result, compared against the
+request's own `positions`:
 
 - **skip:** `selectionRangeProvider` isn't advertised, or no `didOpen` (as D1).
 - **fail:** the array's length isn't the number of positions sent; a `result[i].range` doesn't contain `positions[i]`
   (start ≤ position ≤ end, comparing (line, character) pairs, after clamping each character to its line's length in
-  the negotiated encoding); or a `parent.range` doesn't contain its child's range, anywhere up the chain. A seen
+  the negotiated encoding); or a `parent.range` doesn't contain its child's range, anywhere up the chain. A
+  containment fails only when it fails against every candidate text, each with its own clamping. A seen
   failure stands even when evidence is incomplete. The detail names the first few. When a containment comparison
   fails under the spec's split but succeeds on the same text under one of D5's three wrong splits, the detail names
   every such split as a hint. The verdict and counts are unchanged; LF-only document A never gets a hint because its

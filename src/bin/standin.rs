@@ -237,6 +237,11 @@ const FAULTS: &[(&str, &str)] = &[
          didChange leaves one of its positions past the end of its line, then answer it from that text",
     ),
     (
+        "selection-from-changed-text",
+        "lawful: hold the first selectionRange request until a later didChange leaves one of its positions past the \
+         end of its line, then answer it from that text",
+    ),
+    (
         "old-version-diagnostics",
         "lawful: once 65 versions of a document have been read after its first didChange, publish that change's \
          diagnostics again, labelled with its version",
@@ -437,9 +442,9 @@ fn main() {
     let mut negotiated_units = Units::Utf16;
     // For diagnostics-own-version: the stand-in's own diagnostics counter.
     let mut own_version = 0i64;
-    // For late-wrong-count and selection-from-later-text: the selectionRange
-    // request held (its id, params, document and that document's version),
-    // and whether one was.
+    // For late-wrong-count, selection-from-later-text and
+    // selection-from-changed-text: the selectionRange request held (its id,
+    // params, document and that document's version), and whether one was.
     let mut held_selection: Option<(Value, Value, String, i64)> = None;
     let mut held_one = false;
     // For old-version-diagnostics: each document's first changed version and
@@ -976,10 +981,10 @@ fn main() {
             out.frame(&err(&id, -32601, "method not found"));
             continue;
         }
-        if unbalanced
-            && method == "textDocument/selectionRange"
+        if method == "textDocument/selectionRange"
             && !held_one
-            && (fault("late-wrong-count") || fault("selection-from-later-text"))
+            && ((unbalanced && (fault("late-wrong-count") || fault("selection-from-later-text")))
+                || fault("selection-from-changed-text"))
             && let Some(uri) = msg.pointer("/params/textDocument/uri").and_then(Value::as_str)
             && let Some((_, version)) = docs.get(uri)
         {
