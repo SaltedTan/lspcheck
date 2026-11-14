@@ -2762,6 +2762,78 @@ fn content_modified_answers_to_broken_source_are_lawful() {
     assert!(m2.as_str().unwrap().contains("errors by code: -32801 ×"), "{m2}");
 }
 
+/// The messages a transcript says went `dir` ("out" or "in"), in order.
+fn recorded_messages(transcript: &std::path::Path, dir: &str) -> Vec<Value> {
+    let mut reader = FrameReader::default();
+    std::fs::read_to_string(transcript)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["dir"] == dir)
+        .flat_map(|event| reader.feed(event["data"].as_str().unwrap().as_bytes()))
+        .filter_map(|chunk| match chunk {
+            Chunk::Frame { body, .. } => serde_json::from_slice(&body).ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn answers_to_the_servers_requests_are_held_to_the_mutation_byte_cap() {
+    // Each unbalancing change brings a configuration request whose answer is
+    // about 25 MiB, so the third answer doesn't fit the 64 MiB cap.
+    let fixture = std::fs::read_to_string(mutation_profile()).unwrap();
+    let big = "x".repeat(256 * 1024);
+    let (path, _dir) = profile(&format!("{fixture}\n[client.configuration]\nbig = '{big}'\n"));
+    let (r, t, _keep) = run_with_transcripts(
+        &["--fault", "configure-while-unbalanced"],
+        &["--profile", path.to_str().unwrap(), "--mutate", "--only", "M1,M2"],
+    );
+    // lspcheck's bound, never a failure: the cases it didn't run are unjudged.
+    expect(&r, "M1", "error");
+    expect(&r, "M2", "error");
+    assert!(r.verdicts.values().all(|v| v != "fail"), "{}", r.stdout);
+    assert_eq!(r.status, 2, "{}", r.stdout);
+    let stopped = r.report["mutation"]["stopped"].as_str().unwrap();
+    assert!(
+        stopped
+            .starts_with("answers to the server's requests reached the scenario's written-bytes cap of 64 MiB before "),
+        "{stopped}"
+    );
+    assert!(stopped.contains("lspcheck left the server's workspace/configuration request unanswered"), "{stopped}");
+    let cases_run = r.report["mutation"]["cases_run"].as_u64().unwrap();
+    assert!((1..4).contains(&cases_run), "{cases_run}");
+    for id in ["M1", "M2"] {
+        let result = r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == id).unwrap();
+        assert!(result["detail"].as_str().unwrap().contains(stopped), "{id}: {}", result["detail"]);
+    }
+
+    let transcript = t.join("mutation.jsonl");
+    let asked =
+        recorded_messages(&transcript, "in").into_iter().filter(|m| m["method"] == "workspace/configuration").count();
+    let sent = recorded_messages(&transcript, "out");
+    let answers: Vec<&Value> =
+        sent.iter().filter(|m| m["id"].as_str().is_some_and(|id| id.starts_with("configure-"))).collect();
+    assert_eq!(answers.len(), 2, "{asked} asked");
+    assert!(asked > answers.len());
+    assert!(answers.iter().all(|a| a["result"].as_array().unwrap().iter().all(|item| item == big.as_str())));
+    // The restoration and the shutdown are still sent, from their reserve,
+    // and everything written fits the cap.
+    let methods: Vec<&str> = sent.iter().filter_map(|m| m["method"].as_str()).collect();
+    assert!(methods.ends_with(&["textDocument/didChange", "shutdown", "exit"]), "{methods:?}");
+    let clean = &sent.iter().find(|m| m["method"] == "textDocument/didOpen").unwrap()["params"]["textDocument"]["text"];
+    let restoration = sent.iter().rfind(|m| m["method"] == "textDocument/didChange").unwrap();
+    assert_eq!(&restoration["params"]["contentChanges"][0]["text"], clean);
+    let written: usize = std::fs::read_to_string(&transcript)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["dir"] == "out")
+        .map(|event| event["data"].as_str().unwrap().len())
+        .sum();
+    assert!(written <= lspcheck::checks::MUTATION_BYTES as usize, "{written}");
+}
+
 #[test]
 fn mutation_openings_must_fit_the_byte_cap_before_any_are_sent() {
     let (path, keep) = profile("");

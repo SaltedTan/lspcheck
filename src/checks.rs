@@ -3463,8 +3463,8 @@ fn opens_documents(reply: &Message) -> bool {
     }
 }
 
-/// The mutation scenario's byte-admission cap; automatic answers can exceed
-/// it for now ([step 3's limits](../docs/source-mutations.md#step-3)).
+/// The cap on everything the mutation scenario writes, automatic answers to
+/// the server's requests included ([bounds](../docs/source-mutations.md#bounds)).
 pub const MUTATION_BYTES: u64 = 64 * 1024 * 1024;
 /// What a case reserves for each request it may send, beyond its document's URI.
 const REQUEST_RESERVE: u64 = 2048;
@@ -3519,12 +3519,43 @@ enum Lost {
     Uninspected(String),
     /// A write lspcheck couldn't finish, with no exit seen.
     Undelivered(String),
+    /// The server exited or closed its output, first seen after lspcheck
+    /// had left one of its requests unanswered at the written-bytes cap.
+    AfterWithheld(String),
+}
+
+/// What lspcheck saw become of the server, given whether it had already
+/// withheld an answer before it looked: an exit or end of output a server
+/// left waiting may have come to isn't held against it.
+fn unless_withheld(how: Lost, withheld: bool) -> Lost {
+    match how {
+        Lost::Gone(why) if withheld => Lost::AfterWithheld(format!(
+            "{why} after lspcheck had left one of its requests unanswered at the written-bytes cap"
+        )),
+        how => how,
+    }
+}
+
+/// Why the mutation scenario stops for the written-bytes cap before writing
+/// `next` more bytes at `place`, if it must: it left an answer to one of the
+/// server's requests unwritten, or the answers it wrote left too little room.
+fn answers_capped(s: &Session, next: u64, place: &str) -> Option<String> {
+    let why = match s.answer_withheld() {
+        Some((_, why)) => why.clone(),
+        None if !s.fits(next) => format!("they left too little room for the {next} bytes of {place}"),
+        None => return None,
+    };
+    Some(format!(
+        "answers to the server's requests reached the scenario's written-bytes cap of {} MiB before {place}: {why}",
+        MUTATION_BYTES / (1024 * 1024)
+    ))
 }
 
 /// Classifies a failed write after waiting up to `--exit-timeout`: stopped
 /// inspection takes precedence over exit or EOF evidence, and without
 /// either the write is undelivered.
 async fn lost_after_write(ctx: &mut Ctx<'_>, what: &str, e: &WriteError) -> Lost {
+    let withheld = ctx.s.answer_withheld().is_some();
     if let Some((_, why)) = ctx.s.stopped_reading() {
         return Lost::Uninspected(why);
     }
@@ -3533,17 +3564,19 @@ async fn lost_after_write(ctx: &mut Ctx<'_>, what: &str, e: &WriteError) -> Lost
     if let Some((_, why)) = ctx.s.stopped_reading() {
         return Lost::Uninspected(why);
     }
-    match status {
+    let how = match status {
         Some(status) => Lost::Gone(format!("the server exited with {}", session::describe_status(status))),
         None if ctx.s.stdout_closed() => Lost::Gone("the server closed its output".into()),
         None => Lost::Undelivered(format!("lspcheck couldn't deliver {what} ({e})")),
-    }
+    };
+    unless_withheld(how, withheld)
 }
 
 /// What lspcheck saw when the server's output ended: lspcheck stopped
 /// reading it, or the server closed it (with its exit status, if it exits
 /// within `--exit-timeout`).
 async fn lost_output(ctx: &mut Ctx<'_>) -> Lost {
+    let withheld = ctx.s.answer_withheld().is_some();
     if let Some((_, why)) = ctx.s.stopped_reading() {
         return Lost::Uninspected(why);
     }
@@ -3551,10 +3584,11 @@ async fn lost_output(ctx: &mut Ctx<'_>) -> Lost {
     if let Some((_, why)) = ctx.s.stopped_reading() {
         return Lost::Uninspected(why);
     }
-    match status {
+    let how = match status {
         Some(status) => Lost::Gone(format!("the server exited with {}", session::describe_status(status))),
         None => Lost::Gone("the server closed its output".into()),
-    }
+    };
+    unless_withheld(how, withheld)
 }
 
 /// A `didChange` notification's params.
@@ -3723,16 +3757,23 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         ctx.mutation = Some(summary);
         return;
     }
+    // Until the startup messages are written, answers may use only what they
+    // and shutdown leave.
+    ctx.s.cap_answers(MUTATION_BYTES, startup_bytes);
     let reply = match ctx.initialize_prepared(&id, params).await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
-            let why = format!("initialize didn't succeed: {why}");
+            let why = match answers_capped(&ctx.s, 0, "the reply to initialize") {
+                Some(capped) => format!("{capped}; then initialize didn't succeed: {why}"),
+                None => format!("initialize didn't succeed: {why}"),
+            };
             both(ctx, Verdict::Error, why.clone());
             summary.stopped = Some(why);
             ctx.mutation = Some(summary);
             return;
         }
     };
+    ctx.s.cap_answers(MUTATION_BYTES, SHUTDOWN_RESERVE);
     let Some(caps) = initialize_capabilities(&reply).filter(|c| c.is_object()).cloned() else {
         let why = "initialize had no capabilities object (see L2)".to_string();
         both(ctx, Verdict::Error, why.clone());
@@ -3802,6 +3843,13 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             version: 1,
         });
     }
+    if let Some(why) = answers_capped(&ctx.s, 0, "the seed files were opened") {
+        both(ctx, Verdict::Error, why.clone());
+        summary.stopped = Some(why);
+        ctx.mutation = Some(summary);
+        leave(ctx).await;
+        return;
+    }
     let openings: Vec<Value> = docs
         .iter()
         .map(|doc| {
@@ -3825,7 +3873,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     for (doc, params) in docs.iter().zip(openings) {
         if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(params)).await {
             let why = match lost_after_write(ctx, &format!("didOpen for {}", doc.name), &e).await {
-                Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) => why,
+                Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) | Lost::AfterWithheld(why) => why,
             };
             let why = format!("before the first mutation: {why}");
             both(ctx, Verdict::Error, why.clone());
@@ -3862,7 +3910,13 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     let mut versions = 0u64;
     let mut lost: Option<(Lost, String)> = None;
     let mut cut_short = 0u64;
+    // Why the written-bytes cap stopped the run, if it did.
+    let mut capped: Option<String> = None;
     'cases: for k in 0..settings.cases {
+        if let Some(why) = answers_capped(&ctx.s, 0, &format!("case {k}")) {
+            capped = Some(why);
+            break;
+        }
         let admitted = Instant::now();
         let Some(case_deadline) = mutation_case_deadline(admitted, run_deadline, case_budget) else {
             summary.stopped = Some(format!(
@@ -3895,18 +3949,19 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             };
             next_version[d] += 1;
             let params = did_change(&docs[d].uri, next_version[d], &changes);
-            reserve += notification_bytes("textDocument/didChange", &params);
+            let change_bytes = notification_bytes("textDocument/didChange", &params);
+            reserve += change_bytes;
             reserve += settings.requests_per_step as u64 * (REQUEST_RESERVE + 2 * docs[d].uri.len() as u64);
             texts[d] = after.clone();
-            steps.push((step, params, after, next_version[d]));
+            steps.push((step, params, change_bytes, after, next_version[d]));
         }
-        match restoration_reserve(
+        let restoring = match restoration_reserve(
             &docs,
-            steps.iter().map(|(step, _, after, version)| (step.document, after.as_str(), *version)),
+            steps.iter().map(|(step, _, _, after, version)| (step.document, after.as_str(), *version)),
             encoding,
             sync,
         ) {
-            Ok(bytes) => reserve += bytes,
+            Ok(bytes) => bytes,
             Err(e) => {
                 both(ctx, Verdict::Error, format!("case {k}: {e}"));
                 summary.stopped = Some(format!("case {k}: {e}"));
@@ -3914,7 +3969,8 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 restore_and_leave(ctx, &mut docs, encoding, sync).await;
                 return;
             }
-        }
+        };
+        reserve += restoring;
         if ctx.s.bytes_written() + reserve > MUTATION_BYTES {
             summary.stopped = Some(format!(
                 "case {k} could write up to {reserve} bytes, past the scenario's cap of {} MiB with {} written",
@@ -3923,9 +3979,13 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             ));
             break;
         }
+        // The case's own writes fit, as reserved; answers may use only what
+        // its restoration and shutdown leave, and each step checks it still
+        // fits beside them.
+        ctx.s.cap_answers(MUTATION_BYTES, restoring + SHUTDOWN_RESERVE);
         let record: Vec<Value> = steps
             .iter()
-            .map(|(step, _, _, version)| {
+            .map(|(step, _, _, _, version)| {
                 json!({
                     "document": docs[step.document].name,
                     "version": version,
@@ -3936,19 +3996,27 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         ctx.s.record_mutation(json!({"format": mutation::FORMAT, "seed": seed, "case": k, "steps": record}));
         summary.cases_run += 1;
         let mut rng = mutation::SplitMix64::stream(seed, k, "requests");
-        for (j, (step, params, after, version)) in steps.iter().enumerate() {
+        for (j, (step, params, change_bytes, after, version)) in steps.iter().enumerate() {
             if Instant::now() >= case_deadline {
                 cut_short += 1;
                 break;
             }
             let d = step.document;
             let place = format!("case {k}, step {} ({})", j + 1, describe_edits(step));
+            if let Some(why) = answers_capped(&ctx.s, 0, &place) {
+                capped = Some(why);
+                break;
+            }
             if first_change.is_none() && (ctx.s.output_closed().await || !ctx.s.is_alive()) {
                 lost = Some((lost_output(ctx).await, place));
                 break 'cases;
             }
             if Instant::now() >= case_deadline {
                 cut_short += 1;
+                break;
+            }
+            if let Some(why) = answers_capped(&ctx.s, *change_bytes, &format!("the didChange of {place}")) {
+                capped = Some(why);
                 break;
             }
             let change_at = ctx.s.elapsed();
@@ -3983,6 +4051,14 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 let id = ctx.s.fresh_id();
                 let bytes = frame(&message::request(&id, method, Some(params)));
                 let registered = ctx.s.begin_request(&id, method, Instant::now() + timeout).await;
+                // Registering took in what the server sent, answering it.
+                if registered.is_ok()
+                    && let Some(why) = answers_capped(&ctx.s, bytes.len() as u64, &format!("{method} in {place}"))
+                {
+                    ctx.s.abort_request(&id);
+                    capped = Some(why);
+                    break;
+                }
                 let at = ctx.s.elapsed();
                 let deadline_at = at + timeout;
                 let deadline = Instant::now() + timeout;
@@ -4028,6 +4104,9 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 lost = Some((lost_output(ctx).await, place));
                 break 'cases;
             }
+            if capped.is_some() {
+                break;
+            }
         }
         // The restoration is always sent, even when the case's budget ran out.
         for doc in docs.iter_mut() {
@@ -4055,18 +4134,28 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             doc.version = version;
             versions += 1;
         }
+        ctx.s.cap_answers(MUTATION_BYTES, SHUTDOWN_RESERVE);
         // An exit or the end of output between cases is still M1's.
         if ctx.s.output_closed().await || !ctx.s.is_alive() {
             lost = Some((lost_output(ctx).await, format!("after case {k}")));
+            break;
+        }
+        if capped.is_some() {
             break;
         }
     }
     if cut_short > 0 {
         ctx.s.note(format!("{cut_short} case(s) ran out of their budget before their last step"));
     }
-    leave_mutation(ctx, summary, first_change, versions, lost, &asked).await;
+    if let Some(why) = &capped {
+        ctx.s.note(why.clone());
+        summary.stopped = Some(why.clone());
+    }
+    leave_mutation(ctx, summary, first_change, versions, lost, &asked, capped.as_deref()).await;
 }
 
+/// Judges M1 and M2 and shuts the server down. `capped` says why the
+/// written-bytes cap stopped the run before its cases were done, if it did.
 async fn leave_mutation(
     ctx: &mut Ctx<'_>,
     mut summary: MutationSummary,
@@ -4074,6 +4163,7 @@ async fn leave_mutation(
     versions: u64,
     mut lost: Option<(Lost, String)>,
     asked: &[StepRequest],
+    capped: Option<&str>,
 ) {
     // Everything already read is taken in before M1 is judged: an end of
     // output queued behind it would otherwise go unseen.
@@ -4083,8 +4173,13 @@ async fn leave_mutation(
     let registered = ctx.s.begin_request(&id, "shutdown", deadline).await;
     let exited = !ctx.s.is_alive();
     if ctx.s.stdout_closed() || exited || ctx.s.stopped_reading().is_some() {
-        let place = lost.map(|(_, place)| place).unwrap_or_else(|| "the cases and their restorations".into());
-        lost = Some((lost_output(ctx).await, place));
+        let seen = lost.take();
+        let place = seen.as_ref().map_or_else(|| "the cases and their restorations".into(), |(_, p)| p.clone());
+        lost = match (seen, lost_output(ctx).await) {
+            // A loss seen before an answer was withheld stays M1's.
+            (Some((Lost::Gone(why), _)), Lost::AfterWithheld(_)) => Some((Lost::Gone(why), place)),
+            (_, how) => Some((how, place)),
+        };
     } else if (!drained || registered.is_err()) && !matches!(lost, Some((Lost::Gone(_), _))) {
         // What lspcheck couldn't read may hold the end of output: neither a
         // pass nor a failure.
@@ -4092,11 +4187,13 @@ async fn leave_mutation(
         let why = "lspcheck couldn't finish reading what the server had sent before shutdown".to_string();
         lost = Some((Lost::Uninspected(why), place));
     }
-    if let Some((Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why), place)) = &lost {
+    if let Some((Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) | Lost::AfterWithheld(why), place)) =
+        &lost
+    {
         summary.stopped = Some(format!("{why} during {place}"));
     }
-    judge_m1(ctx, &summary, first_change, versions, lost);
-    judge_m2(ctx, asked);
+    judge_m1(ctx, &summary, first_change, versions, lost, capped.is_some());
+    judge_m2(ctx, asked, capped);
     ctx.mutation = Some(summary);
     if registered.is_ok() {
         let bytes = frame(&message::request(&id, "shutdown", None));
@@ -4124,13 +4221,16 @@ async fn restore_and_leave(ctx: &mut Ctx<'_>, docs: &mut [SeedDoc], encoding: En
 }
 
 /// M1: the server neither exited nor closed its output after the first
-/// mutation's `didChange` was fully written and before `shutdown`.
+/// mutation's `didChange` was fully written and before `shutdown`. A run
+/// the written-bytes cap stopped early (`capped`) can still fail, but not
+/// pass: the cases it didn't run are unjudged.
 fn judge_m1(
     ctx: &mut Ctx<'_>,
     summary: &MutationSummary,
     first_change: Option<Duration>,
     versions: u64,
     lost: Option<(Lost, String)>,
+    capped: bool,
 ) {
     let stopped = summary.stopped.as_ref().map(|why| format!("; no further case started: {why}")).unwrap_or_default();
     match (lost, first_change) {
@@ -4146,13 +4246,19 @@ fn judge_m1(
         (Some((Lost::Undelivered(why), place)), _) => {
             ctx.report("M1", Verdict::Error, format!("{why} during {place}, and the server didn't exit"));
         }
+        (Some((Lost::AfterWithheld(why), place)), _) => {
+            ctx.report("M1", Verdict::Error, format!("{why} during {place}, so it isn't held against the server"));
+        }
+        // A run the cap stopped early leaves cases unjudged: the detail is
+        // the same, with why no further case started.
         (None, None) => ctx.report(
             "M1",
-            Verdict::NotExercised,
+            if capped { Verdict::Error } else { Verdict::NotExercised },
             format!("no case ran{}", summary.stopped.as_ref().map(|w| format!(": {w}")).unwrap_or_default()),
         ),
-        (None, Some(_)) => ctx.pass_with(
+        (None, Some(_)) => ctx.report(
             "M1",
+            if capped { Verdict::Error } else { Verdict::Pass },
             format!(
                 "the server kept running through {} case(s) and {versions} mutated or restored version(s){stopped}",
                 summary.cases_run
@@ -4162,8 +4268,9 @@ fn judge_m1(
 }
 
 /// M2: every request delivered after a mutation got a response within
-/// `--timeout`. A request pending when the server exited is M1's.
-fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest]) {
+/// `--timeout`. A request pending when the server exited is M1's. A run the
+/// written-bytes cap stopped early (`capped`) can still fail, but not pass.
+fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest], capped: Option<&str>) {
     let unanswered: Vec<&StepRequest> = asked.iter().filter(|r| matches!(r.outcome, StepOutcome::Unanswered)).collect();
     if let Some(first) = unanswered.first() {
         let more = if unanswered.len() > 1 { format!(" and {} more", unanswered.len() - 1) } else { String::new() };
@@ -4199,6 +4306,11 @@ fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest]) {
             _ => None,
         })
         .collect();
+    if let Some(why) = capped {
+        let detail =
+            format!("{} request(s) after a mutation got a response, but the run stopped early: {why}", answered.len());
+        return ctx.report("M2", Verdict::Error, detail);
+    }
     if answered.is_empty() {
         return ctx.report("M2", Verdict::NotExercised, "no request was answered or left unanswered after a mutation");
     }
@@ -5155,7 +5267,7 @@ while header := sys.stdin.buffer.readline():
             let mut ctx = mutation_test_ctx(&cfg, 1024).await;
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, first_change, 1, None, &[]).await;
+            leave_mutation(&mut ctx, summary, first_change, 1, None, &[], None).await;
             assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, expected);
             assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::NotExercised);
             ctx.s.finish(Duration::from_millis(200)).await;
@@ -5179,7 +5291,7 @@ while header := sys.stdin.buffer.readline():
                 }
                 let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
                 let lost = Some((Lost::Undelivered("failed write".into()), "restoring case 0".into()));
-                leave_mutation(&mut ctx, summary, first_change, 1, lost, &[]).await;
+                leave_mutation(&mut ctx, summary, first_change, 1, lost, &[], None).await;
                 let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
                 assert_eq!(m1.verdict, expected, "{}", m1.detail);
                 if first_change.is_some() {
@@ -5204,7 +5316,8 @@ while header := sys.stdin.buffer.readline():
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
             let place = if lost.is_some() { "case 0, step 1" } else { "the cases and their restorations" };
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost.map(|how| (how, place.into())), &[]).await;
+            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost.map(|how| (how, place.into())), &[], None)
+                .await;
             let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
             assert_eq!(m1.verdict, Verdict::Error, "{}", m1.detail);
             assert!(
@@ -5215,6 +5328,32 @@ while header := sys.stdin.buffer.readline():
             let stopped = ctx.mutation.as_ref().unwrap().stopped.as_deref().unwrap();
             assert!(stopped.ends_with(&format!("during {place}")), "{stopped}");
             assert!(!stopped.starts_with("exit") && !stopped.starts_with("failed write"), "{stopped}");
+            ctx.s.finish(Duration::from_millis(200)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_exit_after_a_withheld_answer_isnt_m1s_failure() {
+        let request = message::request(&Id::int(1), "workspace/configuration", Some(json!({"items": [{}]})));
+        let request = String::from_utf8(frame(&request)).unwrap();
+        // An exit seen only after the answer was withheld is an error; one
+        // seen before it (recorded as lost) stays a failure.
+        for (seen_before, expected) in [(false, Verdict::Error), (true, Verdict::Fail)] {
+            let cfg = mutation_test_config(&format!("printf '%s' '{request}'; exit 0"));
+            let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+            ctx.s.cap_answers(MUTATION_BYTES, MUTATION_BYTES);
+            ctx.s.drain(Instant::now() + Duration::from_secs(5)).await;
+            assert!(ctx.s.answer_withheld().is_some());
+            assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
+            let lost = seen_before.then(|| (Lost::Gone("the server exited with status 0".into()), "case 0".into()));
+            let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
+            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost, &[], None).await;
+            let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
+            assert_eq!(m1.verdict, expected, "{}", m1.detail);
+            if !seen_before {
+                assert!(m1.detail.contains("after lspcheck had left one of its requests unanswered"), "{}", m1.detail);
+            }
             ctx.s.finish(Duration::from_millis(200)).await;
         }
     }
@@ -5234,7 +5373,7 @@ while header := sys.stdin.buffer.readline():
             outcome: StepOutcome::Unanswered,
         }];
         let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-        leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, None, &asked).await;
+        leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, None, &asked, None).await;
         assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, Verdict::Fail);
         assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::Fail);
         assert_eq!(asked[0].outcome, StepOutcome::Unanswered);
@@ -5288,7 +5427,7 @@ while header := sys.stdin.buffer.readline():
             }
             assert_eq!(asked[0].outcome, if observe_timeout { StepOutcome::Unanswered } else { StepOutcome::Gone });
             assert_eq!(asked[1].outcome, StepOutcome::Gone);
-            judge_m2(&mut ctx, &asked);
+            judge_m2(&mut ctx, &asked, None);
             let m2 = ctx.results.iter().find(|r| r.id == "M2").unwrap();
             assert_eq!(m2.verdict, if observe_timeout { Verdict::Fail } else { Verdict::NotExercised });
             if observe_timeout {
@@ -5398,7 +5537,7 @@ while header := sys.stdin.buffer.readline():
                 outcome: StepOutcome::Unanswered,
             },
         ];
-        judge_m2(&mut ctx, &asked);
+        judge_m2(&mut ctx, &asked, None);
         let result = ctx.results.iter().find(|r| r.id == "M2").unwrap();
         assert_eq!(result.verdict, Verdict::Fail);
         assert_eq!(

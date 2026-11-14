@@ -205,6 +205,11 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: after a didChange that leaves a document's brackets unbalanced, write 2 MiB of log messages, and \
          keep serving",
     ),
+    (
+        "configure-while-unbalanced",
+        "lawful: after a didChange that leaves a document's brackets unbalanced, ask workspace/configuration for 100 \
+         items of section `big`, and keep serving without waiting for the answer",
+    ),
     ("ignore-while-unbalanced", "never answer a request about a document whose brackets are unbalanced"),
     (
         "close-output-mid-restoration",
@@ -693,6 +698,13 @@ fn main() {
                     for _ in 0..2100 {
                         out.frame(&log);
                     }
+                }
+                if unbalanced && fault("configure-while-unbalanced") {
+                    // With a large `big` setting, a few answers reach the
+                    // mutation scenario's written-bytes cap.
+                    let items = vec![json!({"section": "big"}); 100];
+                    let id = format!("configure-{version}");
+                    out.frame(&json!({"jsonrpc": "2.0", "id": id, "method": "workspace/configuration", "params": {"items": items}}));
                 }
                 if !fault("no-diagnostics") {
                     let mut label = Some(json!(version));
