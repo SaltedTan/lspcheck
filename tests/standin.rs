@@ -1976,14 +1976,11 @@ fn code_point_positions_after_a_correct_change_are_a_counting_fault() {
 
 #[test]
 fn an_undeliverable_change_errors_d3_but_keeps_d1s_failure() {
-    // The stand-in publishes version 41's diagnostics with a position inside
-    // the first character, then exits: lspcheck's `didChange` can't be
-    // delivered, so D3 is an error, but D1's failure stands and D2 is still
-    // judged (the diagnostic's version 41 was sent). The server is gone, so
-    // D4 can't be judged either. The requests at version 41 either can't be
-    // written or are cut off by the closed output, depending on when the
-    // server's exit lands; both leave the selectionRange request unanswerable,
-    // so D6 is an error either way.
+    // The stand-in closes stdin before publishing version 41's diagnostics
+    // with a position inside the first character, then exits. The closed
+    // pipe makes didChange undeliverable, so D3 is an error, while D1's
+    // failure stands and D2 still judges the diagnostic's version 41.
+    // D4, D5 and D6 can't be judged: their writes are undeliverable too.
     let r = fault("close-stdin-before-change");
     passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D4", "error"), ("D5", "error"), ("D6", "error")]);
     assert_eq!(r.status, 1, "D1 is a MUST check");
