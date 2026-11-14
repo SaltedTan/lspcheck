@@ -210,6 +210,10 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: after a didChange that leaves a document's brackets unbalanced, ask workspace/configuration for 100 \
          items of section `big`, and keep serving without waiting for the answer",
     ),
+    (
+        "configure-on-shutdown",
+        "before the shutdown reply, ask workspace/configuration for 256 items of section `big`",
+    ),
     ("ignore-while-unbalanced", "never answer a request about a document whose brackets are unbalanced"),
     (
         "close-output-mid-restoration",
@@ -1244,6 +1248,10 @@ fn main() {
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
+                if fault("configure-on-shutdown") {
+                    let items = vec![json!({"section": "big"}); 256];
+                    out.frame(&json!({"jsonrpc": "2.0", "id": "configure-shutdown", "method": "workspace/configuration", "params": {"items": items}}));
+                }
                 let result = if fault("shutdown-result") { json!({}) } else { Value::Null };
                 if fault("exit-on-shutdown") {
                     // Exit first and have a helper deliver the reply, so the
