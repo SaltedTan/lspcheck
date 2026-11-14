@@ -336,7 +336,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   `--help` until recovery (M3) is judged: `lspcheck --profile p.toml --mutate [--mutation-seed N]
   [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2. See the
   [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
-  [step 3's limits](docs/source-mutations.md#step-3) for what is implemented so far. The JSON `mutation.stopped`
+  [implementation status](docs/source-mutations.md) for what is implemented so far, including the
+  [written-bytes bound on automatic answers](docs/source-mutations.md#bounds). The JSON `mutation.stopped`
   field records why the scenario stopped early, including initialization and seed-file errors.
   An observed request timeout still fails M2 if the server exits later in the same batch.
   Reply windows interrupted by an unfinished client write are `ERROR`.

@@ -401,14 +401,16 @@ protocol rule: reaching one gives `ERROR` or `N/E` with the bound named, or just
 
 The session enforces the cap on answers in its send path. Before it writes an automatic answer, it checks the
 answer's serialized size against what the cap leaves beside the current reserve: during startup, the startup messages
-and shutdown; during a case, the case's restoration and shutdown; otherwise, shutdown. An answer that doesn't fit isn't
-written, and the transcript says why. A server left waiting may lawfully hold back what it would send, so lspcheck's
+and shutdown; during a case, the case's restoration and shutdown; otherwise, shutdown. Startup keeps the full
+`initialize` request reserved even while waiting for its reply. An answer that doesn't fit isn't written, and the
+transcript says why. A server left waiting may lawfully hold back what it would send, so lspcheck's
 inspection counts as incomplete from when that request was read: no reply missing since then fails, and an exit or end
 of output first seen after the answer was withheld makes M1 `ERROR`. The scenario then starts no further step or case
 (a step whose own `didChange` or request no longer fits beside the reserve, because answers used its room, stops it
 the same way), sends the current case's restoration and shutdown, and `mutation.stopped` says that answers to the
 server's requests reached the cap. When the run stops early this way, M1 and M2 can still fail on what lspcheck saw,
-but not pass: the cases not run make them `ERROR`. Until step 5, M3 stays `SKIP`.
+but not pass: the cases not run make them `ERROR`. An answer withheld while waiting for shutdown also makes M1 and M2
+`ERROR` unless they fail on earlier evidence, and is included in `mutation.stopped`. Until step 5, M3 stays `SKIP`.
 
 ### Reports, transcripts and reproduction
 
@@ -543,10 +545,8 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
   so far plus the case's reserve fit the written-bytes cap; the reserve counts the case's `didChange` notifications at
   their exact size, 2 KiB plus twice the URI's length for each request, and 1 KiB for `shutdown` and `exit`. For each
   document, the restoration reserve is the largest restoration notification over every step's resulting text and
-  version, plus a small margin, even if the plan ends with the clean text. Answers to the server's own requests
-  anywhere in the mutation scenario (startup, cases, early leave and shutdown) are held to the 64 MiB cap before
-  each write, in the session's send path, as [Bounds](#bounds) describes (added in step 4); they also count towards
-  the next case's check.
+  version, plus a small margin, even if the plan ends with the clean text. Answers to the server's own requests also
+  count towards the next case's check; see [Bounds](#bounds) for their admission rule (added in step 4).
 - Each request's deadline is `--timeout` from when lspcheck began writing it; the step's requests are written back to
   back and then waited for in order, each until its own deadline. Answering queued server requests happens before
   that window starts. Before later writes, after each wait and before classifying a failed write, lspcheck absorbs

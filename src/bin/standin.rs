@@ -210,10 +210,7 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: after a didChange that leaves a document's brackets unbalanced, ask workspace/configuration for 100 \
          items of section `big`, and keep serving without waiting for the answer",
     ),
-    (
-        "configure-on-shutdown",
-        "before the shutdown reply, ask workspace/configuration for 256 items of section `big`",
-    ),
+    ("configure-on-shutdown", "before the shutdown reply, ask workspace/configuration for 256 items of section `big`"),
     ("ignore-while-unbalanced", "never answer a request about a document whose brackets are unbalanced"),
     (
         "close-output-mid-restoration",
