@@ -270,6 +270,11 @@ const FAULTS: &[(&str, &str)] = &[
         "warning-after-unbalanced",
         "lawful: once a document's brackets were unbalanced, add a Warning to every publish about it",
     ),
+    (
+        "malformed-recovery-diagnostics",
+        "once a document's brackets were unbalanced, publish null instead of a diagnostics array",
+    ),
+    ("malformed-baseline-diagnostics", "publish null instead of a diagnostics array before any change"),
     ("reworded-diagnostics", "lawful: put a counter in every diagnostic's message"),
     (
         "shuffled-symbols",
@@ -2151,6 +2156,11 @@ fn publish_diagnostics<W: Write>(
         out.frame(&json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}));
     }
     let mut params = json!({"uri": uri, "diagnostics": diagnostics});
+    if (fault("malformed-recovery-diagnostics") && lingering.broken_once)
+        || (fault("malformed-baseline-diagnostics") && version == Some(json!(1)))
+    {
+        params["diagnostics"] = Value::Null;
+    }
     if let Some(v) = version {
         params["version"] = v;
     }

@@ -34,6 +34,8 @@
 
 ### Fixed
 
+- M3 rejects malformed diagnostic evidence, checks recovery when generated edits restore the seed without an
+  extra write, and caps baseline requests at the absolute `settle_timeout` deadline.
 - D6 in the documents scenario judges a `selectionRange` reply against every text it may describe (D1's candidate
   rule), as the mutation scenario does, so a late reply about the changed, shorter text no longer fails.
 

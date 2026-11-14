@@ -18,8 +18,7 @@ use serde_json::{Map, Value};
 /// full `textDocument/diagnostic` report, or the diagnostics of a
 /// `publishDiagnostics` notification (`answer` is then its params). Two
 /// answers are equal after projection when these values are equal. `None`
-/// for a diagnostic report that isn't a full one, which says nothing about
-/// the diagnostics themselves.
+/// for a diagnostic report that is not full or has malformed projected fields.
 pub fn project(probe: Probe, answer: &Value) -> Option<Value> {
     let projected = match probe {
         Probe::DocumentSymbol => each(answer, symbol),
@@ -30,9 +29,9 @@ pub fn project(probe: Probe, answer: &Value) -> Option<Value> {
             if answer.get("kind").and_then(Value::as_str) != Some("full") {
                 return None;
             }
-            each(answer.get("items").unwrap_or(&Value::Null), diagnostic)
+            diagnostics(answer.get("items")?)?
         }
-        Probe::PublishDiagnostics => each(answer.get("diagnostics").unwrap_or(&Value::Null), diagnostic),
+        Probe::PublishDiagnostics => diagnostics(answer.get("diagnostics")?)?,
     };
     Some(canonical(&projected))
 }
@@ -104,6 +103,30 @@ fn symbol(v: &Value) -> Value {
         out_object.insert("children".into(), each(children, symbol));
     }
     out
+}
+
+fn diagnostics(v: &Value) -> Option<Value> {
+    let items = v.as_array()?;
+    let integer = |v: &Value| v.as_number().and_then(message::integer_value);
+    for item in items {
+        let range = item.get("range")?;
+        for end in ["start", "end"] {
+            let position = range.get(end)?;
+            for axis in ["line", "character"] {
+                let n = integer(position.get(axis)?)?;
+                if !(0..=i64::from(i32::MAX)).contains(&n) {
+                    return None;
+                }
+            }
+        }
+        if item.get("severity").is_some_and(|v| !integer(v).is_some_and(|n| (1..=4).contains(&n)))
+            || item.get("code").is_some_and(|v| !v.is_string() && !integer(v).is_some_and(|n| i32::try_from(n).is_ok()))
+            || item.get("source").is_some_and(|v| !v.is_string())
+        {
+            return None;
+        }
+    }
+    Some(Value::Array(items.iter().map(diagnostic).collect()))
 }
 
 /// A diagnostic's range, severity, code and source.
@@ -382,8 +405,63 @@ mod tests {
         assert_eq!(first_error(&errors).unwrap()["severity"], 1);
         let warnings = project(Probe::PublishDiagnostics, &publish(vec![d("a", 2)], 1)).unwrap();
         assert_eq!(first_error(&warnings), None);
-        let spelled: Value = serde_json::from_str(r#"{"diagnostics": [{"severity": 1.0}]}"#).unwrap();
+        let spelled: Value = serde_json::from_str(
+            &publish(vec![d("a", 1)], 1).to_string().replace("\"severity\":1", "\"severity\":1.0"),
+        )
+        .unwrap();
         assert!(first_error(&project(Probe::PublishDiagnostics, &spelled).unwrap()).is_some());
+    }
+
+    #[test]
+    fn recovery_rejects_malformed_diagnostic_evidence() {
+        let valid = json!({"range": range(0, 0, 0, 1), "message": "word"});
+        let mut invalid = vec![Value::Null, json!({}), json!([null]), json!([{}])];
+        for end in ["start", "end"] {
+            let mut missing = valid.clone();
+            missing["range"].as_object_mut().unwrap().remove(end);
+            invalid.push(json!([missing]));
+            for axis in ["line", "character"] {
+                let mut missing = valid.clone();
+                missing["range"][end].as_object_mut().unwrap().remove(axis);
+                invalid.push(json!([missing]));
+                for bad in [Value::Null, json!("0"), json!(-1), json!(0.5), json!(2147483648u64)] {
+                    let mut item = valid.clone();
+                    item["range"][end][axis] = bad;
+                    invalid.push(json!([item]));
+                }
+            }
+        }
+        for (field, bad) in [
+            ("severity", Value::Null),
+            ("severity", json!(0)),
+            ("severity", json!(5)),
+            ("severity", json!(1.5)),
+            ("severity", json!("1")),
+            ("code", Value::Null),
+            ("code", json!(false)),
+            ("code", json!(1.5)),
+            ("code", json!(2147483648u64)),
+            ("source", Value::Null),
+            ("source", json!(1)),
+        ] {
+            let mut item = valid.clone();
+            item[field] = bad;
+            invalid.push(json!([item]));
+        }
+        for items in invalid {
+            assert!(project(Probe::Diagnostic, &json!({"kind": "full", "items": items})).is_none(), "{items}");
+            assert!(project(Probe::PublishDiagnostics, &json!({"diagnostics": items})).is_none(), "{items}");
+        }
+        for items in [
+            json!([]),
+            json!([valid]),
+            json!([{
+                "range": range(0, 0, 0, 1), "severity": 4, "code": -2147483648i64, "source": "s"
+            }]),
+        ] {
+            assert!(project(Probe::Diagnostic, &json!({"kind": "full", "items": items})).is_some());
+            assert!(project(Probe::PublishDiagnostics, &json!({"diagnostics": items})).is_some());
+        }
     }
 
     #[test]

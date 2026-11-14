@@ -339,7 +339,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   details name the scenario and case. M3 compares the server's answers after each restoration with those it gave
   before the mutations. A recovery not seen within `recovery_timeout` is `ERROR`, not `FAIL`, unless
   `[mutation.recovery]` says the answers are fixed (`expect = "baseline"`) or the seed has no Error diagnostics
-  (`no_errors = true`). See the
+  (`no_errors = true`). Malformed diagnostic evidence is inconclusive, and generated edits that restore the seed
+  still undergo recovery checks. Baseline requests share the absolute `settle_timeout` deadline. See the
   [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
   [implementation status](docs/source-mutations.md) for what is implemented so far, including the
   [written-bytes bound on automatic answers](docs/source-mutations.md#bounds). The JSON `mutation.stopped`

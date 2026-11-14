@@ -3051,6 +3051,57 @@ const STANDIN_PROBES: &str = "probes: textDocument/documentSymbol of main.lua, t
                               publishDiagnostics of main.lua; ";
 
 #[test]
+fn recovery_rejects_malformed_pushed_diagnostics() {
+    for (fault, verdict) in
+        [("malformed-recovery-diagnostics", "error"), ("malformed-baseline-diagnostics", "not-exercised")]
+    {
+        let (path, _keep) =
+            recovery_profile("probes = [\"publishDiagnostics\"]\nno_errors = true\nrecovery_timeout = \"1s\"");
+        let (r, _, _keep) = mutated_with(&path, &[fault], &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+        expect(&r, "M3", verdict);
+        assert!(detail(&r, "M3").contains("malformed diagnostics"), "{}", r.stdout);
+    }
+}
+
+#[test]
+fn recovery_is_checked_when_generated_edits_restore_the_clean_text() {
+    use lspcheck::mutation::{self, Config, Operator};
+    let clean = "f()";
+    let config = Config { steps: 2, operators: vec![Operator::UnbalanceBracket], ..Config::default() };
+    let seed = (0..10000)
+        .find(|&seed| {
+            let plan = mutation::plan_case(seed, 0, &[clean.into()], &config);
+            if plan.steps.len() != 2 {
+                return false;
+            }
+            let mut text = clean.to_string();
+            for m in &plan.steps[0].mutations {
+                text = m.apply(&text);
+            }
+            if text.bytes().filter(|&b| b == b'(').count() == text.bytes().filter(|&b| b == b')').count() {
+                return false;
+            }
+            for m in &plan.steps[1].mutations {
+                text = m.apply(&text);
+            }
+            text == clean
+        })
+        .expect("a two-step bracket mutation returning to f()");
+    let (path, _keep) = profile(&format!(
+        "[workspace]\nfiles = {{ 'seed.txt' = 'f()' }}\n[mutation]\nfiles = ['seed.txt']\nlanguage_id = 'plaintext'\n\
+         seed = {seed}\ncases = 1\nsteps = 2\noperators = ['unbalance-bracket']\nrequests_per_step = 1\nrequests = ['textDocument/documentSymbol']\n\
+         [mutation.recovery]\nexpect = 'baseline'\nprobes = ['textDocument/documentSymbol']\nrecovery_timeout = '1s'\n"
+    ));
+    for (faults, verdict) in [(&[][..], "pass"), (&["stuck-after-unbalanced"][..], "fail")] {
+        let (r, t, _keep) = mutated_with(&path, faults, &["--only", "M1,M2,M3"]);
+        expect(&r, "M3", verdict);
+        let sent = recorded_messages(&t.join("mutation.jsonl"), "out");
+        let changes = sent.iter().filter(|m| m["method"] == "textDocument/didChange").count();
+        assert_eq!(changes, 2, "{sent:?}");
+    }
+}
+
+#[test]
 fn the_clean_standin_recovers_as_the_profile_expects() {
     // The stated expectations hold for the clean stand-in: its answers return
     // to the baseline, and its pushed diagnostics have no Error after each

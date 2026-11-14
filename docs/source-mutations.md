@@ -589,16 +589,21 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
 Step 5 builds [Recovery](#recovery) and M3 as above. Where the rules leave a choice, it makes these:
 
 - Settle and baseline each have their own `settle_timeout`, and `run_timeout` counts from the end of the baseline.
+  Baseline registration, writes and waits share its absolute deadline; replies after it cannot establish stability.
   The baseline's requests come before the first mutation, so M2 doesn't judge them; D1 and K1 do.
 - The request probes are sent with K1's params for each document. An error, a malformed response or a report that
   isn't a full one breaks a probe's run of equal answers: it is asked again, and used only if two answers in a row
-  are then equal (a server may answer with an error while it loads).
+  are then equal (a server may answer with an error while it loads). Diagnostic arrays and their projected fields
+  must be well formed; malformed evidence during recovery makes that probe `ERROR`, even with `no_errors`.
+  Malformed pushed diagnostics before the first mutation leave that probe without a stable baseline.
 - `no_errors = true` without `expect` makes "recovered" mean "no Error diagnostic" for the diagnostics probes, so a
   lingering Warning passes; with `expect = "baseline"` both must hold. `documentSymbol` and `foldingRange` are
   compared with their baseline either way.
 - A pushed-diagnostics probe recovers on the first publish labelled with the restored version whose projection equals
   the baseline (for an unmutated document, the latest one read before the restoration counts). With `no_errors`, its
   publishes are read to the end of `recovery_timeout`, and the last decides, so each case takes the whole bound.
+- Generated edits that leave all documents at their clean text establish the restoration boundary too; recovery
+  is timed from that delivery even when no extra restoration write is needed.
 - Terminal probes are sent with or without an expectation; an answer equal to the baseline counts as recovered. An
   error answer to a terminal probe, or one in a frame lspcheck couldn't read, is `ERROR`, never `FAIL`.
 - Polls are sent when due, never two at once: poll *n* + 1 waits for poll *n*'s replies, then for the gap. A poll still
