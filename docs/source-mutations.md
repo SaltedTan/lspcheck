@@ -302,12 +302,9 @@ request's, a publish the case in progress when it was read.
 
 Two existing judges take care in the mutation scenario, which sends many versions and evicts old texts:
 
-- **D6** uses D1's candidate rule in both scenarios: an entry or parent fails only when containment fails against
-  every candidate text, each with its own clamping. A reply may lawfully describe a later text: a request names
-  column 9 of a ten-character line, a later edit shortens it to three, and a range ending at column 3 contains the
-  position as clamped against that later text. In the mutation scenario, a reply whose candidates include an evicted
-  text has its containment left unjudged, and counted; its entry count is still judged, since one entry per position
-  doesn't depend on the text.
+- **D6** follows the shared [selection-range rules](design.md#documents-and-positions). In the mutation scenario,
+  a reply whose candidates include an evicted text has its containment left unjudged, and counted; its entry count
+  is still judged, since one entry per position doesn't depend on the text.
 - **D2** retains every version number sent, with when lspcheck began writing it, for the whole session
   (`OpenDoc::sent`, at most `cases × (steps + 1) + 1` per document). Evicting a text snapshot leaves that history
   intact, so a lawful publish labelled with an old version still passes.
