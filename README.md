@@ -179,7 +179,8 @@ loosely matches the request's (a number spelled as a string, or one that lost pr
 duplicate, unasked or premature reply fails J2.
 
 lspcheck answers the server's own requests as it reads them, including during
-[exit waits](docs/design.md#lifecycle). J7 checks for unanswered id reuse and continued service
+[exit waits](docs/design.md#lifecycle), subject to the [mutation scenario's answer bound](docs/source-mutations.md#bounds).
+J7 checks for unanswered id reuse and continued service
 after those answers; the [design reference](docs/design.md#json-rpc-correlation) defines the judging rules and the
 answers. A profile's `[client].configuration` answers `workspace/configuration`; without one, each item gets `null`.
 

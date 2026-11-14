@@ -93,7 +93,9 @@ the server could have had the answer. Reusing an id at or after that time is tre
 was written in full. lspcheck answers `workspace/configuration` using the [profile rules](#profiles-optional-toml),
 and returns the workspace for `workspace/workspaceFolders`, `applied: false` and
 `success: false` for `workspace/applyEdit` and `window/showDocument`, `null` for registrations, progress tokens,
-`window/showMessageRequest` and the refresh requests, and MethodNotFound otherwise. A server that stops answering after an answer may have stopped for another reason,
+`window/showMessageRequest` and the refresh requests, and MethodNotFound otherwise. These automatic answers are subject
+to the [mutation scenario's answer bound](source-mutations.md#bounds). A server that stops answering after an answer
+may have stopped for another reason,
 so that alone is never J7's failure. When the evidence is complete and no unanswered id was reused, J7 passes when
 the server answers at least one request lspcheck sent after completing an answer to a server request. It is an error
 when no answer was followed by service but at least one was followed by unanswered requests, and not exercised when
