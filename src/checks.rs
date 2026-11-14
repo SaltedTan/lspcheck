@@ -4503,11 +4503,12 @@ async fn leave_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequ
     judge_extended(ctx, ext, asked, end);
 }
 
-/// D1, D2, D6 and K1 over what the mutation scenario read about the seed
+/// D1, D2 and D6 over what the mutation scenario read about the seed
 /// documents, from the first `didOpen` to `end`, when lspcheck stopped
-/// waiting for shutdown's reply ([design](../docs/source-mutations.md#verdict-rules)).
+/// waiting for shutdown's reply or its write failed ([design](../docs/source-mutations.md#verdict-rules)).
 /// D1 and D2 are reported once a document was opened, D6 once a
-/// `selectionRange` was asked, and K1 only for a MethodNotFound: an
+/// `selectionRange` was asked. K1's request metadata is retained until
+/// cleanup's final stdout drain, and it contributes only a MethodNotFound: an
 /// unanswered request is M2's, never K1's error. [`run`] combines these with
 /// the verdicts the checks' own scenarios give.
 fn judge_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest], end: Duration) {

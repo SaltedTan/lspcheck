@@ -397,10 +397,12 @@ pub struct Source {
     pub asked_at: Option<Duration>,
     /// When it was read.
     pub read_at: Duration,
-    /// The `version` a `publishDiagnostics` is labelled with, if any.
+    /// The URI and version a `publishDiagnostics` is labelled with, if any.
+    /// Its label doesn't constrain related locations in other documents.
     pub label: Option<(String, i64)>,
-    /// Where in its scenario it was read, for a failure's detail (the
-    /// mutation scenario's case); `None` when the scenario needs none.
+    /// Scenario context for a failure's detail: the mutation request's case
+    /// for a reply, or the case in progress when a notification was read.
+    /// `None` when the scenario needs none.
     pub place: Option<String>,
 }
 

@@ -281,26 +281,26 @@ polls.
 - *pass:* every case that reached restoration recovered. The detail gives the cases, the probes used and the slowest
   recovery time.
 
-**Extended checks.** In the mutation scenario, D1 judges positions about the seed documents from their `didOpen` to
-`shutdown`, with D1's candidate rule: a reply refers to the version current when its request was sent or a later one
-sent before it was read; a labelled publish to its version; an unlabelled one to any version sent before it was read.
-lspcheck keeps the last 64 versions of each document. A position whose candidate texts reach further back isn't judged
-and is counted, so a long run's memory stays bounded and no position is judged against a text lspcheck no longer has.
+**Extended checks.** In the mutation scenario, D1 judges positions about the seed documents from their `didOpen`
+until lspcheck stops waiting for `shutdown`'s reply (or its write fails), with
+[D1's candidate rule](design.md#documents-and-positions).
+lspcheck keeps the last 64 text snapshots of each document. A position whose candidate texts reach further back isn't judged
+and is counted, so retained text stays bounded and no position is judged against a text lspcheck no longer has.
 D2 judges every labelled publish against the versions sent before it was read; D6 every `selectionRange` reply; K1
 every MethodNotFound to an advertised request about a seed document (so not `workspace/symbol`), read at any time
-after the request was sent. lspcheck judges what the server sent as it goes, before recording each version it sends,
+after the request was sent, including during cleanup's final stdout drain. lspcheck judges positions and selection
+ranges as it goes, before recording each version it sends,
 so a text is dropped only after everything read while it was kept has been judged against it; what may refer to a
 dropped text is counted in the detail (`that may refer to a version older than the 64 whose texts lspcheck keeps,
 not judged`). A request left unanswered or undelivered is M1's or M2's: it makes none of the four `ERROR`, though
-missed evidence in the window from the first `didOpen` to shutdown does, as in their own scenarios. D1 and D2 are
+missed evidence in that window can make D1, D2 or D6 `ERROR`, as in their own scenarios. D1 and D2 are
 judged once a seed document was opened, D6 once a `selectionRange` was sent, and K1 only when it fails; the scenario
 contributes nothing to them when it stops before opening a document. In the combined detail, each scenario's part
 starts with its verdict and name (`FAIL in the mutation scenario: …; PASS in the documents scenario: …`), the
 winning one first, and each position, publish or reply the mutation scenario names says its case: a reply its
 request's, a publish the case in progress when it was read.
 
-Two of the existing judges need changes before they can be reused here, because the documents scenario sends few
-versions and evicts none:
+The mutation scenario adapts two existing judges, because the documents scenario sends few versions and evicts none:
 
 - **D6** clamps positions against the text current when the request was sent (`judge_selection_reply`). A reply may
   lawfully describe a later text: a request names column 9 of a ten-character line, a later edit shortens it to three,
@@ -308,10 +308,9 @@ versions and evicts none:
   uses D1's candidate rule: an entry or parent fails only when containment fails against every candidate text, each
   with its own clamping. A reply whose candidates include an evicted text has its containment left unjudged, and
   counted; its entry count is still judged, since one entry per position doesn't depend on the text.
-- **D2** takes the versions it accepts from the documents it keeps (`OpenDoc.versions`). Evicting texts must not evict
-  versions, or a lawful publish labelled with an old version would fail. lspcheck keeps every version number it sent,
-  with when its `didChange` was written, for the whole session (a few bytes each, at most `cases × (steps + 1) + 1`
-  per document); only the text snapshots are bounded to 64.
+- **D2** retains every version number sent, with when lspcheck began writing it, for the whole session
+  (`OpenDoc::sent`, at most `cases × (steps + 1) + 1` per document). Evicting a text snapshot leaves that history
+  intact, so a lawful publish labelled with an old version still passes.
 
 ### Profile schema
 
@@ -380,7 +379,7 @@ resolves an empty seed list and M1 to M3 report `SKIP` ("no seed file").
 | Growth per mutation (bytes inserted beyond those removed) | 1 KiB; stress operators the room left | 16 KiB | the operator inserts less |
 | Document size | `max_document_kib`, 64 | 1024 | the operator is redrawn, `truncate` after six tries |
 | Requests per step; recovery polls per case | 4; 40 | 16; 40 | the poll stops: recovery not seen, M3 `ERROR` for that case even with an expectation |
-| Versions kept per document | 64 | 64 | older positions aren't judged, counted |
+| Text snapshots kept per document | 64 | 64 | see [extended checks](#verdict-rules) for judging evicted candidates and retaining version history |
 | Bytes written to the server | 64 MiB | 256 MiB | no new case starts unless its worst case fits (below) |
 
 In the case budget, `probes` counts only request probes: pushed diagnostics need no terminal request. Before the
@@ -530,10 +529,8 @@ Each step is one small pull request with its tests, docs and changelog entry whe
    M3 in the catalogue, reporting `SKIP` without `--mutate`. Stock `.verdicts` files gain their `skip` lines.
 3. **Scenario, M1 and M2.** Open, mutate, request, restore (without probes), `leave()`; the transcript meta line; the
    JSON `"mutation"` field. Stand-in bracket tracking and the M1 and M2 faults.
-4. **Answer cap and extended checks.** The [automatic-answer cap](#bounds) is in place. D1, D2, D6 and K1 over the
-   mutation scenario remain planned, with the 64-text window, D2's whole-session version history, D6's candidate texts,
-   and their faults (including a lawful delayed `selectionRange` reply about a later, shorter text, and a lawful publish
-   labelled with an evicted version).
+4. **Answer cap and extended checks.** Implemented: the [automatic-answer cap](#bounds) and
+   [extended checks](#verdict-rules), with their [stand-in faults](#stand-in-faults-and-tests).
 5. **Recovery, M3.** Settle, stable baselines, projections, polling, `expect` and `no_errors`; the recovery faults,
    lawful ones included.
 6. **Isolation.** Rerunning failing cases alone and writing their transcripts.
