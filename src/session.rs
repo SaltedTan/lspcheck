@@ -453,6 +453,12 @@ pub struct Session {
     opts: Options,
     /// Bytes that reached the server's stdin.
     written: u64,
+    /// The cap automatic answers are held to, with the part of it kept for
+    /// writes lspcheck must still make (see [`Session::cap_answers`]).
+    answer_cap: Option<(u64, u64)>,
+    /// When the first server request lspcheck left unanswered for that cap
+    /// was read, and why.
+    withheld: Option<(Duration, String)>,
     _registration: Registration,
 }
 
@@ -540,6 +546,8 @@ impl Session {
             exit: None,
             opts,
             written: 0,
+            answer_cap: None,
+            withheld: None,
             _registration: registration,
         })
     }
@@ -589,6 +597,27 @@ impl Session {
     /// requests included.
     pub fn bytes_written(&self) -> u64 {
         self.written
+    }
+
+    /// Holds automatic answers to the server's requests to `cap` bytes
+    /// written in all, keeping `reserve` of it for writes lspcheck must still
+    /// make. An answer that doesn't fit isn't written (see
+    /// [`Session::answer_withheld`]). The caller sets `reserve` again as what
+    /// it must still write changes.
+    pub fn cap_answers(&mut self, cap: u64, reserve: u64) {
+        self.answer_cap = Some((cap, reserve));
+    }
+
+    /// Whether `bytes` more fit under the answer cap beside its reserve;
+    /// anything fits without one.
+    pub fn fits(&self, bytes: u64) -> bool {
+        self.answer_cap.is_none_or(|(cap, reserve)| self.written + bytes + reserve <= cap)
+    }
+
+    /// When the first server request left unanswered for the answer cap was
+    /// read, and why, if one was.
+    pub fn answer_withheld(&self) -> Option<&(Duration, String)> {
+        self.withheld.as_ref()
     }
 
     /// When and why lspcheck stopped reading the server's stdout (its output
@@ -1007,9 +1036,27 @@ impl Session {
         };
         // `accept` has just recorded this request.
         let i = self.server_requests.len() - 1;
+        let frame = transport::encode(&serde_json::to_vec(&reply).expect("JSON values serialize"));
+        if let Some((cap, reserve)) = self.answer_cap
+            && !self.fits(frame.len() as u64)
+        {
+            // The server may be waiting for this answer from the moment it
+            // asked, so nothing it held back since can be blamed on it.
+            let at = self.server_requests[i].at;
+            let why = format!(
+                "lspcheck left the server's {method} request unanswered: its {}-byte answer didn't fit the {} MiB \
+                 written-bytes cap beside the {} bytes written and the {reserve} kept for lspcheck's own remaining writes",
+                frame.len(),
+                cap / (1024 * 1024),
+                self.written
+            );
+            self.limit_self(at, why.clone());
+            self.withheld.get_or_insert((at, why));
+            return;
+        }
         let began = self.start.elapsed();
         self.server_requests[i].answer_began = Some(began);
-        let written = self.send_until(&reply, deadline).await;
+        let written = self.write_until(&frame, deadline).await;
         if written.is_ok() {
             self.server_requests[i].answered_at = Some(self.start.elapsed());
         }
@@ -1621,6 +1668,48 @@ mod tests {
             assert!(finish.incomplete_within(since, began).is_some());
             assert!(finish.incomplete_within(Duration::ZERO, before).is_none());
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_past_the_cap_are_withheld_from_when_their_request_was_read() {
+        let frames: Vec<u8> = ["first", "second"]
+            .iter()
+            .flat_map(|id| {
+                let request =
+                    message::request(&Id::Str((*id).into()), "workspace/configuration", Some(json!({"items": [{}]})));
+                transport::encode(&serde_json::to_vec(&request).unwrap())
+            })
+            .collect();
+        let script = format!("printf '%s' '{}'; sleep 30", String::from_utf8(frames).unwrap());
+        let cmd = ServerCommand::new(&["sh".into(), "-c".into(), script.into()]);
+        let opts = Options { configuration: Some(json!({"payload": "x".repeat(1000)})), ..Options::default() };
+        let mut s = Session::start(&cmd, opts).await.unwrap();
+        // Room for 2000 bytes in all, 1500 of them kept: the first answer,
+        // over 1000 bytes, doesn't fit.
+        s.cap_answers(2000, 1500);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(matches!(s.recv(deadline).await, Recv::Message(_)));
+        assert_eq!(s.bytes_written(), 0);
+        let read = s.server_requests[0].at;
+        assert_eq!(s.server_requests[0].answer_began, None);
+        let (at, why) = s.answer_withheld().unwrap().clone();
+        assert_eq!(at, read);
+        assert!(
+            why.starts_with("lspcheck left the server's workspace/configuration request unanswered: its "),
+            "{why}"
+        );
+        assert_eq!(s.own_limit, Some((read, why.clone())));
+        // With the reserve released, the next answer fits and is written;
+        // the first withheld answer is still the one reported.
+        s.cap_answers(2000, 0);
+        assert!(matches!(s.recv(deadline).await, Recv::Message(_)));
+        assert!(s.server_requests[1].answered_at.is_some());
+        assert!(s.bytes_written() > 1000 && s.bytes_written() <= 2000);
+        assert_eq!(s.answer_withheld().map(|(at, _)| *at), Some(read));
+        let finish = s.finish(Duration::from_millis(200)).await;
+        assert!(finish.transcript.iter().any(|e| matches!(&e.kind, EventKind::Note(n) if *n == why)));
+        assert!(finish.incomplete_within(read, read).is_some());
     }
 
     #[cfg(unix)]

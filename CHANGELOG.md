@@ -17,6 +17,8 @@
   When the scenario stops early, `mutation.stopped` records the reason, including initialization and seed-file errors.
   M2 preserves observed timeouts when the server exits during a later request in the same batch.
   Unfinished client writes make overlapping reply windows inconclusive from the write's start.
+  The scenario now enforces its [written-bytes bound](docs/source-mutations.md#bounds) on automatic answers to the
+  server's requests.
 
 ### Changed
 

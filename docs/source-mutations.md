@@ -2,7 +2,8 @@
 
 **Status:** Accepted, 2026-11-11; the questions it left open are settled under [Decisions](#decisions). Steps 1 to 3 of
 the [implementation plan](#implementation-plan) are in place: the planner (`src/mutation.rs`), the profile's
-`[mutation]` section, and the scenario, which judges M1 and M2. `--mutate` and its two flags are experimental and
+`[mutation]` section, and the scenario, which judges M1 and M2; from step 4, answers to the server's own requests are
+held to the [written-bytes cap](#bounds). `--mutate` and its two flags are experimental and
 hidden from `--help` until recovery (M3) is judged; until then the scenario doesn't settle or take baselines, M3 is
 `SKIP`, and D1, D2, D6 and K1 aren't extended to it. See [what step 3 leaves out](#step-3) and the
 [design status](design.md) for its place in the roadmap.
@@ -239,6 +240,8 @@ Every verdict follows the [rules that keep verdicts trustworthy](../AGENTS.md#ru
 `FAIL` needs something lspcheck saw; lspcheck's budgets never make a `FAIL`; a request lspcheck couldn't deliver is
 `ERROR`; every `PASS` and `N/E` that relied on nothing being missed in a window goes through `report_judged` and the
 end-of-scenario recheck, and every missing reply through `fail_absent_between`.
+The [answer-cap rules](#bounds) qualify M1 and M2's verdicts when lspcheck withholds an automatic answer or stops a
+step because earlier answers used its room.
 
 **M1.**
 - *skip:* `--mutate` not given, no seed file, no `didOpen`, or no change sync.
@@ -389,17 +392,24 @@ The written-bytes bound is a cap, not a threshold: everything lspcheck writes in
 `exit`), and before a case starts lspcheck reserves its worst case: the case's `didChange` notifications at their
 exact serialized size, which the plan fixes before the case starts (a step's notification can carry three changes,
 each up to a whole document), plus, computed from the caps, its requests, the restoration, the most polls and the
-terminal probes, and the shutdown allowance. A case whose worst case doesn't fit doesn't start. Answers to the server's own requests (such as
-`workspace/configuration`, which a profile can make large) can't be bounded in advance, so the cap is also enforced
-before every write: answers may use only what isn't reserved for the current case's restoration and the shutdown.
-When that is gone, lspcheck stops the scenario: it sends the restoration and shutdown from their reserve, leaves the
-server's request unanswered, and M3 and the cases not run are `ERROR` (lspcheck's budget, never a failure). Server output stays under
+terminal probes, and the shutdown allowance. A case whose worst case doesn't fit doesn't start. Server output stays under
 `--max-output-mib` and `--max-frame-mib`; missing what they exclude makes waits inconclusive as everywhere else. With
 the bytes written capped, a transcript holds at most that plus what the server wrote. None of these bounds is a
 protocol rule: reaching one gives `ERROR` or `N/E` with the bound named, or just a smaller run, never `FAIL`.
 
-These are the complete design's bounds; [step 3](#step-3) currently leaves answers to server requests uncapped
-throughout the scenario. Enforcement in the session's send path is planned for step 4.
+The session enforces the cap on answers in its send path. Before it writes an automatic answer, it checks the
+answer's serialized size against what the cap leaves beside the current reserve: during startup, the startup messages
+and shutdown; during a case, the case's restoration and shutdown; otherwise, shutdown. Startup keeps the full
+`initialize` request reserved even while waiting for its reply. An answer that doesn't fit isn't written, and the
+transcript says why. A server left waiting may lawfully hold back what it would send, so lspcheck's
+inspection counts as incomplete from when that request was read: no reply missing since then fails, and an exit or end
+of output first seen after the answer was withheld makes M1 `ERROR`. The scenario then starts no further step or case
+(a step whose own `didChange` or request no longer fits beside the reserve, because answers used its room, stops it
+the same way), sends the current case's restoration and shutdown, and `mutation.stopped` says that answers to the
+server's requests reached the cap. When the run stops early this way, M1 and M2 can still fail on what lspcheck saw,
+but not pass: the cases not run make them `ERROR`. An answer withheld after M1 and M2 are judged, while waiting for the
+reply to shutdown, changes neither: their windows end before shutdown. The transcript notes it. Until step 5, M3 stays
+`SKIP`; its planned verdict for a cap stop is `ERROR`.
 
 ### Reports, transcripts and reproduction
 
@@ -508,9 +518,10 @@ Each step is one small pull request with its tests, docs and changelog entry whe
    M3 in the catalogue, reporting `SKIP` without `--mutate`. Stock `.verdicts` files gain their `skip` lines.
 3. **Scenario, M1 and M2.** Open, mutate, request, restore (without probes), `leave()`; the transcript meta line; the
    JSON `"mutation"` field. Stand-in bracket tracking and the M1 and M2 faults.
-4. **Extended checks.** D1, D2, D6 and K1 over the mutation scenario, with the 64-text window, D2's whole-session
-   version history, D6's candidate texts, and their faults (including a lawful delayed `selectionRange` reply about a
-   later, shorter text, and a lawful publish labelled with an evicted version).
+4. **Answer cap and extended checks.** The [automatic-answer cap](#bounds) is in place. D1, D2, D6 and K1 over the
+   mutation scenario remain planned, with the 64-text window, D2's whole-session version history, D6's candidate texts,
+   and their faults (including a lawful delayed `selectionRange` reply about a later, shorter text, and a lawful publish
+   labelled with an evicted version).
 5. **Recovery, M3.** Settle, stable baselines, projections, polling, `expect` and `no_errors`; the recovery faults,
    lawful ones included.
 6. **Isolation.** Rerunning failing cases alone and writing their transcripts.
@@ -534,10 +545,8 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
   so far plus the case's reserve fit the written-bytes cap; the reserve counts the case's `didChange` notifications at
   their exact size, 2 KiB plus twice the URI's length for each request, and 1 KiB for `shutdown` and `exit`. For each
   document, the restoration reserve is the largest restoration notification over every step's resulting text and
-  version, plus a small margin, even if the plan ends with the clean text. Answers to the server's own requests
-  anywhere in the mutation scenario (startup, cases, early leave and shutdown) aren't yet held to the 64 MiB cap
-  before each write; they count towards the next case's check, if any. Enforcing the cap on answers once, in the
-  session's send path, is planned for step 4.
+  version, plus a small margin, even if the plan ends with the clean text. Answers to the server's own requests also
+  count towards the next case's check; see [Bounds](#bounds) for their admission rule (added in step 4).
 - Each request's deadline is `--timeout` from when lspcheck began writing it; the step's requests are written back to
   back and then waited for in order, each until its own deadline. Answering queued server requests happens before
   that window starts. Before later writes, after each wait and before classifying a failed write, lspcheck absorbs

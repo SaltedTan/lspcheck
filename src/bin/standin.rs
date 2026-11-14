@@ -205,6 +205,12 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: after a didChange that leaves a document's brackets unbalanced, write 2 MiB of log messages, and \
          keep serving",
     ),
+    (
+        "configure-while-unbalanced",
+        "lawful: after a didChange that leaves a document's brackets unbalanced, ask workspace/configuration for 100 \
+         items of section `big`, and keep serving without waiting for the answer",
+    ),
+    ("configure-on-shutdown", "before the shutdown reply, ask workspace/configuration for 256 items of section `big`"),
     ("ignore-while-unbalanced", "never answer a request about a document whose brackets are unbalanced"),
     (
         "close-output-mid-restoration",
@@ -234,7 +240,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("codepoint-positions-after-change", "count positions in code points from a didChange on, correctly before it"),
     (
         "close-stdin-before-change",
-        "on didOpen, publish a bad-boundary diagnostic, then exit so didChange can't be sent",
+        "on didOpen, close stdin, publish a bad-boundary diagnostic, then exit so didChange can't be sent",
     ),
     ("big-frame-on-open", "after publishing diagnostics for an opened document, send a 2 MiB log message"),
     ("ignore-unopened", "never answer a request about a document that isn't open"),
@@ -596,10 +602,27 @@ fn main() {
                 let version = msg.pointer("/params/textDocument/version").and_then(Value::as_i64).unwrap_or(0);
                 docs.insert(uri.to_string(), (text.to_string(), version));
                 if fault("close-stdin-before-change") && text.contains("word") {
-                    // Publish version 41's diagnostics with a position inside
-                    // the first character, then exit: the stdin pipe's read
-                    // end closes, so lspcheck's `didChange` can't be
-                    // delivered (D3 is an error) while D1's failure stands.
+                    // Close stdin before publishing version 41's diagnostics:
+                    // neither those diagnostics nor EOF can let lspcheck send
+                    // didChange before the pipe's read end closes. Exiting
+                    // alone can close stdout first, leaving a writable stdin.
+                    drop(input);
+                    #[cfg(unix)]
+                    {
+                        use std::os::fd::{AsRawFd, FromRawFd};
+                        // SAFETY: input was dropped and this process exits
+                        // below without using stdin again.
+                        drop(unsafe { std::fs::File::from_raw_fd(std::io::stdin().as_raw_fd()) });
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+                        // SAFETY: input was dropped and this process exits
+                        // below without using stdin again.
+                        drop(unsafe { std::fs::File::from_raw_handle(std::io::stdin().as_raw_handle()) });
+                    }
+                    // A position inside the first character keeps D1's
+                    // failure while the undeliverable change errors D3.
                     // Only the documents scenario's document carries "word";
                     // the framing scenario's text does not, so it is
                     // unaffected. The message carries non-ASCII text so F2 is
@@ -693,6 +716,13 @@ fn main() {
                     for _ in 0..2100 {
                         out.frame(&log);
                     }
+                }
+                if unbalanced && fault("configure-while-unbalanced") {
+                    // With a large `big` setting, a few answers reach the
+                    // mutation scenario's written-bytes cap.
+                    let items = vec![json!({"section": "big"}); 100];
+                    let id = format!("configure-{version}");
+                    out.frame(&json!({"jsonrpc": "2.0", "id": id, "method": "workspace/configuration", "params": {"items": items}}));
                 }
                 if !fault("no-diagnostics") {
                     let mut label = Some(json!(version));
@@ -1232,6 +1262,10 @@ fn main() {
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
+                if fault("configure-on-shutdown") {
+                    let items = vec![json!({"section": "big"}); 256];
+                    out.frame(&json!({"jsonrpc": "2.0", "id": "configure-shutdown", "method": "workspace/configuration", "params": {"items": items}}));
+                }
                 let result = if fault("shutdown-result") { json!({}) } else { Value::Null };
                 if fault("exit-on-shutdown") {
                     // Exit first and have a helper deliver the reply, so the
