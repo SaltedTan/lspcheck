@@ -2650,9 +2650,9 @@ fn a_bad_mutation_setting_is_a_usage_error_before_any_server_starts() {
         assert!(stderr.contains("--mutate"), "{flag}: {stderr}");
     }
     // A case that can't fit the run, with the request timeout from the command line.
-    let (slow, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\nrun_timeout = \"14m\"\n"));
+    let (slow, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\nrun_timeout = \"17m\"\n"));
     let stderr = usage_error(&["--profile", slow.to_str().unwrap(), "--mutate", "--timeout", "30"]);
-    assert!(stderr.contains("up to 875 s") && stderr.contains("mutation.run_timeout of 840 s"), "{stderr}");
+    assert!(stderr.contains("up to 1055 s") && stderr.contains("mutation.run_timeout of 1020 s"), "{stderr}");
     // A bad [mutation] is refused with or without --mutate.
     let (bad, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\noperators = [\"explode\"]\n"));
     for args in [&["--profile", bad.to_str().unwrap()][..], &["--profile", bad.to_str().unwrap(), "--mutate"]] {

@@ -6293,11 +6293,11 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/standin-mutation.toml");
         let settings = profile::load(&fixture).unwrap().mutation.unwrap();
         let budget = settings.case_budget(Duration::from_secs(3));
-        assert_eq!(budget, Duration::from_secs(59));
+        assert_eq!(budget, Duration::from_secs(77));
         let start = Instant::now();
-        let run_deadline = start + Duration::from_millis(60_500);
+        let run_deadline = start + Duration::from_millis(78_500);
         let case_deadline = mutation_case_deadline(start, run_deadline, budget).unwrap();
-        assert_eq!(case_deadline, start + Duration::from_secs(59));
+        assert_eq!(case_deadline, start + Duration::from_secs(77));
         assert!(mutation_case_deadline(start + Duration::from_secs(3), run_deadline, budget).is_none());
         let last_start = start + Duration::from_millis(1500);
         assert_eq!(mutation_case_deadline(last_start, run_deadline, budget), Some(run_deadline));

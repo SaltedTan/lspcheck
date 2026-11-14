@@ -369,7 +369,7 @@ resolves an empty seed list and M1 to M3 report `SKIP` ("no seed file").
 | Bound | Default | Cap | When it is reached |
 |---|---|---|---|
 | Per request | `--timeout` from when its write began | — | the request is unanswered (M2) |
-| Per case | `(steps + 1) × (1 + requests_per_step) × --timeout` (every write and every reply of the steps, each with its own deadline) `+ documents × --timeout` (the restoration's writes) `+ recovery_timeout + documents × probes × 2 × --timeout` (each terminal probe's write and reply) `+ 5 s` | — | no further step starts; the restoration is always sent |
+| Per case | `(steps + 1) × (1 + requests_per_step) × --timeout` (every write and every reply of the steps, each with its own deadline) `+ documents × --timeout` (the restoration's writes) `+ recovery_timeout + documents × probes × 4 × --timeout` (the writes and replies of a poll begun just before `recovery_timeout` ends, and of each terminal probe) `+ 5 s` | — | no further step starts; the restoration is always sent |
 | Per run | `run_timeout`, 1 h | 4 h | no new case starts; the detail says how many ran |
 | Settle and baseline | `settle_timeout` | 5 min | proceed; unstable probes aren't used |
 | Cases | 20 | 1000 | usage error above the cap |
@@ -602,7 +602,8 @@ Step 5 builds [Recovery](#recovery) and M3 as above. Where the rules leave a cho
 - Terminal probes are sent with or without an expectation; an answer equal to the baseline counts as recovered. An
   error answer to a terminal probe, or one in a frame lspcheck couldn't read, is `ERROR`, never `FAIL`.
 - Polls are sent when due, never two at once: poll *n* + 1 waits for poll *n*'s replies, then for the gap. A poll still
-  waiting when `recovery_timeout` ends keeps its own `--timeout` deadline.
+  waiting when `recovery_timeout` ends keeps its own `--timeout` deadline; the case budget counts that last poll's
+  writes and replies, so it can't overrun the case or `run_timeout`.
 - A stop during a case (an exit, closed output, a write that couldn't be delivered, or the written-bytes cap) leaves
   that case's recovery unjudged, so M3 is `ERROR` unless a judged case failed.
 
