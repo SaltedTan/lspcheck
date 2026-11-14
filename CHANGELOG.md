@@ -4,8 +4,8 @@
 
 ### Added
 
-- M1 to M3 (`POLICY`) are in the catalogue for [seeded source mutation](docs/source-mutations.md), which is being
-  built. Without `--mutate` they are `SKIP`, which doesn't affect the exit status, so reports gain three `SKIP` lines
+- M1 to M3 (`POLICY`) are in the catalogue for experimental [seeded source mutation](docs/source-mutations.md).
+  Without `--mutate` they are `SKIP`, which doesn't affect the exit status, so reports gain three `SKIP` lines
   and each stock-server `.verdicts` file three `skip` lines.
 - Profiles accept a `[mutation]` section, [validated](docs/source-mutations.md#profile-schema) with the rest of the
   profile (a mistake in it is a usage error), and used only with `--mutate`.
@@ -22,11 +22,9 @@
 - Under `--mutate`, D1, D2, D6 and K1 also judge the mutation scenario's evidence under the
   [extended-check rules](docs/source-mutations.md#verdict-rules). Each check's verdict combines with its own
   scenario's, and the detail names the scenario and case. Default runs, and the stock-server baselines, don't change.
-- Under `--mutate`, M3 judges [recovery](docs/source-mutations.md#recovery): the scenario lets the server settle,
-  takes stable baselines of `documentSymbol`, `foldingRange`, pulled and pushed diagnostics, and after each restoration
-  polls them until they return to their baseline or `recovery_timeout` ends. A recovery not seen is `ERROR`; it fails
-  only when `[mutation.recovery]` sets `expect = "baseline"` or `no_errors = true`, judged by a terminal probe written
-  after the deadline (or, for pushed diagnostics, the last publish read by then).
+- Under `--mutate`, M3 judges [recovery](docs/source-mutations.md#recovery) using stable baselines and the profile's
+  optional expectations. See its [verdict rules](docs/source-mutations.md#verdict-rules) for how it distinguishes
+  failures from inconclusive recovery.
 
 ### Changed
 

@@ -3985,9 +3985,9 @@ struct BatchEnd {
 }
 
 /// Writes `batch` back to back, each request with its own deadline,
-/// `--timeout` from when its write began, then waits for each until its
-/// deadline and records it in `asked` with its outcome. `case` is `None`
-/// before the first mutation.
+/// `--timeout` from when its write began, capped by `until` during baseline
+/// collection, then waits for each until its deadline and records it in
+/// `asked` with its outcome. `case` is `None` before the first mutation.
 async fn send_batch(
     ctx: &mut Ctx<'_>,
     asked: &mut Vec<StepRequest>,
@@ -4256,7 +4256,7 @@ struct PushWatch {
 /// How one stable probe did after a case's restoration.
 #[derive(Debug, Clone, PartialEq)]
 enum ProbeEnd {
-    /// Seen to return to its baseline this long after the restoration was
+    /// Seen to satisfy the recovery comparison this long after the restoration was
     /// delivered; by its terminal probe if `terminal`.
     Recovered { after: Duration, terminal: bool },
     /// Seen not to: a failure, unless lspcheck missed something between
@@ -4564,7 +4564,7 @@ async fn take_baseline(
 /// at `began` is delivered ([design](../docs/source-mutations.md#recovery)):
 /// polls the stable request probes, [`FIRST_POLL_GAP`] apart and doubling to
 /// [`LAST_POLL_GAP`], and reads the pushed diagnostics, until each is seen
-/// to return to its baseline or `recovery_timeout` ends. Each request probe
+/// to satisfy the recovery comparison or `recovery_timeout` ends. Each request probe
 /// not seen to then gets one terminal probe, written after that.
 async fn recover(
     ctx: &mut Ctx<'_>,
@@ -5247,7 +5247,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     leave_mutation(ctx, summary, first_change, versions, lost, &asked, capped.as_deref(), &mut ext, &rec).await;
 }
 
-/// Judges M1 and M2 and shuts the server down. `capped` says why the
+/// Judges M1 to M3 and shuts the server down. `capped` says why the
 /// written-bytes cap stopped the run before its cases were done, if it did.
 // Each argument is a separate part of the scenario's end state, which the
 // unit tests below set up one at a time.
@@ -5511,8 +5511,8 @@ fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest], capped: Option<&str>) {
     ctx.pass_with("M2", format!("all {} request(s) after a mutation got a response; {errors}", answered.len()));
 }
 
-/// M3: after each restoration, every stable probe's answers returned to
-/// their baseline ([design](../docs/source-mutations.md#verdict-rules)). A
+/// M3: after each restoration, every stable probe met the
+/// [recovery comparison rules](../docs/source-mutations.md#step-5). A
 /// failure needs an expectation the profile states and complete evidence;
 /// a recovery not seen otherwise is an error. `interrupted` says how the run
 /// lost the server during a case, and `capped` why the written-bytes cap
