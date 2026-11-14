@@ -925,7 +925,7 @@ impl Session {
 
     /// Takes in what has already been read, without waiting for more and
     /// without going past `deadline`. What it doesn't reach is handled later.
-    async fn absorb(&mut self, deadline: Instant) -> bool {
+    pub(crate) async fn absorb(&mut self, deadline: Instant) -> bool {
         tokio::task::yield_now().await;
         let mut n = 0u32;
         while !self.stdout_closed && Instant::now() < deadline {

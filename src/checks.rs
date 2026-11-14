@@ -16,7 +16,8 @@ use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::metamodel::{self, TooLarge};
 use crate::mutation;
 use crate::process::{Coverage, ProcInfo, ServerCommand};
-use crate::profile::{self, Skip};
+use crate::profile::{self, Expect, Skip};
+use crate::recovery;
 use crate::session::{
     self, CallError, Finish, Options, Problem, Recv, ServerRequest, Session, Unmatched, WaitError, WriteError,
 };
@@ -311,6 +312,8 @@ pub struct CheckResult {
 pub struct Recheck {
     pub from: Duration,
     pub to: Duration,
+    /// Further windows: something missed in any of them counts too.
+    pub also: Vec<(Duration, Duration)>,
     pub output_only: bool,
     pub verdict: Verdict,
     pub detail: String,
@@ -465,8 +468,6 @@ pub const MUTATION_OFF: &str = "mutation is off; pass --mutate";
 /// Why M1 to M3 are skipped with nothing to mutate.
 pub const NO_SEED_FILE: &str =
     "no seed file: the profile names none in [mutation].files and has no [document] to mutate";
-/// Why M3 is skipped while recovery isn't judged.
-pub const M3_LATER: &str = "lspcheck doesn't judge recovery yet; M3's probes are a later step";
 /// The checks the mutation scenario extends: it judges them on its own
 /// evidence as well, and [`combine_extended`] folds its verdict into the one
 /// their own scenario gives.
@@ -719,11 +720,9 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
     // in its window, judged again now that everything read is known.
     for r in &mut results {
         let Some(again) = r.unless_missed.take() else { continue };
-        let missed = if again.output_only {
-            finish.missed_output_within(again.from, again.to)
-        } else {
-            finish.incomplete_within(again.from, again.to)
-        };
+        let missed = std::iter::once((again.from, again.to)).chain(again.also).find_map(|(from, to)| {
+            if again.output_only { finish.missed_output_within(from, to) } else { finish.incomplete_within(from, to) }
+        });
         if let Some(why) = missed {
             r.verdict = again.verdict;
             r.detail = again.detail.replace(MISSED, &why);
@@ -855,7 +854,8 @@ impl Ctx<'_> {
     fn unless_missed(&mut self, from: Duration, to: Duration, verdict: Verdict, detail: impl Into<String>) {
         let r = self.results.last_mut().expect("just reported");
         if r.verdict != verdict {
-            r.unless_missed = Some(Recheck { from, to, output_only: false, verdict, detail: detail.into() });
+            r.unless_missed =
+                Some(Recheck { from, to, also: Vec::new(), output_only: false, verdict, detail: detail.into() });
         }
     }
 
@@ -3179,6 +3179,7 @@ fn still_running(ctx: &mut Ctx<'_>, id: &'static str) {
     r.unless_missed = Some(Recheck {
         from: Duration::ZERO,
         to,
+        also: Vec::new(),
         output_only: true,
         verdict: Verdict::Error,
         detail: format!(
@@ -3578,18 +3579,33 @@ struct SeedDoc {
     clean: String,
     current: String,
     version: i64,
+    /// When lspcheck began writing the current version.
+    version_at: Duration,
 }
 
-/// One request the mutation scenario sent after a mutation, and its fate.
+/// One request the mutation scenario sent, and its fate.
 struct StepRequest {
     id: Id,
     method: &'static str,
     /// Its params, for the positions D1 and D6 read in its replies.
     params: Value,
-    case: u64,
+    /// The case it was sent in: a step's request or a recovery poll. `None`
+    /// for a baseline probe, sent before the first mutation, which M2
+    /// doesn't judge.
+    case: Option<u64>,
     at: Duration,
     deadline_at: Duration,
     outcome: StepOutcome,
+}
+
+impl StepRequest {
+    /// Where it was sent, for a detail.
+    fn place(&self) -> String {
+        match self.case {
+            Some(k) => format!("case {k}"),
+            None => "the baseline".into(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3754,7 +3770,7 @@ impl Extended {
             if at < a.at || matches!(a.outcome, StepOutcome::Undelivered(_)) {
                 continue;
             }
-            let place = format!("case {}", a.case);
+            let place = a.place();
             let uri = a.params.pointer("/textDocument/uri").and_then(Value::as_str);
             let Kind::Response { outcome: Outcome::Result(result), .. } = &m.kind else { continue };
             if !before_end(at) {
@@ -3916,8 +3932,15 @@ fn step_outcome(
     }
 }
 
-async fn observe_mutation_batch(s: &mut Session, alive_at: &mut Option<Duration>) -> (bool, bool) {
-    let absorbed_all = s.absorb_all().await;
+async fn observe_mutation_batch(
+    s: &mut Session,
+    alive_at: &mut Option<Duration>,
+    until: Option<Duration>,
+) -> (bool, bool) {
+    let absorbed_all = match until {
+        Some(at) => s.absorb(instant_at(s, at)).await,
+        None => s.absorb_all().await,
+    };
     let at = s.elapsed();
     let closed = s.stdout_closed();
     let exited = !s.is_alive();
@@ -3944,6 +3967,827 @@ fn settle_step_request(
     });
     request.outcome =
         step_outcome(answer, request.deadline_at, server_gone, alive_at, s.stopped_reading(), absorbed_all);
+}
+
+/// A request about to be written in a batch.
+struct Ask {
+    method: &'static str,
+    params: Value,
+}
+
+/// How a batch of requests ended, beyond each request's own outcome.
+#[derive(Default)]
+struct BatchEnd {
+    /// Why the written-bytes cap stopped it before every request was written.
+    capped: Option<String>,
+    /// How lspcheck lost the server, if it did.
+    lost: Option<Lost>,
+}
+
+/// Writes `batch` back to back, each request with its own deadline,
+/// `--timeout` from when its write began, capped by `until` during baseline
+/// collection, then waits for each until its deadline and records it in
+/// `asked` with its outcome. `case` is `None` before the first mutation.
+async fn send_batch(
+    ctx: &mut Ctx<'_>,
+    asked: &mut Vec<StepRequest>,
+    batch: Vec<Ask>,
+    case: Option<u64>,
+    place: &str,
+    until: Option<Duration>,
+) -> BatchEnd {
+    let timeout = ctx.cfg.request_timeout;
+    let start = asked.len();
+    let mut deadlines = Vec::new();
+    let mut failed = None;
+    let mut alive_at = None;
+    let mut end = BatchEnd::default();
+    for Ask { method, params } in batch {
+        if until.is_some_and(|at| ctx.s.elapsed() >= at) {
+            break;
+        }
+        observe_mutation_batch(&mut ctx.s, &mut alive_at, until).await;
+        let id = ctx.s.fresh_id();
+        let bytes = frame(&message::request(&id, method, Some(params.clone())));
+        let registration_deadline =
+            until.map_or(Instant::now() + timeout, |at| instant_at(&ctx.s, at).min(Instant::now() + timeout));
+        let registered = ctx.s.begin_request(&id, method, registration_deadline).await;
+        // Registering took in what the server sent, answering it.
+        if registered.is_ok()
+            && let Some(why) = answers_capped(&ctx.s, bytes.len() as u64, &format!("{method} in {place}"))
+        {
+            ctx.s.abort_request(&id);
+            end.capped = Some(why);
+            break;
+        }
+        let at = ctx.s.elapsed();
+        let deadline_at = until.map_or(at + timeout, |until| until.min(at + timeout));
+        let deadline = instant_at(&ctx.s, deadline_at);
+        let written = match registered {
+            Ok(()) => {
+                let written = ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await;
+                if written.is_err() {
+                    ctx.s.abort_request(&id);
+                }
+                written
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            observe_mutation_batch(&mut ctx.s, &mut alive_at, until).await;
+            let how = match until {
+                Some(_) if ctx.s.stopped_reading().is_some() => {
+                    Lost::Uninspected(ctx.s.stopped_reading().expect("inspection stopped").1)
+                }
+                Some(_) if ctx.s.stdout_closed() || !ctx.s.is_alive() => {
+                    Lost::Gone("the server exited or closed its output during the baseline".into())
+                }
+                Some(_) => {
+                    Lost::Undelivered(format!("lspcheck couldn't deliver {method} before the baseline deadline ({e})"))
+                }
+                None => lost_after_write(ctx, method, &e).await,
+            };
+            // A request the server exited before reading is M1's.
+            let outcome = match &how {
+                Lost::Gone(_) => StepOutcome::Gone,
+                Lost::Uninspected(why) => StepOutcome::Uninspected(why.clone()),
+                _ => StepOutcome::Undelivered(format!("lspcheck couldn't deliver {method} ({e})")),
+            };
+            failed = Some((StepRequest { id, method, params, case, at, deadline_at, outcome }, how));
+            break;
+        }
+        asked.push(StepRequest { id, method, params, case, at, deadline_at, outcome: StepOutcome::Unanswered });
+        deadlines.push(deadline);
+    }
+    for (request, deadline) in asked[start..].iter().zip(deadlines) {
+        let _ = ctx.s.wait_response(&request.id, deadline).await;
+        observe_mutation_batch(&mut ctx.s, &mut alive_at, until).await;
+    }
+    let (absorbed_all, server_gone) = observe_mutation_batch(&mut ctx.s, &mut alive_at, until).await;
+    for request in &mut asked[start..] {
+        settle_step_request(&ctx.s, request, server_gone, alive_at, absorbed_all);
+    }
+    if let Some((request, how)) = failed {
+        asked.push(request);
+        end.lost = Some(how);
+    } else if ctx.s.stdout_closed() || server_gone {
+        end.lost = Some(lost_output(ctx).await);
+    }
+    end
+}
+
+/// The instant at session time `at`.
+fn instant_at(s: &Session, at: Duration) -> Instant {
+    Instant::now() + at.saturating_sub(s.elapsed())
+}
+
+/// Reads what the server sends until session time `until`, answering its
+/// requests; `stop` may end it sooner, after a message. False if the
+/// server's output ended first.
+async fn read_until(s: &mut Session, until: Duration, mut stop: impl FnMut(&Session) -> bool) -> bool {
+    loop {
+        match s.recv(instant_at(s, until)).await {
+            Recv::Closed => return false,
+            Recv::Timeout => return true,
+            Recv::Message(_) if stop(s) => return true,
+            Recv::Message(_) | Recv::Problem(_) => {}
+        }
+    }
+}
+
+/// How long settling waits for quiet: no `publishDiagnostics` or `$/progress`.
+const SETTLE_QUIET: Duration = Duration::from_secs(1);
+/// How far apart the baseline asks each probe.
+const BASELINE_GAP: Duration = Duration::from_secs(1);
+/// The gap after a case's first recovery poll; each gap doubles, up to [`LAST_POLL_GAP`].
+const FIRST_POLL_GAP: Duration = Duration::from_millis(250);
+const LAST_POLL_GAP: Duration = Duration::from_secs(2);
+/// The most recovery polls one case sends ([bounds](../docs/source-mutations.md#bounds)).
+const MAX_POLLS: u32 = 40;
+
+/// Settles the server once the seed documents are open: waits until no
+/// work-done progress it began is unfinished and no `publishDiagnostics` or
+/// `$/progress` has arrived for [`SETTLE_QUIET`], within `timeout`
+/// ([design](../docs/source-mutations.md#the-scenario)). Why it didn't, if
+/// it didn't. An end of output is left for the next write to find.
+async fn settle_server(s: &mut Session, timeout: Duration) -> Option<String> {
+    let began = s.elapsed();
+    let deadline = began + timeout;
+    let mut quiet_since = began;
+    let mut unfinished: Vec<String> = Vec::new();
+    let mut seen = 0;
+    loop {
+        // Progress begun during initialization counts too.
+        for (at, m) in &s.messages[seen..] {
+            let Kind::Notification { method } = &m.kind else { continue };
+            if method == PUBLISH_DIAGNOSTICS {
+                quiet_since = quiet_since.max(*at);
+            } else if method == "$/progress" {
+                quiet_since = quiet_since.max(*at);
+                let token = m.value.pointer("/params/token").map(Value::to_string).unwrap_or_default();
+                match m.value.pointer("/params/value/kind").and_then(Value::as_str) {
+                    Some("begin") if !unfinished.contains(&token) => unfinished.push(token),
+                    Some("end") => unfinished.retain(|t| *t != token),
+                    _ => {}
+                }
+            }
+        }
+        seen = s.messages.len();
+        let now = s.elapsed();
+        if unfinished.is_empty() && now >= quiet_since + SETTLE_QUIET {
+            return None;
+        }
+        if now >= deadline {
+            let why = if unfinished.is_empty() {
+                "kept sending publishDiagnostics or $/progress".to_string()
+            } else {
+                format!("still had work-done progress {} unfinished", unfinished.join(", "))
+            };
+            return Some(format!("the server didn't settle within settle_timeout ({} s): it {why}", seconds(timeout)));
+        }
+        let until = if unfinished.is_empty() { (quiet_since + SETTLE_QUIET).min(deadline) } else { deadline };
+        if let Recv::Closed = s.recv(instant_at(s, until)).await {
+            return Some("the server's output ended while lspcheck waited for it to settle".into());
+        }
+    }
+}
+
+/// Whether a probe is one of the diagnostics, which `no_errors` speaks about.
+fn is_diagnostics(probe: profile::Probe) -> bool {
+    matches!(probe, profile::Probe::Diagnostic | profile::Probe::PublishDiagnostics)
+}
+
+/// Why a request probe isn't asked about a document.
+fn unoffered(caps: &Value, probe: profile::Probe) -> String {
+    let capability = match probe {
+        profile::Probe::DocumentSymbol => "documentSymbolProvider",
+        profile::Probe::FoldingRange => "foldingRangeProvider",
+        _ => "diagnosticProvider",
+    };
+    if advertises(caps, capability) {
+        format!("the documentSelector of {capability} doesn't select the document")
+    } else {
+        format!("the server doesn't advertise {capability}")
+    }
+}
+
+/// A probe's answer to `request`, projected, or why there is none to compare.
+fn probe_answer(s: &Session, request: &StepRequest, probe: profile::Probe, timeout: Duration) -> Result<Value, String> {
+    match &request.outcome {
+        StepOutcome::Answered(None) => match s.answer_to(&request.id).map(|m| &m.kind) {
+            Some(Kind::Response { outcome: Outcome::Result(result), .. }) => recovery::project(probe, result)
+                .ok_or_else(|| {
+                    "was answered with a diagnostic report that is not full or has malformed projected fields"
+                        .to_string()
+                }),
+            _ => Err("was answered with a malformed response (see J5)".into()),
+        },
+        StepOutcome::Answered(Some(code)) => Err(format!("was answered with error {code}")),
+        StepOutcome::Unanswered => Err(format!("got no reply within {} s (--timeout)", seconds(timeout))),
+        StepOutcome::Gone => Err("got no reply before the server exited or closed its output".into()),
+        StepOutcome::Uninspected(why) | StepOutcome::Undelivered(why) => Err(format!("wasn't judged: {why}")),
+    }
+}
+
+/// The seed document a labelled `publishDiagnostics` is about, and its label.
+fn labelled_publish(m: &Message, docs: &[SeedDoc]) -> Option<(usize, i64)> {
+    if !matches!(&m.kind, Kind::Notification { method } if method == PUBLISH_DIAGNOSTICS) {
+        return None;
+    }
+    let params = m.value.get("params")?;
+    let uri = params.get("uri")?.as_str()?;
+    let label = params.get("version").and_then(documents::version_number)?;
+    Some((docs.iter().position(|doc| documents::same_uri(&doc.uri, uri))?, label))
+}
+
+/// A recovery probe of one seed document with a stable baseline.
+struct Stable {
+    doc: usize,
+    probe: profile::Probe,
+    /// The probe and the document, as a detail names them.
+    label: String,
+    /// Its request's params; `None` for pushed diagnostics.
+    params: Option<Value>,
+    /// Its answer at baseline, projected.
+    baseline: Value,
+}
+
+/// The labelled `publishDiagnostics` read about each seed document: for
+/// each label, the latest, as an index into the session's messages.
+#[derive(Default)]
+struct PushLog {
+    scanned: usize,
+    latest: Vec<HashMap<i64, usize>>,
+}
+
+impl PushLog {
+    /// Logs the publishes read by session time `until` since the last call,
+    /// and returns each as its document, label and index.
+    fn scan(&mut self, msgs: &[(Duration, Message)], docs: &[SeedDoc], until: Duration) -> Vec<(usize, i64, usize)> {
+        self.latest.resize_with(docs.len(), HashMap::new);
+        let mut read = Vec::new();
+        while let Some((at, m)) = msgs.get(self.scanned)
+            && *at <= until
+        {
+            if let Some((d, label)) = labelled_publish(m, docs) {
+                self.latest[d].insert(label, self.scanned);
+                read.push((d, label, self.scanned));
+            }
+            self.scanned += 1;
+        }
+        read
+    }
+}
+
+/// What the pushed diagnostics of one stable probe showed during a case's
+/// recovery: only publishes labelled with the document's current version,
+/// read after lspcheck began sending it, count.
+#[derive(Debug, Clone, Default)]
+struct PushWatch {
+    /// The latest such publish: its index in the session's messages, and when it was read.
+    latest: Option<(usize, Duration)>,
+    /// When one was first read that showed the probe recovered.
+    matched: Option<Duration>,
+    /// When those read since stopped including an Error diagnostic, if they have.
+    clean_since: Option<Duration>,
+    invalid: bool,
+}
+
+/// How one stable probe did after a case's restoration.
+#[derive(Debug, Clone, PartialEq)]
+enum ProbeEnd {
+    /// Seen to satisfy the recovery comparison this long after the restoration was
+    /// delivered; by its terminal probe if `terminal`.
+    Recovered { after: Duration, terminal: bool },
+    /// Seen not to: a failure, unless lspcheck missed something between
+    /// `from` and `to`.
+    Failed { detail: String, from: Duration, to: Duration },
+    /// Not seen to: an error, and why.
+    Unseen(String),
+}
+
+/// One case's recovery, for M3.
+struct CaseRecovery {
+    case: u64,
+    /// From when the restoration was delivered to when lspcheck stopped watching.
+    window: (Duration, Duration),
+    /// Each stable probe's outcome, in the order of [`Recovery::stable`].
+    outcomes: Vec<ProbeEnd>,
+}
+
+/// What M3 judges: the probes with stable baselines and how each case's
+/// restoration went ([design](../docs/source-mutations.md#recovery)).
+#[derive(Default)]
+struct Recovery {
+    expect: Expect,
+    /// The profile's `no_errors`, unless the server contradicted it at baseline.
+    no_errors: bool,
+    /// The profile's `recovery_timeout`.
+    timeout: Duration,
+    /// Why the server didn't settle, if it didn't.
+    unsettled: Option<String>,
+    stable: Vec<Stable>,
+    /// Each probe without a stable baseline, and why.
+    unused: Vec<String>,
+    /// Pushed diagnostics are a probe whose baselines are still to be
+    /// taken, just before the first mutation.
+    pushes_pending: bool,
+    /// Why the profile's `no_errors` and the server disagree, if they do.
+    contradicted: Option<String>,
+    cases: Vec<CaseRecovery>,
+    pushes: PushLog,
+}
+
+impl Recovery {
+    /// Takes the pushed diagnostics' baselines just before the first
+    /// mutation: for each seed document, the publishes labelled with version
+    /// 1 read since it was opened; if they are all equal after projection,
+    /// the last. Then holds the profile's `no_errors` to every diagnostics
+    /// baseline.
+    fn before_first_mutation(&mut self, msgs: &[(Duration, Message)], docs: &[SeedDoc]) {
+        if std::mem::take(&mut self.pushes_pending) {
+            for (d, doc) in docs.iter().enumerate() {
+                let label = format!("{} of {}", profile::Probe::PublishDiagnostics.name(), doc.name);
+                let publishes: Option<Vec<Value>> = msgs
+                    .iter()
+                    .filter(|(at, m)| *at >= doc.version_at && labelled_publish(m, docs) == Some((d, 1)))
+                    .map(|(_, m)| recovery::project(profile::Probe::PublishDiagnostics, &m.value["params"]))
+                    .collect();
+                let Some(publishes) = publishes else {
+                    self.unused.push(format!(
+                        "{label}: malformed diagnostics labelled with version 1 arrived before the first mutation"
+                    ));
+                    continue;
+                };
+                match publishes.last() {
+                    None => self.unused.push(format!(
+                        "{label}: no publishDiagnostics labelled with version 1 arrived before the first mutation"
+                    )),
+                    Some(last) if publishes.iter().any(|p| p != last) => self.unused.push(format!(
+                        "{label}: the {} publishDiagnostics labelled with version 1 before the first mutation differed",
+                        publishes.len()
+                    )),
+                    Some(last) => self.stable.push(Stable {
+                        doc: d,
+                        probe: profile::Probe::PublishDiagnostics,
+                        label,
+                        params: None,
+                        baseline: last.clone(),
+                    }),
+                }
+            }
+        }
+        if self.no_errors
+            && let Some((s, error)) = self
+                .stable
+                .iter()
+                .filter(|s| is_diagnostics(s.probe))
+                .find_map(|s| recovery::first_error(&s.baseline).map(|e| (s, e)))
+        {
+            self.contradicted = Some(format!(
+                "the profile and the server disagree before any mutation: mutation.recovery.no_errors says the seed \
+                 has no Error diagnostics, but {} has {} at baseline",
+                s.label,
+                metamodel::shorten_value(error)
+            ));
+            self.no_errors = false;
+        }
+    }
+
+    /// Whether `projected`, an answer of stable probe `i`, shows it
+    /// recovered: equal to its baseline, or, for diagnostics held only to
+    /// `no_errors`, free of Error diagnostics.
+    fn recovered(&self, i: usize, projected: &Value) -> bool {
+        let s = &self.stable[i];
+        if self.no_errors && self.expect == Expect::Observe && is_diagnostics(s.probe) {
+            recovery::first_error(projected).is_none()
+        } else {
+            *projected == s.baseline
+        }
+    }
+
+    /// Whether the profile holds probe `i` to an expectation, so that a
+    /// difference lspcheck saw in full fails M3.
+    fn held(&self, i: usize) -> bool {
+        self.expect == Expect::Baseline || (self.no_errors && is_diagnostics(self.stable[i].probe))
+    }
+
+    /// Takes in publish `index`, of document `d` and labelled `label`, for
+    /// that document's push probes, if it describes the current version.
+    fn push_read(
+        &self,
+        watches: &mut [PushWatch],
+        msgs: &[(Duration, Message)],
+        docs: &[SeedDoc],
+        d: usize,
+        label: i64,
+        index: usize,
+    ) {
+        let (at, m) = &msgs[index];
+        if label != docs[d].version || *at < docs[d].version_at {
+            return;
+        }
+        let projected = recovery::project(profile::Probe::PublishDiagnostics, &m.value["params"]);
+        for (i, s) in self.stable.iter().enumerate() {
+            if s.doc != d || s.probe != profile::Probe::PublishDiagnostics {
+                continue;
+            }
+            let w = &mut watches[i];
+            w.latest = Some((index, *at));
+            let Some(projected) = &projected else {
+                w.invalid = true;
+                continue;
+            };
+            if w.matched.is_none() && self.recovered(i, projected) {
+                w.matched = Some(*at);
+            }
+            if recovery::first_error(projected).is_some() {
+                w.clean_since = None;
+            } else {
+                w.clean_since.get_or_insert(*at);
+            }
+        }
+    }
+
+    /// Whether every stable probe has been seen to recover. With `no_errors`,
+    /// pushed diagnostics are read to the end of the bound: the last publish
+    /// by then is the server's final word.
+    fn all_seen(&self, seen: &[Option<(Duration, bool)>], watches: &[PushWatch]) -> bool {
+        self.stable.iter().enumerate().all(|(i, s)| match s.params {
+            Some(_) => seen[i].is_some(),
+            None => watches[i].matched.is_some() && !self.no_errors,
+        })
+    }
+
+    /// The outcome for probe `i` of case `k` when its deciding answer,
+    /// `projected`, didn't show it recovered: a failure when the profile
+    /// holds it to an expectation and lspcheck saw the answer in full
+    /// (`whole`; what it may have missed in `window` is judged with M3),
+    /// else an error that shows the difference.
+    #[allow(clippy::too_many_arguments)]
+    fn differs(
+        &self,
+        i: usize,
+        k: u64,
+        deciding: &str,
+        projected: &Value,
+        window: (Duration, Duration),
+        whole: Result<(), String>,
+        how_long: &str,
+    ) -> ProbeEnd {
+        let s = &self.stable[i];
+        let error = (self.no_errors && is_diagnostics(s.probe)).then(|| recovery::first_error(projected)).flatten();
+        let shown = match (error, recovery::difference(&s.baseline, projected)) {
+            (Some(e), _) => format!(
+                "{deciding} has {}, though mutation.recovery.no_errors says the seed has no Error diagnostics",
+                metamodel::shorten_value(e)
+            ),
+            (None, Some(d)) => format!("{deciding} differs {}", d.describe(recovery::root(s.probe), "the answer")),
+            (None, None) => format!("{deciding} isn't the baseline"),
+        };
+        let t = seconds(self.timeout);
+        if !self.held(i) {
+            return ProbeEnd::Unseen(format!(
+                "case {k}: {} not seen to recover within {t} s; lspcheck's bound, not a protocol rule: set \
+                 `[mutation.recovery].expect` if the answers are fixed ({shown})",
+                s.label
+            ));
+        }
+        if let Err(why) = whole {
+            return ProbeEnd::Unseen(format!("case {k}: {}: {why}, so this isn't a failure ({shown})", s.label));
+        }
+        let what = if error.is_some() { "isn't free of Error diagnostics" } else { "didn't return to its baseline" };
+        ProbeEnd::Failed {
+            detail: format!(
+                "case {k}: {} {what} within {t} s of the restoration (mutation.recovery.recovery_timeout): {shown}; \
+                 {how_long}",
+                s.label
+            ),
+            from: window.0,
+            to: window.1,
+        }
+    }
+}
+
+/// The baseline ([design](../docs/source-mutations.md#the-scenario)): asks
+/// each request probe about each seed document, then again every
+/// [`BASELINE_GAP`], until two answers in a row are equal after projection,
+/// within `timeout`. A probe with a stable answer is used; each other is
+/// listed with why it isn't.
+#[allow(clippy::too_many_arguments)]
+async fn take_baseline(
+    ctx: &mut Ctx<'_>,
+    rec: &mut Recovery,
+    caps: &Value,
+    docs: &[SeedDoc],
+    probes: &[profile::Probe],
+    encoding: Encoding,
+    asked: &mut Vec<StepRequest>,
+    timeout: Duration,
+) -> BatchEnd {
+    /// A request probe being asked: its last answer, projected, while two in
+    /// a row aren't equal, and why it isn't stable yet.
+    struct Asking {
+        doc: usize,
+        probe: profile::Probe,
+        params: Value,
+        last: Option<Value>,
+        stable: bool,
+        why: String,
+    }
+    let mut asking = Vec::new();
+    for (d, doc) in docs.iter().enumerate() {
+        for &probe in probes.iter().filter(|p| p.is_request()) {
+            match step_request(caps, doc, probe.name(), Spot { line: 0, column: 0 }, encoding, "") {
+                Some(params) => asking.push(Asking {
+                    doc: d,
+                    probe,
+                    params,
+                    last: None,
+                    stable: false,
+                    why: "it wasn't asked before settle_timeout ended".into(),
+                }),
+                None => rec.unused.push(format!("{} of {}: {}", probe.name(), doc.name, unoffered(caps, probe))),
+            }
+        }
+    }
+    let timeout_per_request = ctx.cfg.request_timeout;
+    let deadline = ctx.s.elapsed() + timeout;
+    let mut end = BatchEnd::default();
+    while asking.iter().any(|a| !a.stable) && ctx.s.elapsed() < deadline {
+        let round = ctx.s.elapsed();
+        let pending: Vec<usize> = (0..asking.len()).filter(|&n| !asking[n].stable).collect();
+        let batch =
+            pending.iter().map(|&n| Ask { method: asking[n].probe.name(), params: asking[n].params.clone() }).collect();
+        let start = asked.len();
+        end = send_batch(ctx, asked, batch, None, "the baseline", Some(deadline)).await;
+        for (request, &n) in asked[start..].iter().zip(&pending) {
+            let a = &mut asking[n];
+            if request.deadline_at == deadline && !matches!(request.outcome, StepOutcome::Answered(_)) {
+                a.last = None;
+                a.why = "no usable answer arrived before settle_timeout ended".into();
+                continue;
+            }
+            match probe_answer(&ctx.s, request, a.probe, timeout_per_request) {
+                Ok(projected) if a.last.as_ref() == Some(&projected) => a.stable = true,
+                Ok(projected) => {
+                    a.last = Some(projected);
+                    a.why = "its answers didn't repeat before settle_timeout ended".into();
+                }
+                Err(why) => {
+                    a.last = None;
+                    a.why = format!("it {why}");
+                }
+            }
+        }
+        if end.lost.is_some() || end.capped.is_some() || asking.iter().all(|a| a.stable) {
+            break;
+        }
+        if !read_until(&mut ctx.s, (round + BASELINE_GAP).min(deadline), |_| false).await {
+            end.lost = Some(lost_output(ctx).await);
+            break;
+        }
+    }
+    for a in asking {
+        let label = format!("{} of {}", a.probe.name(), docs[a.doc].name);
+        match (a.stable, a.last) {
+            (true, Some(baseline)) => {
+                rec.stable.push(Stable { doc: a.doc, probe: a.probe, label, params: Some(a.params), baseline })
+            }
+            _ => rec.unused.push(format!("{label}: {}", a.why)),
+        }
+    }
+    end
+}
+
+/// Watches case `k`'s recovery once the restoration lspcheck began writing
+/// at `began` is delivered ([design](../docs/source-mutations.md#recovery)):
+/// polls the stable request probes, [`FIRST_POLL_GAP`] apart and doubling to
+/// [`LAST_POLL_GAP`], and reads the pushed diagnostics, until each is seen
+/// to satisfy the recovery comparison or `recovery_timeout` ends. Each request probe
+/// not seen to then gets one terminal probe, written after that.
+async fn recover(
+    ctx: &mut Ctx<'_>,
+    rec: &mut Recovery,
+    docs: &[SeedDoc],
+    asked: &mut Vec<StepRequest>,
+    k: u64,
+    restoration: (Duration, Duration),
+) -> BatchEnd {
+    let (began, restored) = restoration;
+    let timeout = ctx.cfg.request_timeout;
+    let bound = restored + rec.timeout;
+    let n = rec.stable.len();
+    // For each request probe, when it was seen to recover, and whether by
+    // its terminal probe.
+    let mut seen: Vec<Option<(Duration, bool)>> = vec![None; n];
+    let mut invalid = vec![None; n];
+    let mut watches = vec![PushWatch::default(); n];
+    // What was read before the restoration began gives only each
+    // document's latest word about its current version: an unmutated
+    // document's, which the server needn't publish again.
+    rec.pushes.scan(&ctx.s.messages, docs, began);
+    for s in rec.stable.iter().filter(|s| s.params.is_none()) {
+        if let Some(&index) = rec.pushes.latest[s.doc].get(&docs[s.doc].version) {
+            rec.push_read(&mut watches, &ctx.s.messages, docs, s.doc, docs[s.doc].version, index);
+        }
+    }
+    let (mut polls, mut gap, mut next, mut spent) = (0u32, FIRST_POLL_GAP, restored, false);
+    let mut end = BatchEnd::default();
+    loop {
+        for (d, label, index) in rec.pushes.scan(&ctx.s.messages, docs, bound) {
+            rec.push_read(&mut watches, &ctx.s.messages, docs, d, label, index);
+        }
+        if rec.all_seen(&seen, &watches) || ctx.s.elapsed() >= bound {
+            break;
+        }
+        let pending: Vec<usize> = (0..n).filter(|&i| rec.stable[i].params.is_some() && seen[i].is_none()).collect();
+        spent |= !pending.is_empty() && polls == MAX_POLLS;
+        let until = if pending.is_empty() || spent { bound } else { next.min(bound) };
+        if ctx.s.elapsed() < until {
+            let alive = read_until(&mut ctx.s, until, |s| {
+                for (d, label, index) in rec.pushes.scan(&s.messages, docs, bound) {
+                    rec.push_read(&mut watches, &s.messages, docs, d, label, index);
+                }
+                rec.all_seen(&seen, &watches)
+            })
+            .await;
+            if !alive {
+                end.lost = Some(lost_output(ctx).await);
+                break;
+            }
+            continue;
+        }
+        polls += 1;
+        let batch = pending
+            .iter()
+            .map(|&i| Ask {
+                method: rec.stable[i].probe.name(),
+                params: rec.stable[i].params.clone().expect("a request probe"),
+            })
+            .collect();
+        let start = asked.len();
+        end = send_batch(ctx, asked, batch, Some(k), &format!("recovery poll {polls} of case {k}"), None).await;
+        for (request, &i) in asked[start..].iter().zip(&pending) {
+            match probe_answer(&ctx.s, request, rec.stable[i].probe, timeout) {
+                Ok(projected) if rec.recovered(i, &projected) => {
+                    let at = ctx.s.answered_at(&request.id).unwrap_or(request.deadline_at);
+                    seen[i] = Some((at.saturating_sub(restored), false));
+                }
+                Err(why)
+                    if matches!(ctx.s.answer_to(&request.id).map(|m| &m.kind),
+                    Some(Kind::Response { outcome: Outcome::Result(result), .. })
+                        if recovery::project(rec.stable[i].probe, result).is_none()) =>
+                {
+                    invalid[i] = Some(why);
+                }
+                _ => {}
+            }
+        }
+        if end.lost.is_some() || end.capped.is_some() {
+            break;
+        }
+        next = ctx.s.elapsed() + gap;
+        gap = (gap * 2).min(LAST_POLL_GAP);
+    }
+    let stopped = match (&end.lost, &end.capped) {
+        (Some(Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) | Lost::AfterWithheld(why)), _)
+        | (None, Some(why)) => Some(why.clone()),
+        (None, None) => None,
+    };
+    // Everything read by the end of the bound, for the pushed diagnostics.
+    let drained = stopped.is_none() && ctx.s.absorb_all().await;
+    for (d, label, index) in rec.pushes.scan(&ctx.s.messages, docs, bound) {
+        rec.push_read(&mut watches, &ctx.s.messages, docs, d, label, index);
+    }
+    // The terminal probes: requests written after the bound, whose answers decide.
+    let mut terminal: Vec<Option<usize>> = vec![None; n];
+    let watched = ctx.s.elapsed();
+    if stopped.is_none() {
+        let pending: Vec<usize> = (0..n).filter(|&i| rec.stable[i].params.is_some() && seen[i].is_none()).collect();
+        if !pending.is_empty() {
+            let batch = pending
+                .iter()
+                .map(|&i| Ask {
+                    method: rec.stable[i].probe.name(),
+                    params: rec.stable[i].params.clone().expect("a request probe"),
+                })
+                .collect();
+            let start = asked.len();
+            end = send_batch(ctx, asked, batch, Some(k), &format!("the terminal probes of case {k}"), None).await;
+            for (offset, &i) in pending.iter().enumerate().filter(|(offset, _)| start + offset < asked.len()) {
+                terminal[i] = Some(start + offset);
+            }
+        }
+    }
+    let unwritten = match (&end.lost, &end.capped) {
+        (Some(Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) | Lost::AfterWithheld(why)), _)
+        | (None, Some(why)) => why.clone(),
+        (None, None) => "lspcheck stopped".into(),
+    };
+    let t = seconds(rec.timeout);
+    let polled = format!(
+        "lspcheck polled {polls} time(s) in the {} s before it sent the terminal probe",
+        seconds_3(watched.saturating_sub(restored))
+    );
+    let mut outcomes = Vec::with_capacity(n);
+    for i in 0..n {
+        let s = &rec.stable[i];
+        let outcome = if let Some(why) = &invalid[i] {
+            ProbeEnd::Unseen(format!("case {k}: {} {why}", s.label))
+        } else if watches[i].invalid {
+            ProbeEnd::Unseen(format!("case {k}: {} had malformed diagnostics during recovery", s.label))
+        } else if s.params.is_some() {
+            match (seen[i], &stopped, terminal[i]) {
+                (Some((after, terminal)), ..) => ProbeEnd::Recovered { after, terminal },
+                (None, Some(why), _) => {
+                    ProbeEnd::Unseen(format!("case {k}: {} wasn't seen to recover: {why}", s.label))
+                }
+                (None, None, None) => ProbeEnd::Unseen(format!(
+                    "case {k}: {} wasn't seen to recover, and its terminal probe wasn't written: {unwritten}",
+                    s.label
+                )),
+                (None, None, Some(index)) => {
+                    let request = &asked[index];
+                    match probe_answer(&ctx.s, request, s.probe, timeout) {
+                        Ok(projected) if rec.recovered(i, &projected) => {
+                            let at = ctx.s.answered_at(&request.id).unwrap_or(request.deadline_at);
+                            ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: true }
+                        }
+                        Ok(projected) => {
+                            let to = ctx.s.answered_at(&request.id).unwrap_or(request.deadline_at);
+                            let whole = if spent {
+                                Err(format!(
+                                    "lspcheck stopped polling at its budget of {MAX_POLLS} polls before \
+                                     recovery_timeout ended"
+                                ))
+                            } else {
+                                Ok(())
+                            };
+                            rec.differs(
+                                i,
+                                k,
+                                "its terminal probe's answer",
+                                &projected,
+                                (request.at, to),
+                                whole,
+                                &polled,
+                            )
+                        }
+                        Err(why) => ProbeEnd::Unseen(format!(
+                            "case {k}: {} wasn't seen to recover within {t} s, and its terminal probe {why}",
+                            s.label
+                        )),
+                    }
+                }
+            }
+        } else {
+            let w = &watches[i];
+            let version = docs[s.doc].version;
+            match (w.matched, &stopped, w.latest) {
+                (Some(at), ..) if !rec.no_errors => {
+                    ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: false }
+                }
+                (_, Some(why), _) => ProbeEnd::Unseen(format!("case {k}: {} wasn't seen to recover: {why}", s.label)),
+                _ if !drained => ProbeEnd::Unseen(format!(
+                    "case {k}: {}: lspcheck couldn't finish reading what the server sent within recovery_timeout",
+                    s.label
+                )),
+                (_, None, None) => ProbeEnd::Unseen(format!(
+                    "case {k}: {}: no publishDiagnostics labelled with version {version} was read within {t} s of \
+                     the restoration, and LSP doesn't require one for every version",
+                    s.label
+                )),
+                (matched, None, Some((index, at))) => {
+                    let params = &ctx.s.messages[index].1.value["params"];
+                    let projected =
+                        recovery::project(profile::Probe::PublishDiagnostics, params).expect("a publish projects");
+                    let deciding = format!(
+                        "the last publishDiagnostics labelled with version {version} read within {t} s of the \
+                         restoration"
+                    );
+                    let error = rec.no_errors && recovery::first_error(&projected).is_some();
+                    let read = format!("lspcheck read all the server sent in those {t} s, and polled {polls} time(s)");
+                    match (error, matched) {
+                        (false, _) if rec.no_errors && rec.expect == Expect::Observe => ProbeEnd::Recovered {
+                            after: w.clean_since.unwrap_or(at).saturating_sub(restored),
+                            terminal: false,
+                        },
+                        (false, Some(m)) => ProbeEnd::Recovered { after: m.saturating_sub(restored), terminal: false },
+                        _ => rec.differs(i, k, &deciding, &projected, (at, bound), Ok(()), &read),
+                    }
+                }
+            }
+        };
+        outcomes.push(outcome);
+    }
+    rec.cases.push(CaseRecovery { case: k, window: (restored, ctx.s.elapsed()), outcomes });
+    end
+}
+
+/// A duration in seconds, to the millisecond.
+fn seconds_3(d: Duration) -> String {
+    format!("{:.3}", d.as_secs_f64())
 }
 
 /// The params of a step's request: K1's, at `spot`, about the document as
@@ -3973,19 +4817,20 @@ fn describe_edits(step: &mutation::Step) -> String {
 }
 
 /// The mutation scenario ([design](../docs/source-mutations.md#the-scenario)):
-/// open the seed documents, run seeded cases that mutate them step by step
-/// and ask about each mutated text, restore the clean text after each case,
-/// then shut down. M1 judges whether the server survives, M2 whether every
-/// request is answered. Recovery (M3) is a later step.
+/// open the seed documents, let the server settle and take the recovery
+/// probes' baselines, run seeded cases that mutate them step by step and
+/// ask about each mutated text, restore the clean text after each case and
+/// watch the answers return, then shut down. M1 judges whether the server
+/// survives, M2 whether every request is answered, M3 whether it recovers.
 async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     let settings = ctx.cfg.mutation.clone().expect("the mutation scenario runs only with --mutate");
     let seed = settings.seed.expect("main chooses the seed");
     let mut summary =
         MutationSummary { seed, format: mutation::FORMAT, cases: settings.cases, cases_run: 0, stopped: None };
-    ctx.report("M3", Verdict::Skip, M3_LATER);
-    let both = |ctx: &mut Ctx<'_>, verdict: Verdict, detail: String| {
-        ctx.report("M1", verdict, detail.clone());
-        ctx.report("M2", verdict, detail);
+    let all = |ctx: &mut Ctx<'_>, verdict: Verdict, detail: String| {
+        for id in ["M1", "M2", "M3"] {
+            ctx.report(id, verdict, detail.clone());
+        }
     };
     let params = ctx.with_options(capabilities_initialize_params(&ctx.root));
     let id = ctx.s.fresh_id();
@@ -3994,7 +4839,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         let why = format!(
             "the profile's initializationOptions and settings would write {startup_bytes} bytes before any mutation, past the scenario's cap of 64 MiB"
         );
-        both(ctx, Verdict::Error, why.clone());
+        all(ctx, Verdict::Error, why.clone());
         summary.stopped = Some(why);
         ctx.mutation = Some(summary);
         return;
@@ -4009,7 +4854,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 Some(capped) => format!("{capped}; then initialize didn't succeed: {why}"),
                 None => format!("initialize didn't succeed: {why}"),
             };
-            both(ctx, Verdict::Error, why.clone());
+            all(ctx, Verdict::Error, why.clone());
             summary.stopped = Some(why);
             ctx.mutation = Some(summary);
             return;
@@ -4018,7 +4863,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     ctx.s.cap_answers(MUTATION_BYTES, SHUTDOWN_RESERVE);
     let Some(caps) = initialize_capabilities(&reply).filter(|c| c.is_object()).cloned() else {
         let why = "initialize had no capabilities object (see L2)".to_string();
-        both(ctx, Verdict::Error, why.clone());
+        all(ctx, Verdict::Error, why.clone());
         summary.stopped = Some(why);
         ctx.mutation = Some(summary);
         leave(ctx).await;
@@ -4029,7 +4874,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         SyncKind::Incremental => mutation::Sync::Incremental,
         SyncKind::None => {
             let why = "the server takes no document changes (textDocumentSync change is absent or 0)".to_string();
-            both(ctx, Verdict::Skip, why.clone());
+            all(ctx, Verdict::Skip, why.clone());
             summary.stopped = Some(why);
             ctx.mutation = Some(summary);
             leave(ctx).await;
@@ -4038,7 +4883,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     };
     if !opens_documents(&reply) {
         let why = "the server doesn't ask for didOpen (textDocumentSync openClose)".to_string();
-        both(ctx, Verdict::Skip, why.clone());
+        all(ctx, Verdict::Skip, why.clone());
         summary.stopped = Some(why);
         ctx.mutation = Some(summary);
         leave(ctx).await;
@@ -4047,7 +4892,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     let encoding = match negotiated_encoding(&reply) {
         Ok(encoding) => encoding,
         Err(why) => {
-            both(ctx, Verdict::Error, why.clone());
+            all(ctx, Verdict::Error, why.clone());
             summary.stopped = Some(why);
             ctx.mutation = Some(summary);
             leave(ctx).await;
@@ -4069,7 +4914,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         let text = match text {
             Ok(text) => text,
             Err(why) => {
-                both(ctx, Verdict::Error, why.clone());
+                all(ctx, Verdict::Error, why.clone());
                 summary.stopped = Some(why);
                 ctx.mutation = Some(summary);
                 leave(ctx).await;
@@ -4083,10 +4928,11 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             current: text.clone(),
             clean: text,
             version: 1,
+            version_at: Duration::ZERO,
         });
     }
     if let Some(why) = answers_capped(&ctx.s, 0, "the seed files were opened") {
-        both(ctx, Verdict::Error, why.clone());
+        all(ctx, Verdict::Error, why.clone());
         summary.stopped = Some(why);
         ctx.mutation = Some(summary);
         leave(ctx).await;
@@ -4107,20 +4953,22 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     if opening_bytes > MUTATION_BYTES {
         let why =
             format!("opening the seed files would write {opening_bytes} bytes, past the scenario's cap of 64 MiB");
-        both(ctx, Verdict::Error, why.clone());
+        all(ctx, Verdict::Error, why.clone());
         summary.stopped = Some(why);
         ctx.mutation = Some(summary);
         leave(ctx).await;
         return;
     }
-    for (d, (doc, params)) in docs.iter().zip(openings).enumerate() {
-        ext.record(&ctx.s, &[], d, ctx.s.elapsed(), 1, doc.clean.clone());
+    for (d, params) in openings.into_iter().enumerate() {
+        let at = ctx.s.elapsed();
+        ext.record(&ctx.s, &[], d, at, 1, docs[d].clean.clone());
+        docs[d].version_at = at;
         if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(params)).await {
-            let why = match lost_after_write(ctx, &format!("didOpen for {}", doc.name), &e).await {
+            let why = match lost_after_write(ctx, &format!("didOpen for {}", docs[d].name), &e).await {
                 Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) | Lost::AfterWithheld(why) => why,
             };
             let why = format!("before the first mutation: {why}");
-            both(ctx, Verdict::Error, why.clone());
+            all(ctx, Verdict::Error, why.clone());
             summary.stopped = Some(why);
             ctx.mutation = Some(summary);
             leave_extended(ctx, &mut ext, &[]).await;
@@ -4147,16 +4995,47 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     };
     let timeout = ctx.cfg.request_timeout;
     let case_budget = settings.case_budget(timeout);
-    let run_deadline = Instant::now() + settings.run_timeout;
     let mut cursor = 0usize;
     let mut asked: Vec<StepRequest> = Vec::new();
     let mut first_change: Option<Duration> = None;
     let mut versions = 0u64;
     let mut lost: Option<(Lost, String)> = None;
     let mut cut_short = 0u64;
+    // Settle, then the baseline, before the first case; each within
+    // settle_timeout. The run's own budget starts after them.
+    let settle_timeout = settings.settle_timeout(ctx.cfg.startup_timeout);
+    let probes = settings.recovery.probes.clone().unwrap_or_else(|| profile::Probe::ALL.to_vec());
+    let mut rec = Recovery {
+        expect: settings.recovery.expect,
+        no_errors: settings.recovery.no_errors,
+        timeout: settings.recovery_timeout(timeout),
+        pushes_pending: probes.contains(&profile::Probe::PublishDiagnostics),
+        ..Recovery::default()
+    };
+    rec.unsettled = settle_server(&mut ctx.s, settle_timeout).await;
+    if let Some(why) = &rec.unsettled {
+        ctx.s.note(why.clone());
+    }
+    let baseline = take_baseline(ctx, &mut rec, &caps, &docs, &probes, encoding, &mut asked, settle_timeout).await;
+    if let Some(how) = baseline.lost {
+        lost = Some((how, "the baseline".into()));
+    }
     // Why the written-bytes cap stopped the run, if it did.
-    let mut capped: Option<String> = None;
+    let mut capped = baseline.capped;
+    // What the case reserve keeps for recovery: the most polls and the
+    // terminal probes, each asking every stable request probe.
+    let probe_bytes: u64 = rec
+        .stable
+        .iter()
+        .filter(|s| s.params.is_some())
+        .map(|s| REQUEST_RESERVE + 2 * docs[s.doc].uri.len() as u64)
+        .sum();
+    let recovery_reserve = (MAX_POLLS as u64 + 1) * probe_bytes;
+    let run_deadline = Instant::now() + settings.run_timeout;
     'cases: for k in 0..settings.cases {
+        if lost.is_some() || capped.is_some() {
+            break;
+        }
         if let Some(why) = answers_capped(&ctx.s, 0, &format!("case {k}")) {
             capped = Some(why);
             break;
@@ -4178,13 +5057,13 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         let mut texts = clean.clone();
         let mut next_version: Vec<i64> = docs.iter().map(|d| d.version).collect();
         let mut steps = Vec::new();
-        let mut reserve = SHUTDOWN_RESERVE;
+        let mut reserve = SHUTDOWN_RESERVE + recovery_reserve;
         for step in &plan.steps {
             let d = step.document;
             let (changes, after) = match mutation::step_changes(&texts[d], step, encoding, sync) {
                 Ok(changed) => changed,
                 Err(e) => {
-                    both(ctx, Verdict::Error, format!("case {k}: {e}"));
+                    all(ctx, Verdict::Error, format!("case {k}: {e}"));
                     summary.stopped = Some(format!("case {k}: {e}"));
                     ctx.mutation = Some(summary);
                     restore_and_leave(ctx, &mut docs, sync, &mut ext, &asked).await;
@@ -4207,7 +5086,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         ) {
             Ok(bytes) => bytes,
             Err(e) => {
-                both(ctx, Verdict::Error, format!("case {k}: {e}"));
+                all(ctx, Verdict::Error, format!("case {k}: {e}"));
                 summary.stopped = Some(format!("case {k}: {e}"));
                 ctx.mutation = Some(summary);
                 restore_and_leave(ctx, &mut docs, sync, &mut ext, &asked).await;
@@ -4240,6 +5119,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         ctx.s.record_mutation(json!({"format": mutation::FORMAT, "seed": seed, "case": k, "steps": record}));
         summary.cases_run += 1;
         ext.cases.push((ctx.s.elapsed(), k));
+        let mut restoring = None;
         let mut rng = mutation::SplitMix64::stream(seed, k, "requests");
         for (j, (step, params, change_bytes, after, version)) in steps.iter().enumerate() {
             if Instant::now() >= case_deadline {
@@ -4264,6 +5144,9 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 capped = Some(why);
                 break;
             }
+            if first_change.is_none() {
+                rec.before_first_mutation(&ctx.s.messages, &docs);
+            }
             let change_at = ctx.s.elapsed();
             ext.record(&ctx.s, &asked, d, change_at, *version, after.clone());
             if let Err(e) = ctx.s.notify("textDocument/didChange", Some(params.clone())).await {
@@ -4273,14 +5156,13 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             first_change.get_or_insert(change_at);
             docs[d].current = after.clone();
             docs[d].version = *version;
+            docs[d].version_at = change_at;
             versions += 1;
+            restoring = docs.iter().all(|doc| doc.current == doc.clean).then(|| (change_at, ctx.s.elapsed()));
             // The step's requests, written back to back, then each waited
             // for until its own deadline.
             let identifiers = mutation::identifiers(&docs[d].current, &settings.planner.lexicon);
-            let step_start = asked.len();
-            let mut deadlines = Vec::new();
-            let mut failed_request = None;
-            let mut alive_at = None;
+            let mut batch = Vec::new();
             for _ in 0..settings.requests_per_step {
                 if methods.is_empty() {
                     break;
@@ -4289,73 +5171,14 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 cursor += 1;
                 let (line, column) = mutation::request_spot(&mut rng, &docs[d].current, &identifiers);
                 let query = mutation::request_query(&mut rng, &docs[d].current, &identifiers);
-                let Some(params) = step_request(&caps, &docs[d], method, Spot { line, column }, encoding, &query)
-                else {
-                    continue;
-                };
-                observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
-                let id = ctx.s.fresh_id();
-                let bytes = frame(&message::request(&id, method, Some(params.clone())));
-                let registered = ctx.s.begin_request(&id, method, Instant::now() + timeout).await;
-                // Registering took in what the server sent, answering it.
-                if registered.is_ok()
-                    && let Some(why) = answers_capped(&ctx.s, bytes.len() as u64, &format!("{method} in {place}"))
-                {
-                    ctx.s.abort_request(&id);
-                    capped = Some(why);
-                    break;
+                if let Some(params) = step_request(&caps, &docs[d], method, Spot { line, column }, encoding, &query) {
+                    batch.push(Ask { method, params });
                 }
-                let at = ctx.s.elapsed();
-                let deadline_at = at + timeout;
-                let deadline = Instant::now() + timeout;
-                let written = match registered {
-                    Ok(()) => {
-                        let written = ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await;
-                        if written.is_err() {
-                            ctx.s.abort_request(&id);
-                        }
-                        written
-                    }
-                    Err(e) => Err(e),
-                };
-                if let Err(e) = written {
-                    observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
-                    let how = lost_after_write(ctx, method, &e).await;
-                    // A request the server exited before reading is M1's.
-                    let outcome = match &how {
-                        Lost::Gone(_) => StepOutcome::Gone,
-                        Lost::Uninspected(why) => StepOutcome::Uninspected(why.clone()),
-                        _ => StepOutcome::Undelivered(format!("lspcheck couldn't deliver {method} ({e})")),
-                    };
-                    failed_request = Some((StepRequest { id, method, params, case: k, at, deadline_at, outcome }, how));
-                    break;
-                }
-                asked.push(StepRequest {
-                    id,
-                    method,
-                    params,
-                    case: k,
-                    at,
-                    deadline_at,
-                    outcome: StepOutcome::Unanswered,
-                });
-                deadlines.push(deadline);
             }
-            for (request, deadline) in asked[step_start..].iter().zip(deadlines) {
-                let _ = ctx.s.wait_response(&request.id, deadline).await;
-                observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
-            }
-            let (absorbed_all, server_gone) = observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
-            for request in &mut asked[step_start..] {
-                settle_step_request(&ctx.s, request, server_gone, alive_at, absorbed_all);
-            }
-            if let Some((request, how)) = failed_request {
-                asked.push(request);
+            let end = send_batch(ctx, &mut asked, batch, Some(k), &place, None).await;
+            capped = capped.or(end.capped);
+            if let Some(how) = end.lost {
                 lost = Some((how, place));
-                break 'cases;
-            }
-            if ctx.s.stdout_closed() || server_gone {
-                lost = Some((lost_output(ctx).await, place));
                 break 'cases;
             }
             capped = capped.or_else(|| answers_capped(&ctx.s, 0, &format!("the end of {place}")));
@@ -4371,7 +5194,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             let change = match mutation::restore_change(&doc.current, &doc.clean, encoding, sync) {
                 Ok(change) => change,
                 Err(e) => {
-                    both(ctx, Verdict::Error, format!("restoring case {k}: {e}"));
+                    all(ctx, Verdict::Error, format!("restoring case {k}: {e}"));
                     summary.stopped = Some(format!("restoring case {k}: {e}"));
                     ctx.mutation = Some(summary);
                     leave_extended(ctx, &mut ext, &asked).await;
@@ -4380,14 +5203,18 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             };
             let version = doc.version + 1;
             let params = did_change(&doc.uri, version, &[change]);
-            ext.record(&ctx.s, &asked, d, ctx.s.elapsed(), version, doc.clean.clone());
+            let at = ctx.s.elapsed();
+            restoring.get_or_insert((at, at));
+            ext.record(&ctx.s, &asked, d, at, version, doc.clean.clone());
             if let Err(e) = ctx.s.notify("textDocument/didChange", Some(params)).await {
                 let place = format!("restoring {} after case {k}", doc.name);
                 lost = Some((lost_after_write(ctx, "the restoring didChange", &e).await, place));
                 break 'cases;
             }
+            restoring.as_mut().expect("restoration started").1 = ctx.s.elapsed();
             doc.current = doc.clean.clone();
             doc.version = version;
+            doc.version_at = at;
             versions += 1;
         }
         ctx.s.cap_answers(MUTATION_BYTES, SHUTDOWN_RESERVE);
@@ -4400,14 +5227,27 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         if capped.is_some() {
             break;
         }
+        if let Some((began, restored)) = restoring
+            && !rec.stable.is_empty()
+        {
+            let end = recover(ctx, &mut rec, &docs, &mut asked, k, (began, restored)).await;
+            if let Some(how) = end.lost {
+                lost = Some((how, format!("the recovery of case {k}")));
+                break;
+            }
+            if let Some(why) = end.capped {
+                capped = Some(why);
+                break;
+            }
+        }
     }
     if cut_short > 0 {
         ctx.s.note(format!("{cut_short} case(s) ran out of their budget before their last step"));
     }
-    leave_mutation(ctx, summary, first_change, versions, lost, &asked, capped.as_deref(), &mut ext).await;
+    leave_mutation(ctx, summary, first_change, versions, lost, &asked, capped.as_deref(), &mut ext, &rec).await;
 }
 
-/// Judges M1 and M2 and shuts the server down. `capped` says why the
+/// Judges M1 to M3 and shuts the server down. `capped` says why the
 /// written-bytes cap stopped the run before its cases were done, if it did.
 // Each argument is a separate part of the scenario's end state, which the
 // unit tests below set up one at a time.
@@ -4421,7 +5261,14 @@ async fn leave_mutation(
     asked: &[StepRequest],
     capped: Option<&str>,
     ext: &mut Extended,
+    rec: &Recovery,
 ) {
+    // A loss seen while a case was under way left its recovery unjudged.
+    let interrupted = lost.as_ref().map(|(how, place)| match how {
+        Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) | Lost::AfterWithheld(why) => {
+            format!("{why} during {place}")
+        }
+    });
     // Everything already read is taken in before M1 is judged: an end of
     // output queued behind it would otherwise go unseen.
     let drained = ctx.s.absorb_all().await;
@@ -4461,6 +5308,7 @@ async fn leave_mutation(
     }
     judge_m1(ctx, &summary, first_change, versions, lost, capped.is_some());
     judge_m2(ctx, asked, capped.as_deref());
+    judge_m3(ctx, rec, interrupted.as_deref(), capped.as_deref());
     ctx.mutation = Some(summary);
     // Every case is judged by now; an answer withheld while shutting down
     // stops nothing, and the session notes it in the transcript. As in
@@ -4539,7 +5387,7 @@ fn judge_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest], 
                         .and_then(Value::as_str)
                         .is_some_and(|uri| ext.docs.iter().any(|doc| documents::same_uri(&doc.uri, uri)))
             })
-            .map(|a| (a.id.clone(), a.at, format!("{} in case {}", a.method, a.case)))
+            .map(|a| (a.id.clone(), a.at, format!("{} in {}", a.method, a.place())))
             .collect(),
     });
 }
@@ -4600,7 +5448,10 @@ fn judge_m1(
 /// `--timeout`. A request pending when the server exited is M1's. A run the
 /// written-bytes cap stopped early (`capped`) can still fail, but not pass.
 fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest], capped: Option<&str>) {
-    let unanswered: Vec<&StepRequest> = asked.iter().filter(|r| matches!(r.outcome, StepOutcome::Unanswered)).collect();
+    // The baseline's probes were sent before the first mutation.
+    let asked: Vec<&StepRequest> = asked.iter().filter(|r| r.case.is_some()).collect();
+    let unanswered: Vec<&StepRequest> =
+        asked.iter().copied().filter(|r| matches!(r.outcome, StepOutcome::Unanswered)).collect();
     if let Some(first) = unanswered.first() {
         let more = if unanswered.len() > 1 { format!(" and {} more", unanswered.len() - 1) } else { String::new() };
         ctx.fail_absent_between(
@@ -4608,9 +5459,9 @@ fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest], capped: Option<&str>) {
             first.at,
             first.deadline_at,
             format!(
-                "{} in case {} got no response within {} s (--timeout){more}",
+                "{} in {} got no response within {} s (--timeout){more}",
                 first.method,
-                first.case,
+                first.place(),
                 seconds(ctx.cfg.request_timeout)
             ),
         );
@@ -4658,6 +5509,93 @@ fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest], capped: Option<&str>) {
         format!("errors by code: {}", list.join(", "))
     };
     ctx.pass_with("M2", format!("all {} request(s) after a mutation got a response; {errors}", answered.len()));
+}
+
+/// M3: after each restoration, every stable probe met the
+/// [recovery comparison rules](../docs/source-mutations.md#step-5). A
+/// failure needs an expectation the profile states and complete evidence;
+/// a recovery not seen otherwise is an error. `interrupted` says how the run
+/// lost the server during a case, and `capped` why the written-bytes cap
+/// stopped it, if either did.
+fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped: Option<&str>) {
+    let mut notes = String::new();
+    if !rec.unused.is_empty() {
+        notes.push_str(&format!("; not used: {}", rec.unused.join("; ")));
+    }
+    if let Some(why) = &rec.unsettled {
+        notes.push_str(&format!("; {why}"));
+    }
+    if rec.stable.is_empty() && !rec.pushes_pending {
+        let why = if rec.unused.is_empty() { "the profile names none".to_string() } else { rec.unused.join("; ") };
+        let unsettled = rec.unsettled.as_ref().map(|why| format!("; {why}")).unwrap_or_default();
+        return ctx.report(
+            "M3",
+            Verdict::NotExercised,
+            format!("no recovery probe had a stable baseline: {why}{unsettled}"),
+        );
+    }
+    let mut fails = Vec::new();
+    let mut errors: Vec<String> = rec.contradicted.iter().cloned().collect();
+    let mut slowest: Option<(Duration, u64, usize, bool)> = None;
+    for c in &rec.cases {
+        for (i, outcome) in c.outcomes.iter().enumerate() {
+            match outcome {
+                ProbeEnd::Recovered { after, terminal } => {
+                    if slowest.is_none_or(|(t, ..)| *after > t) {
+                        slowest = Some((*after, c.case, i, *terminal));
+                    }
+                }
+                // A failure rests on nothing having superseded the deciding answer.
+                ProbeEnd::Failed { detail, from, to } => match ctx.s.incomplete_within(*from, *to) {
+                    Some(why) => errors.push(format!("inconclusive, because {why}: {detail}")),
+                    None => fails.push((detail, *from, *to)),
+                },
+                ProbeEnd::Unseen(why) => errors.push(why.clone()),
+            }
+        }
+    }
+    if let Some(why) = interrupted {
+        errors.push(format!("the run stopped before every case's recovery was judged: {why}"));
+    }
+    errors.extend(capped.map(str::to_owned));
+    let more = |n: usize| if n > 1 { format!("; and {} more", n - 1) } else { String::new() };
+    if let Some((detail, ..)) = fails.first() {
+        ctx.fail("M3", format!("{detail}{}", more(fails.len())));
+        ctx.results.last_mut().expect("just reported").absent_at = fails.iter().map(|(_, f, t)| (*f, *t)).collect();
+        return;
+    }
+    if let Some(first) = errors.first() {
+        return ctx.report("M3", Verdict::Error, format!("{first}{}{notes}", more(errors.len())));
+    }
+    let Some((after, case, i, terminal)) = slowest else {
+        return ctx.report("M3", Verdict::NotExercised, format!("no case reached its restoration{notes}"));
+    };
+    let probes: Vec<&str> = rec.stable.iter().map(|s| s.label.as_str()).collect();
+    let pass = format!(
+        "all {} case(s) that reached their restoration recovered; probes: {}; slowest recovery {} s after the \
+         restoration ({} in case {case}{}){notes}",
+        rec.cases.len(),
+        probes.join(", "),
+        seconds_3(after),
+        rec.stable[i].label,
+        if terminal { ", seen by its terminal probe" } else { "" }
+    );
+    // A recovery seen stands, but what lspcheck missed in a recovery window
+    // could have been a failure.
+    let unless = |why: &str| {
+        format!("nothing failed, but lspcheck may have missed evidence in a recovery window, because {why}: {pass}")
+    };
+    match rec.cases.iter().find_map(|c| ctx.s.incomplete_within(c.window.0, c.window.1)) {
+        Some(why) => ctx.report("M3", Verdict::Error, unless(&why)),
+        None => {
+            ctx.pass_with("M3", pass.clone());
+            let (from, to) = rec.cases[0].window;
+            let also = rec.cases[1..].iter().map(|c| c.window).collect();
+            let r = ctx.results.last_mut().expect("just reported");
+            r.unless_missed =
+                Some(Recheck { from, to, also, output_only: false, verdict: Verdict::Error, detail: unless(MISSED) });
+        }
+    }
 }
 
 const OFFERED_ENCODINGS: [&str; 3] = ["utf-8", "utf-32", "utf-16"];
@@ -5409,11 +6347,11 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/standin-mutation.toml");
         let settings = profile::load(&fixture).unwrap().mutation.unwrap();
         let budget = settings.case_budget(Duration::from_secs(3));
-        assert_eq!(budget, Duration::from_secs(59));
+        assert_eq!(budget, Duration::from_secs(77));
         let start = Instant::now();
-        let run_deadline = start + Duration::from_millis(60_500);
+        let run_deadline = start + Duration::from_millis(78_500);
         let case_deadline = mutation_case_deadline(start, run_deadline, budget).unwrap();
-        assert_eq!(case_deadline, start + Duration::from_secs(59));
+        assert_eq!(case_deadline, start + Duration::from_secs(77));
         assert!(mutation_case_deadline(start + Duration::from_secs(3), run_deadline, budget).is_none());
         let last_start = start + Duration::from_millis(1500);
         assert_eq!(mutation_case_deadline(last_start, run_deadline, budget), Some(run_deadline));
@@ -5483,6 +6421,140 @@ mod tests {
             k1_pending: None,
             mutation: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn recovery_test_config(mode: &str) -> Config {
+        let script = r#"import json, sys
+count = 0
+pending = None
+def reply(request, result):
+    body = json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}).encode()
+    sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
+    sys.stdout.buffer.flush()
+while header := sys.stdin.buffer.readline():
+    length = int(header.split(b':')[1])
+    assert sys.stdin.buffer.readline() == b'\r\n'
+    request = json.loads(sys.stdin.buffer.read(length))
+    method = request['method']
+    if method == 'exit':
+        break
+    if method == 'lspcheck/release':
+        reply(pending, [])
+        continue
+    count += 1
+    if sys.argv[1] == 'bound' and count > 1:
+        pending = request
+        continue
+    invalid = (sys.argv[1] == 'retry' and count == 1) or (sys.argv[1] == 'invalid' and count == 3)
+    reply(request, {'kind': 'full', 'items': None if invalid else []} if method == 'textDocument/diagnostic' else [])
+"#;
+        let mut cfg = mutation_test_config("exit 0");
+        cfg.server = ServerCommand::new(&["python3".into(), "-I".into(), "-c".into(), script.into(), mode.into()]);
+        cfg
+    }
+
+    #[cfg(unix)]
+    fn recovery_test_docs() -> Vec<SeedDoc> {
+        vec![SeedDoc {
+            name: "seed.txt".into(),
+            uri: "file:///seed.txt".into(),
+            language_id: "plaintext".into(),
+            clean: "f()".into(),
+            current: "f()".into(),
+            version: 1,
+            version_at: Duration::ZERO,
+        }]
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_baseline_retries_malformed_pull_diagnostics() {
+        let cfg = recovery_test_config("retry");
+        let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+        let mut rec = Recovery::default();
+        let mut asked = Vec::new();
+        let end = take_baseline(
+            &mut ctx,
+            &mut rec,
+            &json!({"diagnosticProvider": {"interFileDependencies": false, "workspaceDiagnostics": false}}),
+            &recovery_test_docs(),
+            &[profile::Probe::Diagnostic],
+            Encoding::Utf16,
+            &mut asked,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(end.lost.is_none() && end.capped.is_none());
+        assert_eq!(asked.len(), 3);
+        assert_eq!(rec.stable.len(), 1);
+        assert_eq!(rec.stable[0].baseline, json!([]));
+        ctx.s.notify("exit", None).await.unwrap();
+        ctx.s.finish(Duration::from_millis(200)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_malformed_pull_evidence_is_an_error_even_if_a_later_poll_recovers() {
+        let cfg = recovery_test_config("invalid");
+        let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+        let mut rec = Recovery { no_errors: true, timeout: Duration::from_secs(3), ..Recovery::default() };
+        let docs = recovery_test_docs();
+        let mut asked = Vec::new();
+        take_baseline(
+            &mut ctx,
+            &mut rec,
+            &json!({"diagnosticProvider": {"interFileDependencies": false, "workspaceDiagnostics": false}}),
+            &docs,
+            &[profile::Probe::Diagnostic],
+            Encoding::Utf16,
+            &mut asked,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(rec.stable.len(), 1);
+        let restored = ctx.s.elapsed();
+        recover(&mut ctx, &mut rec, &docs, &mut asked, 0, (restored, restored)).await;
+        assert!(matches!(&rec.cases[0].outcomes[0], ProbeEnd::Unseen(why) if why.contains("malformed")));
+        judge_m3(&mut ctx, &rec, None, None);
+        assert_eq!(ctx.results.iter().find(|r| r.id == "M3").unwrap().verdict, Verdict::Error);
+        ctx.s.notify("exit", None).await.unwrap();
+        ctx.s.finish(Duration::from_millis(200)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_baseline_caps_waits_and_excludes_late_samples() {
+        let cfg = recovery_test_config("bound");
+        let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+        let mut rec = Recovery::default();
+        let mut asked = Vec::new();
+        let timeout = Duration::from_secs(2);
+        let end = take_baseline(
+            &mut ctx,
+            &mut rec,
+            &json!({"documentSymbolProvider": true}),
+            &recovery_test_docs(),
+            &[profile::Probe::DocumentSymbol],
+            Encoding::Utf16,
+            &mut asked,
+            timeout,
+        )
+        .await;
+        assert!(end.lost.is_none() && end.capped.is_none());
+        assert_eq!(asked.len(), 2);
+        let deadline = asked[0].deadline_at;
+        let last = asked.last_mut().unwrap();
+        assert_eq!(last.deadline_at, deadline);
+        assert!(rec.stable.is_empty());
+        assert!(rec.unused[0].contains("before settle_timeout ended"));
+        ctx.s.notify("lspcheck/release", None).await.unwrap();
+        ctx.s.wait_response(&last.id, Instant::now() + cfg.request_timeout).await.unwrap();
+        assert!(ctx.s.answered_at(&last.id).unwrap() > last.deadline_at);
+        settle_step_request(&ctx.s, last, false, Some(ctx.s.elapsed()), true);
+        assert_eq!(last.outcome, StepOutcome::Unanswered);
+        ctx.s.notify("exit", None).await.unwrap();
+        ctx.s.finish(Duration::from_millis(200)).await;
     }
 
     #[cfg(unix)]
@@ -5602,7 +6674,8 @@ while header := sys.stdin.buffer.readline():
             let mut ctx = mutation_test_ctx(&cfg, 1024).await;
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, first_change, 1, None, &[], None, &mut unopened()).await;
+            leave_mutation(&mut ctx, summary, first_change, 1, None, &[], None, &mut unopened(), &Recovery::default())
+                .await;
             assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, expected);
             assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::NotExercised);
             ctx.s.finish(Duration::from_millis(200)).await;
@@ -5626,7 +6699,18 @@ while header := sys.stdin.buffer.readline():
                 }
                 let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
                 let lost = Some((Lost::Undelivered("failed write".into()), "restoring case 0".into()));
-                leave_mutation(&mut ctx, summary, first_change, 1, lost, &[], None, &mut unopened()).await;
+                leave_mutation(
+                    &mut ctx,
+                    summary,
+                    first_change,
+                    1,
+                    lost,
+                    &[],
+                    None,
+                    &mut unopened(),
+                    &Recovery::default(),
+                )
+                .await;
                 let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
                 assert_eq!(m1.verdict, expected, "{}", m1.detail);
                 if first_change.is_some() {
@@ -5652,7 +6736,18 @@ while header := sys.stdin.buffer.readline():
             let place = if lost.is_some() { "case 0, step 1" } else { "the cases and their restorations" };
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
             let lost = lost.map(|how| (how, place.into()));
-            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost, &[], None, &mut unopened()).await;
+            leave_mutation(
+                &mut ctx,
+                summary,
+                Some(Duration::ZERO),
+                1,
+                lost,
+                &[],
+                None,
+                &mut unopened(),
+                &Recovery::default(),
+            )
+            .await;
             let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
             assert_eq!(m1.verdict, Verdict::Error, "{}", m1.detail);
             assert!(
@@ -5683,7 +6778,18 @@ while header := sys.stdin.buffer.readline():
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
             let lost = seen_before.then(|| (Lost::Gone("the server exited with status 0".into()), "case 0".into()));
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost, &[], None, &mut unopened()).await;
+            leave_mutation(
+                &mut ctx,
+                summary,
+                Some(Duration::ZERO),
+                1,
+                lost,
+                &[],
+                None,
+                &mut unopened(),
+                &Recovery::default(),
+            )
+            .await;
             let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
             assert_eq!(m1.verdict, expected, "{}", m1.detail);
             if !seen_before {
@@ -5726,13 +6832,14 @@ while header := sys.stdin.buffer.readline():
                 id,
                 method: "textDocument/hover",
                 params: Value::Null,
-                case: 0,
+                case: Some(0),
                 at,
                 deadline_at: at + Duration::from_secs(5),
                 outcome: StepOutcome::Answered(None),
             }];
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, Some(at), 1, None, &asked, None, &mut unopened()).await;
+            leave_mutation(&mut ctx, summary, Some(at), 1, None, &asked, None, &mut unopened(), &Recovery::default())
+                .await;
             let withheld = ctx.s.answer_withheld().is_some();
             let finish = ctx.s.finish(Duration::from_millis(200)).await;
             for id in ["M1", "M2"] {
@@ -5779,6 +6886,7 @@ while header := sys.stdin.buffer.readline():
                 &[],
                 None,
                 &mut unopened(),
+                &Recovery::default(),
             )
             .await;
             let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
@@ -5871,7 +6979,7 @@ send({'jsonrpc': '2.0', 'id': held, 'error': {'code': int(sys.argv[1]), 'message
                     id,
                     method: "textDocument/hover",
                     params: json!({"textDocument": {"uri": "file:///seed"}}),
-                    case: 7,
+                    case: Some(7),
                     at,
                     deadline_at: ctx.s.elapsed(),
                     outcome: StepOutcome::Answered(None),
@@ -5882,7 +6990,8 @@ send({'jsonrpc': '2.0', 'id': held, 'error': {'code': int(sys.argv[1]), 'message
                     leave_extended(&mut ctx, &mut ext, &asked).await;
                 } else {
                     let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-                    leave_mutation(&mut ctx, summary, Some(at), 1, None, &asked, None, &mut ext).await;
+                    leave_mutation(&mut ctx, summary, Some(at), 1, None, &asked, None, &mut ext, &Recovery::default())
+                        .await;
                 }
                 assert!(!ctx.s.messages.iter().any(|(_, m)| k1_outcome(m) == capabilities::Outcome::Error(code)));
                 let pending = ctx.k1_pending.take();
@@ -5932,13 +7041,13 @@ signal.pause()
             id: Id::int(100),
             method: SELECTION_RANGE,
             params: json!({"textDocument": {"uri": "file:///seed"}, "positions": []}),
-            case: 0,
+            case: Some(0),
             at: Duration::ZERO,
             deadline_at: Duration::ZERO,
             outcome: StepOutcome::Unanswered,
         }];
         let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-        leave_mutation(&mut ctx, summary, None, 1, None, &asked, None, &mut ext).await;
+        leave_mutation(&mut ctx, summary, None, 1, None, &asked, None, &mut ext, &Recovery::default()).await;
         let results = ctx.results;
         ctx.s.finish(Duration::from_millis(200)).await;
         for id in ["D1", "D2", "D6"] {
@@ -5958,13 +7067,24 @@ signal.pause()
             id: Id::int(1),
             method: "textDocument/hover",
             params: Value::Null,
-            case: 0,
+            case: Some(0),
             at: Duration::ZERO,
             deadline_at: Duration::from_secs(1),
             outcome: StepOutcome::Unanswered,
         }];
         let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-        leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, None, &asked, None, &mut unopened()).await;
+        leave_mutation(
+            &mut ctx,
+            summary,
+            Some(Duration::ZERO),
+            1,
+            None,
+            &asked,
+            None,
+            &mut unopened(),
+            &Recovery::default(),
+        )
+        .await;
         assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, Verdict::Fail);
         assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::Fail);
         assert_eq!(asked[0].outcome, StepOutcome::Unanswered);
@@ -6003,7 +7123,7 @@ while header := sys.stdin.buffer.readline():
                     id,
                     method,
                     params: Value::Null,
-                    case: 0,
+                    case: Some(0),
                     at,
                     deadline_at,
                     outcome: StepOutcome::Unanswered,
@@ -6013,13 +7133,13 @@ while header := sys.stdin.buffer.readline():
             assert_eq!(ctx.s.wait_response(&asked[0].id, Instant::now()).await.unwrap_err(), WaitError::Timeout);
             let mut alive_at = None;
             if observe_timeout {
-                assert_eq!(observe_mutation_batch(&mut ctx.s, &mut alive_at).await, (true, false));
+                assert_eq!(observe_mutation_batch(&mut ctx.s, &mut alive_at, None).await, (true, false));
                 let at = alive_at.unwrap();
                 assert!(at >= asked[0].deadline_at && at < asked[1].deadline_at);
             }
             ctx.s.notify("lspcheck/exit", None).await.unwrap();
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
-            let (absorbed_all, server_gone) = observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
+            let (absorbed_all, server_gone) = observe_mutation_batch(&mut ctx.s, &mut alive_at, None).await;
             assert!(absorbed_all && server_gone);
             for request in &mut asked {
                 settle_step_request(&ctx.s, request, server_gone, alive_at, absorbed_all);
@@ -6123,7 +7243,7 @@ while header := sys.stdin.buffer.readline():
                 id: Id::int(1),
                 method: "textDocument/hover",
                 params: Value::Null,
-                case: 0,
+                case: Some(0),
                 at: Duration::from_millis(10),
                 deadline_at: Duration::from_secs(1),
                 outcome: StepOutcome::Unanswered,
@@ -6132,7 +7252,7 @@ while header := sys.stdin.buffer.readline():
                 id: Id::int(2),
                 method: "textDocument/hover",
                 params: Value::Null,
-                case: 0,
+                case: Some(0),
                 at: Duration::from_millis(20),
                 deadline_at: Duration::from_secs(2),
                 outcome: StepOutcome::Unanswered,
@@ -6162,7 +7282,7 @@ while header := sys.stdin.buffer.readline():
             id,
             method: "textDocument/hover",
             params: Value::Null,
-            case: 0,
+            case: Some(0),
             at,
             deadline_at: at + Duration::from_secs(5),
             outcome: StepOutcome::Unanswered,
@@ -6184,6 +7304,7 @@ while header := sys.stdin.buffer.readline():
             clean: clean.into(),
             current: clean.into(),
             version: 1,
+            version_at: Duration::ZERO,
         };
         let docs = [doc("file:///a", "a"), doc("file:///b", "😀"), doc("file:///c", "untouched")];
         let many_lines = "a(\n".repeat(10_000);

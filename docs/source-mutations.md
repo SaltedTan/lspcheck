@@ -4,9 +4,10 @@
 the [implementation plan](#implementation-plan) are in place: the planner (`src/mutation.rs`), the profile's
 `[mutation]` section, and the scenario, which judges M1 and M2. Step 4 is in place too: D1, D2, D6 and K1 are
 [extended](#verdict-rules) to the scenario, and answers to the server's own requests are held to the
-[written-bytes cap](#bounds). `--mutate` and its two flags are experimental and hidden from `--help` until recovery
-(M3) is judged; until then the scenario doesn't settle or take baselines, and M3 is `SKIP`. See
-[what step 3 leaves out](#step-3) and the [design status](design.md) for its place in the roadmap.
+[written-bytes cap](#bounds). Step 5 is in place: the scenario settles, takes the [recovery probes'](#recovery)
+baselines, polls them after each restoration and judges M3, with `expect` and `no_errors`. `--mutate` and its two
+flags are experimental and hidden from `--help`. See [how steps 3 and 5 are built](#step-3) and the
+[design status](design.md) for its place in the roadmap.
 
 ## Context
 
@@ -85,7 +86,8 @@ extends is selected and not skipped by the profile.
    the baseline's stability rule below still protects M3.
 4. **Baseline**: send each recovery probe (below) about each seed document, then again each second, until two answers
    in a row are equal after projection, or `settle_timeout` ends. A probe with a stable answer is used; one that
-   errors, varies or isn't advertised isn't, and the detail says why. Pushed diagnostics are a notification, never
+   remains unusable or unstable, or isn't advertised, isn't, and the detail says why. See [step 5](#step-5) for retries
+   and the absolute baseline deadline. Pushed diagnostics are a notification, never
    requested, and a lawful server may publish once per version: their baseline is the publishes labelled with version 1
    read before the first mutation. If there is at least one and all of them are equal after projection, the last is the
    baseline; if they differ, or none arrived, pushed diagnostics aren't used (and `no_errors` can only be established
@@ -94,11 +96,12 @@ extends is selected and not skipped by the profile.
    cases before it or on the server's timing. Each step applies one to three mutations to one document, sends them in
    one `didChange`, then sends the step's requests (default four) without waiting between them, and waits for each
    reply until its own deadline.
-6. **Restore**: one `didChange` replaces each mutated document's whole text with its clean text, at the next version:
-   the full text for a server with full sync, and for incremental sync one change whose range covers the whole current
-   document.
-   Then lspcheck polls the stable probes, 250 ms apart and doubling to 2 s, until every answer equals its baseline or
-   `recovery_timeout` ends. Each poll is a request like any other, judged by M2 and the cross-cutting checks.
+6. **Restore**: when a document still differs from its clean text, one `didChange` replaces its whole text at the next
+   version: the full text for a server with full sync, and for incremental sync one change whose range covers the
+   whole current document.
+   Then lspcheck polls the stable probes, 250 ms apart and doubling to 2 s, until every probe recovers under
+   [step 5's comparison rules](#step-5) or `recovery_timeout` ends. Each poll is a request like any other, judged by M2
+   and the cross-cutting checks.
 7. After the last case, `leave()`: `shutdown`, `exit`, and L9's scan.
 
 ### Mutations
@@ -187,7 +190,7 @@ what describes the text and drops what may lawfully vary:
 |---|---|---|
 | `textDocument/documentSymbol` | name, kind, ranges, children; for `SymbolInformation`, the range and container name | `detail`, `tags`, `deprecated`, `data` |
 | `textDocument/foldingRange` | start and end lines and characters, kind | `collapsedText` |
-| `textDocument/diagnostic` (a full report) | each item's range, severity, code, source | `message`, `data`, `relatedInformation`, `codeDescription`, `resultId` |
+| `textDocument/diagnostic` (a full report) | each item's range, severity, code, source | `message`, `data`, `relatedInformation`, `codeDescription`, `tags`, `resultId` |
 | `publishDiagnostics` labelled with a version | the same per diagnostic | the same |
 
 Every array of the projection compares as a multiset, recursively (a symbol's `children` too), because servers may
@@ -195,8 +198,8 @@ order them by hash; each element is projected before the comparison. `semanticTo
 `data` is long, and a legend change between answers would need decoding. Unlabelled `publishDiagnostics` aren't used:
 lspcheck can't tell which text they describe. The profile's `recovery.probes` may narrow the list.
 
-A case has **recovered** when every stable probe of every seed document, asked after the restoring `didChange` was
-delivered, gets an answer equal to its baseline (for pushed diagnostics, a publish labelled with the restored version).
+A case has **recovered** when every stable probe of every seed document satisfies [step 5's comparison rules](#step-5)
+after restoration. Those rules cover `no_errors`, pushed diagnostics and generated edits that restore the clean text.
 lspcheck can observe that without knowing the language. It cannot decide:
 
 - whether the baseline was right: the clean answer might already be wrong;
@@ -214,9 +217,8 @@ stated in `[mutation.recovery]`:
   request, the **terminal probe**, written after the deadline; M3 fails when its answer differs from the stable
   baseline. Judging the answer to a request sent after the deadline, not the last poll before it, keeps the verdict
   independent of lspcheck's poll interval: a server that recovered at 19.8 s of 20 answers the terminal probe with the
-  baseline, whenever the last poll was. Pushed diagnostics (when they are a stable probe) are compared the same way
-  through the push rule below: the last publish labelled with the restored version and read by the end of
-  `recovery_timeout` fails M3 when its projection differs from the baseline publish's.
+  baseline, whenever the last poll was. For pushed diagnostics, [step 5's publish rule](#step-5) determines whether
+  recovery was seen.
 - `no_errors = true`: the seed has no Error-severity diagnostics. It must hold at baseline (pushed diagnostics labelled
   1, or a pull report); if it doesn't, M3 is `ERROR` ("the profile and the server disagree before any mutation"),
   since lspcheck can't tell which is wrong. After restoration, a pulled report is judged by its terminal probe, as
@@ -225,8 +227,8 @@ stated in `[mutation.recovery]`:
   profile's deadline; if it includes an error, M3 fails. No publish labelled with the restored version by then is
   `ERROR`, not a failure: LSP doesn't require a server to publish for every version.
 
-Either way the server confirmed the expectation itself before the mutations, then answered against it about the same
-text past the deadline. A failure needs complete evidence: the terminal probe delivered and answered (for pushed
+A failure needs a deciding answer about the restored text that contradicts an expectation the server confirmed before
+the mutations. It also needs complete evidence: the terminal probe delivered and answered (for pushed
 diagnostics, the whole bound read), and nothing missed in lspcheck's reading of the server's output (a skipped or
 cut-short frame) between the deciding answer and its end (for a pull, from the terminal probe's write to its answer;
 for a push, from that publish to the end of the bound). Anything less, including polling stopped early by lspcheck's
@@ -268,16 +270,21 @@ polls.
   ServerCancelled (-32802) and RequestFailed (-32803); the detail counts them by code.
 
 **M3.**
+
+A fully evidenced failure takes precedence over errors in other cases or probes.
+
 - *skip:* as M1.
-- *not-exercised:* no probe had a stable baseline (each one's reason is listed), or no case reached its restoration.
+- *not-exercised:* no probe had a stable baseline (each one's reason is listed), or no case reached its restoration
+  and no error below applies.
 - *fail:* only as stated above, with `expect` or `no_errors`. The detail names the case, the probe, the first
   difference after projection (a path and both values, shortened like K2's) and how long lspcheck polled. Unlike a
   position inside a character, this failure rests on nothing having superseded the last answer, so missed evidence
   after it, or polling stopped by the poll budget before the bound, makes it `ERROR`, never `FAIL`.
 - *error:* without a stated expectation, a probe didn't return to its baseline within `recovery_timeout`
   ("not seen to recover within 20 s; lspcheck's bound, not a protocol rule: set `[mutation.recovery].expect` if the
-  answers are fixed"); the restoring `didChange` couldn't be delivered; the server exited first (M1's failure); a
-  stated expectation was contradicted at baseline; or nothing failed but evidence was missed in a recovery window.
+  answers are fixed"); with a stable probe, a stop during a case (an exit, closed output, an undeliverable write or
+  the written-bytes cap) left its recovery unjudged; a stated expectation was contradicted at baseline; malformed
+  diagnostic evidence arrived during recovery; or nothing failed but evidence was missed in a recovery window.
 - *pass:* every case that reached restoration recovered. The detail gives the cases, the probes used and the slowest
   recovery time.
 
@@ -368,14 +375,14 @@ resolves an empty seed list and M1 to M3 report `SKIP` ("no seed file").
 | Bound | Default | Cap | When it is reached |
 |---|---|---|---|
 | Per request | `--timeout` from when its write began | — | the request is unanswered (M2) |
-| Per case | `(steps + 1) × (1 + requests_per_step) × --timeout` (every write and every reply of the steps, each with its own deadline) `+ documents × --timeout` (the restoration's writes) `+ recovery_timeout + documents × probes × 2 × --timeout` (each terminal probe's write and reply) `+ 5 s` | — | no further step starts; the restoration is always sent |
+| Per case | `(steps + 1) × (1 + requests_per_step) × --timeout` (every write and every reply of the steps, each with its own deadline) `+ documents × --timeout` (the restoration's writes) `+ recovery_timeout + documents × probes × 4 × --timeout` (the writes and replies of a poll begun just before `recovery_timeout` ends, and of each terminal probe) `+ 5 s` | — | no further step starts; the restoration is always sent |
 | Per run | `run_timeout`, 1 h | 4 h | no new case starts; the detail says how many ran |
 | Settle and baseline | `settle_timeout` | 5 min | proceed; unstable probes aren't used |
 | Cases | 20 | 1000 | usage error above the cap |
 | Mutations per step; steps per case | 1 to 3; `steps` | 3; 3 | — |
 | Growth per mutation (bytes inserted beyond those removed) | 1 KiB; stress operators the room left | 16 KiB | the operator inserts less |
 | Document size | `max_document_kib`, 64 | 1024 | the operator is redrawn, `truncate` after six tries |
-| Requests per step; recovery polls per case | 4; 40 | 16; 40 | the poll stops: recovery not seen, M3 `ERROR` for that case even with an expectation |
+| Requests per step; recovery polls per case | 4; 40 | 16; 40 | polling stops; a differing terminal answer gives M3 `ERROR` even with an expectation |
 | Text snapshots kept per document | 64 | 64 | see [extended checks](#verdict-rules) for judging evicted candidates and retaining version history |
 | Bytes written to the server | 64 MiB | 256 MiB | no new case starts unless its worst case fits (below) |
 
@@ -414,8 +421,8 @@ of output first seen after the answer was withheld makes M1 `ERROR`. The scenari
 the same way), sends the current case's restoration and shutdown, and `mutation.stopped` says that answers to the
 server's requests reached the cap. When the run stops early this way, M1 and M2 can still fail on what lspcheck saw,
 but not pass: the cases not run make them `ERROR`. An answer withheld after M1 and M2 are judged, while waiting for the
-reply to shutdown, changes neither: their windows end before shutdown. The transcript notes it. Until step 5, M3 stays
-`SKIP`; its planned verdict for a cap stop is `ERROR`.
+reply to shutdown, changes neither: their windows end before shutdown. The transcript notes it. M3 likewise can fail
+on the cases it judged, but not pass: a cap stop makes it `ERROR`.
 
 ### Reports, transcripts and reproduction
 
@@ -458,19 +465,21 @@ a window. Lawful faults count replies, not milliseconds.
 | `configure-on-shutdown` | before the `shutdown` reply, ask `workspace/configuration` for 256 items of section `big` | M1 and M2 pass: the withheld answer changes no M verdict, and `exit` follows `shutdown` |
 | `close-output-mid-restoration` | Unix only: partway through reading a large document's restoration, send 20,000 requests and close stdout, then read nothing more after it | M1 `ERROR` (the end of output is queued behind requests lspcheck can't answer before shutdown), never `PASS` |
 | `late-wrong-count` | answer one `selectionRange` with `[]` after more than 64 later versions | D6 fails from the mutation scenario, on the entry count alone (M2 fails too, as for `selection-from-later-text`) |
-| `recover-before-deadline` | lawful: after rebalancing, answer `documentSymbol` with `[]` until just before `recovery_timeout`, counted in replies to a poll schedule the test fixes, then with the baseline | nothing fails with `expect = "baseline"`: the terminal probe sees the baseline |
+| `recover-before-deadline` | lawful: after restoration, answer the first four `documentSymbol` requests with `[]`, then with the baseline | nothing fails with `expect = "baseline"` under the test's fixed poll schedule: the terminal probe sees the baseline |
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails |
 | `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |
-| `recovery-in-skipped-frame` | after rebalancing, answer the first poll with `[]`, then send the recovered answer in a frame larger than `--max-frame-mib` | M3 `ERROR` with `expect = "baseline"`, never `FAIL` |
+| `recovery-in-skipped-frame` | after restoration, answer the first poll with `[]`, then send the recovered answer in a frame larger than `--max-frame-mib` | M3 `ERROR` with `expect = "baseline"`, never `FAIL` |
 | `errors-after-unbalanced` | once unbalanced, publish an Error diagnostic forever | M3 fails with `no_errors = true` |
 | `warning-after-unbalanced` | once unbalanced, publish an extra Warning forever | M3 fails with `expect = "baseline"` and pushed diagnostics as the only probe; passes with `no_errors = true` alone |
+| `malformed-recovery-diagnostics` | once unbalanced, publish `null` instead of a diagnostics array | M3 `ERROR`, including with `no_errors = true` |
+| `malformed-baseline-diagnostics` | publish `null` instead of a diagnostics array at version 1 | pushed diagnostics unused; M3 `N/E` when they are the only probe |
 | `method-not-found-while-unbalanced` | answer advertised requests with -32601 while unbalanced | K1 fails from the mutation scenario |
 | `selection-from-later-text` | lawful: hold one `selectionRange` until a later change leaves its position past the end of its line, then answer from that text | D6 passes (M2 fails: the reply is necessarily later than `--timeout`, since the next version is sent only after the request's wait) |
 | `selection-from-changed-text` | lawful: as `selection-from-later-text`, for the first `selectionRange` about any document | with `utf8-encoding`, D6 passes in the documents scenario, whose version 42 leaves `name`'s end past its line (K1 `ERROR`: its own `selectionRange` is never answered) |
 | `old-version-diagnostics` | lawful: 65 versions after a document's first change, publish that change's diagnostics again, labelled with its version | D2 passes; D1 counts the positions as not judged |
 | `codepoint-positions-after-change` (exists) | count positions in code points after a change | D1 fails from the mutation scenario (with `unicode`) |
 | `diagnostics-own-version` (exists) | label diagnostics with its own counter | D2 fails from the mutation scenario (with two seed files, so the counter runs ahead of each) |
-| `slow-recovery` | lawful: answer the first three `documentSymbol` after rebalancing with `[]` | nothing fails; M3 passes |
+| `slow-recovery` | lawful: answer the first three `documentSymbol` after restoration with `[]` | nothing fails; M3 passes |
 | `reworded-diagnostics` | lawful: put a counter in every diagnostic message | nothing fails |
 | `no-diagnostics` (exists) | lawful: never publish diagnostics | nothing fails; pushed diagnostics unused |
 | `content-modified-while-unbalanced` | lawful: answer requests with -32801 while unbalanced | nothing fails; M2 passes |
@@ -531,8 +540,8 @@ Each step is one small pull request with its tests, docs and changelog entry whe
    JSON `"mutation"` field. Stand-in bracket tracking and the M1 and M2 faults.
 4. **Answer cap and extended checks.** Implemented: the [automatic-answer cap](#bounds) and
    [extended checks](#verdict-rules), with their [stand-in faults](#stand-in-faults-and-tests).
-5. **Recovery, M3.** Settle, stable baselines, projections, polling, `expect` and `no_errors`; the recovery faults,
-   lawful ones included.
+5. **Recovery, M3.** Implemented: settle, stable baselines, projections, polling, `expect` and `no_errors`
+   ([step 5](#step-5)); the recovery faults, lawful ones included.
 6. **Isolation.** Rerunning failing cases alone and writing their transcripts.
 7. **Stock matrix.** `[mutation]` in the example profiles, a mutation job and `.mutation.verdicts` (a workflow change,
    so the maintainer merges it).
@@ -542,8 +551,7 @@ Each step is one small pull request with its tests, docs and changelog entry whe
 
 Step 3 runs the scenario without the parts later steps add, and says so where it matters:
 
-- No settle or baseline (step 5): the cases start right after the seed documents are opened. M3 is `SKIP` ("lspcheck
-  doesn't judge recovery yet").
+- Step 3 sent no settle or baseline, and M3 was `SKIP`; [step 5](#step-5) adds them and judges M3.
 - Before sending `initialize`, lspcheck checks its exact serialized request (including the profile's
   `initializationOptions`), `initialized`, optional `workspace/didChangeConfiguration`, and 1 KiB for shutdown against
   the 64 MiB cap. If they do not fit, M1 and M2 are `ERROR` and the scenario writes nothing.
@@ -552,7 +560,8 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
 - The case budget and `run_timeout` are as above; planning, serialization and hashing consume the admitted case's
   budget. Before a case starts, lspcheck checks that the bytes it has written
   so far plus the case's reserve fit the written-bytes cap; the reserve counts the case's `didChange` notifications at
-  their exact size, 2 KiB plus twice the URI's length for each request, and 1 KiB for `shutdown` and `exit`. For each
+  their exact size, 2 KiB plus twice the URI's length for each request (step 5 adds 41 such requests per stable
+  request probe: the most polls and the terminal probe), and 1 KiB for `shutdown` and `exit`. For each
   document, the restoration reserve is the largest restoration notification over every step's resulting text and
   version, plus a small margin, even if the plan ends with the clean text. Answers to the server's own requests also
   count towards the next case's check; see [Bounds](#bounds) for their admission rule (added in step 4).
@@ -582,6 +591,32 @@ Step 3 runs the scenario without the parts later steps add, and says so where it
 - A request K1 wouldn't send about the document (a `documentSelector` that doesn't select it) is skipped, and the
   round robin moves on.
 - Case plans use the [transcript format above](#reports-transcripts-and-reproduction).
+
+### Step 5
+
+Step 5 builds [Recovery](#recovery) and M3 as above. Where the rules leave a choice, it makes these:
+
+- Settle and baseline each have their own `settle_timeout`, and `run_timeout` counts from the end of the baseline.
+  Baseline registration, writes and waits share its absolute deadline; replies after it cannot establish stability.
+  The baseline's requests come before the first mutation, so M2 doesn't judge them; D1 and K1 do.
+- The request probes are sent with K1's params for each document. An error, a malformed response or a report that
+  isn't a full one breaks a probe's run of equal answers: it is asked again, and used only if two answers in a row
+  are then equal (a server may answer with an error while it loads). Diagnostic arrays and their projected fields
+  must be well formed; malformed evidence during recovery makes that probe `ERROR`, even with `no_errors`.
+  Malformed pushed diagnostics before the first mutation leave that probe without a stable baseline.
+- `no_errors = true` without `expect` makes "recovered" mean "no Error diagnostic" for the diagnostics probes, so a
+  lingering Warning passes; with `expect = "baseline"` both must hold. `documentSymbol` and `foldingRange` are
+  compared with their baseline either way.
+- A pushed-diagnostics probe recovers on the first publish labelled with the restored version whose projection equals
+  the baseline (for an unmutated document, the latest one read before the restoration counts). With `no_errors`, its
+  publishes are read to the end of `recovery_timeout`, and the last decides, so each case takes the whole bound.
+- Generated edits that leave all documents at their clean text establish the restoration boundary too; recovery
+  is timed from that delivery even when no extra restoration write is needed.
+- Terminal probes are sent with or without an expectation; an answer equal to the baseline counts as recovered. An
+  error answer to a terminal probe, or one in a frame lspcheck couldn't read, is `ERROR`, never `FAIL`.
+- Polls are sent when due, never two at once: poll *n* + 1 waits for poll *n*'s replies, then for the gap. A poll still
+  waiting when `recovery_timeout` ends keeps its own `--timeout` deadline; the case budget counts that last poll's
+  writes and replies, so it can't overrun the case or `run_timeout`.
 
 ## Decisions
 

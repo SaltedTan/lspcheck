@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). v0.4.0 expands the [example profile catalogue](../examples/profiles/README.md) to 18 servers and the [stock-server CI matrix](../ci/stock-servers/README.md) to 11, accepts unknown values of the tag and kind enumerations clients must tolerate in K2, refines [K2's failure detail](#capabilities-and-robustness), and [isolates Content-Type probes](#framing-and-output). M4 is done (see the [integration milestone](#milestones)). Next is [seeded source mutation](source-mutations.md), whose design is accepted; steps 1 to 4 are implemented. See the
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). v0.4.0 expands the [example profile catalogue](../examples/profiles/README.md) to 18 servers and the [stock-server CI matrix](../ci/stock-servers/README.md) to 11, accepts unknown values of the tag and kind enumerations clients must tolerate in K2, refines [K2's failure detail](#capabilities-and-robustness), and [isolates Content-Type probes](#framing-and-output). M4 is done (see the [integration milestone](#milestones)). Next is [seeded source mutation](source-mutations.md), whose design is accepted; steps 1 to 5 are implemented, so M1 to M3 are judged under `--mutate`. See the
 [mutation implementation status](source-mutations.md) for current behavior and the
 [implementation plan](source-mutations.md#implementation-plan) for the remaining steps.
 D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios.
@@ -25,8 +25,8 @@ See the [README](../README.md#exit-status) for exit statuses and `--strict`.
 
 ## Non-goals
 - Not a certification or "LSP compliant" badge. Each check states its basis, and the report lists what wasn't exercised.
-- Not semantic correctness of answers (hover text, definitions): that needs language oracles. Language profiles may add
-  source mutation and recovery later, but not in the core.
+- Not semantic correctness of answers (hover text, definitions): that needs language oracles. The opt-in
+  [mutation scenario](source-mutations.md#recovery) checks recovery without a language-specific correctness oracle.
 - Not coverage-guided fuzzing (LSPFuzz does that with instrumented builds).
 - Not an editor or client test.
 
@@ -698,7 +698,7 @@ No network access at runtime.
   `--fault stdout-banner`, `char-length`, `string-id-to-number`, `reply-twice`, `reply-unsent-id`,
   `reply-to-notification`, `no-jsonrpc-field`, `result-and-error`, `wrong-unknown-error`, `exit-on-shutdown`,
   `exit-status`, `ignore-eof`, `orphan-child`, `bad-encoding`, … **Every check has a test that fails it on its fault and
-  passes the clean stand-in, except M3, which isn't judged yet.** That guards against false greens.
+  passes the clean stand-in.** That guards against false greens.
 - Self-tests for the harness: partial frames, stderr floods, a server that stops reading stdin, a hung server, signals
   during spawn, cleanup after a crash.
 - The [stock-server CI matrix](../ci/stock-servers/README.md) documents its baseline contract and update procedure.
@@ -715,9 +715,8 @@ No network access at runtime.
 - **M4** dogfood in virgil-lsp: a pinned binary download in CI (a dependency + workflow change, so a human merge there).
   Done: virgil-lsp's `lspcheck-linux` job checks its freshly built server with the pinned v0.3.0 release.
 - K2 meta-model validation (released in v0.3.0).
-- Later: language profiles with seeded source mutation and recovery oracles, ported from
-  `test/protocol/source_mutations.py`. [Accepted design](source-mutations.md): an opt-in `--mutate` scenario with
-  checks M1 to M3, which also extends D1, D2, D6 and K1 to real source.
+- Seeded source mutation: see the [implementation plan](source-mutations.md#implementation-plan) for completed and
+  remaining steps.
 
 ## Open questions
 - MSRV policy: pin the toolchain in `rust-toolchain.toml` and support the last few stable releases.

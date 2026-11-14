@@ -326,8 +326,9 @@ impl Mutation {
 
     /// The most time one case may take: every write and reply of its steps
     /// and of the restoration's steps, each with its own deadline, the
-    /// restoration's writes, `recovery_timeout`, and each terminal probe's
-    /// write and reply ([Bounds](../docs/source-mutations.md#bounds)).
+    /// restoration's writes, `recovery_timeout`, the writes and replies of a
+    /// poll begun just before it ends, and each terminal probe's write and
+    /// reply ([Bounds](../docs/source-mutations.md#bounds)).
     pub fn case_budget(&self, request_timeout: Duration) -> Duration {
         let documents = self.seeds.len().max(1) as u32;
         let requested_probes = match &self.recovery.probes {
@@ -340,7 +341,7 @@ impl Mutation {
             .saturating_mul((steps + 1) * per_step)
             .saturating_add(request_timeout.saturating_mul(documents))
             .saturating_add(self.recovery_timeout(request_timeout))
-            .saturating_add(request_timeout.saturating_mul(documents * requested_probes * 2))
+            .saturating_add(request_timeout.saturating_mul(documents * requested_probes * 4))
             .saturating_add(CASE_MARGIN)
     }
 }
@@ -1824,8 +1825,8 @@ mod tests {
         let secs = Duration::from_secs;
         let mut m = Mutation::defaults(section_seed("main.lua", ""));
         // (3 + 1) steps × (1 + 4) writes and replies × 30 s, the restoration's write, recovery_timeout (60 s),
-        // three terminal probes' writes and replies, and 5 s.
-        assert_eq!(m.case_budget(secs(30)), secs(600 + 30 + 60 + 180 + 5));
+        // the writes and replies of a last poll and of the terminal probes, for three probes, and 5 s.
+        assert_eq!(m.case_budget(secs(30)), secs(600 + 30 + 60 + 360 + 5));
         m.recovery.probes = Some(vec![Probe::PublishDiagnostics]);
         m.recovery.recovery_timeout = Some(secs(20));
         m.seeds.push(m.seeds[0].clone());
@@ -1837,10 +1838,10 @@ mod tests {
 
     #[test]
     fn a_case_budget_over_the_run_timeout_is_refused_naming_both() {
-        let p = parse_here(&format!("{LUA}[mutation]\nrun_timeout = \"14m\"\n")).unwrap();
-        // 875 s at 30 s per request: one case can't fit in 840 s.
+        let p = parse_here(&format!("{LUA}[mutation]\nrun_timeout = \"17m\"\n")).unwrap();
+        // 1055 s at 30 s per request: one case can't fit in 1020 s.
         let e = mutation_settings(&p, None, None, Duration::from_secs(30)).unwrap_err();
-        assert!(e.contains("up to 875 s") && e.contains("of 30 s") && e.contains("run_timeout of 840 s"), "{e}");
+        assert!(e.contains("up to 1055 s") && e.contains("of 30 s") && e.contains("run_timeout of 1020 s"), "{e}");
         assert!(mutation_settings(&p, None, None, Duration::from_secs(10)).is_ok());
         let e = mutation_settings(&p, None, None, Duration::from_millis(29_500)).unwrap_err();
         assert!(e.contains("of 29.500 s"), "{e}");

@@ -4,12 +4,12 @@
 
 ### Added
 
-- M1 to M3 (`POLICY`) are in the catalogue for [seeded source mutation](docs/source-mutations.md), which is being
-  built. Without `--mutate` they are `SKIP`, which doesn't affect the exit status, so reports gain three `SKIP` lines
+- M1 to M3 (`POLICY`) are in the catalogue for experimental [seeded source mutation](docs/source-mutations.md).
+  Without `--mutate` they are `SKIP`, which doesn't affect the exit status, so reports gain three `SKIP` lines
   and each stock-server `.verdicts` file three `skip` lines.
 - Profiles accept a `[mutation]` section, [validated](docs/source-mutations.md#profile-schema) with the rest of the
   profile (a mistake in it is a usage error), and used only with `--mutate`.
-- An experimental `--mutate`, hidden from `--help` until recovery (M3) is judged, runs the mutation scenario: seeded
+- An experimental `--mutate`, hidden from `--help`, runs the mutation scenario: seeded
   edits of the profile's seed files, requests about each broken text, and the clean text restored after each case.
   It judges M1 (the server survives) and M2 (every request is answered within `--timeout`); `--mutation-seed` and
   `--mutation-cases` override the profile. The JSON report gains `"mutation"` (`null` when the scenario doesn't run),
@@ -22,6 +22,9 @@
 - Under `--mutate`, D1, D2, D6 and K1 also judge the mutation scenario's evidence under the
   [extended-check rules](docs/source-mutations.md#verdict-rules). Each check's verdict combines with its own
   scenario's, and the detail names the scenario and case. Default runs, and the stock-server baselines, don't change.
+- Under `--mutate`, M3 judges [recovery](docs/source-mutations.md#recovery) using stable baselines and the profile's
+  optional expectations. See its [verdict rules](docs/source-mutations.md#verdict-rules) for how it distinguishes
+  failures from inconclusive recovery.
 
 ### Changed
 
@@ -29,6 +32,8 @@
 
 ### Fixed
 
+- M3 rejects malformed diagnostic evidence, checks recovery when generated edits restore the seed without an
+  extra write, and caps baseline requests at the absolute `settle_timeout` deadline.
 - D6 in the documents scenario judges a `selectionRange` reply against every text it may describe (D1's candidate
   rule), as the mutation scenario does, so a late reply about the changed, shorter text no longer fails.
 

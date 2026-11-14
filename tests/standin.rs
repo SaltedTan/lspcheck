@@ -2650,9 +2650,9 @@ fn a_bad_mutation_setting_is_a_usage_error_before_any_server_starts() {
         assert!(stderr.contains("--mutate"), "{flag}: {stderr}");
     }
     // A case that can't fit the run, with the request timeout from the command line.
-    let (slow, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\nrun_timeout = \"14m\"\n"));
+    let (slow, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\nrun_timeout = \"17m\"\n"));
     let stderr = usage_error(&["--profile", slow.to_str().unwrap(), "--mutate", "--timeout", "30"]);
-    assert!(stderr.contains("up to 875 s") && stderr.contains("mutation.run_timeout of 840 s"), "{stderr}");
+    assert!(stderr.contains("up to 1055 s") && stderr.contains("mutation.run_timeout of 1020 s"), "{stderr}");
     // A bad [mutation] is refused with or without --mutate.
     let (bad, _keep) = profile(&format!("{MUTATION_PROFILE}[mutation]\noperators = [\"explode\"]\n"));
     for args in [&["--profile", bad.to_str().unwrap()][..], &["--profile", bad.to_str().unwrap(), "--mutate"]] {
@@ -2690,7 +2690,7 @@ fn recorded_plans(transcripts: &std::path::Path) -> Vec<Value> {
 #[test]
 fn the_clean_standin_survives_mutation() {
     let (r, t, _keep) = mutated(&[], &[]);
-    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "skip")]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
     assert_eq!(r.status, 0, "{}", r.stdout);
     assert_eq!(
         r.report["mutation"],
@@ -2699,9 +2699,19 @@ fn the_clean_standin_survives_mutation() {
     assert!(r.stdout.lines().next().unwrap().ends_with("— mutation seed 20261111, 4 cases"), "{}", r.stdout);
     let m2 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M2").unwrap()["detail"];
     assert!(m2.as_str().unwrap().contains("got a response; none with an error"), "{m2}");
-    assert_eq!(
-        r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M3").unwrap()["detail"],
-        lspcheck::checks::M3_LATER
+    // M3 passed on evidence: every probe the stand-in offers had a stable
+    // baseline and returned to it after each restoration.
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.starts_with(
+            "all 4 case(s) that reached their restoration recovered; probes: textDocument/documentSymbol of main.lua, \
+             textDocument/foldingRange of main.lua, publishDiagnostics of main.lua; slowest recovery "
+        ),
+        "{m3}"
+    );
+    assert!(
+        m3.contains("; not used: textDocument/diagnostic of main.lua: the server doesn't advertise diagnosticProvider"),
+        "{m3}"
     );
     // One plan per case, before it is sent, with the versions the steps sent.
     let plans = recorded_plans(&t);
@@ -2761,6 +2771,10 @@ fn mutation_server_exit_records_early_stop_and_fails_m1() {
     // A request pending when it exited, or that it exited before reading,
     // is M1's, not M2's: nothing was answered after a mutation.
     expect(&r, "M2", "not-exercised");
+    // No case reached its restoration, and the run stopped early.
+    expect(&r, "M3", "error");
+    let m3 = detail(&r, "M3");
+    assert!(m3.starts_with(&format!("the run stopped before every case's recovery was judged: {m1}; ")), "{m3}");
 }
 
 #[test]
@@ -2783,7 +2797,7 @@ fn a_request_left_unanswered_after_a_mutation_fails_m2() {
 #[test]
 fn content_modified_answers_to_broken_source_are_lawful() {
     let (r, _, _keep) = mutated(&["content-modified-while-unbalanced"], &[]);
-    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "skip")]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
     let m2 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M2").unwrap()["detail"];
     assert!(m2.as_str().unwrap().contains("errors by code: -32801 ×"), "{m2}");
 }
@@ -2884,7 +2898,14 @@ fn an_answer_withheld_while_shutting_down_changes_no_mutation_verdict() {
     let sent = recorded_messages(&transcript, "out");
     assert!(!sent.iter().any(|m| m["id"] == "configure-shutdown"));
     let methods: Vec<&str> = sent.iter().filter_map(|m| m["method"].as_str()).collect();
-    assert!(methods.ends_with(&["textDocument/didChange", "shutdown", "exit"]), "{methods:?}");
+    let restored = methods.iter().rposition(|m| *m == "textDocument/didChange").unwrap();
+    let (polls, rest) = methods[restored + 1..].split_at(methods.len() - restored - 3);
+    assert_eq!(rest, ["shutdown", "exit"], "{methods:?}");
+    assert!(
+        !polls.is_empty()
+            && polls.iter().all(|m| ["textDocument/documentSymbol", "textDocument/foldingRange"].contains(m)),
+        "{methods:?}"
+    );
 }
 
 /// A check's detail in the JSON report.
@@ -2961,7 +2982,7 @@ fn a_late_selection_reply_with_the_wrong_count_fails_d6() {
     // so M2 fails too.
     let (r, _, _keep) = mutated(&["late-wrong-count"], &["--mutation-cases", "40", "--timeout", "2"]);
     assert!(r.server_stderr.contains("standin: answered the held selectionRange"), "{}", r.server_stderr);
-    passes_except(&r, &[("D6", "fail"), ("M1", "pass"), ("M2", "fail"), ("M3", "skip")]);
+    passes_except(&r, &[("D6", "fail"), ("M1", "pass"), ("M2", "fail"), ("M3", "pass")]);
     let d6 = detail(&r, "D6");
     assert!(d6.starts_with("FAIL in the mutation scenario: 1 selectionRange finding(s): case "), "{d6}");
     assert!(d6.contains(" or later: 0 entries for 1 positions"), "{d6}");
@@ -2980,7 +3001,7 @@ fn a_delayed_selection_reply_about_a_later_shorter_text_is_lawful() {
     // comes after the request's deadline.
     let (r, _, _keep) = mutated(&["selection-from-later-text"], &["--timeout", "2"]);
     assert!(r.server_stderr.contains("standin: answered the held selectionRange"), "{}", r.server_stderr);
-    passes_except(&r, &[("M1", "pass"), ("M2", "fail"), ("M3", "skip")]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "fail"), ("M3", "pass")]);
     assert!(detail(&r, "D6").contains("PASS in the mutation scenario: "), "{}", detail(&r, "D6"));
 }
 
@@ -2992,7 +3013,7 @@ fn a_publish_labelled_with_a_version_whose_text_is_gone_is_lawful() {
     // them; it still knows the version was sent, so D2 passes.
     let (r, _, _keep) = mutated(&["old-version-diagnostics"], &["--mutation-cases", "40"]);
     assert!(r.server_stderr.contains("standin: published version 2 again at version 67"), "{}", r.server_stderr);
-    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "skip")]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
     let d1 = detail(&r, "D1");
     assert!(
         d1.contains("that may refer to a version older than the 64 whose texts lspcheck keeps, not judged"),
@@ -3006,7 +3027,7 @@ fn method_not_found_for_an_advertised_request_about_a_mutated_document_fails_k1(
     // The capabilities scenario asks about the clean seed, which the
     // stand-in answers; only the mutation scenario sees MethodNotFound.
     let (r, _, _keep) = mutated(&["method-not-found-while-unbalanced"], &[]);
-    passes_except(&r, &[("K1", "fail"), ("M1", "pass"), ("M2", "pass"), ("M3", "skip")]);
+    passes_except(&r, &[("K1", "fail"), ("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
     let k1 = detail(&r, "K1");
     assert!(
         k1.starts_with("FAIL in the mutation scenario: MethodNotFound (-32601) for ")
@@ -3016,6 +3037,280 @@ fn method_not_found_for_an_advertised_request_about_a_mutated_document_fails_k1(
     assert!(k1.contains("; PASS in the capabilities scenario: "), "{k1}");
     // MethodNotFound is an answer: M2 counts it, and it fails nothing else.
     assert!(detail(&r, "M2").contains("errors by code: -32601 ×"), "{}", detail(&r, "M2"));
+}
+
+/// The stand-in's mutation profile with `recovery` as its
+/// `[mutation.recovery]` section.
+fn recovery_profile(recovery: &str) -> (std::path::PathBuf, tempfile::TempDir) {
+    let fixture = std::fs::read_to_string(mutation_profile()).unwrap();
+    profile(&format!("{fixture}\n[mutation.recovery]\n{recovery}\n"))
+}
+
+/// The probes the clean stand-in offers its mutation profile, as M3 lists them.
+const STANDIN_PROBES: &str = "probes: textDocument/documentSymbol of main.lua, textDocument/foldingRange of main.lua, \
+                              publishDiagnostics of main.lua; ";
+
+#[test]
+fn recovery_rejects_malformed_pushed_diagnostics() {
+    for (fault, verdict) in
+        [("malformed-recovery-diagnostics", "error"), ("malformed-baseline-diagnostics", "not-exercised")]
+    {
+        let (path, _keep) =
+            recovery_profile("probes = [\"publishDiagnostics\"]\nno_errors = true\nrecovery_timeout = \"1s\"");
+        let (r, _, _keep) = mutated_with(&path, &[fault], &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+        expect(&r, "M3", verdict);
+        assert!(detail(&r, "M3").contains("malformed diagnostics"), "{}", r.stdout);
+    }
+}
+
+#[test]
+fn recovery_is_checked_when_generated_edits_restore_the_clean_text() {
+    use lspcheck::mutation::{self, Config, Operator};
+    let clean = "f()";
+    let config = Config { steps: 2, operators: vec![Operator::UnbalanceBracket], ..Config::default() };
+    let seed = (0..10000)
+        .find(|&seed| {
+            let plan = mutation::plan_case(seed, 0, &[clean.into()], &config);
+            if plan.steps.len() != 2 {
+                return false;
+            }
+            let mut text = clean.to_string();
+            for m in &plan.steps[0].mutations {
+                text = m.apply(&text);
+            }
+            if text.bytes().filter(|&b| b == b'(').count() == text.bytes().filter(|&b| b == b')').count() {
+                return false;
+            }
+            for m in &plan.steps[1].mutations {
+                text = m.apply(&text);
+            }
+            text == clean
+        })
+        .expect("a two-step bracket mutation returning to f()");
+    let (path, _keep) = profile(&format!(
+        "[workspace]\nfiles = {{ 'seed.txt' = 'f()' }}\n[mutation]\nfiles = ['seed.txt']\nlanguage_id = 'plaintext'\n\
+         seed = {seed}\ncases = 1\nsteps = 2\noperators = ['unbalance-bracket']\nrequests_per_step = 1\nrequests = ['textDocument/documentSymbol']\n\
+         [mutation.recovery]\nexpect = 'baseline'\nprobes = ['textDocument/documentSymbol']\nrecovery_timeout = '1s'\n"
+    ));
+    for (faults, verdict) in [(&[][..], "pass"), (&["stuck-after-unbalanced"][..], "fail")] {
+        let (r, t, _keep) = mutated_with(&path, faults, &["--only", "M1,M2,M3"]);
+        expect(&r, "M3", verdict);
+        let sent = recorded_messages(&t.join("mutation.jsonl"), "out");
+        let changes = sent.iter().filter(|m| m["method"] == "textDocument/didChange").count();
+        assert_eq!(changes, 2, "{sent:?}");
+    }
+}
+
+#[test]
+fn the_clean_standin_recovers_as_the_profile_expects() {
+    // The stated expectations hold for the clean stand-in: its answers return
+    // to the baseline, and its pushed diagnostics have no Error after each
+    // restoration.
+    let (path, _keep) = recovery_profile("expect = \"baseline\"\nno_errors = true\nrecovery_timeout = \"3s\"");
+    let (r, _, _keep) = mutated_with(&path, &[], &["--mutation-cases", "2"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+    let m3 = detail(&r, "M3");
+    assert!(m3.starts_with("all 2 case(s) that reached their restoration recovered; ") && m3.contains(STANDIN_PROBES));
+}
+
+#[test]
+fn answers_that_never_return_to_the_baseline_are_an_error_unless_the_profile_expects_them_to() {
+    // Once unbalanced, the stand-in answers documentSymbol with [] forever.
+    // Without a stated expectation that is lspcheck's bound, not a failure;
+    // with `expect = "baseline"` the terminal probe's answer fails M3.
+    let (path, _keep) = recovery_profile("recovery_timeout = \"1s\"");
+    let (r, _, _keep) = mutated_with(&path, &["stuck-after-unbalanced"], &["--mutation-cases", "1"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "error")]);
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.starts_with(
+            "case 0: textDocument/documentSymbol of main.lua not seen to recover within 1 s; lspcheck's bound, not a \
+             protocol rule: set `[mutation.recovery].expect` if the answers are fixed (its terminal probe's answer \
+             differs at result[*]: "
+        ),
+        "{m3}"
+    );
+    assert_eq!(r.status, 2, "{}", r.stdout);
+
+    let (path, _keep) = recovery_profile("expect = \"baseline\"\nrecovery_timeout = \"1s\"");
+    let (r, t, _keep) = mutated_with(&path, &["stuck-after-unbalanced"], &["--mutation-cases", "1"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "fail")]);
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.starts_with(
+            "case 0: textDocument/documentSymbol of main.lua didn't return to its baseline within 1 s of the \
+             restoration (mutation.recovery.recovery_timeout): its terminal probe's answer differs at result[*]: "
+        ) && m3.contains(" in the baseline, nothing in the answer; lspcheck polled "),
+        "{m3}"
+    );
+    // A POLICY failure fails the job only with --strict.
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    // The terminal probe was written after the deadline, and answered.
+    let sent = recorded_messages(&t.join("mutation.jsonl"), "out");
+    let restored = sent.iter().rposition(|m| m["method"] == "textDocument/didChange").unwrap();
+    let probes: Vec<&Value> =
+        sent[restored..].iter().filter(|m| m["method"] == "textDocument/documentSymbol").collect();
+    assert!(probes.len() >= 2, "{probes:?}");
+}
+
+#[test]
+fn a_recovery_just_before_the_deadline_is_seen_by_the_terminal_probe() {
+    // The stand-in answers the first four documentSymbol requests after each
+    // restoration with [], then as usual. lspcheck polls at 0, 0.25, 0.75 and
+    // 1.75 s after the restoration (the next would be at 3.75 s), so with a
+    // 3.7 s recovery_timeout the terminal probe, written after the deadline,
+    // is the fifth request and sees the baseline. A runner too slow to send
+    // all four polls within 3.7 s says nothing either way, so that run is
+    // repeated.
+    let (path, _keep) = recovery_profile("expect = \"baseline\"\nrecovery_timeout = \"3700ms\"");
+    for _ in 0..5 {
+        let (r, t, _keep) = mutated_with(&path, &["recover-before-deadline"], &["--mutation-cases", "1"]);
+        let sent = recorded_messages(&t.join("mutation.jsonl"), "out");
+        let restored = sent.iter().rposition(|m| m["method"] == "textDocument/didChange").unwrap();
+        let probes = sent[restored..].iter().filter(|m| m["method"] == "textDocument/documentSymbol").count();
+        if probes < 5 {
+            continue;
+        }
+        assert_eq!(probes, 5, "{}", r.stdout);
+        passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+        let m3 = detail(&r, "M3");
+        assert!(
+            m3.contains(" s after the restoration (textDocument/documentSymbol of main.lua in case 0, seen by its terminal probe)"),
+            "{m3}"
+        );
+        return;
+    }
+    panic!("lspcheck never sent four polls within the 3.7 s recovery_timeout in 5 runs");
+}
+
+#[test]
+fn a_recovered_answer_in_a_frame_lspcheck_skipped_is_an_error_not_a_failure() {
+    // After the restoration, the stand-in answers the first documentSymbol
+    // with [], and every later one, the baseline, in a frame past
+    // --max-frame-mib. lspcheck can't see the recovery, so it can't fail it.
+    let (path, _keep) = recovery_profile("expect = \"baseline\"\nrecovery_timeout = \"1s\"");
+    let (r, _, _keep) = mutated_with(
+        &path,
+        &["recovery-in-skipped-frame"],
+        &["--mutation-cases", "1", "--max-frame-mib", "1", "--timeout", "2", "--only", "M1,M2,M3"],
+    );
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "error");
+    expect(&r, "M3", "error");
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.starts_with("case 0: textDocument/documentSymbol of main.lua wasn't seen to recover within 1 s"),
+        "{m3}"
+    );
+    assert_eq!(r.status, 2, "{}", r.stdout);
+}
+
+#[test]
+fn an_error_diagnostic_after_the_restoration_fails_m3_when_the_seed_has_none() {
+    // Once unbalanced, the stand-in adds an Error diagnostic to every publish.
+    let (path, _keep) = recovery_profile("no_errors = true\nrecovery_timeout = \"3s\"");
+    let (r, _, _keep) = mutated_with(&path, &["errors-after-unbalanced"], &["--mutation-cases", "1"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "fail")]);
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.starts_with(
+            "case 0: publishDiagnostics of main.lua isn't free of Error diagnostics within 3 s of the restoration \
+             (mutation.recovery.recovery_timeout): the last publishDiagnostics labelled with version "
+        ) && m3.contains(", though mutation.recovery.no_errors says the seed has no Error diagnostics; lspcheck read all the server sent in those 3 s"),
+        "{m3}"
+    );
+}
+
+#[test]
+fn a_lingering_warning_fails_m3_only_when_the_profile_expects_the_baseline() {
+    // Once unbalanced, the stand-in adds a Warning to every publish: a
+    // difference from the baseline, but not an Error.
+    let (path, _keep) =
+        recovery_profile("expect = \"baseline\"\nprobes = [\"publishDiagnostics\"]\nrecovery_timeout = \"3s\"");
+    let (r, _, _keep) = mutated_with(&path, &["warning-after-unbalanced"], &["--mutation-cases", "1"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "fail")]);
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.starts_with(
+            "case 0: publishDiagnostics of main.lua didn't return to its baseline within 3 s of the restoration \
+             (mutation.recovery.recovery_timeout): the last publishDiagnostics labelled with version "
+        ) && m3.contains(" differs at params.diagnostics[*]: nothing in the baseline, "),
+        "{m3}"
+    );
+    let (path, _keep) = recovery_profile("no_errors = true\nrecovery_timeout = \"3s\"");
+    let (r, _, _keep) = mutated_with(&path, &["warning-after-unbalanced"], &["--mutation-cases", "1"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+}
+
+#[test]
+fn a_seed_with_errors_contradicts_no_errors_before_any_mutation() {
+    // The seed has an unmatched bracket, which the stand-in reports as an
+    // Error at baseline. lspcheck can't tell whether the profile or the
+    // server is wrong.
+    let fixture = std::fs::read_to_string(mutation_profile()).unwrap();
+    let unbalanced = fixture.replacen("print(add(1, 2)[1], greeting)", "print(add(1, 2)[1], greeting))", 1);
+    assert_ne!(unbalanced, fixture);
+    let (path, _keep) = profile(&format!("{unbalanced}\n[mutation.recovery]\nno_errors = true\n"));
+    let (r, _, _keep) = mutated_with(&path, &[], &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+    expect(&r, "M3", "error");
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.starts_with(
+            "the profile and the server disagree before any mutation: mutation.recovery.no_errors says the seed has \
+             no Error diagnostics, but publishDiagnostics of main.lua has "
+        ) && m3.contains(" at baseline"),
+        "{m3}"
+    );
+}
+
+#[test]
+fn lawful_recoveries_and_variations_fail_nothing() {
+    // Slow recovery, reworded messages, shuffled symbols with a changing
+    // detail, and no diagnostics at all: each probe still recovers, judged
+    // after its projection.
+    for (fault, args, probes) in [
+        ("slow-recovery", &["--mutation-cases", "2"][..], STANDIN_PROBES),
+        ("reworded-diagnostics", &[][..], STANDIN_PROBES),
+        ("shuffled-symbols", &[][..], STANDIN_PROBES),
+        (
+            "no-diagnostics",
+            &[][..],
+            "probes: textDocument/documentSymbol of main.lua, textDocument/foldingRange of main.lua; ",
+        ),
+    ] {
+        let (r, _, _keep) = mutated(&[fault], args);
+        let mut expected = vec![("M1", "pass"), ("M2", "pass"), ("M3", "pass")];
+        if fault == "no-diagnostics" {
+            // As in the default run: nothing to judge.
+            expected.extend([("D2", "not-exercised"), ("D5", "not-exercised")]);
+        }
+        passes_except(&r, &expected);
+        let m3 = detail(&r, "M3");
+        assert!(m3.contains(probes), "{fault}: {m3}");
+        if fault == "no-diagnostics" {
+            assert!(
+                m3.contains(
+                    "publishDiagnostics of main.lua: no publishDiagnostics labelled with version 1 arrived before the \
+                     first mutation"
+                ),
+                "{m3}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_probe_without_a_stable_baseline_isnt_used() {
+    // The stand-in adds a symbol named by a counter to every documentSymbol
+    // answer, so no two answers are equal and there is nothing to recover to.
+    let (path, _keep) = recovery_profile("probes = [\"textDocument/documentSymbol\"]\nsettle_timeout = \"2s\"");
+    let (r, _, _keep) = mutated_with(&path, &["unstable-symbols"], &["--mutation-cases", "1"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "not-exercised")]);
+    assert_eq!(
+        detail(&r, "M3"),
+        "no recovery probe had a stable baseline: textDocument/documentSymbol of main.lua: its answers didn't repeat \
+         before settle_timeout ended"
+    );
 }
 
 #[test]
@@ -3037,10 +3332,11 @@ fn mutation_openings_must_fit_the_byte_cap_before_any_are_sent() {
     .unwrap();
     let (r, transcripts, _keep) = run_with_transcripts(
         &["--fault", "no-diagnostics"],
-        &["--profile", path.to_str().unwrap(), "--mutate", "--only", "M1,M2"],
+        &["--profile", path.to_str().unwrap(), "--mutate", "--only", "M1,M2,M3"],
     );
     expect(&r, "M1", "error");
     expect(&r, "M2", "error");
+    expect(&r, "M3", "error");
     assert_eq!(r.report["mutation"]["cases_run"], 0);
     assert!(r.report["mutation"]["stopped"].as_str().unwrap().starts_with("opening the seed files would write "));
     let events = std::fs::read_to_string(transcripts.join("mutation.jsonl")).unwrap();
@@ -3096,11 +3392,11 @@ fn mutation_early_initialize_errors_record_their_stop_reasons() {
         ("no-capabilities", "initialize had no capabilities object (see L2)"),
         ("bad-encoding", "not judged: the server chose positionEncoding"),
     ] {
-        let (r, _, _keep) = mutated(&[fault], &["--only", "M1,M2"]);
+        let (r, _, _keep) = mutated(&[fault], &["--only", "M1,M2,M3"]);
         assert_eq!(r.report["mutation"]["cases_run"], 0);
         let stopped = r.report["mutation"]["stopped"].as_str().unwrap();
         assert!(stopped.starts_with(expected), "{fault}: {stopped}");
-        for id in ["M1", "M2"] {
+        for id in MUTATION_CHECKS {
             expect(&r, id, "error");
             let result = r.report["results"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap();
             assert_eq!(result["detail"], stopped);
