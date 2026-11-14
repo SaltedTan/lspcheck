@@ -398,7 +398,7 @@ pub struct Source {
     /// When it was read.
     pub read_at: Duration,
     /// The `version` a `publishDiagnostics` is labelled with, if any.
-    pub label: Option<i64>,
+    pub label: Option<(String, i64)>,
     /// Where in its scenario it was read, for a failure's detail (the
     /// mutation scenario's case); `None` when the scenario needs none.
     pub place: Option<String>,
@@ -459,7 +459,8 @@ fn normalized(uri: &str) -> String {
 /// [`candidates_for`]); `None` when one of them is a text lspcheck no
 /// longer keeps.
 pub fn candidates<'a>(doc: &'a OpenDoc, source: &Source) -> Option<Vec<&'a Version>> {
-    candidates_for(doc, source.label, source.asked_at, source.read_at)
+    let label = source.label.as_ref().filter(|(uri, _)| same_uri(uri, &doc.uri)).map(|(_, version)| *version);
+    candidates_for(doc, label, source.asked_at, source.read_at)
 }
 
 /// The texts something about `doc` read at `read_at` may refer to. A
@@ -1420,7 +1421,7 @@ mod tests {
             found,
             asked_at: None,
             read_at: Duration::from_millis(read),
-            label,
+            label: label.map(|version| (URI.into(), version)),
             place: None,
         }
     }
@@ -1488,6 +1489,34 @@ mod tests {
         let early = diagnostics(vec![range(URI, (0, 1), (0, 1))], 5, None);
         let j = judge_positions(Encoding::Utf16, std::slice::from_ref(&d), &[early]);
         assert_eq!((j.seen, j.before_open, j.invalid.len()), (0, 2, 0));
+    }
+
+    #[test]
+    fn review_regression_diagnostics_labels_apply_only_to_their_uri() {
+        let a = doc(&[(10, 2, "😀abc"), (20, 3, "abc")]);
+        let mut b = doc(&[(10, 2, "😀abc"), (20, 3, "abc")]);
+        b.uri = "file:///w/other.txt".into();
+        let params = serde_json::json!({
+            "uri": URI, "version": 2,
+            "diagnostics": [{
+                "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 2}},
+                "message": "example",
+                "relatedInformation": [{
+                    "location": {"uri": "file:///w/%6fther.txt", "range": {
+                        "start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}
+                    }}, "message": "related example"
+                }]
+            }]
+        });
+        let source = diagnostics(text::positions("textDocument/publishDiagnostics", &params, None), 30, Some(2));
+        let j = judge_positions(Encoding::Utf16, &[a.clone(), b.clone()], std::slice::from_ref(&source));
+        assert_eq!((j.valid, j.invalid.len(), j.evicted), (4, 0, 0));
+        let primary = diagnostics(vec![range(URI, (0, 1), (0, 1))], 30, Some(2));
+        let j = judge_positions(Encoding::Utf16, std::slice::from_ref(&a), &[primary]);
+        assert_eq!((j.valid, j.invalid.len()), (0, 2));
+        b.push(Version { at: Duration::from_millis(25), number: 4, text: "abc".into() }, 1);
+        let j = judge_positions(Encoding::Utf16, &[a, b], &[source]);
+        assert_eq!((j.valid, j.invalid.len(), j.evicted), (2, 0, 2));
     }
 
     #[test]
