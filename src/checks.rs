@@ -1996,16 +1996,17 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
             Some(capabilities::judge(&asked, &notes))
         }
         K1Pending::Mutation { asked } => {
-            let not_found: Vec<_> = asked
-                .iter()
-                .filter(|(id, sent, _)| {
-                    finish.messages.iter().any(|(at, m)| {
-                        at >= sent
-                            && m.response_id() == Some(id)
-                            && k1_outcome(m) == capabilities::Outcome::Error(codes::METHOD_NOT_FOUND)
-                    })
-                })
-                .collect();
+            let by_id: HashMap<_, _> = asked.iter().enumerate().map(|(i, (id, ..))| (id, i)).collect();
+            let mut found = vec![false; asked.len()];
+            for (at, m) in &finish.messages {
+                if let Some(&i) = m.response_id().and_then(|id| by_id.get(id))
+                    && *at >= asked[i].1
+                    && k1_outcome(m) == capabilities::Outcome::Error(codes::METHOD_NOT_FOUND)
+                {
+                    found[i] = true;
+                }
+            }
+            let not_found: Vec<_> = asked.iter().zip(found).filter_map(|(a, found)| found.then_some(a)).collect();
             if not_found.is_empty() {
                 return None;
             }
@@ -5778,6 +5779,48 @@ while header := sys.stdin.buffer.readline():
             assert_eq!(gone, expected == Verdict::Fail);
             assert_eq!(m1.verdict, expected, "{}", m1.detail);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_k1_matches_ids_times_and_reports_in_request_order() {
+        let cfg = mutation_test_config("exit 0");
+        let ctx = mutation_test_ctx(&cfg, 1024).await;
+        let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
+        let mut asked: Vec<_> = (1..=7)
+            .map(|id| (Id::int(id), Duration::from_millis(10), format!("textDocument/hover in case {id}")))
+            .collect();
+        asked.push((Id::Str("8".into()), Duration::from_millis(10), "textDocument/hover in case 8".into()));
+        finish.messages = vec![
+            (9, json!({"jsonrpc": "2.0", "id": 5, "error": {"code": -32601, "message": "early"}})),
+            (20, json!({"jsonrpc": "2.0", "id": "7", "error": {"code": -32601, "message": "string id"}})),
+            (20, json!({"jsonrpc": "2.0", "id": 8, "error": {"code": -32601, "message": "numeric id"}})),
+            (20, json!({"jsonrpc": "2.0", "id": 99, "error": {"code": -32601, "message": "unasked"}})),
+            (20, json!({"jsonrpc": "2.0", "id": 6, "result": null})),
+            (20, json!({"jsonrpc": "2.0", "id": 6, "error": {"code": -32801, "message": "content modified"}})),
+        ]
+        .into_iter()
+        .map(|(at, value)| (Duration::from_millis(at), Message::classify(value)))
+        .collect();
+        assert!(judge_k1(K1Pending::Mutation { asked: asked.clone() }, &finish).is_none());
+        for (at, value) in [
+            (20, json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32601, "message": "fourth"}})),
+            (20, json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32601, "message": "third"}})),
+            (10, json!({"jsonrpc": "2.0", "id": 2, "error": {"code": -32601, "message": "second"}})),
+            (10, json!({"jsonrpc": "2.0", "id": 1.0, "error": {"code": -32601, "message": "first"}})),
+            (30, json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "duplicate"}})),
+        ] {
+            finish.messages.push((Duration::from_millis(at), Message::classify(value)));
+        }
+        finish.messages.sort_by_key(|(at, _)| *at);
+        let Some(Judgement::Fail(detail)) = judge_k1(K1Pending::Mutation { asked }, &finish) else {
+            panic!("observed MethodNotFound responses must fail mutation K1");
+        };
+        assert_eq!(
+            detail,
+            "MethodNotFound (-32601) for 4 advertised request(s) about the mutated documents: \
+            textDocument/hover in case 1, textDocument/hover in case 2, textDocument/hover in case 3; and 1 more"
+        );
     }
 
     #[cfg(unix)]
