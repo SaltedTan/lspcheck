@@ -335,7 +335,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
 - **`[mutation]`** configures [seeded source mutation](docs/source-mutations.md#profile-schema). The section is
   validated with the rest of the profile, and used only with `--mutate`, which is experimental and hidden from
   `--help` until recovery (M3) is judged: `lspcheck --profile p.toml --mutate [--mutation-seed N]
-  [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2. See the
+  [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2; D1, D2, D6 and K1 judge what the
+  server says about the mutated texts too, and their details name the scenario and case. See the
   [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
   [implementation status](docs/source-mutations.md) for what is implemented so far, including the
   [written-bytes bound on automatic answers](docs/source-mutations.md#bounds). The JSON `mutation.stopped`

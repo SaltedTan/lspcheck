@@ -467,6 +467,10 @@ pub const NO_SEED_FILE: &str =
     "no seed file: the profile names none in [mutation].files and has no [document] to mutate";
 /// Why M3 is skipped while recovery isn't judged.
 pub const M3_LATER: &str = "lspcheck doesn't judge recovery yet; M3's probes are a later step";
+/// The checks the mutation scenario extends: it judges them on its own
+/// evidence as well, and [`combine_extended`] folds its verdict into the one
+/// their own scenario gives.
+pub const EXTENDED: &[&str] = &["D1", "D2", "D6", "K1"];
 
 /// Runs the scenarios needed for `selected` (every check when empty) and
 /// returns them with cross-cutting verdicts appended as a final "all" run.
@@ -478,6 +482,7 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
     // skips, so skipping a check changes no other check's verdict.
     let judges = |id: &str| wants(id) && !skipped(id);
     let any_cross = CROSS_CUTTING.iter().any(|c| judges(c));
+    let any_extended = EXTENDED.iter().any(|c| judges(c));
     let mut runs = Vec::new();
     for s in SCENARIOS {
         if s.name == MUTATION {
@@ -496,13 +501,16 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
                     mutation: None,
                 }),
                 Some(_) => {}
-                None if any_cross || s.checks.iter().any(|c| judges(c)) => runs.push(run_scenario(s, cfg).await?),
+                None if any_cross || any_extended || s.checks.iter().any(|c| judges(c)) => {
+                    runs.push(run_scenario(s, cfg).await?)
+                }
                 None => {}
             }
         } else if any_cross || s.checks.iter().any(|c| judges(c)) {
             runs.push(run_scenario(s, cfg).await?);
         }
     }
+    combine_extended(&mut runs);
     let cross: Vec<CheckResult> = [
         judge_f1(&runs),
         judge_f2(&runs),
@@ -537,6 +545,47 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
         }
     }
     Ok(runs)
+}
+
+/// How a verdict ranks when two scenarios judge the same check: a failure
+/// anywhere fails, then an error, a pass, no evidence, and a skip.
+fn rank(v: Verdict) -> u8 {
+    match v {
+        Verdict::Fail => 4,
+        Verdict::Error => 3,
+        Verdict::Pass => 2,
+        Verdict::NotExercised => 1,
+        Verdict::Skip => 0,
+    }
+}
+
+/// Folds the mutation scenario's verdict for each check it extends into the
+/// one the check's own scenario gives: the higher-ranked verdict wins (the
+/// own scenario's on a tie), with the scenario it came from, and the detail
+/// gives both, each with its scenario. A check whose own scenario didn't
+/// judge it keeps the mutation scenario's verdict as it is.
+fn combine_extended(runs: &mut [ScenarioRun]) {
+    let Some(m) = runs.iter().position(|r| r.name == MUTATION) else { return };
+    for id in EXTENDED {
+        let Some(i) = runs[m].results.iter().position(|r| r.id == *id) else { continue };
+        let Some((o, j)) = runs
+            .iter()
+            .enumerate()
+            .filter(|(o, _)| *o != m)
+            .find_map(|(o, r)| r.results.iter().position(|r| r.id == *id).map(|j| (o, j)))
+        else {
+            continue;
+        };
+        let theirs = runs[m].results.remove(i);
+        let own = &runs[o].results[j];
+        let (winner, other) = if rank(theirs.verdict) > rank(own.verdict) { (&theirs, own) } else { (own, &theirs) };
+        let part = |r: &CheckResult| {
+            let detail = if r.detail.is_empty() { String::new() } else { format!(": {}", r.detail) };
+            format!("{} in the {} scenario{detail}", r.verdict.label(), r.scenario)
+        };
+        let combined = result(winner.scenario, id, winner.verdict, format!("{}; {}", part(winner), part(other)));
+        runs[o].results[j] = combined;
+    }
 }
 
 /// Runs one scenario. Errors only when its transcript can't be written.
@@ -632,8 +681,10 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
     }
     let Ctx { s, mut results, j3_exercise, k1_pending, mutation, .. } = ctx;
     let finish = s.finish(cfg.leftover_grace).await;
-    if let Some(pending) = k1_pending {
-        let (verdict, detail) = match judge_k1(pending, &finish) {
+    if let Some(pending) = k1_pending
+        && let Some(judgement) = judge_k1(pending, &finish)
+    {
+        let (verdict, detail) = match judgement {
             Judgement::Fail(detail) => (Verdict::Fail, detail),
             Judgement::Error(detail) => (Verdict::Error, detail),
             Judgement::NotExercised(detail) => (Verdict::NotExercised, detail),
@@ -1898,6 +1949,7 @@ struct K1Asked {
 enum K1Pending {
     Judged(Judgement),
     Sent { asked: Vec<K1Asked>, notes: Vec<String> },
+    Mutation { asked: Vec<(Id, Duration, String)> },
 }
 
 /// K1: opens the profile's document (or lspcheck's own) and sends advertised
@@ -1915,9 +1967,9 @@ async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
     leave(ctx).await;
 }
 
-fn judge_k1(pending: K1Pending, finish: &Finish) -> Judgement {
+fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
     match pending {
-        K1Pending::Judged(judgement) => judgement,
+        K1Pending::Judged(judgement) => Some(judgement),
         K1Pending::Sent { mut asked, notes } => {
             for a in &mut asked {
                 let Some(id) = &a.id else { continue };
@@ -1941,7 +1993,31 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Judgement {
                 }
             }
             let asked: Vec<(String, capabilities::Outcome)> = asked.into_iter().map(|a| (a.label, a.outcome)).collect();
-            capabilities::judge(&asked, &notes)
+            Some(capabilities::judge(&asked, &notes))
+        }
+        K1Pending::Mutation { asked } => {
+            let by_id: HashMap<_, _> = asked.iter().enumerate().map(|(i, (id, ..))| (id, i)).collect();
+            let mut found = vec![false; asked.len()];
+            for (at, m) in &finish.messages {
+                if let Some(&i) = m.response_id().and_then(|id| by_id.get(id))
+                    && *at >= asked[i].1
+                    && k1_outcome(m) == capabilities::Outcome::Error(codes::METHOD_NOT_FOUND)
+                {
+                    found[i] = true;
+                }
+            }
+            let not_found: Vec<_> = asked.iter().zip(found).filter_map(|(a, found)| found.then_some(a)).collect();
+            if not_found.is_empty() {
+                return None;
+            }
+            let n = not_found.len();
+            let more = n.saturating_sub(K1_NAMED);
+            let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
+            let named: Vec<_> = not_found.iter().take(K1_NAMED).map(|(_, _, label)| label.as_str()).collect();
+            Some(Judgement::Fail(format!(
+                "MethodNotFound (-32601) for {n} advertised request(s) about the mutated documents: {}{tail}",
+                named.join(", ")
+            )))
         }
     }
 }
@@ -2629,10 +2705,8 @@ async fn documents(ctx: &mut Ctx<'_>) {
         leave(ctx).await;
         return;
     }
-    let mut docs = vec![OpenDoc {
-        uri: uri.clone(),
-        versions: vec![Version { at: opened_at, number: DOC_A_VERSION, text: text.clone() }],
-    }];
+    let mut docs =
+        vec![OpenDoc::opened(uri.clone(), Version { at: opened_at, number: DOC_A_VERSION, text: text.clone() })];
 
     let mut asked = Vec::new();
     let mut notes = Vec::new();
@@ -2735,10 +2809,10 @@ async fn documents(ctx: &mut Ctx<'_>) {
         ctx.report("D5", Verdict::Error, format!("lspcheck couldn't send didOpen for the line-ending document: {e}"));
     } else {
         b_opened = true;
-        docs.push(OpenDoc {
-            uri: b_uri.clone(),
-            versions: vec![Version { at: b_opened_at, number: DOC_B_VERSION, text: b_text.clone() }],
-        });
+        docs.push(OpenDoc::opened(
+            b_uri.clone(),
+            Version { at: b_opened_at, number: DOC_B_VERSION, text: b_text.clone() },
+        ));
         // The advertised requests about B, with positions on B2 and B4. A
         // stall here doesn't affect D4, which concerns only A.
         // B's requests are the latest before D4's, so they say whether the
@@ -2784,14 +2858,24 @@ async fn documents(ctx: &mut Ctx<'_>) {
             if let Some(uri) = params.get("uri").and_then(Value::as_str) {
                 // The raw value: `null` or a non-integer version isn't D2's
                 // to judge, but it isn't an integer version either.
-                published.push(Published { uri: uri.into(), version: params.get("version").cloned(), read_at: *at });
+                published.push(Published {
+                    uri: uri.into(),
+                    version: params.get("version").cloned(),
+                    read_at: *at,
+                    place: None,
+                });
             }
             sources.push(Source {
                 method: PUBLISH_DIAGNOSTICS.into(),
                 found: text::positions(PUBLISH_DIAGNOSTICS, &params, None),
                 asked_at: None,
                 read_at: *at,
-                label: params.get("version").and_then(documents::version_number),
+                label: params
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .zip(params.get("version").and_then(documents::version_number))
+                    .map(|(uri, version)| (uri.into(), version)),
+                place: None,
             });
         }
     }
@@ -2807,6 +2891,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
                 asked_at: Some(a.at),
                 read_at: *at,
                 label: None,
+                place: None,
             });
         }
     }
@@ -3491,6 +3576,8 @@ struct SeedDoc {
 struct StepRequest {
     id: Id,
     method: &'static str,
+    /// Its params, for the positions D1 and D6 read in its replies.
+    params: Value,
     case: u64,
     at: Duration,
     deadline_at: Duration,
@@ -3549,6 +3636,151 @@ fn answers_capped(s: &Session, next: u64, place: &str) -> Option<String> {
         "answers to the server's requests reached the scenario's written-bytes cap of {} MiB before {place}: {why}",
         MUTATION_BYTES / (1024 * 1024)
     ))
+}
+
+/// What the mutation scenario gathers for the checks it extends, D1, D2, D6
+/// and K1 ([design](../docs/source-mutations.md#verdict-rules)): the
+/// versions it sent, and the evidence judged so far.
+///
+/// Only the latest [`documents::KEPT_TEXTS`] texts of each document are
+/// kept, so what the server sent is judged before each new version is
+/// recorded, while the texts it may refer to are still there. Whatever may
+/// refer to a text already dropped isn't judged, and is counted.
+struct Extended {
+    encoding: Encoding,
+    /// Every version of each seed document lspcheck began sending, in the
+    /// order of the scenario's seed documents, with the latest texts.
+    docs: Vec<OpenDoc>,
+    /// When lspcheck began writing the first `didOpen`, once it had.
+    opened_at: Option<Duration>,
+    /// When each case began, in order.
+    cases: Vec<(Duration, u64)>,
+    /// How many of the session's messages have been judged.
+    judged_to: usize,
+    /// The step requests by id, as an index into the scenario's list, and
+    /// how many of that list are indexed.
+    by_id: HashMap<Id, usize>,
+    indexed: usize,
+    /// D1's judgements so far.
+    positions: documents::Judged,
+    /// D2's evidence: the diagnostics notifications read.
+    published: Vec<Published>,
+    /// D6's judgements so far.
+    selection: Vec<documents::SelectionReply>,
+}
+
+impl Extended {
+    fn new(encoding: Encoding, uris: impl Iterator<Item = String>) -> Extended {
+        Extended {
+            encoding,
+            docs: uris.map(|uri| OpenDoc { uri, ..OpenDoc::default() }).collect(),
+            opened_at: None,
+            cases: Vec::new(),
+            judged_to: 0,
+            by_id: HashMap::new(),
+            indexed: 0,
+            positions: documents::Judged::default(),
+            published: Vec::new(),
+            selection: Vec::new(),
+        }
+    }
+
+    /// Records version `number` of seed document `d`, with its text, from
+    /// when lspcheck began writing it, after judging what was read before:
+    /// recording it may drop the oldest text. A write that fails partway
+    /// still counts as sent, since the server may have read it, and a
+    /// version counted as sent can't make a check fail.
+    fn record(&mut self, s: &Session, asked: &[StepRequest], d: usize, at: Duration, number: i64, text: String) {
+        self.judge(&s.messages, asked, None);
+        self.opened_at.get_or_insert(at);
+        self.docs[d].push(Version { at, number, text }, documents::KEPT_TEXTS);
+    }
+
+    /// The case in progress when something was read, for a detail.
+    fn case_at(&self, at: Duration) -> String {
+        match self.cases.iter().rfind(|(began, _)| *began <= at) {
+            Some((_, k)) => format!("case {k}"),
+            None => "before the first case".into(),
+        }
+    }
+
+    /// Judges the messages read since the last call. Positions and selection
+    /// ranges use D1's candidate rule; only what was read before `end` (when
+    /// given) counts for D1, D2 and D6.
+    fn judge(&mut self, msgs: &[(Duration, Message)], asked: &[StepRequest], end: Option<Duration>) {
+        for (i, a) in asked.iter().enumerate().skip(self.indexed) {
+            self.by_id.insert(a.id.clone(), i);
+        }
+        self.indexed = asked.len();
+        let before_end = |at: Duration| end.is_none_or(|end| at < end);
+        for (at, m) in &msgs[self.judged_to..] {
+            let at = *at;
+            if m.method() == Some(PUBLISH_DIAGNOSTICS) && matches!(m.kind, Kind::Notification { .. }) && before_end(at)
+            {
+                let params = m.value.get("params").cloned().unwrap_or(Value::Null);
+                let place = Some(self.case_at(at));
+                if let Some(uri) = params.get("uri").and_then(Value::as_str) {
+                    let version = params.get("version").cloned();
+                    self.published.push(Published { uri: uri.into(), version, read_at: at, place: place.clone() });
+                }
+                let source = Source {
+                    method: PUBLISH_DIAGNOSTICS.into(),
+                    found: text::positions(PUBLISH_DIAGNOSTICS, &params, None),
+                    asked_at: None,
+                    read_at: at,
+                    label: params
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .zip(params.get("version").and_then(documents::version_number))
+                        .map(|(uri, version)| (uri.into(), version)),
+                    place,
+                };
+                documents::judge_source(&mut self.positions, self.encoding, &self.docs, &source);
+                continue;
+            }
+            // Every response with a step request's id read after it was
+            // sent, not only the first: a duplicate is J2's finding, but
+            // what it says still counts.
+            let Some(&index) = m.response_id().and_then(|id| self.by_id.get(id)) else { continue };
+            let a = &asked[index];
+            if at < a.at || matches!(a.outcome, StepOutcome::Undelivered(_)) {
+                continue;
+            }
+            let place = format!("case {}", a.case);
+            let uri = a.params.pointer("/textDocument/uri").and_then(Value::as_str);
+            let Kind::Response { outcome: Outcome::Result(result), .. } = &m.kind else { continue };
+            if !before_end(at) {
+                continue;
+            }
+            let source = Source {
+                method: a.method.into(),
+                found: text::positions(a.method, &a.params, Some(result)),
+                asked_at: Some(a.at),
+                read_at: at,
+                label: None,
+                place: Some(place.clone()),
+            };
+            documents::judge_source(&mut self.positions, self.encoding, &self.docs, &source);
+            if a.method != SELECTION_RANGE {
+                continue;
+            }
+            let Some(doc) = self.docs.iter().find(|d| uri.is_some_and(|u| documents::same_uri(&d.uri, u))) else {
+                continue;
+            };
+            let Some((_, version)) = doc.sent().filter(|(sent, _)| *sent <= a.at).last() else { continue };
+            let texts = documents::candidates_for(doc, None, Some(a.at), at);
+            let positions = documents::request_positions(&a.params);
+            if let Some(mut r) =
+                documents::judge_selection_candidates(texts.as_deref(), self.encoding, version, &positions, result)
+            {
+                for f in &mut r.failures {
+                    *f = format!("{place}: {f}");
+                }
+                self.selection.push(r);
+            }
+        }
+        self.judged_to = msgs.len();
+    }
 }
 
 /// Classifies a failed write after waiting up to `--exit-timeout`: stopped
@@ -3860,6 +4092,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             }})
         })
         .collect();
+    let mut ext = Extended::new(encoding, docs.iter().map(|d| d.uri.clone()));
     let opening_bytes = ctx.s.bytes_written()
         + SHUTDOWN_RESERVE
         + openings.iter().map(|params| notification_bytes("textDocument/didOpen", params)).sum::<u64>();
@@ -3872,7 +4105,8 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         leave(ctx).await;
         return;
     }
-    for (doc, params) in docs.iter().zip(openings) {
+    for (d, (doc, params)) in docs.iter().zip(openings).enumerate() {
+        ext.record(&ctx.s, &[], d, ctx.s.elapsed(), 1, doc.clean.clone());
         if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(params)).await {
             let why = match lost_after_write(ctx, &format!("didOpen for {}", doc.name), &e).await {
                 Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) | Lost::AfterWithheld(why) => why,
@@ -3881,7 +4115,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             both(ctx, Verdict::Error, why.clone());
             summary.stopped = Some(why);
             ctx.mutation = Some(summary);
-            leave(ctx).await;
+            leave_extended(ctx, &mut ext, &[]).await;
             return;
         }
     }
@@ -3945,7 +4179,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                     both(ctx, Verdict::Error, format!("case {k}: {e}"));
                     summary.stopped = Some(format!("case {k}: {e}"));
                     ctx.mutation = Some(summary);
-                    restore_and_leave(ctx, &mut docs, encoding, sync).await;
+                    restore_and_leave(ctx, &mut docs, sync, &mut ext, &asked).await;
                     return;
                 }
             };
@@ -3968,7 +4202,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 both(ctx, Verdict::Error, format!("case {k}: {e}"));
                 summary.stopped = Some(format!("case {k}: {e}"));
                 ctx.mutation = Some(summary);
-                restore_and_leave(ctx, &mut docs, encoding, sync).await;
+                restore_and_leave(ctx, &mut docs, sync, &mut ext, &asked).await;
                 return;
             }
         };
@@ -3997,6 +4231,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             .collect();
         ctx.s.record_mutation(json!({"format": mutation::FORMAT, "seed": seed, "case": k, "steps": record}));
         summary.cases_run += 1;
+        ext.cases.push((ctx.s.elapsed(), k));
         let mut rng = mutation::SplitMix64::stream(seed, k, "requests");
         for (j, (step, params, change_bytes, after, version)) in steps.iter().enumerate() {
             if Instant::now() >= case_deadline {
@@ -4022,6 +4257,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 break;
             }
             let change_at = ctx.s.elapsed();
+            ext.record(&ctx.s, &asked, d, change_at, *version, after.clone());
             if let Err(e) = ctx.s.notify("textDocument/didChange", Some(params.clone())).await {
                 lost = Some((lost_after_write(ctx, "a didChange", &e).await, place));
                 break 'cases;
@@ -4051,7 +4287,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 };
                 observe_mutation_batch(&mut ctx.s, &mut alive_at).await;
                 let id = ctx.s.fresh_id();
-                let bytes = frame(&message::request(&id, method, Some(params)));
+                let bytes = frame(&message::request(&id, method, Some(params.clone())));
                 let registered = ctx.s.begin_request(&id, method, Instant::now() + timeout).await;
                 // Registering took in what the server sent, answering it.
                 if registered.is_ok()
@@ -4083,10 +4319,18 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                         Lost::Uninspected(why) => StepOutcome::Uninspected(why.clone()),
                         _ => StepOutcome::Undelivered(format!("lspcheck couldn't deliver {method} ({e})")),
                     };
-                    failed_request = Some((StepRequest { id, method, case: k, at, deadline_at, outcome }, how));
+                    failed_request = Some((StepRequest { id, method, params, case: k, at, deadline_at, outcome }, how));
                     break;
                 }
-                asked.push(StepRequest { id, method, case: k, at, deadline_at, outcome: StepOutcome::Unanswered });
+                asked.push(StepRequest {
+                    id,
+                    method,
+                    params,
+                    case: k,
+                    at,
+                    deadline_at,
+                    outcome: StepOutcome::Unanswered,
+                });
                 deadlines.push(deadline);
             }
             for (request, deadline) in asked[step_start..].iter().zip(deadlines) {
@@ -4112,7 +4356,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             }
         }
         // The restoration is always sent, even when the case's budget ran out.
-        for doc in docs.iter_mut() {
+        for (d, doc) in docs.iter_mut().enumerate() {
             if doc.current == doc.clean {
                 continue;
             }
@@ -4122,12 +4366,13 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                     both(ctx, Verdict::Error, format!("restoring case {k}: {e}"));
                     summary.stopped = Some(format!("restoring case {k}: {e}"));
                     ctx.mutation = Some(summary);
-                    leave(ctx).await;
+                    leave_extended(ctx, &mut ext, &asked).await;
                     return;
                 }
             };
             let version = doc.version + 1;
             let params = did_change(&doc.uri, version, &[change]);
+            ext.record(&ctx.s, &asked, d, ctx.s.elapsed(), version, doc.clean.clone());
             if let Err(e) = ctx.s.notify("textDocument/didChange", Some(params)).await {
                 let place = format!("restoring {} after case {k}", doc.name);
                 lost = Some((lost_after_write(ctx, "the restoring didChange", &e).await, place));
@@ -4151,11 +4396,14 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     if cut_short > 0 {
         ctx.s.note(format!("{cut_short} case(s) ran out of their budget before their last step"));
     }
-    leave_mutation(ctx, summary, first_change, versions, lost, &asked, capped.as_deref()).await;
+    leave_mutation(ctx, summary, first_change, versions, lost, &asked, capped.as_deref(), &mut ext).await;
 }
 
 /// Judges M1 and M2 and shuts the server down. `capped` says why the
 /// written-bytes cap stopped the run before its cases were done, if it did.
+// Each argument is a separate part of the scenario's end state, which the
+// unit tests below set up one at a time.
+#[allow(clippy::too_many_arguments)]
 async fn leave_mutation(
     ctx: &mut Ctx<'_>,
     mut summary: MutationSummary,
@@ -4164,6 +4412,7 @@ async fn leave_mutation(
     mut lost: Option<(Lost, String)>,
     asked: &[StepRequest],
     capped: Option<&str>,
+    ext: &mut Extended,
 ) {
     // Everything already read is taken in before M1 is judged: an end of
     // output queued behind it would otherwise go unseen.
@@ -4206,31 +4455,91 @@ async fn leave_mutation(
     judge_m2(ctx, asked, capped.as_deref());
     ctx.mutation = Some(summary);
     // Every case is judged by now; an answer withheld while shutting down
-    // stops nothing, and the session notes it in the transcript.
+    // stops nothing, and the session notes it in the transcript. As in
+    // `leave`, the extended checks take what was read by the time lspcheck
+    // stopped waiting for shutdown's reply.
+    let mut end = ctx.s.elapsed();
     if registered.is_ok() {
         let bytes = frame(&message::request(&id, "shutdown", None));
         if ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await.is_err() {
+            end = ctx.s.elapsed();
             ctx.s.abort_request(&id);
-        } else if ctx.s.wait_response(&id, deadline).await.is_ok() && ctx.s.notify("exit", None).await.is_ok() {
-            let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+        } else {
+            let answered = ctx.s.wait_response(&id, deadline).await.is_ok();
+            end = ctx.s.elapsed();
+            if answered && ctx.s.notify("exit", None).await.is_ok() {
+                let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+            }
         }
     }
     ctx.s.take_in();
+    judge_extended(ctx, ext, asked, end);
 }
 
 /// Sends each mutated document's clean text back, then leaves. For a run
 /// that stops before its cases are done.
-async fn restore_and_leave(ctx: &mut Ctx<'_>, docs: &mut [SeedDoc], encoding: Encoding, sync: mutation::Sync) {
-    for doc in docs.iter_mut().filter(|d| d.current != d.clean) {
-        let Ok(change) = mutation::restore_change(&doc.current, &doc.clean, encoding, sync) else { break };
+async fn restore_and_leave(
+    ctx: &mut Ctx<'_>,
+    docs: &mut [SeedDoc],
+    sync: mutation::Sync,
+    ext: &mut Extended,
+    asked: &[StepRequest],
+) {
+    for (d, doc) in docs.iter_mut().enumerate().filter(|(_, d)| d.current != d.clean) {
+        let Ok(change) = mutation::restore_change(&doc.current, &doc.clean, ext.encoding, sync) else { break };
         doc.version += 1;
+        ext.record(&ctx.s, asked, d, ctx.s.elapsed(), doc.version, doc.clean.clone());
         if ctx.s.notify("textDocument/didChange", Some(did_change(&doc.uri, doc.version, &[change]))).await.is_err() {
             break;
         }
         doc.current = doc.clean.clone();
     }
-    leave(ctx).await;
+    leave_extended(ctx, ext, asked).await;
 }
+
+/// Leaves, then judges the checks the scenario extends over what was read.
+async fn leave_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest]) {
+    let end = leave(ctx).await;
+    judge_extended(ctx, ext, asked, end);
+}
+
+/// D1, D2 and D6 over what the mutation scenario read about the seed
+/// documents, from the first `didOpen` to `end`, when lspcheck stopped
+/// waiting for shutdown's reply or its write failed ([design](../docs/source-mutations.md#verdict-rules)).
+/// D1 and D2 are reported once a document was opened, D6 once a
+/// `selectionRange` was asked. K1's request metadata is retained until
+/// cleanup's final stdout drain, and it contributes only a MethodNotFound: an
+/// unanswered request is M2's, never K1's error. [`run`] combines these with
+/// the verdicts the checks' own scenarios give.
+fn judge_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest], end: Duration) {
+    let Some(opened_at) = ext.opened_at else { return };
+    ext.judge(&ctx.s.messages, asked, Some(end));
+    let encoding = ext.encoding;
+    let ext = &*ext;
+    ctx.report_judged("D1", opened_at, end, |why| documents::judge_d1(encoding, &ext.positions, why));
+    ctx.report_judged("D2", opened_at, end, |why| documents::judge_d2(&ext.docs, &ext.published, why));
+    if asked.iter().any(|a| a.method == SELECTION_RANGE) {
+        ctx.report_judged("D6", opened_at, end, |why| documents::judge_d6(&ext.selection, why));
+    }
+    ctx.k1_pending = Some(K1Pending::Mutation {
+        asked: asked
+            .iter()
+            .filter(|a| {
+                !matches!(a.outcome, StepOutcome::Undelivered(_))
+                    && a.params
+                        .pointer("/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .is_some_and(|uri| ext.docs.iter().any(|doc| documents::same_uri(&doc.uri, uri)))
+            })
+            .map(|a| (a.id.clone(), a.at, format!("{} in case {}", a.method, a.case)))
+            .collect(),
+    });
+}
+
+/// How many MethodNotFound answers a mutation K1 failure names.
+const K1_NAMED: usize = 3;
+
+const SELECTION_RANGE: &str = "textDocument/selectionRange";
 
 /// M1: the server neither exited nor closed its output after the first
 /// mutation's `didChange` was fully written and before `shutdown`. A run
@@ -5271,6 +5580,12 @@ while header := sys.stdin.buffer.readline():
         ctx.s.finish(Duration::from_millis(200)).await;
     }
 
+    /// The extended checks' evidence when no seed document was opened.
+    #[cfg(unix)]
+    fn unopened() -> Extended {
+        Extended::new(Encoding::Utf16, std::iter::empty())
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn mutation_exit_before_shutdown_is_judged_at_both_first_change_boundaries() {
@@ -5279,7 +5594,7 @@ while header := sys.stdin.buffer.readline():
             let mut ctx = mutation_test_ctx(&cfg, 1024).await;
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, first_change, 1, None, &[], None).await;
+            leave_mutation(&mut ctx, summary, first_change, 1, None, &[], None, &mut unopened()).await;
             assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, expected);
             assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::NotExercised);
             ctx.s.finish(Duration::from_millis(200)).await;
@@ -5303,7 +5618,7 @@ while header := sys.stdin.buffer.readline():
                 }
                 let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
                 let lost = Some((Lost::Undelivered("failed write".into()), "restoring case 0".into()));
-                leave_mutation(&mut ctx, summary, first_change, 1, lost, &[], None).await;
+                leave_mutation(&mut ctx, summary, first_change, 1, lost, &[], None, &mut unopened()).await;
                 let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
                 assert_eq!(m1.verdict, expected, "{}", m1.detail);
                 if first_change.is_some() {
@@ -5328,8 +5643,8 @@ while header := sys.stdin.buffer.readline():
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
             let place = if lost.is_some() { "case 0, step 1" } else { "the cases and their restorations" };
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost.map(|how| (how, place.into())), &[], None)
-                .await;
+            let lost = lost.map(|how| (how, place.into()));
+            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost, &[], None, &mut unopened()).await;
             let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
             assert_eq!(m1.verdict, Verdict::Error, "{}", m1.detail);
             assert!(
@@ -5360,7 +5675,7 @@ while header := sys.stdin.buffer.readline():
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
             let lost = seen_before.then(|| (Lost::Gone("the server exited with status 0".into()), "case 0".into()));
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost, &[], None).await;
+            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, lost, &[], None, &mut unopened()).await;
             let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
             assert_eq!(m1.verdict, expected, "{}", m1.detail);
             if !seen_before {
@@ -5402,13 +5717,14 @@ while header := sys.stdin.buffer.readline():
             let asked = [StepRequest {
                 id,
                 method: "textDocument/hover",
+                params: Value::Null,
                 case: 0,
                 at,
                 deadline_at: at + Duration::from_secs(5),
                 outcome: StepOutcome::Answered(None),
             }];
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, Some(at), 1, None, &asked, None).await;
+            leave_mutation(&mut ctx, summary, Some(at), 1, None, &asked, None, &mut unopened()).await;
             let withheld = ctx.s.answer_withheld().is_some();
             let finish = ctx.s.finish(Duration::from_millis(200)).await;
             for id in ["M1", "M2"] {
@@ -5446,13 +5762,181 @@ while header := sys.stdin.buffer.readline():
             let after_withheld = matches!(how, Lost::AfterWithheld(_));
             let gone = matches!(how, Lost::Gone(_));
             let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, Some((how, "case 0".into())), &[], None).await;
+            leave_mutation(
+                &mut ctx,
+                summary,
+                Some(Duration::ZERO),
+                1,
+                Some((how, "case 0".into())),
+                &[],
+                None,
+                &mut unopened(),
+            )
+            .await;
             let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
             ctx.s.finish(Duration::from_millis(200)).await;
             assert!(withheld);
             assert_eq!(after_withheld, expected == Verdict::Error);
             assert_eq!(gone, expected == Verdict::Fail);
             assert_eq!(m1.verdict, expected, "{}", m1.detail);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_k1_matches_ids_times_and_reports_in_request_order() {
+        let cfg = mutation_test_config("exit 0");
+        let ctx = mutation_test_ctx(&cfg, 1024).await;
+        let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
+        let mut asked: Vec<_> = (1..=7)
+            .map(|id| (Id::int(id), Duration::from_millis(10), format!("textDocument/hover in case {id}")))
+            .collect();
+        asked.push((Id::Str("8".into()), Duration::from_millis(10), "textDocument/hover in case 8".into()));
+        finish.messages = vec![
+            (9, json!({"jsonrpc": "2.0", "id": 5, "error": {"code": -32601, "message": "early"}})),
+            (20, json!({"jsonrpc": "2.0", "id": "7", "error": {"code": -32601, "message": "string id"}})),
+            (20, json!({"jsonrpc": "2.0", "id": 8, "error": {"code": -32601, "message": "numeric id"}})),
+            (20, json!({"jsonrpc": "2.0", "id": 99, "error": {"code": -32601, "message": "unasked"}})),
+            (20, json!({"jsonrpc": "2.0", "id": 6, "result": null})),
+            (20, json!({"jsonrpc": "2.0", "id": 6, "error": {"code": -32801, "message": "content modified"}})),
+        ]
+        .into_iter()
+        .map(|(at, value)| (Duration::from_millis(at), Message::classify(value)))
+        .collect();
+        assert!(judge_k1(K1Pending::Mutation { asked: asked.clone() }, &finish).is_none());
+        for (at, value) in [
+            (20, json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32601, "message": "fourth"}})),
+            (20, json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32601, "message": "third"}})),
+            (10, json!({"jsonrpc": "2.0", "id": 2, "error": {"code": -32601, "message": "second"}})),
+            (10, json!({"jsonrpc": "2.0", "id": 1.0, "error": {"code": -32601, "message": "first"}})),
+            (30, json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "duplicate"}})),
+        ] {
+            finish.messages.push((Duration::from_millis(at), Message::classify(value)));
+        }
+        finish.messages.sort_by_key(|(at, _)| *at);
+        let Some(Judgement::Fail(detail)) = judge_k1(K1Pending::Mutation { asked }, &finish) else {
+            panic!("observed MethodNotFound responses must fail mutation K1");
+        };
+        assert_eq!(
+            detail,
+            "MethodNotFound (-32601) for 4 advertised request(s) about the mutated documents: \
+            textDocument/hover in case 1, textDocument/hover in case 2, textDocument/hover in case 3; and 1 more"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn review_regression_mutation_k1_waits_for_the_final_stdout_drain() {
+        let script = r#"import json, signal, sys
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+held = None
+def send(value):
+    body = json.dumps(value).encode()
+    sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
+    sys.stdout.buffer.flush()
+while header := sys.stdin.buffer.readline():
+    length = int(header.split(b':')[1])
+    assert sys.stdin.buffer.readline() == b'\r\n'
+    request = json.loads(sys.stdin.buffer.read(length))
+    if request['method'] == 'textDocument/hover':
+        held = request['id']
+    if 'id' in request:
+        send({'jsonrpc': '2.0', 'id': request['id'], 'result': None})
+send({'jsonrpc': '2.0', 'id': held, 'error': {'code': int(sys.argv[1]), 'message': 'late error'}})
+"#;
+        for ordinary_leave in [false, true] {
+            for code in [codes::METHOD_NOT_FOUND, -32801] {
+                let mut cfg = mutation_test_config("exit 0");
+                cfg.exit_timeout = Duration::ZERO;
+                cfg.server = ServerCommand::new(&[
+                    "python3".into(),
+                    "-I".into(),
+                    "-c".into(),
+                    script.into(),
+                    code.to_string().into(),
+                ]);
+                let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+                let at = ctx.s.elapsed();
+                let id = ctx.s.fresh_id();
+                ctx.s.call_with_id(&id, "textDocument/hover", None, Duration::from_secs(5)).await.unwrap();
+                let asked = [StepRequest {
+                    id,
+                    method: "textDocument/hover",
+                    params: json!({"textDocument": {"uri": "file:///seed"}}),
+                    case: 7,
+                    at,
+                    deadline_at: ctx.s.elapsed(),
+                    outcome: StepOutcome::Answered(None),
+                }];
+                let mut ext = Extended::new(Encoding::Utf16, ["file:///seed".to_string()].into_iter());
+                ext.opened_at = Some(at);
+                if ordinary_leave {
+                    leave_extended(&mut ctx, &mut ext, &asked).await;
+                } else {
+                    let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
+                    leave_mutation(&mut ctx, summary, Some(at), 1, None, &asked, None, &mut ext).await;
+                }
+                assert!(!ctx.s.messages.iter().any(|(_, m)| k1_outcome(m) == capabilities::Outcome::Error(code)));
+                let pending = ctx.k1_pending.take();
+                let finish = ctx.s.finish(Duration::from_millis(200)).await;
+                let pending = pending.expect("mutation K1 must retain its requests until cleanup");
+                assert!(finish.messages.iter().any(|(_, m)| k1_outcome(m) == capabilities::Outcome::Error(code)));
+                match judge_k1(pending, &finish) {
+                    Some(Judgement::Fail(detail)) => {
+                        assert_eq!(code, codes::METHOD_NOT_FOUND);
+                        assert!(
+                            detail.contains(
+                                "1 advertised request(s) about the mutated documents: textDocument/hover in case 7"
+                            ),
+                            "{detail}"
+                        );
+                    }
+                    None => assert_ne!(code, codes::METHOD_NOT_FOUND),
+                    _ => panic!("mutation K1 must contribute only an observed failure"),
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn review_regression_mutation_failed_shutdown_write_extends_inspection_window() {
+        let script = r#"import fcntl, json, signal, sys
+fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETPIPE_SZ, 4096)
+header = sys.stdin.buffer.readline()
+length = int(header.split(b':')[1])
+assert sys.stdin.buffer.readline() == b'\r\n'
+request = json.loads(sys.stdin.buffer.read(length))
+body = json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': None}).encode()
+sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
+sys.stdout.buffer.flush()
+signal.pause()
+"#;
+        let mut cfg = mutation_test_config("exit 0");
+        cfg.request_timeout = Duration::from_millis(200);
+        cfg.server = ServerCommand::new(&["python3".into(), "-I".into(), "-c".into(), script.into()]);
+        let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+        ctx.s.call("lspcheck/ready", None, Duration::from_secs(5)).await.unwrap();
+        ctx.s.write_raw(&[b' '; 4096]).await.unwrap();
+        let mut ext = Extended::new(Encoding::Utf16, ["file:///seed".to_string()].into_iter());
+        ext.opened_at = Some(Duration::ZERO);
+        let asked = [StepRequest {
+            id: Id::int(100),
+            method: SELECTION_RANGE,
+            params: json!({"textDocument": {"uri": "file:///seed"}, "positions": []}),
+            case: 0,
+            at: Duration::ZERO,
+            deadline_at: Duration::ZERO,
+            outcome: StepOutcome::Unanswered,
+        }];
+        let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
+        leave_mutation(&mut ctx, summary, None, 1, None, &asked, None, &mut ext).await;
+        let results = ctx.results;
+        ctx.s.finish(Duration::from_millis(200)).await;
+        for id in ["D1", "D2", "D6"] {
+            let r = results.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(r.verdict, Verdict::Error, "{id}: {}", r.detail);
+            assert!(r.detail.contains("couldn't finish its write"), "{}", r.detail);
         }
     }
 
@@ -5465,13 +5949,14 @@ while header := sys.stdin.buffer.readline():
         let asked = [StepRequest {
             id: Id::int(1),
             method: "textDocument/hover",
+            params: Value::Null,
             case: 0,
             at: Duration::ZERO,
             deadline_at: Duration::from_secs(1),
             outcome: StepOutcome::Unanswered,
         }];
         let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
-        leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, None, &asked, None).await;
+        leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, None, &asked, None, &mut unopened()).await;
         assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, Verdict::Fail);
         assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::Fail);
         assert_eq!(asked[0].outcome, StepOutcome::Unanswered);
@@ -5506,7 +5991,15 @@ while header := sys.stdin.buffer.readline():
                 let at = ctx.s.elapsed();
                 let deadline_at = if asked.is_empty() { at } else { Duration::MAX };
                 ctx.s.write_raw(&frame(&message::request(&id, method, Some(json!({}))))).await.unwrap();
-                asked.push(StepRequest { id, method, case: 0, at, deadline_at, outcome: StepOutcome::Unanswered });
+                asked.push(StepRequest {
+                    id,
+                    method,
+                    params: Value::Null,
+                    case: 0,
+                    at,
+                    deadline_at,
+                    outcome: StepOutcome::Unanswered,
+                });
             }
             ctx.s.call("lspcheck/ready", None, Duration::from_secs(5)).await.unwrap();
             assert_eq!(ctx.s.wait_response(&asked[0].id, Instant::now()).await.unwrap_err(), WaitError::Timeout);
@@ -5621,6 +6114,7 @@ while header := sys.stdin.buffer.readline():
             StepRequest {
                 id: Id::int(1),
                 method: "textDocument/hover",
+                params: Value::Null,
                 case: 0,
                 at: Duration::from_millis(10),
                 deadline_at: Duration::from_secs(1),
@@ -5629,6 +6123,7 @@ while header := sys.stdin.buffer.readline():
             StepRequest {
                 id: Id::int(2),
                 method: "textDocument/hover",
+                params: Value::Null,
                 case: 0,
                 at: Duration::from_millis(20),
                 deadline_at: Duration::from_secs(2),
@@ -5658,6 +6153,7 @@ while header := sys.stdin.buffer.readline():
         let mut request = StepRequest {
             id,
             method: "textDocument/hover",
+            params: Value::Null,
             case: 0,
             at,
             deadline_at: at + Duration::from_secs(5),
@@ -6187,5 +6683,62 @@ while header := sys.stdin.buffer.readline():
             info(id);
         }
         assert_eq!(seen.len(), CATALOGUE.len(), "every catalogued check is reported");
+    }
+
+    fn scenario_run(name: &'static str, results: Vec<CheckResult>) -> ScenarioRun {
+        ScenarioRun { name, results, observed: None, transcript: None, mutation: None }
+    }
+
+    #[test]
+    fn the_mutation_scenarios_verdicts_combine_with_their_own_scenarios() {
+        let mut runs = vec![
+            scenario_run(
+                "documents",
+                vec![
+                    result("documents", "D1", Verdict::Pass, "fine"),
+                    result("documents", "D2", Verdict::Fail, "own counter"),
+                    result("documents", "D6", Verdict::Skip, "no selectionRangeProvider"),
+                ],
+            ),
+            scenario_run("capabilities", vec![result("capabilities", "K1", Verdict::NotExercised, "none")]),
+            scenario_run(
+                MUTATION,
+                vec![
+                    result(MUTATION, "M1", Verdict::Pass, ""),
+                    result(MUTATION, "D1", Verdict::Fail, "inside a character"),
+                    result(MUTATION, "D2", Verdict::Fail, "runs ahead"),
+                    result(MUTATION, "K1", Verdict::Fail, "MethodNotFound"),
+                ],
+            ),
+        ];
+        combine_extended(&mut runs);
+        let got = |id: &str| runs.iter().flat_map(|r| &r.results).filter(|r| r.id == id).collect::<Vec<_>>();
+        // One result per check, from the scenario whose verdict wins.
+        let d1 = got("D1");
+        assert_eq!((d1.len(), d1[0].verdict, d1[0].scenario), (1, Verdict::Fail, MUTATION));
+        assert_eq!(
+            d1[0].detail,
+            "FAIL in the mutation scenario: inside a character; PASS in the documents scenario: fine"
+        );
+        // On a tie, the check's own scenario comes first.
+        let d2 = got("D2");
+        assert_eq!((d2.len(), d2[0].scenario), (1, "documents"));
+        assert_eq!(
+            d2[0].detail,
+            "FAIL in the documents scenario: own counter; FAIL in the mutation scenario: runs ahead"
+        );
+        let k1 = got("K1");
+        assert_eq!((k1.len(), k1[0].verdict, k1[0].scenario), (1, Verdict::Fail, MUTATION));
+        // Nothing from the mutation scenario: unchanged.
+        let d6 = got("D6");
+        assert_eq!((d6[0].verdict, d6[0].detail.as_str()), (Verdict::Skip, "no selectionRangeProvider"));
+        assert_eq!(got("M1").len(), 1);
+        // The ranking: a failure, an error, a pass, no evidence, a skip.
+        let order = [Verdict::Fail, Verdict::Error, Verdict::Pass, Verdict::NotExercised, Verdict::Skip];
+        assert!(order.windows(2).all(|w| rank(w[0]) > rank(w[1])));
+        // A check only the mutation scenario judged keeps its verdict as it is.
+        let mut runs = vec![scenario_run(MUTATION, vec![result(MUTATION, "D1", Verdict::Pass, "fine")])];
+        combine_extended(&mut runs);
+        assert_eq!((runs[0].results[0].scenario, runs[0].results[0].detail.as_str()), (MUTATION, "fine"));
     }
 }

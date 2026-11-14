@@ -257,8 +257,7 @@ pub struct Change {
 /// diagnostics labelled with such a version. A late reply to an earlier
 /// request, or unlabelled diagnostics, may refer to the text before.
 pub fn only_after(doc: &OpenDoc, source: &Source, change_at: Duration) -> bool {
-    let candidates = candidates(doc, source);
-    !candidates.is_empty() && candidates.iter().all(|v| v.at >= change_at)
+    candidates(doc, source).is_some_and(|c| !c.is_empty() && c.iter().all(|v| v.at >= change_at))
 }
 
 /// Forgets what lspcheck read about `uri` from `closed_at` on, when it began
@@ -338,12 +337,43 @@ fn apply_lenient(text: &str, encoding: Encoding, change: &ContentChange) -> Opti
     }
 }
 
+/// How many of a document's latest texts the mutation scenario keeps for D1
+/// and D6. Older versions keep only their numbers and times.
+pub const KEPT_TEXTS: usize = 64;
+
 /// A document lspcheck opened.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OpenDoc {
     pub uri: String,
-    /// Every version sent, oldest first.
+    /// The versions sent whose texts lspcheck keeps, oldest first.
     pub versions: Vec<Version>,
+    /// The versions sent before those, whose texts lspcheck no longer keeps:
+    /// when it began writing each, and its number, oldest first.
+    pub dropped: Vec<(Duration, i64)>,
+}
+
+impl OpenDoc {
+    /// A document opened at `version`.
+    pub fn opened(uri: String, version: Version) -> OpenDoc {
+        OpenDoc { uri, versions: vec![version], dropped: Vec::new() }
+    }
+
+    /// Adds the version just sent, keeping the texts of the latest `keep`
+    /// only: an older version keeps its number and time, so D2 still knows
+    /// it was sent and D1 that a position may refer to a text it lacks.
+    pub fn push(&mut self, version: Version, keep: usize) {
+        self.versions.push(version);
+        if self.versions.len() > keep {
+            let old = self.versions.remove(0);
+            self.dropped.push((old.at, old.number));
+        }
+    }
+
+    /// Every version sent, oldest first: when lspcheck began writing it, and
+    /// its number.
+    pub fn sent(&self) -> impl Iterator<Item = (Duration, i64)> + '_ {
+        self.dropped.iter().copied().chain(self.versions.iter().map(|v| (v.at, v.number)))
+    }
 }
 
 /// Document B, the line-ending document: its URI and the window it was open.
@@ -367,8 +397,13 @@ pub struct Source {
     pub asked_at: Option<Duration>,
     /// When it was read.
     pub read_at: Duration,
-    /// The `version` a `publishDiagnostics` is labelled with, if any.
-    pub label: Option<i64>,
+    /// The URI and version a `publishDiagnostics` is labelled with, if any.
+    /// Its label doesn't constrain related locations in other documents.
+    pub label: Option<(String, i64)>,
+    /// Scenario context for a failure's detail: the mutation request's case
+    /// for a reply, or the case in progress when a notification was read.
+    /// `None` when the scenario needs none.
+    pub place: Option<String>,
 }
 
 /// A `textDocument/publishDiagnostics` notification the server sent.
@@ -379,6 +414,8 @@ pub struct Published {
     pub version: Option<Value>,
     /// When the notification was read.
     pub read_at: Duration,
+    /// Where in its scenario it was read, as [`Source::place`].
+    pub place: Option<String>,
 }
 
 /// A document version's value, when it is a JSON integer that fits, however
@@ -420,23 +457,46 @@ fn normalized(uri: &str) -> String {
     text
 }
 
-/// The texts a position from `source` about `doc` may refer to. A
+/// The texts a position from `source` about `doc` may refer to (see
+/// [`candidates_for`]); `None` when one of them is a text lspcheck no
+/// longer keeps.
+pub fn candidates<'a>(doc: &'a OpenDoc, source: &Source) -> Option<Vec<&'a Version>> {
+    let label = source.label.as_ref().filter(|(uri, _)| same_uri(uri, &doc.uri)).map(|(_, version)| *version);
+    candidates_for(doc, label, source.asked_at, source.read_at)
+}
+
+/// The texts something about `doc` read at `read_at` may refer to. A
 /// `publishDiagnostics` labelled with a version lspcheck sent refers to that
-/// version. A reply refers to the version current when its request was sent,
-/// or to one sent before it was read, should a change have overtaken it. Any
-/// other notification may refer to any version sent before it was read.
-pub fn candidates<'a>(doc: &'a OpenDoc, source: &Source) -> Vec<&'a Version> {
-    let sent = |v: &&Version| v.at <= source.read_at;
-    if let Some(n) = source.label
-        && let Some(v) = doc.versions.iter().filter(sent).find(|v| v.number == n)
+/// version. A reply (to a request sent at `asked_at`) refers to the version
+/// current when its request was sent, or to one sent before it was read,
+/// should a change have overtaken it. Any other notification may refer to
+/// any version sent before it was read. `None` when one of those versions'
+/// texts was dropped ([`OpenDoc::dropped`]): judging the others alone could
+/// blame a position on a text it doesn't refer to.
+pub fn candidates_for(
+    doc: &OpenDoc,
+    label: Option<i64>,
+    asked_at: Option<Duration>,
+    read_at: Duration,
+) -> Option<Vec<&Version>> {
+    // Every version sent, dropped ones first, by index.
+    let dropped = doc.dropped.len();
+    let count = dropped + doc.versions.len();
+    let sent_at = |i: usize| {
+        if i < dropped { doc.dropped[i] } else { (doc.versions[i - dropped].at, doc.versions[i - dropped].number) }
+    };
+    let text = |i: usize| i.checked_sub(dropped).map(|k| &doc.versions[k]);
+    let sent = |i: &usize| sent_at(*i).0 <= read_at;
+    if let Some(n) = label
+        && let Some(i) = (0..count).filter(sent).find(|i| sent_at(*i).1 == n)
     {
-        return vec![v];
+        return text(i).map(|v| vec![v]);
     }
-    let from = match source.asked_at {
-        Some(asked) => doc.versions.iter().rposition(|v| v.at <= asked).unwrap_or(0),
+    let from = match asked_at {
+        Some(asked) => (0..count).rposition(|i| sent_at(i).0 <= asked).unwrap_or(0),
         None => 0,
     };
-    doc.versions[from..].iter().filter(sent).collect()
+    (from..count).filter(sent).map(text).collect()
 }
 
 /// How a counting is named in details.
@@ -480,6 +540,9 @@ pub struct Judged {
     /// Positions read before lspcheck sent any version of their document
     /// (a server may read the saved file), which have no text to refer to.
     pub before_open: usize,
+    /// Positions that may refer to a text lspcheck no longer keeps, which
+    /// aren't judged.
+    pub evicted: usize,
 }
 
 /// Judges every position in `sources` that is about a document in `docs`,
@@ -497,29 +560,41 @@ pub fn judge_positions_where(
 ) -> Judged {
     let mut j = Judged::default();
     for source in sources.iter().filter(|s| when(s)) {
-        for found in &source.found {
-            if found.kind == FoundKind::Line {
-                continue;
-            }
-            let Some(doc) = docs.iter().find(|d| same_uri(&d.uri, &found.uri)) else {
-                j.elsewhere += found.at.len();
-                continue;
-            };
-            let texts = candidates(doc, source);
-            if texts.is_empty() {
-                j.before_open += found.at.len();
-                continue;
-            }
-            let ends: &[&str] = if found.kind == FoundKind::Range { &[".start", ".end"] } else { &[""] };
-            for (p, end) in found.at.iter().zip(ends) {
-                j.seen += 1;
-                let path = format!("{}{end}", found.pointer);
-                let where_ = format!("{} {}", source.method, path.trim_start_matches('.'));
-                judge_one(&mut j, encoding, &texts, *p, &where_);
-            }
-        }
+        judge_source(&mut j, encoding, docs, source);
     }
     j
+}
+
+/// Adds what every position in `source` about a document in `docs` shows,
+/// counted in `encoding`, to `j`.
+pub fn judge_source(j: &mut Judged, encoding: Encoding, docs: &[OpenDoc], source: &Source) {
+    for found in &source.found {
+        if found.kind == FoundKind::Line {
+            continue;
+        }
+        let Some(doc) = docs.iter().find(|d| same_uri(&d.uri, &found.uri)) else {
+            j.elsewhere += found.at.len();
+            continue;
+        };
+        let Some(texts) = candidates(doc, source) else {
+            j.evicted += found.at.len();
+            continue;
+        };
+        if texts.is_empty() {
+            j.before_open += found.at.len();
+            continue;
+        }
+        let ends: &[&str] = if found.kind == FoundKind::Range { &[".start", ".end"] } else { &[""] };
+        for (p, end) in found.at.iter().zip(ends) {
+            j.seen += 1;
+            let path = format!("{}{end}", found.pointer);
+            let mut where_ = format!("{} {}", source.method, path.trim_start_matches('.'));
+            if let Some(place) = &source.place {
+                where_ = format!("{place}: {where_}");
+            }
+            judge_one(j, encoding, &texts, *p, &where_);
+        }
+    }
 }
 
 fn judge_one(j: &mut Judged, encoding: Encoding, texts: &[&Version], p: Position, where_: &str) {
@@ -638,6 +713,12 @@ fn counts(j: &Judged) -> String {
     );
     if j.before_open > 0 {
         out.push_str(&format!(", {} read before it was opened", j.before_open));
+    }
+    if j.evicted > 0 {
+        out.push_str(&format!(
+            ", {} that may refer to a version older than the {KEPT_TEXTS} whose texts lspcheck keeps, not judged",
+            j.evicted
+        ));
     }
     for (e, n) in &j.past_end_fits {
         out.push_str(&format!(
@@ -878,6 +959,9 @@ pub struct SelectionReply {
     /// Containment comparisons actually made (a position in its range, or a
     /// child in its parent): the evidence a pass needs.
     pub compared: usize,
+    /// Replies whose containment wasn't judged because a text they may
+    /// describe is one lspcheck no longer keeps (their entry count was).
+    pub evicted: usize,
 }
 
 /// The `positions` of a `textDocument/selectionRange` request's params.
@@ -924,15 +1008,36 @@ fn contains_range(lines: &[&str], encoding: Encoding, outer: Range, inner: Range
     Some((os.line, os.character) <= (is.line, is.character) && (ie.line, ie.character) <= (oe.line, oe.character))
 }
 
+/// A text a selection reply may describe, with its lines.
+type Described<'a> = (&'a str, Vec<&'a str>);
+
+/// Whether `outer` contains `inner` in a text the reply may describe, each
+/// with its own clamping: `Some(true)` when it does in one, `Some(false)`
+/// when it doesn't in any (and every line exists in each), `None` otherwise
+/// (not judged), as D1 judges a position against its candidate texts.
+fn contains_in_any(texts: &[Described], encoding: Encoding, outer: Range, inner: Range) -> Option<bool> {
+    let each: Vec<Option<bool>> =
+        texts.iter().map(|(_, lines)| contains_range(lines, encoding, outer, inner)).collect();
+    if each.contains(&Some(true)) {
+        Some(true)
+    } else if !each.is_empty() && each.iter().all(|c| *c == Some(false)) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// The hint a D6 failure gets when the same comparison holds under a line
-/// split the spec doesn't allow: names every such split, as D5 does. Empty
-/// when none explains the failure.
-fn wrong_split_hint(text: &str, encoding: Encoding, outer: Range, inner: Range) -> String {
+/// split the spec doesn't allow, in a text the reply may describe: names
+/// every such split, as D5 does. Empty when none explains the failure.
+fn wrong_split_hint(texts: &[Described], encoding: Encoding, outer: Range, inner: Range) -> String {
     let names: Vec<&str> = WRONG_SPLITS
         .iter()
         .filter(|s| {
-            let lines = split_lines_wrong(text, **s);
-            contains_range(&lines, encoding, outer, inner) == Some(true)
+            texts.iter().any(|(text, _)| {
+                let lines = split_lines_wrong(text, **s);
+                contains_range(&lines, encoding, outer, inner) == Some(true)
+            })
         })
         .map(|s| wrong_split_name(*s))
         .collect();
@@ -945,17 +1050,17 @@ fn fmt_range(r: Range) -> String {
 }
 
 /// Walks one entry's parent chain, judging the first node's range against the
-/// position and every parent's range against its child's.
+/// position and every parent's range against its child's, in the texts the
+/// reply may describe (`version` names them).
 fn judge_chain(
-    text: &str,
+    texts: &[Described],
     encoding: Encoding,
-    version: i64,
+    version: &str,
     entry_idx: usize,
     position: Option<Position>,
     node: &Value,
     r: &mut SelectionReply,
 ) {
-    let lines = text::split_lines(text);
     let mut depth = 0;
     let mut current = node;
     loop {
@@ -968,14 +1073,14 @@ fn judge_chain(
             r.entries += 1;
             // The first node's range must contain the position.
             if let Some(p) = position {
-                match contains_range(&lines, encoding, rng, Range { start: p, end: p }) {
+                match contains_in_any(texts, encoding, rng, Range { start: p, end: p }) {
                     Some(true) => r.compared += 1,
                     Some(false) => r.failures.push(format!(
                         "selectionRange at version {version}, entry {entry_idx}: range {} doesn't contain the position ({}, {}){}",
                         fmt_range(rng),
                         p.line,
                         p.character,
-                        wrong_split_hint(text, encoding, rng, Range { start: p, end: p })
+                        wrong_split_hint(texts, encoding, rng, Range { start: p, end: p })
                     )),
                     None => r.no_line += 1,
                 }
@@ -990,13 +1095,13 @@ fn judge_chain(
         }
         let parent_range = as_range(parent.get("range")).expect("checked above");
         // The parent's range must contain the child's.
-        match contains_range(&lines, encoding, parent_range, rng) {
+        match contains_in_any(texts, encoding, parent_range, rng) {
             Some(true) => r.compared += 1,
             Some(false) => r.failures.push(format!(
                 "selectionRange at version {version}, entry {entry_idx}: parent {} doesn't contain {}{}",
                 fmt_range(parent_range),
                 fmt_range(rng),
-                wrong_split_hint(text, encoding, parent_range, rng)
+                wrong_split_hint(texts, encoding, parent_range, rng)
             )),
             None => r.no_line += 1,
         }
@@ -1022,6 +1127,40 @@ pub fn judge_selection_reply(
     positions: &[Position],
     result: &Value,
 ) -> Option<SelectionReply> {
+    judge_selection(Some(&[text]), encoding, &version.to_string(), positions, result)
+}
+
+/// [`judge_selection_reply`] with D1's candidate rule: `texts` are the
+/// versions the reply may describe ([`candidates_for`]), and a containment
+/// fails only when it fails in every one, each with its own clamping (a reply
+/// may lawfully describe a later, shorter text). With `None`, one of them is
+/// a text lspcheck no longer keeps: only the entry count is judged, since one
+/// entry per position doesn't depend on the text. `version` names the
+/// request's version in that case.
+pub fn judge_selection_candidates(
+    texts: Option<&[&Version]>,
+    encoding: Encoding,
+    version: i64,
+    positions: &[Position],
+    result: &Value,
+) -> Option<SelectionReply> {
+    match texts {
+        Some(texts) => {
+            let numbers: Vec<String> = texts.iter().map(|v| v.number.to_string()).collect();
+            let texts: Vec<&str> = texts.iter().map(|v| v.text.as_str()).collect();
+            judge_selection(Some(&texts), encoding, &numbers.join(" or "), positions, result)
+        }
+        None => judge_selection(None, encoding, &format!("{version} or later"), positions, result),
+    }
+}
+
+fn judge_selection(
+    texts: Option<&[&str]>,
+    encoding: Encoding,
+    version: &str,
+    positions: &[Position],
+    result: &Value,
+) -> Option<SelectionReply> {
     let entries = result.as_array()?;
     let mut r = SelectionReply::default();
     if entries.len() != positions.len() {
@@ -1031,14 +1170,19 @@ pub fn judge_selection_reply(
             positions.len()
         ));
     }
+    let Some(texts) = texts else {
+        r.evicted += 1;
+        return Some(r);
+    };
+    let texts: Vec<Described> = texts.iter().map(|t| (*t, text::split_lines(t))).collect();
     for (i, entry) in entries.iter().enumerate() {
-        judge_chain(text, encoding, version, i, positions.get(i).copied(), entry, &mut r);
+        judge_chain(&texts, encoding, version, i, positions.get(i).copied(), entry, &mut r);
     }
     Some(r)
 }
 
 /// The extras a D6 detail gives, after its main clause.
-fn selection_extras(malformed: usize, no_line: usize, cut_chains: usize) -> String {
+fn selection_extras(malformed: usize, no_line: usize, cut_chains: usize, evicted: usize) -> String {
     let mut out = String::new();
     if malformed > 0 {
         out.push_str(&format!(", {malformed} malformed entr(y/ies), which D6 doesn't judge"));
@@ -1049,7 +1193,19 @@ fn selection_extras(malformed: usize, no_line: usize, cut_chains: usize) -> Stri
     if cut_chains > 0 {
         out.push_str(&format!(", {cut_chains} parent chain(s) cut short at the bound"));
     }
+    out.push_str(&selection_evicted(evicted));
     out
+}
+
+/// What a D6 detail says of replies about texts lspcheck no longer keeps.
+fn selection_evicted(evicted: usize) -> String {
+    if evicted == 0 {
+        return String::new();
+    }
+    format!(
+        ", {evicted} reply(s) that may describe a version older than the {KEPT_TEXTS} whose texts lspcheck keeps, \
+         whose containment wasn't judged"
+    )
 }
 
 /// D6's verdict over the selectionRange replies judged. A failure seen stands
@@ -1057,8 +1213,8 @@ fn selection_extras(malformed: usize, no_line: usize, cut_chains: usize) -> Stri
 /// no reply with an array result is not exercised.
 pub fn judge_d6(replies: &[SelectionReply], incomplete: Option<&str>) -> (Verdict, String) {
     let mut failures: Vec<String> = Vec::new();
-    let (mut judged, mut entries, mut malformed, mut no_line, mut cut_chains, mut compared) =
-        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut judged, mut entries, mut malformed, mut no_line, mut cut_chains, mut compared, mut evicted) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     for r in replies {
         judged += 1;
         compared += r.compared;
@@ -1066,6 +1222,7 @@ pub fn judge_d6(replies: &[SelectionReply], incomplete: Option<&str>) -> (Verdic
         malformed += r.malformed;
         no_line += r.no_line;
         cut_chains += r.cut_chains;
+        evicted += r.evicted;
         failures.extend(r.failures.iter().cloned());
     }
     if !failures.is_empty() {
@@ -1076,18 +1233,19 @@ pub fn judge_d6(replies: &[SelectionReply], incomplete: Option<&str>) -> (Verdic
         return (
             Verdict::Fail,
             format!(
-                "{} selectionRange finding(s): {}{tail}; {} reply(s) with {} entries judged, {} malformed, {} range(s) on a line the text doesn't have, {} parent chain(s) cut short",
+                "{} selectionRange finding(s): {}{tail}; {} reply(s) with {} entries judged, {} malformed, {} range(s) on a line the text doesn't have, {} parent chain(s) cut short{}",
                 failures.len(),
                 first.join("; "),
                 judged,
                 entries,
                 malformed,
                 no_line,
-                cut_chains
+                cut_chains,
+                selection_evicted(evicted)
             ),
         );
     }
-    let extras = selection_extras(malformed, no_line, cut_chains);
+    let extras = selection_extras(malformed, no_line, cut_chains, evicted);
     if let Some(why) = incomplete {
         return (
             Verdict::Error,
@@ -1117,6 +1275,26 @@ pub fn judge_d6(replies: &[SelectionReply], incomplete: Option<&str>) -> (Verdic
             judged, entries
         ),
     )
+}
+
+/// Version numbers for a detail, joined by "and", with a run of three or
+/// more consecutive ones written as its first and last ("1 to 80").
+fn version_list(numbers: &[i64]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < numbers.len() {
+        let mut j = i;
+        while j + 1 < numbers.len() && numbers[j + 1] == numbers[j] + 1 {
+            j += 1;
+        }
+        if j >= i + 2 {
+            parts.push(format!("{} to {}", numbers[i], numbers[j]));
+        } else {
+            parts.extend(numbers[i..=j].iter().map(i64::to_string));
+        }
+        i = j + 1;
+    }
+    parts.join(" and ")
 }
 
 /// The lawful publishes a D2 detail counts, after its main clause.
@@ -1151,16 +1329,17 @@ pub fn judge_d2(docs: &[OpenDoc], published: &[Published], incomplete: Option<&s
             continue;
         };
         // The same "sent" test as `candidates`: what lspcheck had written
-        // for this URI by the time the notification was read.
-        let sent: Vec<i64> = doc.versions.iter().filter(|v| v.at <= p.read_at).map(|v| v.number).collect();
+        // for this URI by the time the notification was read, including
+        // versions whose texts it no longer keeps.
+        let sent: Vec<i64> = doc.sent().filter(|(at, _)| *at <= p.read_at).map(|(_, n)| n).collect();
         if sent.contains(&n) {
             checked += 1;
             continue;
         }
-        let had = sent.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" and ");
-        let had = if had.is_empty() { "none".to_string() } else { had };
+        let had = if sent.is_empty() { "none".to_string() } else { version_list(&sent) };
+        let place = p.place.as_ref().map(|place| format!("{place}: ")).unwrap_or_default();
         fails.push(format!(
-            "{} carries version {}, and lspcheck had sent {had} for it before the notification was read",
+            "{place}{} carries version {}, and lspcheck had sent {had} for it before the notification was read",
             p.uri, n
         ));
     }
@@ -1214,6 +1393,7 @@ mod tests {
                 .iter()
                 .map(|(at, n, t)| Version { at: Duration::from_millis(*at), number: *n, text: t.to_string() })
                 .collect(),
+            dropped: Vec::new(),
         }
     }
 
@@ -1233,6 +1413,7 @@ mod tests {
             asked_at: Some(Duration::from_millis(asked)),
             read_at: Duration::from_millis(read),
             label: None,
+            place: None,
         }
     }
 
@@ -1242,7 +1423,8 @@ mod tests {
             found,
             asked_at: None,
             read_at: Duration::from_millis(read),
-            label,
+            label: label.map(|version| (URI.into(), version)),
+            place: None,
         }
     }
 
@@ -1291,7 +1473,7 @@ mod tests {
     #[test]
     fn candidates_follow_versions_and_labels() {
         let d = doc(&[(10, 41, "a"), (100, 42, "b")]);
-        let nums = |s: &Source| candidates(&d, s).iter().map(|v| v.number).collect::<Vec<_>>();
+        let nums = |s: &Source| candidates(&d, s).unwrap().iter().map(|v| v.number).collect::<Vec<_>>();
         // A reply to a request sent at version 41 and read before the change.
         assert_eq!(nums(&reply(vec![], 20, 50)), [41]);
         // Read after the change: either.
@@ -1309,6 +1491,34 @@ mod tests {
         let early = diagnostics(vec![range(URI, (0, 1), (0, 1))], 5, None);
         let j = judge_positions(Encoding::Utf16, std::slice::from_ref(&d), &[early]);
         assert_eq!((j.seen, j.before_open, j.invalid.len()), (0, 2, 0));
+    }
+
+    #[test]
+    fn review_regression_diagnostics_labels_apply_only_to_their_uri() {
+        let a = doc(&[(10, 2, "😀abc"), (20, 3, "abc")]);
+        let mut b = doc(&[(10, 2, "😀abc"), (20, 3, "abc")]);
+        b.uri = "file:///w/other.txt".into();
+        let params = serde_json::json!({
+            "uri": URI, "version": 2,
+            "diagnostics": [{
+                "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 2}},
+                "message": "example",
+                "relatedInformation": [{
+                    "location": {"uri": "file:///w/%6fther.txt", "range": {
+                        "start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}
+                    }}, "message": "related example"
+                }]
+            }]
+        });
+        let source = diagnostics(text::positions("textDocument/publishDiagnostics", &params, None), 30, Some(2));
+        let j = judge_positions(Encoding::Utf16, &[a.clone(), b.clone()], std::slice::from_ref(&source));
+        assert_eq!((j.valid, j.invalid.len(), j.evicted), (4, 0, 0));
+        let primary = diagnostics(vec![range(URI, (0, 1), (0, 1))], 30, Some(2));
+        let j = judge_positions(Encoding::Utf16, std::slice::from_ref(&a), &[primary]);
+        assert_eq!((j.valid, j.invalid.len()), (0, 2));
+        b.push(Version { at: Duration::from_millis(25), number: 4, text: "abc".into() }, 1);
+        let j = judge_positions(Encoding::Utf16, &[a, b], &[source]);
+        assert_eq!((j.valid, j.invalid.len(), j.evicted), (2, 0, 2));
     }
 
     #[test]
@@ -1397,11 +1607,11 @@ mod tests {
     }
 
     fn publish(uri: &str, version: Value, read: u64) -> Published {
-        Published { uri: uri.into(), version: Some(version), read_at: Duration::from_millis(read) }
+        Published { uri: uri.into(), version: Some(version), read_at: Duration::from_millis(read), place: None }
     }
 
     fn unversioned(uri: &str, read: u64) -> Published {
-        Published { uri: uri.into(), version: None, read_at: Duration::from_millis(read) }
+        Published { uri: uri.into(), version: None, read_at: Duration::from_millis(read), place: None }
     }
 
     #[test]
@@ -1699,9 +1909,19 @@ mod tests {
             diagnostics(vec![range(b, (1, 1), (1, 2))], 50, None),
         ];
         let mut published = vec![
-            Published { uri: b.into(), version: Some(serde_json::json!(7)), read_at: Duration::from_millis(150) },
-            Published { uri: b.into(), version: Some(serde_json::json!(7)), read_at: Duration::from_millis(50) },
-            Published { uri: URI.into(), version: None, read_at: Duration::from_millis(150) },
+            Published {
+                uri: b.into(),
+                version: Some(serde_json::json!(7)),
+                read_at: Duration::from_millis(150),
+                place: None,
+            },
+            Published {
+                uri: b.into(),
+                version: Some(serde_json::json!(7)),
+                read_at: Duration::from_millis(50),
+                place: None,
+            },
+            Published { uri: URI.into(), version: None, read_at: Duration::from_millis(150), place: None },
         ];
         forget_after_close(&mut sources, &mut published, b, at);
         assert_eq!(sources[0].found.len(), 1);
@@ -1829,6 +2049,7 @@ mod tests {
             past_end_fits: Vec::new(),
             no_line: 0,
             before_open: 0,
+            evicted: 0,
         }
     }
 
@@ -2382,5 +2603,102 @@ mod tests {
         // A malformed position is skipped.
         let params = serde_json::json!({"positions": [{"line": 0}, {"line": 1, "character": 2}]});
         assert_eq!(request_positions(&params), sel_positions(&[(1, 2)]));
+    }
+
+    // --- The mutation scenario's window of texts ---------------------------
+
+    /// A document sent at versions 1 to `n` (at 10 ms apart), whose text at
+    /// version `v` is `"v"` repeated, keeping the latest `keep` texts.
+    fn long_doc(n: i64, keep: usize) -> OpenDoc {
+        let mut d = OpenDoc::opened(URI.into(), Version { at: Duration::from_millis(10), number: 1, text: "1".into() });
+        for v in 2..=n {
+            let text = v.to_string().repeat(v as usize);
+            d.push(Version { at: Duration::from_millis(10 * v as u64), number: v, text }, keep);
+        }
+        d
+    }
+
+    #[test]
+    fn dropped_texts_keep_their_versions_and_leave_what_refers_to_them_unjudged() {
+        let d = long_doc(10, 4);
+        assert_eq!(d.versions.iter().map(|v| v.number).collect::<Vec<_>>(), [7, 8, 9, 10]);
+        assert_eq!(d.sent().map(|(_, n)| n).collect::<Vec<_>>(), (1..=10).collect::<Vec<_>>());
+        let nums = |s: &Source| candidates(&d, s).map(|c| c.iter().map(|v| v.number).collect::<Vec<_>>());
+        // A reply to a request sent at version 7 or later is judged; one sent
+        // at version 6 may refer to its text, which is gone.
+        assert_eq!(nums(&reply(vec![], 75, 85)), Some(vec![7, 8]));
+        assert_eq!(nums(&reply(vec![], 65, 85)), None);
+        // A publish labelled with a kept version is judged against it alone; one
+        // labelled with a dropped version, or unlabelled, isn't judged.
+        assert_eq!(nums(&diagnostics(vec![], 200, Some(9))), Some(vec![9]));
+        assert_eq!(nums(&diagnostics(vec![], 200, Some(3))), None);
+        assert_eq!(nums(&diagnostics(vec![], 200, None)), None);
+        // Before the open, still nothing to refer to.
+        assert_eq!(nums(&diagnostics(vec![], 5, None)), Some(vec![]));
+        // Unjudged positions are counted, and shown.
+        let early = reply(vec![range(URI, (0, 1), (0, 2))], 65, 85);
+        let j = judge_positions(Encoding::Utf16, std::slice::from_ref(&d), &[early]);
+        assert_eq!((j.seen, j.evicted, j.invalid.len()), (0, 2, 0));
+        let (_, detail) = judge_d1(Encoding::Utf16, &j, None);
+        assert!(
+            detail.contains(", 2 that may refer to a version older than the 64 whose texts lspcheck keeps"),
+            "{detail}"
+        );
+        // Nothing is dropped below the bound.
+        assert!(long_doc(10, KEPT_TEXTS).dropped.is_empty());
+    }
+
+    #[test]
+    fn d2_accepts_a_version_whose_text_was_dropped_and_names_versions_compactly() {
+        let d = long_doc(10, 4);
+        let (v, detail) = judge_d2(std::slice::from_ref(&d), &[publish(URI, serde_json::json!(2), 200)], None);
+        assert_eq!(v, Verdict::Pass, "{detail}");
+        let mut late = publish(URI, serde_json::json!(11), 200);
+        late.place = Some("case 3".into());
+        let (v, detail) = judge_d2(std::slice::from_ref(&d), &[late], None);
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(
+            detail.contains(": case 3: file:///w/doc.txt carries version 11, and lspcheck had sent 1 to 10 for it"),
+            "{detail}"
+        );
+        assert_eq!(version_list(&[41, 42]), "41 and 42");
+        assert_eq!(version_list(&[1, 2, 3, 5, 7, 8]), "1 to 3 and 5 and 7 and 8");
+        assert_eq!(version_list(&[7]), "7");
+    }
+
+    #[test]
+    fn d6_judges_a_reply_against_every_text_it_may_describe() {
+        // Version 3's line 0 has ten characters; version 4 shortens it to three.
+        // A request at column 9 of version 3, answered late about version 4: the
+        // parent ends at column 3, which contains the position clamped there.
+        let v3 = Version { at: Duration::from_millis(10), number: 3, text: "abcdefghij\n".into() };
+        let v4 = Version { at: Duration::from_millis(20), number: 4, text: "abc\n".into() };
+        let positions = sel_positions(&[(0, 9)]);
+        let result = serde_json::json!([{"range": rng(0, 9, 0, 9), "parent": {"range": rng(0, 0, 0, 3)}}]);
+        // Against version 3 alone, the parent doesn't contain its child.
+        let alone = judge_selection_candidates(Some(&[&v3]), Encoding::Utf16, 3, &positions, &result).unwrap();
+        assert_eq!(
+            alone.failures,
+            ["selectionRange at version 3, entry 0: parent (0,0)-(0,3) doesn't contain (0,9)-(0,9)"]
+        );
+        // Against either, it does in version 4: no failure.
+        let either = judge_selection_candidates(Some(&[&v3, &v4]), Encoding::Utf16, 3, &positions, &result).unwrap();
+        assert!(either.failures.is_empty(), "{:?}", either.failures);
+        assert_eq!((either.entries, either.compared), (1, 2));
+        // A failure in every text names them all.
+        let outside = serde_json::json!([{"range": rng(0, 0, 0, 1)}]);
+        let r = judge_selection_candidates(Some(&[&v3, &v4]), Encoding::Utf16, 3, &positions, &outside).unwrap();
+        assert_eq!(
+            r.failures,
+            ["selectionRange at version 3 or 4, entry 0: range (0,0)-(0,1) doesn't contain the position (0, 9)"]
+        );
+        // A text lspcheck no longer keeps: the count is judged, containment isn't.
+        let r = judge_selection_candidates(None, Encoding::Utf16, 3, &positions, &outside).unwrap();
+        assert!(r.failures.is_empty() && r.compared == 0 && r.evicted == 1, "{r:?}");
+        let r = judge_selection_candidates(None, Encoding::Utf16, 3, &positions, &serde_json::json!([])).unwrap();
+        assert_eq!(r.failures, ["selectionRange at version 3 or later: 0 entries for 1 positions"]);
+        let (v, d) = judge_d6(&[r], None);
+        assert_eq!(v, Verdict::Fail, "{d}");
+        assert!(d.ends_with("1 reply(s) that may describe a version older than the 64 whose texts lspcheck keeps, whose containment wasn't judged"), "{d}");
     }
 }

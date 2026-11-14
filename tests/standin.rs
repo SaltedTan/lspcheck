@@ -2700,6 +2700,20 @@ fn the_clean_standin_survives_mutation() {
             }
         }
     }
+    // D1, D2 and D6 also passed on the mutation scenario's evidence, and say
+    // so; K1 takes only a failure from it.
+    for (id, evidence) in [
+        ("D1", "PASS in the mutation scenario: "),
+        ("D2", "PASS in the mutation scenario: "),
+        ("D6", "PASS in the mutation scenario: "),
+    ] {
+        let d = detail(&r, id);
+        assert!(d.starts_with("PASS in the documents scenario: ") && d.contains(evidence), "{id}: {d}");
+    }
+    assert!(
+        detail(&r, "D1").contains("informative position(s) on character boundaries, counted in UTF-16 code units; ")
+    );
+    assert!(!detail(&r, "K1").contains("mutation"), "{}", detail(&r, "K1"));
     // The same seed plans the same cases.
     let (_, again, _keep) = mutated(&[], &[]);
     assert_eq!(recorded_plans(&again), plans);
@@ -2856,6 +2870,137 @@ fn an_answer_withheld_while_shutting_down_changes_no_mutation_verdict() {
     assert!(!sent.iter().any(|m| m["id"] == "configure-shutdown"));
     let methods: Vec<&str> = sent.iter().filter_map(|m| m["method"].as_str()).collect();
     assert!(methods.ends_with(&["textDocument/didChange", "shutdown", "exit"]), "{methods:?}");
+}
+
+/// A check's detail in the JSON report.
+fn detail(r: &Run, id: &str) -> String {
+    let result = r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == id);
+    result.unwrap_or_else(|| panic!("no {id}\n{}", r.stdout))["detail"].as_str().unwrap().to_owned()
+}
+
+/// The stand-in's mutation profile with `edits` made to its text.
+fn mutation_variant(edits: &[(&str, &str)]) -> (std::path::PathBuf, tempfile::TempDir) {
+    let mut text = std::fs::read_to_string(mutation_profile()).unwrap();
+    for (old, new) in edits {
+        assert!(text.contains(old), "{old}");
+        text = text.replacen(old, new, 1);
+    }
+    profile(&text)
+}
+
+/// Like [`mutated`], with the profile at `path`.
+fn mutated_with(
+    path: &std::path::Path,
+    faults: &[&str],
+    args: &[&str],
+) -> (Run, std::path::PathBuf, tempfile::TempDir) {
+    let standin: Vec<&str> = faults.iter().flat_map(|f| ["--fault", f]).collect();
+    let mut lspcheck = vec!["--profile", path.to_str().unwrap(), "--mutate"];
+    lspcheck.extend_from_slice(args);
+    run_with_transcripts(&standin, &lspcheck)
+}
+
+#[test]
+fn a_position_inside_a_character_of_a_mutated_text_fails_d1() {
+    // The stand-in counts positions in code points from its first change on.
+    // The unicode operator puts astral characters before the seed's words,
+    // so their positions land inside a character of the mutated text. The
+    // documents scenario fails D1 too; the detail shows the mutation
+    // scenario's failure, with the case of each position named.
+    let (path, _keep) = mutation_variant(&[("operators = [\"unbalance-bracket\"]", "operators = [\"unicode\"]")]);
+    let (r, _, _keep) = mutated_with(&path, &["codepoint-positions-after-change"], &[]);
+    expect(&r, "D1", "fail");
+    let d1 = detail(&r, "D1");
+    let mutation = &d1[d1.find("FAIL in the mutation scenario: ").expect(&d1)..];
+    assert!(mutation.contains("position(s) fall inside a character, counted in UTF-16 code units"), "{d1}");
+    assert!(mutation.contains(": case ") && mutation.contains("(on a boundary if counted in code points)"), "{d1}");
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+}
+
+#[test]
+fn a_diagnostics_version_never_sent_in_the_mutation_scenario_fails_d2() {
+    // The stand-in labels diagnostics with its own counter. With one seed
+    // document it would match the versions sent; with two, it runs ahead of
+    // each. The documents scenario fails D2 too; the detail shows the
+    // mutation scenario's failure.
+    let (path, _keep) = mutation_variant(&[
+        ("files = { \"main.lua\" = \"\"\"", "files = { \"other.lua\" = \"local x = (1)\\n\", \"main.lua\" = \"\"\""),
+        ("[mutation]\n", "[mutation]\nfiles = [\"main.lua\", \"other.lua\"]\n"),
+    ]);
+    let (r, _, _keep) = mutated_with(&path, &["diagnostics-own-version"], &[]);
+    expect(&r, "D2", "fail");
+    let d2 = detail(&r, "D2");
+    let mutation = &d2[d2.find("FAIL in the mutation scenario: ").expect(&d2)..];
+    assert!(mutation.contains("other.lua carries version 2, and lspcheck had sent 1 for it"), "{d2}");
+    assert!(mutation.contains("main.lua carries version"), "{d2}");
+}
+
+#[test]
+fn a_late_selection_reply_with_the_wrong_count_fails_d6() {
+    // The stand-in answers one selectionRange with no entries, after it has
+    // read 65 later versions of the document. The text the reply may describe
+    // is then one lspcheck no longer keeps, so containment isn't judged, but
+    // the entry count still is. The reply comes after the request's deadline
+    // by construction (lspcheck sends the next version only after the wait),
+    // so M2 fails too.
+    let (r, _, _keep) = mutated(&["late-wrong-count"], &["--mutation-cases", "40", "--timeout", "2"]);
+    assert!(r.server_stderr.contains("standin: answered the held selectionRange"), "{}", r.server_stderr);
+    passes_except(&r, &[("D6", "fail"), ("M1", "pass"), ("M2", "fail"), ("M3", "skip")]);
+    let d6 = detail(&r, "D6");
+    assert!(d6.starts_with("FAIL in the mutation scenario: 1 selectionRange finding(s): case "), "{d6}");
+    assert!(d6.contains(" or later: 0 entries for 1 positions"), "{d6}");
+    assert!(d6.contains("1 reply(s) that may describe a version older than the 64 whose texts"), "{d6}");
+    assert!(d6.contains("; PASS in the documents scenario: "), "{d6}");
+    assert!(detail(&r, "M2").starts_with("textDocument/selectionRange in case "), "{}", detail(&r, "M2"));
+}
+
+#[test]
+fn a_delayed_selection_reply_about_a_later_shorter_text_is_lawful() {
+    // The stand-in holds a selectionRange until a later change leaves its
+    // position past the end of its line, then answers from that text. The
+    // reply's parent ends at the shorter line's end: it contains the
+    // position clamped against that text, though not against the text the
+    // request was sent about. Only M2 fails, since the reply necessarily
+    // comes after the request's deadline.
+    let (r, _, _keep) = mutated(&["selection-from-later-text"], &["--timeout", "2"]);
+    assert!(r.server_stderr.contains("standin: answered the held selectionRange"), "{}", r.server_stderr);
+    passes_except(&r, &[("M1", "pass"), ("M2", "fail"), ("M3", "skip")]);
+    assert!(detail(&r, "D6").contains("PASS in the mutation scenario: "), "{}", detail(&r, "D6"));
+}
+
+#[test]
+fn a_publish_labelled_with_a_version_whose_text_is_gone_is_lawful() {
+    // After 65 more versions, the stand-in publishes its first change's
+    // diagnostics again, labelled with that change's version. lspcheck no
+    // longer keeps that text, so D1 counts the positions without judging
+    // them; it still knows the version was sent, so D2 passes.
+    let (r, _, _keep) = mutated(&["old-version-diagnostics"], &["--mutation-cases", "40"]);
+    assert!(r.server_stderr.contains("standin: published version 2 again at version 67"), "{}", r.server_stderr);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "skip")]);
+    let d1 = detail(&r, "D1");
+    assert!(
+        d1.contains("that may refer to a version older than the 64 whose texts lspcheck keeps, not judged"),
+        "{d1}"
+    );
+    assert!(detail(&r, "D2").contains("PASS in the mutation scenario: "), "{}", detail(&r, "D2"));
+}
+
+#[test]
+fn method_not_found_for_an_advertised_request_about_a_mutated_document_fails_k1() {
+    // The capabilities scenario asks about the clean seed, which the
+    // stand-in answers; only the mutation scenario sees MethodNotFound.
+    let (r, _, _keep) = mutated(&["method-not-found-while-unbalanced"], &[]);
+    passes_except(&r, &[("K1", "fail"), ("M1", "pass"), ("M2", "pass"), ("M3", "skip")]);
+    let k1 = detail(&r, "K1");
+    assert!(
+        k1.starts_with("FAIL in the mutation scenario: MethodNotFound (-32601) for ")
+            && k1.contains(" advertised request(s) about the mutated documents: textDocument/hover in case 0"),
+        "{k1}"
+    );
+    assert!(k1.contains("; PASS in the capabilities scenario: "), "{k1}");
+    // MethodNotFound is an answer: M2 counts it, and it fails nothing else.
+    assert!(detail(&r, "M2").contains("errors by code: -32601 ×"), "{}", detail(&r, "M2"));
 }
 
 #[test]

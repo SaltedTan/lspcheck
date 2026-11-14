@@ -19,6 +19,9 @@
   Unfinished client writes make overlapping reply windows inconclusive from the write's start.
   The scenario now enforces its [written-bytes bound](docs/source-mutations.md#bounds) on automatic answers to the
   server's requests.
+- Under `--mutate`, D1, D2, D6 and K1 also judge the mutation scenario's evidence under the
+  [extended-check rules](docs/source-mutations.md#verdict-rules). Each check's verdict combines with its own
+  scenario's, and the detail names the scenario and case. Default runs, and the stock-server baselines, don't change.
 
 ### Changed
 
