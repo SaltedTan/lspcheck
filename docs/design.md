@@ -295,14 +295,16 @@ The design's original rule (a), "D1's positions in LF-only document A were infor
 for the reason D3 dropped its own: valid positions elsewhere never prove the server splits B's lines correctly.
 
 D6 judges the `selectionRange` replies to the requests lspcheck sent about the open documents (A at 41 or 42, B at
-7), read while each was open (the same windows D1 uses). The text a reply refers to is the version current when its
-request was sent; it is used only to clamp. For each reply with an array result, compared against the request's own
+7), read while each was open (the same windows D1 uses). A reply may describe any text D1's candidate rule allows: the
+version current when its request was sent, or one sent before the reply was read, should a change have overtaken it.
+The texts are used only to clamp. For each reply with an array result, compared against the request's own
 `positions`:
 
 - **skip:** `selectionRangeProvider` isn't advertised, or no `didOpen` (as D1).
 - **fail:** the array's length isn't the number of positions sent; a `result[i].range` doesn't contain `positions[i]`
   (start ≤ position ≤ end, comparing (line, character) pairs, after clamping each character to its line's length in
-  the negotiated encoding); or a `parent.range` doesn't contain its child's range, anywhere up the chain. A seen
+  the negotiated encoding); or a `parent.range` doesn't contain its child's range, anywhere up the chain. A
+  containment fails only when it fails against every candidate text, each with its own clamping. A seen
   failure stands even when evidence is incomplete. The detail names the first few. When a containment comparison
   fails under the spec's split but succeeds on the same text under one of D5's three wrong splits, the detail names
   every such split as a hint. The verdict and counts are unchanged; LF-only document A never gets a hint because its

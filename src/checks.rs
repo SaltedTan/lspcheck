@@ -2963,10 +2963,11 @@ async fn documents(ctx: &mut Ctx<'_>) {
         });
     }
     // D6: selectionRange replies about open documents, judged against the
-    // request's own positions, in the text current when the request was
-    // sent. The same windows D1 uses: before A's `didClose`, and for B
-    // before B's. Skipped when the server advertises no
-    // selectionRangeProvider, so no request is sent.
+    // request's own positions with D1's candidate rule: the text current
+    // when the request was sent, or one sent before the reply was read. The
+    // same windows D1 uses: before A's `didClose`, and for B before B's.
+    // Skipped when the server advertises no selectionRangeProvider, so no
+    // request is sent.
     if !advertises(&caps, "selectionRangeProvider") {
         ctx.report(
             "D6",
@@ -2989,17 +2990,24 @@ async fn documents(ctx: &mut Ctx<'_>) {
             } else {
                 end
             };
-            // The version current when the request was sent, used only to
-            // clamp.
+            // The version current when the request was sent.
             let Some(version) = doc.versions.iter().rfind(|v| v.at <= a.at) else { continue };
             let positions = documents::request_positions(&a.params);
-            for (_at, m) in
+            for (at, m) in
                 d6_msgs.iter().filter(|(at, m)| *at >= a.at && *at < window_end && m.response_id() == Some(&a.id))
             {
                 let Kind::Response { outcome: Outcome::Result(result), .. } = &m.kind else { continue };
-                if let Some(r) =
-                    documents::judge_selection_reply(&version.text, encoding, version.number, &positions, result)
-                {
+                // The texts the reply may describe, each with its own
+                // clamping. This scenario keeps every text, so none is
+                // missing.
+                let texts = documents::candidates_for(doc, None, Some(a.at), *at);
+                if let Some(r) = documents::judge_selection_candidates(
+                    texts.as_deref(),
+                    encoding,
+                    version.number,
+                    &positions,
+                    result,
+                ) {
                     selection.push(r);
                 }
             }

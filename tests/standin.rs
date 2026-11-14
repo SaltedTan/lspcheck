@@ -2109,6 +2109,21 @@ fn a_selection_parent_inside_its_child_fails_d6() {
     assert!(r.stdout.contains("doesn't contain"), "{}", r.stdout);
 }
 
+#[test]
+fn a_delayed_selection_reply_about_the_changed_text_passes_d6() {
+    // Counted in UTF-8, the end of `name` (2,32) is past the end of line 2
+    // once version 42 inserts a line before it (28 bytes). The stand-in holds
+    // the first selectionRange until it has read that change, then answers
+    // from the changed text: the parent ends at (2,28), which contains the
+    // position clamped against version 42, though not against version 41.
+    // The capabilities scenario changes no document, so K1's selectionRange
+    // is never answered and K1 is an error; nothing else is affected.
+    let r = run(&["--fault", "selection-from-changed-text", "--fault", "utf8-encoding"], &["--timeout", "2"]);
+    assert!(r.server_stderr.contains("standin: answered the held selectionRange at version 42"), "{}", r.server_stderr);
+    passes_except(&r, &[("K1", "error")]);
+    assert!(detail(&r, "D6").contains("selectionRange went unanswered"), "{}", detail(&r, "D6"));
+}
+
 // --- replay -----------------------------------------------------------------
 
 #[test]
