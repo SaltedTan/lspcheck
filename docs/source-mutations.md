@@ -409,8 +409,8 @@ of output first seen after the answer was withheld makes M1 `ERROR`. The scenari
 (a step whose own `didChange` or request no longer fits beside the reserve, because answers used its room, stops it
 the same way), sends the current case's restoration and shutdown, and `mutation.stopped` says that answers to the
 server's requests reached the cap. When the run stops early this way, M1 and M2 can still fail on what lspcheck saw,
-but not pass: the cases not run make them `ERROR`. An answer withheld while waiting for shutdown also makes M1 and M2
-`ERROR` unless they fail on earlier evidence, and is included in `mutation.stopped`. Until step 5, M3 stays `SKIP`.
+but not pass: the cases not run make them `ERROR`. An answer withheld after M1 and M2 are judged, while waiting for the
+reply to shutdown, changes neither: their windows end before shutdown. The transcript notes it. Until step 5, M3 stays `SKIP`.
 
 ### Reports, transcripts and reproduction
 

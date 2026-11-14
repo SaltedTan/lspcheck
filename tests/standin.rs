@@ -2835,10 +2835,10 @@ fn answers_to_the_servers_requests_are_held_to_the_mutation_byte_cap() {
 }
 
 #[test]
-fn answers_withheld_while_waiting_for_shutdown_remain_in_the_mutation_report() {
-    // The mutation contract makes lspcheck's 64 MiB answer cap an ERROR
-    // with a JSON stop reason, even if the request arrives during shutdown.
-    // 256 copies of this setting fill that cap before envelope overhead.
+fn an_answer_withheld_while_shutting_down_changes_no_mutation_verdict() {
+    // M1's and M2's windows end before shutdown, so an answer the cap holds
+    // back while lspcheck waits for the shutdown reply is only noted.
+    // 256 copies of this setting are past the 64 MiB cap.
     let fixture = std::fs::read_to_string(mutation_profile()).unwrap();
     let big = "x".repeat(256 * 1024);
     let (path, _dir) = profile(&format!("{fixture}\n[client.configuration]\nbig = '{big}'\n"));
@@ -2846,17 +2846,13 @@ fn answers_withheld_while_waiting_for_shutdown_remain_in_the_mutation_report() {
         &["--fault", "configure-on-shutdown"],
         &["--profile", path.to_str().unwrap(), "--mutate", "--only", "M1,M2"],
     );
-    expect(&r, "M1", "error");
-    expect(&r, "M2", "error");
-    assert_eq!(r.status, 2, "{}", r.stdout);
-    let stopped = r.report["mutation"]["stopped"].as_str().unwrap();
-    assert!(stopped.contains("written-bytes cap of 64 MiB"), "{stopped}");
-    assert!(stopped.contains("lspcheck left the server's workspace/configuration request unanswered"), "{stopped}");
-    for id in ["M1", "M2"] {
-        let result = r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == id).unwrap();
-        assert!(result["detail"].as_str().unwrap().contains(stopped), "{id}: {}", result["detail"]);
-    }
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    assert!(r.report["mutation"]["stopped"].is_null(), "{}", r.report["mutation"]);
     let transcript = t.join("mutation.jsonl");
+    let notes = std::fs::read_to_string(&transcript).unwrap();
+    assert!(notes.contains("lspcheck left the server's workspace/configuration request unanswered"));
     let received = recorded_messages(&transcript, "in");
     assert!(received.iter().any(|m| m["id"] == "configure-shutdown"));
     let sent = recorded_messages(&transcript, "out");

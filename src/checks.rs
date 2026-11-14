@@ -4192,17 +4192,8 @@ async fn leave_mutation(
     {
         summary.stopped = Some(format!("{why} during {place}"));
     }
-    if registered.is_ok() {
-        let bytes = frame(&message::request(&id, "shutdown", None));
-        if ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await.is_err() {
-            ctx.s.abort_request(&id);
-        } else if ctx.s.wait_response(&id, deadline).await.is_ok() && ctx.s.notify("exit", None).await.is_ok() {
-            let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
-        }
-    }
-    ctx.s.take_in();
-    // Shutdown's response and exit waits also answer server requests. Keep
-    // the pre-shutdown loss evidence, but include any answers withheld here.
+    // An answer withheld up to here falls inside M1's window (which ends
+    // before shutdown), so neither M1 nor M2 can pass.
     let capped = capped.map(str::to_owned).or_else(|| answers_capped(&ctx.s, 0, "judging the mutation run"));
     if let Some(why) = &capped {
         ctx.s.note(why.clone());
@@ -4214,6 +4205,17 @@ async fn leave_mutation(
     judge_m1(ctx, &summary, first_change, versions, lost, capped.is_some());
     judge_m2(ctx, asked, capped.as_deref());
     ctx.mutation = Some(summary);
+    // Every case is judged by now; an answer withheld while shutting down
+    // stops nothing, and the session notes it in the transcript.
+    if registered.is_ok() {
+        let bytes = frame(&message::request(&id, "shutdown", None));
+        if ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await.is_err() {
+            ctx.s.abort_request(&id);
+        } else if ctx.s.wait_response(&id, deadline).await.is_ok() && ctx.s.notify("exit", None).await.is_ok() {
+            let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+        }
+    }
+    ctx.s.take_in();
 }
 
 /// Sends each mutated document's clean text back, then leaves. For a run
