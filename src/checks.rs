@@ -3555,11 +3555,12 @@ fn answers_capped(s: &Session, next: u64, place: &str) -> Option<String> {
 /// inspection takes precedence over exit or EOF evidence, and without
 /// either the write is undelivered.
 async fn lost_after_write(ctx: &mut Ctx<'_>, what: &str, e: &WriteError) -> Lost {
-    let withheld = ctx.s.answer_withheld().is_some();
     if let Some((_, why)) = ctx.s.stopped_reading() {
         return Lost::Uninspected(why);
     }
+    let closed = ctx.s.stdout_closed();
     let status = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await;
+    let withheld_before_drain = ctx.s.answer_withheld().is_some();
     ctx.s.absorb_all().await;
     if let Some((_, why)) = ctx.s.stopped_reading() {
         return Lost::Uninspected(why);
@@ -3569,6 +3570,7 @@ async fn lost_after_write(ctx: &mut Ctx<'_>, what: &str, e: &WriteError) -> Lost
         None if ctx.s.stdout_closed() => Lost::Gone("the server closed its output".into()),
         None => Lost::Undelivered(format!("lspcheck couldn't deliver {what} ({e})")),
     };
+    let withheld = if status.is_some() || closed { withheld_before_drain } else { ctx.s.answer_withheld().is_some() };
     unless_withheld(how, withheld)
 }
 
@@ -4104,6 +4106,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 lost = Some((lost_output(ctx).await, place));
                 break 'cases;
             }
+            capped = capped.or_else(|| answers_capped(&ctx.s, 0, &format!("the end of {place}")));
             if capped.is_some() {
                 break;
             }
@@ -4140,16 +4143,13 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             lost = Some((lost_output(ctx).await, format!("after case {k}")));
             break;
         }
+        capped = capped.or_else(|| answers_capped(&ctx.s, 0, &format!("the end of case {k}")));
         if capped.is_some() {
             break;
         }
     }
     if cut_short > 0 {
         ctx.s.note(format!("{cut_short} case(s) ran out of their budget before their last step"));
-    }
-    if let Some(why) = &capped {
-        ctx.s.note(why.clone());
-        summary.stopped = Some(why.clone());
     }
     leave_mutation(ctx, summary, first_change, versions, lost, &asked, capped.as_deref()).await;
 }
@@ -4192,8 +4192,16 @@ async fn leave_mutation(
     {
         summary.stopped = Some(format!("{why} during {place}"));
     }
+    let capped = capped.map(str::to_owned).or_else(|| answers_capped(&ctx.s, 0, "judging the mutation run"));
+    if let Some(why) = &capped {
+        ctx.s.note(why.clone());
+        summary.stopped = Some(match summary.stopped {
+            Some(stopped) => format!("{stopped}; {why}"),
+            None => why.clone(),
+        });
+    }
     judge_m1(ctx, &summary, first_change, versions, lost, capped.is_some());
-    judge_m2(ctx, asked, capped);
+    judge_m2(ctx, asked, capped.as_deref());
     ctx.mutation = Some(summary);
     if registered.is_ok() {
         let bytes = frame(&message::request(&id, "shutdown", None));
@@ -5355,6 +5363,92 @@ while header := sys.stdin.buffer.readline():
                 assert!(m1.detail.contains("after lspcheck had left one of its requests unanswered"), "{}", m1.detail);
             }
             ctx.s.finish(Duration::from_millis(200)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_withholding_is_reported_before_judging_only() {
+        let script = r#"import json, sys
+stage = sys.argv[1]
+def send(value):
+    body = json.dumps(value).encode()
+    sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
+    sys.stdout.buffer.flush()
+while header := sys.stdin.buffer.readline():
+    length = int(header.split(b':')[1])
+    assert sys.stdin.buffer.readline() == b'\r\n'
+    request = json.loads(sys.stdin.buffer.read(length))
+    method = request['method']
+    if method == 'exit':
+        sys.exit(0)
+    if method == stage:
+        send({'jsonrpc': '2.0', 'id': 'configure', 'method': 'workspace/configuration',
+              'params': {'items': [{}] * 600}})
+    send({'jsonrpc': '2.0', 'id': request['id'], 'result': None})
+"#;
+        for (stage, expected) in [("textDocument/hover", Verdict::Error), ("shutdown", Verdict::Pass)] {
+            let mut cfg = mutation_test_config("exit 0");
+            cfg.server = ServerCommand::new(&["python3".into(), "-I".into(), "-c".into(), script.into(), stage.into()]);
+            let mut ctx = mutation_test_ctx(&cfg, 32 * 1024).await;
+            ctx.s.cap_answers(MUTATION_BYTES, MUTATION_BYTES - 1024);
+            let id = ctx.s.fresh_id();
+            let at = ctx.s.elapsed();
+            ctx.s.call_with_id(&id, "textDocument/hover", None, Duration::from_secs(5)).await.unwrap();
+            let asked = [StepRequest {
+                id,
+                method: "textDocument/hover",
+                case: 0,
+                at,
+                deadline_at: at + Duration::from_secs(5),
+                outcome: StepOutcome::Answered(None),
+            }];
+            let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
+            leave_mutation(&mut ctx, summary, Some(at), 1, None, &asked, None).await;
+            let withheld = ctx.s.answer_withheld().is_some();
+            let finish = ctx.s.finish(Duration::from_millis(200)).await;
+            for id in ["M1", "M2"] {
+                let result = ctx.results.iter().find(|r| r.id == id).unwrap();
+                assert_eq!(result.verdict, expected, "{id}: {}", result.detail);
+            }
+            let stopped = &ctx.mutation.as_ref().unwrap().stopped;
+            if stage == "textDocument/hover" {
+                assert!(stopped.as_deref().unwrap().contains("workspace/configuration request unanswered"));
+            } else {
+                assert!(stopped.is_none());
+            }
+            assert!(withheld);
+            assert!(finish.transcript.iter().any(|e| matches!(&e.kind,
+                session::EventKind::Note(why) if why.contains("workspace/configuration request unanswered"))));
+            assert!(finish.transcript.iter().any(|e| matches!(&e.kind,
+                session::EventKind::Sent(bytes) if String::from_utf8_lossy(bytes).contains("\"method\":\"exit\""))));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_withholding_during_write_loss_is_ordered() {
+        let request = message::request(&Id::int(1), "workspace/configuration", Some(json!({"items": [{}]})));
+        let request = String::from_utf8(frame(&request)).unwrap();
+        for (ending, expected) in [("exec 0<&- 1>&-; sleep 30", Verdict::Error), ("exit 0", Verdict::Fail)] {
+            let cfg = mutation_test_config(&format!("printf '%s' '{request}'; {ending}"));
+            let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+            ctx.s.cap_answers(MUTATION_BYTES, MUTATION_BYTES);
+            ctx.s.close_stdin();
+            let error = ctx.s.notify("textDocument/didChange", Some(json!({}))).await.unwrap_err();
+            assert!(ctx.s.answer_withheld().is_none());
+            let how = lost_after_write(&mut ctx, "didChange", &error).await;
+            let withheld = ctx.s.answer_withheld().is_some();
+            let after_withheld = matches!(how, Lost::AfterWithheld(_));
+            let gone = matches!(how, Lost::Gone(_));
+            let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, stopped: None };
+            leave_mutation(&mut ctx, summary, Some(Duration::ZERO), 1, Some((how, "case 0".into())), &[], None).await;
+            let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
+            ctx.s.finish(Duration::from_millis(200)).await;
+            assert!(withheld);
+            assert_eq!(after_withheld, expected == Verdict::Error);
+            assert_eq!(gone, expected == Verdict::Fail);
+            assert_eq!(m1.verdict, expected, "{}", m1.detail);
         }
     }
 
