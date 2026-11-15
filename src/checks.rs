@@ -564,11 +564,33 @@ pub struct Trouble {
     /// step during which the server was lost.
     pub what: String,
     pub result: CheckResult,
+    /// For an M2 failure: each request the case left unanswered, by method,
+    /// and its wait. Settling names the methods in `what`.
+    unanswered: Vec<(&'static str, Duration, Duration)>,
 }
 
 impl Trouble {
     fn new(case: u64, check: &str, verdict: Verdict, what: impl Into<String>) -> Self {
-        Trouble { case, what: what.into(), result: result(MUTATION, check, verdict, "") }
+        Trouble { case, what: what.into(), result: result(MUTATION, check, verdict, ""), unanswered: Vec::new() }
+    }
+
+    /// Settles its result, as [`CheckResult::settle`] does, then names the
+    /// methods an M2 trouble left unanswered. A failure leaves out a method
+    /// whose every wait had output lspcheck didn't inspect, since its reply
+    /// may have been there; an error, every wait such, names them all.
+    fn settle(&mut self, finish: &Finish) {
+        self.result.settle(finish);
+        if self.unanswered.is_empty() {
+            return;
+        }
+        let error = self.verdict() == Verdict::Error;
+        let mut methods: Vec<&str> = Vec::new();
+        for &(method, from, to) in &self.unanswered {
+            if !methods.contains(&method) && (error || finish.incomplete_within(from, to).is_none()) {
+                methods.push(method);
+            }
+        }
+        self.what = name_methods(&methods);
     }
 
     fn check(&self) -> &'static str {
@@ -1079,9 +1101,11 @@ async fn run_session(
     }
     // The verdicts, and each mutation case's own, judged again now that
     // everything read is known.
-    let cases = mutation.iter_mut().flat_map(|m| m.troubles.iter_mut().chain(&mut m.recovered));
-    for r in results.iter_mut().chain(cases.map(|t| &mut t.result)) {
+    for r in &mut results {
         r.settle(&finish);
+    }
+    for t in mutation.iter_mut().flat_map(|m| m.troubles.iter_mut().chain(&mut m.recovered)) {
+        t.settle(&finish);
     }
     let (transcript, unwritten) = match &cfg.transcripts {
         Some(dir) => {
@@ -5847,7 +5871,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         && matches!(r.verdict, Verdict::Fail | Verdict::Error)
         && let Some(m) = &mut ctx.mutation
     {
-        m.troubles.push(Trouble { case, what: place, result: r.clone() });
+        m.troubles.push(Trouble { case, what: place, result: r.clone(), unanswered: Vec::new() });
     }
 }
 
@@ -5915,9 +5939,8 @@ async fn leave_mutation(
     // couldn't deliver or inspect. One pending when the server went is M1's.
     // As for M2's verdict, a case's failure carries each of its unanswered
     // requests' waits, and is an error if lspcheck may have missed a reply
-    // in every one, and names each method left unanswered.
+    // in every one. Settling names the methods left unanswered.
     let failed = |case: u64| move |t: &Trouble| t.case == case && t.check() == "M2" && t.verdict() == Verdict::Fail;
-    let mut unanswered: Vec<(u64, Vec<&str>)> = Vec::new();
     for r in asked {
         let Some(case) = r.case else { continue };
         match r.outcome {
@@ -5930,21 +5953,12 @@ async fn leave_mutation(
                     }
                 };
                 t.result.absent_at.push((r.at, r.deadline_at));
-                match unanswered.iter_mut().find(|(c, _)| *c == case) {
-                    Some((_, methods)) if !methods.contains(&r.method) => methods.push(r.method),
-                    Some(_) => {}
-                    None => unanswered.push((case, vec![r.method])),
-                }
+                t.unanswered.push((r.method, r.at, r.deadline_at));
             }
             StepOutcome::Undelivered(_) | StepOutcome::Uninspected(_) => {
                 summary.troubles.push(Trouble::new(case, "M2", Verdict::Error, r.method));
             }
             StepOutcome::Answered(_) | StepOutcome::Gone => {}
-        }
-    }
-    for (case, methods) in unanswered {
-        if let Some(t) = summary.troubles.iter_mut().find(|t| failed(case)(t)) {
-            t.what = name_methods(&methods);
         }
     }
     ctx.mutation = Some(summary);

@@ -2990,8 +2990,10 @@ fn cases_with_a_failure_are_run_alone_before_cases_with_only_errors() {
         .map(|i| (i["case"].as_u64().unwrap(), i["detail"].as_str().unwrap()))
         .collect();
     // Alone, the oversized answer goes to case 3's workspace/symbol request,
-    // which joins the methods it left unanswered.
-    let alone = "textDocument/selectionRange, textDocument/documentSymbol, textDocument/foldingRange and 1 more";
+    // sent in the same batch as foldingRange. lspcheck skipped the frame, so
+    // either may have been answered in it: the label leaves both out and
+    // names only the methods whose waits it read in full.
+    let alone = "textDocument/selectionRange and textDocument/documentSymbol";
     assert_eq!(
         isolated,
         [

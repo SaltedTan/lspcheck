@@ -705,7 +705,8 @@ Step 6 builds [isolation](#reports-transcripts-and-reproduction). Where the rule
   judged wasn't, and otherwise `null`. The detail names each trouble with what it was seen in (a request's method, a
   probe, or the step during which the server was lost), and the isolated run's when it saw it only elsewhere (an M2
   failure names each method the case left unanswered, in the order sent and without repeats, up to three and then
-  how many more): `reproduced: M2 FAIL in textDocument/hover, alone in textDocument/foldingRange`, `not reproduced:
+  how many more, leaving out a method whose every wait had output lspcheck didn't inspect, since its reply may have
+  been there; an M2 error names them all): `reproduced: M2 FAIL in textDocument/hover, alone in textDocument/foldingRange`, `not reproduced:
   M2 FAIL in textDocument/hover and workspace/symbol not seen again`, `unknown: M3 FAIL in publishDiagnostics of
   main.lua not judged alone: no stable baseline for publishDiagnostics of main.lua`, then what only the isolated run
   saw.
