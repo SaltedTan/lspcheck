@@ -338,10 +338,6 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   files and judges M1 to M3; D1, D2, D6 and K1 judge what the server says about the mutated texts too, and their
   details name the scenario and case. Configure `[mutation.recovery]` using the
   [recovery rules](docs/source-mutations.md#recovery) and [profile schema](docs/source-mutations.md#profile-schema).
-  Incomplete inspection before the first mutation makes a pushed-diagnostics baseline unusable, including when
-  the missing evidence becomes known later; dependent recovery verdicts become `ERROR`.
-  A stop detected while draining recovery output or completing terminal probes also leaves that case unjudged.
-  M3's failure description and count include only failures with evidence that survives the final recheck.
   See the [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
   [implementation status](docs/source-mutations.md) for what is implemented so far, including the
   [written-bytes bound on automatic answers](docs/source-mutations.md#bounds). The JSON `mutation.stopped`
