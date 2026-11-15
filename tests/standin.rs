@@ -3308,6 +3308,41 @@ fn a_pushed_baseline_with_a_publish_lspcheck_skipped_is_not_used() {
 }
 
 #[test]
+fn a_late_baseline_publish_after_the_first_mutation_does_not_fail_m3() {
+    // On reading the first didChange, before applying it, the stand-in
+    // publishes the opened text's diagnostics, labelled with version 1, with
+    // a Warning (or an Error) added, and keeps it. lspcheck reads that publish
+    // only after writing the first mutation, so its baseline lacks it; the
+    // publish shows the baseline wasn't stable, so the same diagnostics after
+    // the restoration can't fail M3.
+    for (fault, settings, why) in [
+        (
+            "late-baseline-warning",
+            "expect = \"baseline\"",
+            "case 0: publishDiagnostics of main.lua: a publishDiagnostics labelled with version 1 read after the \
+             first mutation differed from the baseline (it differs at params.diagnostics[*]: ",
+        ),
+        (
+            "late-baseline-error",
+            "no_errors = true",
+            "case 0: the profile and the server disagree before any mutation: mutation.recovery.no_errors says the \
+             seed has no Error diagnostics, but publishDiagnostics of main.lua has ",
+        ),
+    ] {
+        let (path, _keep) =
+            recovery_profile(&format!("{settings}\nprobes = [\"publishDiagnostics\"]\nrecovery_timeout = \"3s\""));
+        let (r, _, _keep) = mutated_with(&path, &[fault], &["--mutation-cases", "1"]);
+        passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "error")]);
+        let m3 = detail(&r, "M3");
+        assert!(m3.starts_with(why), "{fault}: {m3}");
+        assert!(
+            m3.contains("a publishDiagnostics labelled with version 1 read after the first mutation"),
+            "{fault}: {m3}"
+        );
+    }
+}
+
+#[test]
 fn an_error_diagnostic_after_the_restoration_fails_m3_when_the_seed_has_none() {
     // Once unbalanced, the stand-in adds an Error diagnostic to every publish.
     let (path, _keep) = recovery_profile("no_errors = true\nrecovery_timeout = \"3s\"");

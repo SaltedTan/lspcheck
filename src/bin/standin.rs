@@ -273,6 +273,12 @@ const FAULTS: &[(&str, &str)] = &[
          added, in a frame padded past 2 MiB, and add that Warning to every later publish about it",
     ),
     (
+        "late-baseline-warning",
+        "lawful: on reading a document's first didChange, before applying it, publish the opened text's \
+         diagnostics labelled with version 1 with a Warning added, and add that Warning to every later publish about it",
+    ),
+    ("late-baseline-error", "lawful: as late-baseline-warning, with an Error instead of the Warning"),
+    (
         "errors-after-unbalanced",
         "once a document's brackets were unbalanced, add an Error diagnostic to every publish about it",
     ),
@@ -791,6 +797,17 @@ fn main() {
                 let version = msg.pointer("/params/textDocument/version").and_then(Value::as_i64).unwrap_or(0);
                 let previous_version = *old_version;
                 let old_text = text.clone();
+                // Version 1's analysis finishing late: lspcheck reads this
+                // only after it has written the first mutation.
+                if (fault("late-baseline-warning") || fault("late-baseline-error"))
+                    && previous_version == 1
+                    && late.insert(uri.to_string())
+                {
+                    publishes += 1;
+                    let lingering =
+                        Lingering { broken_once: broken.contains(uri), late: true, padded: false, publishes };
+                    publish_diagnostics(&mut out, &faults, units, uri, text, Some(json!(1)), lingering);
+                }
                 if fault("codepoint-positions-after-change") {
                     // From the change on, count positions in code points; the
                     // change itself is applied in the negotiated encoding.
@@ -2140,8 +2157,9 @@ fn shuffled_symbols(text: &str, units: Units, split: LineSplit, answer: usize) -
 struct Lingering {
     /// Its brackets were unbalanced once.
     broken_once: bool,
-    /// It was given a late Warning (late-warning-in-skipped-frame), in a
-    /// frame padded past 2 MiB if `padded`.
+    /// It was given a late Warning (late-warning-in-skipped-frame,
+    /// late-baseline-warning; an Error with late-baseline-error), in a frame
+    /// padded past 2 MiB if `padded`.
     late: bool,
     padded: bool,
     /// Which publish of the session this is.
@@ -2217,7 +2235,9 @@ fn publish_diagnostics<W: Write>(
         // The message isn't part of what recovery compares, so padding it
         // leaves the Warning the same.
         let message = if lingering.padded { "x".repeat(2 * 1024 * 1024 + 1) } else { "on reflection".into() };
-        diagnostics.push(json!({"range": range(0, 0, 0, 0), "severity": 2, "source": "standin", "message": message}));
+        let severity = if fault("late-baseline-error") { 1 } else { 2 };
+        diagnostics
+            .push(json!({"range": range(0, 0, 0, 0), "severity": severity, "source": "standin", "message": message}));
     }
     if fault("positions-in-data") {
         for d in &mut diagnostics {

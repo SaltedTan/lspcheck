@@ -310,14 +310,27 @@ pub struct CheckResult {
 /// in its evidence windows. [`MISSED`] in `detail` stands for the reason.
 #[derive(Debug, Clone)]
 pub enum Recheck {
-    UnlessMissed { windows: Vec<(Duration, Duration)>, output_only: bool, verdict: Verdict, detail: String },
+    UnlessMissed {
+        windows: Vec<(Duration, Duration)>,
+        output_only: bool,
+        verdict: Verdict,
+        detail: String,
+    },
     Failures(Vec<RecoveryFailure>),
+    /// M3's pass: an error if a pushed baseline turns out not to be stable,
+    /// else as `then`.
+    Recovered {
+        pushed: Vec<PushBaseline>,
+        then: Box<Recheck>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct RecoveryFailure {
     pub detail: String,
     pub windows: Vec<(Duration, Duration)>,
+    /// The failing probe's baseline, if it is pushed diagnostics.
+    pub pushed: Option<PushBaseline>,
 }
 
 impl CheckResult {
@@ -335,7 +348,17 @@ impl CheckResult {
             Recheck::Failures(mut failures) => {
                 let mut first = None;
                 failures.retain(|failure| {
-                    match failure.windows.iter().find_map(|&(from, to)| finish.incomplete_within(from, to)) {
+                    let why = match failure.windows.iter().find_map(|&(from, to)| finish.incomplete_within(from, to)) {
+                        Some(why) => Some(format!(
+                            "inconclusive, because {why}; a baseline or recovery window may be incomplete"
+                        )),
+                        None => failure
+                            .pushed
+                            .as_ref()
+                            .and_then(|p| p.unstable(&finish.messages))
+                            .map(|why| format!("inconclusive, because {why}")),
+                    };
+                    match why {
                         Some(why) => {
                             first.get_or_insert(why);
                             false
@@ -351,12 +374,19 @@ impl CheckResult {
                     );
                 } else if let Some(why) = first {
                     self.verdict = Verdict::Error;
-                    self.detail = format!(
-                        "inconclusive, because {why}; a baseline or recovery window may be incomplete: {}",
-                        self.detail
-                    );
+                    self.detail = format!("{why}: {}", self.detail);
                 }
             }
+            Recheck::Recovered { pushed, then } => match pushed.iter().find_map(|p| p.unstable(&finish.messages)) {
+                Some(why) => {
+                    self.verdict = Verdict::Error;
+                    self.detail = format!("inconclusive, because {why}: {}", self.detail);
+                }
+                None => {
+                    self.unless_missed = Some(*then);
+                    self.recheck(finish);
+                }
+            },
         }
     }
 }
@@ -4228,13 +4258,71 @@ fn probe_answer(s: &Session, request: &StepRequest, probe: profile::Probe, timeo
 
 /// The seed document a labelled `publishDiagnostics` is about, and its label.
 fn labelled_publish(m: &Message, docs: &[SeedDoc]) -> Option<(usize, i64)> {
+    let (uri, label) = publish_label(m)?;
+    Some((docs.iter().position(|doc| documents::same_uri(&doc.uri, uri))?, label))
+}
+
+/// The URI and version label of `m`, if it is a labelled `publishDiagnostics`.
+fn publish_label(m: &Message) -> Option<(&str, i64)> {
     if !matches!(&m.kind, Kind::Notification { method } if method == PUBLISH_DIAGNOSTICS) {
         return None;
     }
     let params = m.value.get("params")?;
-    let uri = params.get("uri")?.as_str()?;
-    let label = params.get("version").and_then(documents::version_number)?;
-    Some((docs.iter().position(|doc| documents::same_uri(&doc.uri, uri))?, label))
+    Some((params.get("uri")?.as_str()?, params.get("version").and_then(documents::version_number)?))
+}
+
+/// A pushed-diagnostics baseline, as M3 holds every publish labelled with
+/// version 1 to it. Those read after the first mutation still describe the
+/// opened text, so one that differs shows the baseline wasn't stable,
+/// however late it was read.
+#[derive(Debug, Clone)]
+pub struct PushBaseline {
+    label: String,
+    uri: String,
+    /// When lspcheck began writing the document's `didOpen`.
+    opened_at: Duration,
+    baseline: Value,
+    no_errors: bool,
+}
+
+impl PushBaseline {
+    /// Why the publishes labelled with version 1 in `msgs` don't all show
+    /// the baseline, if they don't.
+    fn unstable(&self, msgs: &[(Duration, Message)]) -> Option<String> {
+        let late = "a publishDiagnostics labelled with version 1 read after the first mutation";
+        msgs.iter()
+            .filter(|(at, m)| {
+                *at >= self.opened_at
+                    && publish_label(m).is_some_and(|(uri, label)| label == 1 && documents::same_uri(&self.uri, uri))
+            })
+            .find_map(|(_, m)| {
+                let Some(projected) = recovery::project(profile::Probe::PublishDiagnostics, &m.value["params"]) else {
+                    return Some(format!("{}: {late} was malformed", self.label));
+                };
+                if projected == self.baseline {
+                    return None;
+                }
+                if self.no_errors
+                    && let Some(error) = recovery::first_error(&projected)
+                {
+                    return Some(format!(
+                        "the profile and the server disagree before any mutation: mutation.recovery.no_errors says \
+                         the seed has no Error diagnostics, but {} has {} in {late}",
+                        self.label,
+                        metamodel::shorten_value(error)
+                    ));
+                }
+                let shown = recovery::difference(&self.baseline, &projected)
+                    .map(|d| {
+                        format!(
+                            " (it differs {})",
+                            d.describe(recovery::root(profile::Probe::PublishDiagnostics), "the publish")
+                        )
+                    })
+                    .unwrap_or_default();
+                Some(format!("{}: {late} differed from the baseline{shown}", self.label))
+            })
+    }
 }
 
 /// A recovery probe of one seed document with a stable baseline.
@@ -4334,6 +4422,8 @@ struct Recovery {
     contradicted: Option<String>,
     cases: Vec<CaseRecovery>,
     pushes: PushLog,
+    /// The seed documents' URIs, once pushed baselines have been taken.
+    uris: Vec<String>,
 }
 
 impl Recovery {
@@ -4345,6 +4435,7 @@ impl Recovery {
     fn before_first_mutation(&mut self, s: &Session, docs: &[SeedDoc], until: Duration) {
         let msgs = &s.messages;
         if std::mem::take(&mut self.pushes_pending) {
+            self.uris = docs.iter().map(|doc| doc.uri.clone()).collect();
             for (d, doc) in docs.iter().enumerate() {
                 let label = format!("{} of {}", profile::Probe::PublishDiagnostics.name(), doc.name);
                 // A publish lspcheck missed may have differed from those it read.
@@ -4399,6 +4490,17 @@ impl Recovery {
             ));
             self.no_errors = false;
         }
+    }
+
+    /// What M3 holds later publishes to, if `s` is pushed diagnostics.
+    fn push_baseline(&self, s: &Stable) -> Option<PushBaseline> {
+        Some(PushBaseline {
+            label: s.label.clone(),
+            uri: self.uris.get(s.doc)?.clone(),
+            opened_at: s.baseline_window?.0,
+            baseline: s.baseline.clone(),
+            no_errors: self.no_errors,
+        })
     }
 
     /// Whether `projected`, an answer of stable probe `i`, shows it
@@ -5607,6 +5709,11 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
     let mut fails = Vec::new();
     let mut errors: Vec<String> = rec.contradicted.iter().cloned().collect();
     let mut slowest: Option<(Duration, u64, usize, bool)> = None;
+    // A publish labelled with version 1 read after the first mutation that
+    // differs leaves the probe without a stable baseline, as if read before.
+    let pushed: Vec<Option<PushBaseline>> = rec.stable.iter().map(|s| rec.push_baseline(s)).collect();
+    let unstable: Vec<Option<String>> =
+        pushed.iter().map(|p| p.as_ref().and_then(|p| p.unstable(&ctx.s.messages))).collect();
     for c in &rec.cases {
         for (i, outcome) in c.outcomes.iter().enumerate() {
             let stable = &rec.stable[i];
@@ -5615,6 +5722,10 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
                     "case {}: {}: lspcheck may have missed a publishDiagnostics before the first mutation, because {why}",
                     c.case, stable.label
                 ));
+                continue;
+            }
+            if let Some(why) = &unstable[i] {
+                errors.push(format!("case {}: {why}", c.case));
                 continue;
             }
             match outcome {
@@ -5629,6 +5740,7 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
                     None => fails.push(RecoveryFailure {
                         detail: detail.clone(),
                         windows: std::iter::once((*from, *to)).chain(stable.baseline_window).collect(),
+                        pushed: pushed[i].clone(),
                     }),
                 },
                 ProbeEnd::Unseen(why) => errors.push(why.clone()),
@@ -5675,11 +5787,14 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
         None => {
             ctx.pass_with("M3", pass.clone());
             let r = ctx.results.last_mut().expect("just reported");
-            r.unless_missed = Some(Recheck::UnlessMissed {
-                windows,
-                output_only: false,
-                verdict: Verdict::Error,
-                detail: unless(MISSED),
+            r.unless_missed = Some(Recheck::Recovered {
+                pushed: pushed.into_iter().flatten().collect(),
+                then: Box::new(Recheck::UnlessMissed {
+                    windows,
+                    output_only: false,
+                    verdict: Verdict::Error,
+                    detail: unless(MISSED),
+                }),
             });
         }
     }
@@ -6810,6 +6925,71 @@ while header := sys.stdin.buffer.readline():
             } else {
                 assert!(m3.detail.starts_with("case 0: textDocument/documentSymbol of seed.txt"), "{}", m3.detail);
                 assert!(m3.detail.ends_with("; and 1 more"), "{}", m3.detail);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_pushed_baseline_is_held_to_publishes_read_after_judgment() {
+        // A publish labelled with version 1 read only after M3 was judged,
+        // with a Warning the baseline lacks, turns what rested on that
+        // baseline into an error; an independent failure stands.
+        for (recovered, independent_failure) in [(false, false), (false, true), (true, false)] {
+            let cfg = mutation_test_config("exit 0");
+            let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+            let docs = recovery_test_docs();
+            let publish = |diagnostics: Value| {
+                let n = message::notification(
+                    PUBLISH_DIAGNOSTICS,
+                    Some(json!({"uri": docs[0].uri, "version": 1, "diagnostics": diagnostics})),
+                );
+                Message::parse(&serde_json::to_vec(&n).unwrap()).unwrap()
+            };
+            ctx.s.messages.push((Duration::ZERO, publish(json!([]))));
+            let mut rec = Recovery { expect: Expect::Baseline, pushes_pending: true, ..Recovery::default() };
+            rec.before_first_mutation(&ctx.s, &docs, Duration::from_secs(2));
+            assert_eq!(rec.stable.len(), 1);
+            if independent_failure {
+                rec.stable.push(Stable {
+                    doc: 0,
+                    probe: profile::Probe::DocumentSymbol,
+                    label: "textDocument/documentSymbol of seed.txt".into(),
+                    params: Some(json!({"textDocument": {"uri": docs[0].uri}})),
+                    baseline: json!([]),
+                    baseline_window: None,
+                });
+            }
+            let window = (Duration::from_secs(4), Duration::from_secs(5));
+            let mut outcomes = vec![if recovered {
+                ProbeEnd::Recovered { after: Duration::ZERO, terminal: false }
+            } else {
+                rec.differs(0, 0, "the last publish", &json!([{"severity": 2}]), window, Ok(()), "read in full")
+            }];
+            if independent_failure {
+                outcomes.push(rec.differs(1, 0, "the terminal answer", &json!([{}]), window, Ok(()), "read in full"));
+            }
+            rec.cases.push(CaseRecovery { case: 0, window, outcomes });
+            judge_m3(&mut ctx, &rec, None, None);
+            let mut m3 = ctx.results.pop().unwrap();
+            assert_eq!(m3.verdict, if recovered { Verdict::Pass } else { Verdict::Fail });
+            let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
+            let range = json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}});
+            finish.messages.push((Duration::from_secs(6), publish(json!([{"range": range, "severity": 2}]))));
+            m3.recheck(&finish);
+            if independent_failure {
+                assert_eq!(m3.verdict, Verdict::Fail);
+                assert!(m3.detail.starts_with("case 0: textDocument/documentSymbol of seed.txt"), "{}", m3.detail);
+            } else {
+                assert_eq!(m3.verdict, Verdict::Error);
+                assert!(
+                    m3.detail.starts_with(
+                        "inconclusive, because publishDiagnostics of seed.txt: a publishDiagnostics labelled with \
+                         version 1 read after the first mutation differed from the baseline"
+                    ),
+                    "{}",
+                    m3.detail
+                );
             }
         }
     }
