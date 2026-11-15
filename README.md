@@ -84,8 +84,8 @@ lspcheck 0.4.0 — basedpyright-langserver --stdio
 lspcheck is early: its checks cover framing, JSON-RPC correlation, the lifecycle, cancellation, document positions,
 advertised capabilities, message types, and parameter, malformed-body, large-document and request-id robustness.
 The [capabilities and robustness reference](docs/design.md#capabilities-and-robustness) explains the K1, K2 and R
-checks' verdict rules. M1 to M3 belong to [seeded source mutation](docs/source-mutations.md), which is being
-built: without `--mutate` they are `SKIP`, which doesn't affect the exit status.
+checks' verdict rules. M1 to M3 belong to [seeded source mutation](docs/source-mutations.md), which is
+experimental: without `--mutate` they are `SKIP`, which doesn't affect the exit status.
 [The design](docs/design.md) lists the rest, which cover framing edge cases, request ids, documents and robustness.
 
 ## What it doesn't do
@@ -334,10 +334,11 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   See the [mutation reference](docs/source-mutations.md#profile-schema) for mutation seed selection.
 - **`[mutation]`** configures [seeded source mutation](docs/source-mutations.md#profile-schema). The section is
   validated with the rest of the profile, and used only with `--mutate`, which is experimental and hidden from
-  `--help` until recovery (M3) is judged: `lspcheck --profile p.toml --mutate [--mutation-seed N]
-  [--mutation-cases N]` mutates the profile's seed files and judges M1 and M2; D1, D2, D6 and K1 judge what the
-  server says about the mutated texts too, and their details name the scenario and case. See the
-  [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
+  `--help`: `lspcheck --profile p.toml --mutate [--mutation-seed N] [--mutation-cases N]` mutates the profile's seed
+  files and judges M1 to M3; D1, D2, D6 and K1 judge what the server says about the mutated texts too, and their
+  details name the scenario and case. Configure `[mutation.recovery]` using the
+  [recovery rules](docs/source-mutations.md#recovery) and [profile schema](docs/source-mutations.md#profile-schema).
+  See the [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
   [implementation status](docs/source-mutations.md) for what is implemented so far, including the
   [written-bytes bound on automatic answers](docs/source-mutations.md#bounds). The JSON `mutation.stopped`
   field records why the scenario stopped early, including initialization and seed-file errors.

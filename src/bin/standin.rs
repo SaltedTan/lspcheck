@@ -246,6 +246,59 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: once 65 versions of a document have been read after its first didChange, publish that change's \
          diagnostics again, labelled with its version",
     ),
+    (
+        "recover-before-deadline",
+        "lawful: after each restoration of a document's opened text, answer its first documentSymbol request with \
+         [] 4 s late, then as usual",
+    ),
+    (
+        "slow-recovery",
+        "lawful: after each restoration of a document's opened text, answer its first three documentSymbol requests \
+         with [], then as usual",
+    ),
+    ("stuck-after-unbalanced", "once a document's brackets were unbalanced, answer its documentSymbol with [] forever"),
+    (
+        "recovery-in-skipped-frame",
+        "after each restoration of a document's opened text, answer its first documentSymbol request with [], and \
+         every later one as usual, padded past 2 MiB",
+    ),
+    (
+        "exit-during-terminal-probes",
+        "after each restoration of a document's opened text, answer its documentSymbol and foldingRange requests \
+         with [], the first documentSymbol 4 s late, and exit on reading the second foldingRange",
+    ),
+    (
+        "late-warning-in-skipped-frame",
+        "lawful: after publishing a document's diagnostics when it is opened, publish them again with a Warning \
+         added, in a frame padded past 2 MiB, and add that Warning to every later publish about it",
+    ),
+    (
+        "late-baseline-warning",
+        "lawful: on reading a document's first didChange, before applying it, publish the opened text's \
+         diagnostics labelled with version 1 with a Warning added, and add that Warning to every later publish about it",
+    ),
+    ("late-baseline-error", "lawful: as late-baseline-warning, with an Error instead of the Warning"),
+    ("late-baseline-in-skipped-frame", "lawful: as late-baseline-warning, with the late publish padded past 2 MiB"),
+    (
+        "errors-after-unbalanced",
+        "once a document's brackets were unbalanced, add an Error diagnostic to every publish about it",
+    ),
+    (
+        "warning-after-unbalanced",
+        "lawful: once a document's brackets were unbalanced, add a Warning to every publish about it",
+    ),
+    (
+        "malformed-recovery-diagnostics",
+        "once a document's brackets were unbalanced, publish null instead of a diagnostics array",
+    ),
+    ("malformed-baseline-diagnostics", "publish null instead of a diagnostics array before any change"),
+    ("reworded-diagnostics", "lawful: put a counter in every diagnostic's message"),
+    (
+        "shuffled-symbols",
+        "lawful: answer documentSymbol with a symbol per line whose children are its words, both in a different order \
+         each time and with a changing detail",
+    ),
+    ("unstable-symbols", "lawful: add a symbol named by a counter to every documentSymbol answer"),
     ("ignore-changes", "don't apply didChange, and label the old text's diagnostics with the new version"),
     ("codepoint-changes", "apply incremental change ranges counting code points, and answer correctly otherwise"),
     (
@@ -450,6 +503,17 @@ fn main() {
     // For old-version-diagnostics: each document's first changed version and
     // text, and whether they were published again.
     let mut first_change: HashMap<String, (i64, String, bool)> = HashMap::new();
+    // For the recovery faults: each document's text when opened; how many
+    // documentSymbol and foldingRange requests about it were read since its
+    // text was last restored to that, while it is; the documents whose
+    // brackets were ever unbalanced, or that were given a late Warning; and
+    // how many documentSymbol answers and publishes so far.
+    let mut opened: HashMap<String, String> = HashMap::new();
+    let mut since_restored: HashMap<String, usize> = HashMap::new();
+    let mut folds_since_restored: HashMap<String, usize> = HashMap::new();
+    let mut late: HashSet<String> = HashSet::new();
+    let mut broken: HashSet<String> = HashSet::new();
+    let (mut symbol_answers, mut publishes) = (0usize, 0u64);
     loop {
         if queued.is_empty() && !input.ready() {
             // About to wait for input: send what was held back, newest first.
@@ -633,6 +697,7 @@ fn main() {
                 }
                 let version = msg.pointer("/params/textDocument/version").and_then(Value::as_i64).unwrap_or(0);
                 docs.insert(uri.to_string(), (text.to_string(), version));
+                opened.insert(uri.to_string(), text.to_string());
                 if fault("close-stdin-before-change") && text.contains("word") {
                     // Close stdin before publishing version 41's diagnostics:
                     // neither those diagnostics nor EOF can let lspcheck send
@@ -681,7 +746,20 @@ fn main() {
                     if fault("unversioned-diagnostics") {
                         label = None;
                     }
-                    publish_diagnostics(&mut out, &faults, units, uri, text, label);
+                    publishes += 1;
+                    let lingering = Lingering {
+                        broken_once: broken.contains(uri),
+                        late: late.contains(uri),
+                        padded: false,
+                        publishes,
+                    };
+                    publish_diagnostics(&mut out, &faults, units, uri, text, label.clone(), lingering);
+                    if fault("late-warning-in-skipped-frame") {
+                        late.insert(uri.to_string());
+                        publishes += 1;
+                        let lingering = Lingering { late: true, padded: true, publishes, ..lingering };
+                        publish_diagnostics(&mut out, &faults, units, uri, text, label, lingering);
+                    }
                 }
                 if fault("big-frame-on-open") {
                     let text = "x".repeat(2 * 1024 * 1024);
@@ -720,6 +798,19 @@ fn main() {
                 let version = msg.pointer("/params/textDocument/version").and_then(Value::as_i64).unwrap_or(0);
                 let previous_version = *old_version;
                 let old_text = text.clone();
+                // Version 1's analysis finishing late: lspcheck reads this
+                // only after it has written the first mutation.
+                if (fault("late-baseline-warning")
+                    || fault("late-baseline-error")
+                    || fault("late-baseline-in-skipped-frame"))
+                    && previous_version == 1
+                    && late.insert(uri.to_string())
+                {
+                    publishes += 1;
+                    let padded = fault("late-baseline-in-skipped-frame");
+                    let lingering = Lingering { broken_once: broken.contains(uri), late: true, padded, publishes };
+                    publish_diagnostics(&mut out, &faults, units, uri, text, Some(json!(1)), lingering);
+                }
                 if fault("codepoint-positions-after-change") {
                     // From the change on, count positions in code points; the
                     // change itself is applied in the negotiated encoding.
@@ -739,6 +830,16 @@ fn main() {
                 }
                 *old_version = version;
                 let unbalanced = !unmatched_brackets(text, units, split).is_empty();
+                if unbalanced {
+                    broken.insert(uri.to_string());
+                }
+                if opened.get(uri) != Some(text) {
+                    since_restored.remove(uri);
+                    folds_since_restored.remove(uri);
+                } else if old_text != *text {
+                    since_restored.insert(uri.to_string(), 0);
+                    folds_since_restored.insert(uri.to_string(), 0);
+                }
                 if unbalanced && fault("exit-on-unbalanced") {
                     eprintln!("standin: exit-on-unbalanced");
                     std::process::exit(5);
@@ -769,7 +870,14 @@ fn main() {
                     if fault("stale-diagnostics") || fault("stale-unversioned-diagnostics") {
                         let stale =
                             if fault("stale-unversioned-diagnostics") { None } else { Some(json!(previous_version)) };
-                        publish_diagnostics(&mut out, &faults, units, uri, &old_text, stale);
+                        publishes += 1;
+                        let lingering = Lingering {
+                            broken_once: broken.contains(uri),
+                            late: late.contains(uri),
+                            padded: false,
+                            publishes,
+                        };
+                        publish_diagnostics(&mut out, &faults, units, uri, &old_text, stale, lingering);
                     }
                     // ignore-changes and mislabelled-diagnostics publish the
                     // previous text, labelled with the new version.
@@ -778,7 +886,14 @@ fn main() {
                     if fault("unversioned-diagnostics") || fault("stale-unversioned-diagnostics") {
                         label = None;
                     }
-                    publish_diagnostics(&mut out, &faults, units, uri, publish_text, label);
+                    publishes += 1;
+                    let lingering = Lingering {
+                        broken_once: broken.contains(uri),
+                        late: late.contains(uri),
+                        padded: false,
+                        publishes,
+                    };
+                    publish_diagnostics(&mut out, &faults, units, uri, publish_text, label, lingering);
                 }
                 if fault("codepoint-positions-after-change") {
                     // Mark one character of the all-emoji line (line 1) in
@@ -824,7 +939,14 @@ fn main() {
                     if !*again && version >= *first + 65 {
                         *again = true;
                         eprintln!("standin: published version {first} again at version {version}");
-                        publish_diagnostics(&mut out, &faults, units, uri, first_text, Some(json!(*first)));
+                        publishes += 1;
+                        let lingering = Lingering {
+                            broken_once: broken.contains(uri),
+                            late: late.contains(uri),
+                            padded: false,
+                            publishes,
+                        };
+                        publish_diagnostics(&mut out, &faults, units, uri, first_text, Some(json!(*first)), lingering);
                     }
                 }
             }
@@ -1483,11 +1605,54 @@ fn main() {
                     None
                 };
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                let result = match (text, disk) {
+                let mut result = match (text, disk) {
                     (Some(t), _) => document_answer(&method, &params, t, units, split, &faults),
                     (None, Some(t)) => document_answer(&method, &params, &t, units, split, &faults),
                     _ => Value::Null,
                 };
+                let uri = msg.pointer("/params/textDocument/uri").and_then(Value::as_str);
+                let mut nth = None;
+                if method == "textDocument/documentSymbol"
+                    && let Some(uri) = uri
+                    && let Some(t) = text
+                {
+                    symbol_answers += 1;
+                    nth = since_restored.get_mut(uri).map(|n| {
+                        *n += 1;
+                        *n
+                    });
+                    let state = SymbolState { nth, broken_once: broken.contains(uri), answers: symbol_answers };
+                    result = recovery_symbols(result, t, units, split, &faults, state);
+                }
+                if method == "textDocument/foldingRange"
+                    && let Some(uri) = uri
+                {
+                    nth = folds_since_restored.get_mut(uri).map(|n| {
+                        *n += 1;
+                        *n
+                    });
+                }
+                // Late enough that lspcheck's first recovery poll is
+                // answered after a recovery_timeout under 4 s, however fast
+                // it runs, so the next request is its terminal probe. (Under
+                // the default 10 s --timeout the tests use, so M2 still passes.)
+                if method == "textDocument/documentSymbol"
+                    && nth == Some(1)
+                    && (fault("recover-before-deadline") || fault("exit-during-terminal-probes"))
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(4));
+                }
+                if fault("exit-during-terminal-probes")
+                    && let Some(n) = nth
+                {
+                    // lspcheck polls both together, so the second of each is
+                    // its terminal probe.
+                    if method == "textDocument/foldingRange" && n == 2 {
+                        eprintln!("standin: exit-during-terminal-probes");
+                        std::process::exit(0);
+                    }
+                    result = json!([]);
+                }
                 out.frame(&ok(&id, result));
                 if method == "textDocument/documentSymbol" && fault("invalid-duplicate-symbols") {
                     // Offset 1 of line 0 is inside its first emoji in UTF-8, UTF-16 alike.
@@ -1898,11 +2063,118 @@ fn document_answer(
     }
 }
 
+/// Where a documentSymbol request stands for the recovery faults.
+struct SymbolState {
+    /// Which documentSymbol request about the document this is since its
+    /// text was last restored to what it was opened with; `None` while it
+    /// isn't that text.
+    nth: Option<usize>,
+    /// The document's brackets were unbalanced once.
+    broken_once: bool,
+    /// Which documentSymbol answer of the session this is.
+    answers: usize,
+}
+
+/// What the recovery faults make of a documentSymbol answer about `text`.
+fn recovery_symbols(
+    answer: Value,
+    text: &str,
+    units: Units,
+    split: LineSplit,
+    faults: &[String],
+    state: SymbolState,
+) -> Value {
+    let fault = |name: &str| faults.iter().any(|f| f == name);
+    if fault("stuck-after-unbalanced") && state.broken_once {
+        return json!([]);
+    }
+    if let Some(n) = state.nth
+        && ((fault("recover-before-deadline") && n == 1)
+            || (fault("slow-recovery") && n <= 3)
+            || (fault("recovery-in-skipped-frame") && n == 1))
+    {
+        return json!([]);
+    }
+    let mut answer =
+        if fault("shuffled-symbols") { shuffled_symbols(text, units, split, state.answers) } else { answer };
+    if fault("unstable-symbols")
+        && let Some(symbols) = answer.as_array_mut()
+    {
+        let at = range(0, 0, 0, 0);
+        symbols
+            .push(json!({"name": format!("counter{}", state.answers), "kind": 13, "range": at, "selectionRange": at}));
+    }
+    if fault("recovery-in-skipped-frame")
+        && state.nth.is_some()
+        && let Some(first) = answer.get_mut(0)
+    {
+        first["detail"] = json!("x".repeat(2 * 1024 * 1024 + 1));
+    }
+    answer
+}
+
+/// For shuffled-symbols: a symbol per line with words, named by its first,
+/// whose children are the line's words; lines and children are rotated by
+/// `answer`, and reversed when it is odd, and every symbol's detail names it.
+fn shuffled_symbols(text: &str, units: Units, split: LineSplit, answer: usize) -> Value {
+    let detail = format!("answer {answer}");
+    let shuffle = |items: &mut Vec<Value>| {
+        if !items.is_empty() {
+            let n = items.len();
+            items.rotate_left(answer % n);
+            if answer % 2 == 1 {
+                items.reverse();
+            }
+        }
+    };
+    let mut lines: Vec<Vec<(usize, usize, usize, &str)>> = Vec::new();
+    for word in words(text, units, split) {
+        match lines.last_mut() {
+            Some(line) if line[0].0 == word.0 => line.push(word),
+            _ => lines.push(vec![word]),
+        }
+    }
+    let mut symbols: Vec<Value> = lines
+        .iter()
+        .map(|words| {
+            let (line, start, first_end, name) = words[0];
+            let end = words[words.len() - 1].2;
+            let mut children: Vec<Value> = words
+                .iter()
+                .map(|(l, s, e, w)| {
+                    json!({"name": w, "kind": 13, "detail": detail, "range": range(*l, *s, *l, *e),
+                           "selectionRange": range(*l, *s, *l, *e)})
+                })
+                .collect();
+            shuffle(&mut children);
+            json!({"name": name, "kind": 12, "detail": detail, "range": range(line, start, line, end),
+                   "selectionRange": range(line, start, line, first_end), "children": children})
+        })
+        .collect();
+    shuffle(&mut symbols);
+    json!(symbols)
+}
+
+/// What the recovery faults add to every publish about a document.
+#[derive(Clone, Copy, Default)]
+struct Lingering {
+    /// Its brackets were unbalanced once.
+    broken_once: bool,
+    /// It was given a late Warning (late-warning-in-skipped-frame,
+    /// late-baseline-warning, late-baseline-in-skipped-frame; an Error with
+    /// late-baseline-error), in a frame padded past 2 MiB if `padded`.
+    late: bool,
+    padded: bool,
+    /// Which publish of the session this is.
+    publishes: u64,
+}
+
 /// A URI the stand-in publishes about without it ever being opened.
 const ELSEWHERE: &str = "file:///lspcheck-standin/elsewhere.txt";
 
 /// Publishes a warning for each ASCII word of a document, labelled with its
-/// version when there is one, plus what the lawful position faults add.
+/// version when there is one, plus what the lawful position faults and the
+/// recovery faults add.
 fn publish_diagnostics<W: Write>(
     out: &mut Writer<W>,
     faults: &[String],
@@ -1910,6 +2182,7 @@ fn publish_diagnostics<W: Write>(
     uri: &str,
     text: &str,
     version: Option<Value>,
+    lingering: Lingering,
 ) {
     let fault = |name: &str| faults.iter().any(|f| f == name);
     let split = line_split(faults);
@@ -1948,6 +2221,27 @@ fn publish_diagnostics<W: Write>(
             d["tags"] = json!([9]);
         }
     }
+    if fault("reworded-diagnostics") {
+        for d in &mut diagnostics {
+            d["message"] = json!(format!("{} (publish {})", d["message"].as_str().unwrap_or(""), lingering.publishes));
+        }
+    }
+    if lingering.broken_once && fault("errors-after-unbalanced") {
+        diagnostics
+            .push(json!({"range": range(0, 0, 0, 0), "severity": 1, "source": "standin", "message": "still broken"}));
+    }
+    if lingering.broken_once && fault("warning-after-unbalanced") {
+        diagnostics
+            .push(json!({"range": range(0, 0, 0, 0), "severity": 2, "source": "standin", "message": "still odd"}));
+    }
+    if lingering.late {
+        // The message isn't part of what recovery compares, so padding it
+        // leaves the Warning the same.
+        let message = if lingering.padded { "x".repeat(2 * 1024 * 1024 + 1) } else { "on reflection".into() };
+        let severity = if fault("late-baseline-error") { 1 } else { 2 };
+        diagnostics
+            .push(json!({"range": range(0, 0, 0, 0), "severity": severity, "source": "standin", "message": message}));
+    }
     if fault("positions-in-data") {
         for d in &mut diagnostics {
             d["data"] = json!({"line": 0, "character": 1, "range": range(0, 1, 0, 3)});
@@ -1964,6 +2258,11 @@ fn publish_diagnostics<W: Write>(
         out.frame(&json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}));
     }
     let mut params = json!({"uri": uri, "diagnostics": diagnostics});
+    if (fault("malformed-recovery-diagnostics") && lingering.broken_once)
+        || (fault("malformed-baseline-diagnostics") && version == Some(json!(1)))
+    {
+        params["diagnostics"] = Value::Null;
+    }
     if let Some(v) = version {
         params["version"] = v;
     }
@@ -2468,6 +2767,7 @@ mod tests {
                     "file:///brackets",
                     "😀(\r\né]\r{\n[)\r\n}",
                     Some(json!(2)),
+                    Lingering::default(),
                 );
                 let body = out.out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
                 let published: Value = serde_json::from_slice(&out.out[body..]).unwrap();

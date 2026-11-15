@@ -78,7 +78,7 @@ struct Cli {
     max_output_mib: usize,
 
     /// Run the mutation scenario (M1 to M3). Hidden while it is
-    /// experimental: recovery (M3) isn't judged yet.
+    /// experimental.
     #[arg(long, hide = true)]
     mutate: bool,
 

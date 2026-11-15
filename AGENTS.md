@@ -17,6 +17,7 @@ lifecycle, and whether it leaves processes behind. Read the [README](README.md) 
 | `src/metamodel.rs` | K2: the vendored LSP 3.17 meta-model, parsed once, and validation of JSON values against its types. |
 | `vendor/lsp-3.17/` | The LSP 3.17 `metaModel.json`, unmodified (CC BY 4.0; attribution in its README). |
 | `src/mutation.rs` | The seeded mutation planner: SplitMix64, the lexicon, the operators, the changes that send an edit, where requests are asked, and how edits are recorded. The `mutation` scenario that runs it is in `src/checks.rs`. |
+| `src/recovery.rs` | M3's comparisons: the recovery probes' projections, compared as multisets, and the first difference. The polling is in `src/checks.rs`. |
 | `src/sha256.rs` | SHA-256, for recording long inserted text without a dependency. |
 | `src/documents.rs` | The documents lspcheck opens, the texts a position may refer to, and D1's judging. |
 | `src/profile.rs` | `--profile`: reading and validating the TOML, the workspace files, and merging with the flags. |
