@@ -286,6 +286,10 @@ const FAULTS: &[(&str, &str)] = &[
          added, in a frame padded past 2 MiB, and add that Warning to every later publish about it",
     ),
     (
+        "second-baseline-warning",
+        "lawful: as late-warning-in-skipped-frame, with the second publish in a frame of its usual size",
+    ),
+    (
         "late-baseline-warning",
         "lawful: on reading a document's first didChange, before applying it, publish the opened text's \
          diagnostics labelled with version 1 with a Warning added, and add that Warning to every later publish about it",
@@ -776,10 +780,11 @@ fn main() {
                         publishes,
                     };
                     publish_diagnostics(&mut out, &faults, units, uri, text, label.clone(), lingering);
-                    if fault("late-warning-in-skipped-frame") {
+                    if fault("late-warning-in-skipped-frame") || fault("second-baseline-warning") {
                         late.insert(uri.to_string());
                         publishes += 1;
-                        let lingering = Lingering { late: true, padded: true, publishes, ..lingering };
+                        let padded = fault("late-warning-in-skipped-frame");
+                        let lingering = Lingering { late: true, padded, publishes, ..lingering };
                         publish_diagnostics(&mut out, &faults, units, uri, text, label, lingering);
                     }
                 }
@@ -2203,7 +2208,8 @@ struct Lingering {
     /// Its brackets were unbalanced once.
     broken_once: bool,
     /// It was given a late Warning (late-warning-in-skipped-frame,
-    /// late-baseline-warning, late-baseline-in-skipped-frame; an Error with
+    /// second-baseline-warning, late-baseline-warning,
+    /// late-baseline-in-skipped-frame; an Error with
     /// late-baseline-error), in a frame padded past 2 MiB if `padded`.
     late: bool,
     padded: bool,

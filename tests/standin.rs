@@ -3565,6 +3565,33 @@ fn a_pushed_baseline_with_a_publish_lspcheck_skipped_is_not_used() {
 }
 
 #[test]
+fn baseline_publishes_that_differ_by_a_warning_leave_no_errors_judged() {
+    // On reading the seed's didOpen, the stand-in publishes its diagnostics,
+    // then again with a Warning added, and keeps the Warning: lspcheck reads
+    // both before it writes the first mutation. Held only to no_errors, M3
+    // asks whether the restored text has an Error, which the Warning says
+    // nothing about, as for a late publish: the baseline is used, and M3
+    // passes. With expect, the publishes must agree, so nothing changes:
+    // pushed diagnostics have no stable baseline.
+    let (path, _keep) =
+        recovery_profile("no_errors = true\nprobes = [\"publishDiagnostics\"]\nrecovery_timeout = \"3s\"");
+    let (r, _, _keep) = mutated_with(&path, &["second-baseline-warning"], &["--mutation-cases", "1"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+    let (path, _keep) = recovery_profile(
+        "expect = \"baseline\"\nno_errors = true\nprobes = [\"publishDiagnostics\"]\nrecovery_timeout = \"3s\"",
+    );
+    let (r, _, _keep) =
+        mutated_with(&path, &["second-baseline-warning"], &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M3", "not-exercised");
+    assert_eq!(
+        detail(&r, "M3"),
+        "no recovery probe had a stable baseline: publishDiagnostics of main.lua: the 2 publishDiagnostics labelled \
+         with version 1 before the first mutation differed"
+    );
+}
+
+#[test]
 fn a_late_baseline_publish_after_the_first_mutation_does_not_fail_m3() {
     // On reading the first didChange, before applying it, the stand-in
     // publishes the opened text's diagnostics, labelled with version 1, with

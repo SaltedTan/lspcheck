@@ -4836,10 +4836,15 @@ impl Recovery {
     /// Takes the pushed diagnostics' baselines just before the first
     /// mutation: for each seed document, the publishes labelled with version
     /// 1 read since it was opened; if they are all equal after projection,
-    /// and lspcheck missed nothing since, the last. Then holds the profile's
-    /// `no_errors` to every diagnostics baseline.
+    /// and lspcheck missed nothing since, the last. Held only to
+    /// `no_errors`, they need only agree that there is no Error, as later
+    /// ones do ([`PushBaseline`]). Then holds the profile's `no_errors` to
+    /// every diagnostics baseline, and to each publish taken for one.
     fn before_first_mutation(&mut self, s: &Session, docs: &[SeedDoc], until: Duration) {
         let msgs = &s.messages;
+        let errors_only = self.no_errors && self.expect == Expect::Observe;
+        // An Error in a publish taken for a baseline before its last.
+        let mut earlier_error: Option<(String, Value)> = None;
         if std::mem::take(&mut self.pushes_pending) {
             self.uris = docs.iter().map(|doc| doc.uri.clone()).collect();
             for (d, doc) in docs.iter().enumerate() {
@@ -4866,33 +4871,44 @@ impl Recovery {
                     None => self.unused.push(format!(
                         "{label}: no publishDiagnostics labelled with version 1 arrived before the first mutation"
                     )),
-                    Some(last) if publishes.iter().any(|p| p != last) => self.unused.push(format!(
+                    Some(last) if !errors_only && publishes.iter().any(|p| p != last) => self.unused.push(format!(
                         "{label}: the {} publishDiagnostics labelled with version 1 before the first mutation differed",
                         publishes.len()
                     )),
-                    Some(last) => self.stable.push(Stable {
-                        doc: d,
-                        probe: profile::Probe::PublishDiagnostics,
-                        label,
-                        params: None,
-                        baseline: last.clone(),
-                        baseline_window: Some((doc.version_at, until)),
-                    }),
+                    Some(last) => {
+                        if earlier_error.is_none() {
+                            earlier_error = publishes
+                                .iter()
+                                .find_map(recovery::first_error)
+                                .map(|error| (label.clone(), error.clone()));
+                        }
+                        self.stable.push(Stable {
+                            doc: d,
+                            probe: profile::Probe::PublishDiagnostics,
+                            label,
+                            params: None,
+                            baseline: last.clone(),
+                            baseline_window: Some((doc.version_at, until)),
+                        })
+                    }
                 }
             }
         }
+        let at_baseline = self
+            .stable
+            .iter()
+            .filter(|s| is_diagnostics(s.probe))
+            .find_map(|s| recovery::first_error(&s.baseline).map(|e| (s.label.clone(), e.clone(), "at baseline")));
+        let earlier = earlier_error.map(|(label, error)| {
+            (label, error, "in a publishDiagnostics labelled with version 1 before the first mutation")
+        });
         if self.no_errors
-            && let Some((s, error)) = self
-                .stable
-                .iter()
-                .filter(|s| is_diagnostics(s.probe))
-                .find_map(|s| recovery::first_error(&s.baseline).map(|e| (s, e)))
+            && let Some((label, error, when)) = at_baseline.or(earlier)
         {
             self.contradicted = Some(format!(
                 "the profile and the server disagree before any mutation: mutation.recovery.no_errors says the seed \
-                 has no Error diagnostics, but {} has {} at baseline",
-                s.label,
-                metamodel::shorten_value(error)
+                 has no Error diagnostics, but {label} has {} {when}",
+                metamodel::shorten_value(&error)
             ));
             self.no_errors = false;
         }
@@ -7393,6 +7409,56 @@ while header := sys.stdin.buffer.readline():
                     assert_eq!(rechecked.verdict, Verdict::Error);
                     assert!(rechecked.detail.contains("an unfinished frame was lost"));
                 }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pushed_baselines_held_only_to_no_errors_need_only_agree_there_is_no_error() {
+        // Two publishes labelled with version 1 before the first mutation,
+        // the first with a Warning or an Error the second lacks. Held only to
+        // no_errors, a Warning leaves the baseline usable, and an Error
+        // contradicts no_errors; with expect, they must be equal.
+        let range = json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}});
+        let cfg = mutation_test_config("exit 0");
+        for (severity, expect, stable, contradicted) in [
+            (2, Expect::Observe, true, false),
+            (1, Expect::Observe, true, true),
+            (2, Expect::Baseline, false, false),
+            (1, Expect::Baseline, false, false),
+        ] {
+            let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+            let docs = recovery_test_docs();
+            for (at, diagnostics) in [(0, json!([{"range": range, "severity": severity}])), (1, json!([]))] {
+                let n = message::notification(
+                    PUBLISH_DIAGNOSTICS,
+                    Some(json!({"uri": docs[0].uri, "version": 1, "diagnostics": diagnostics})),
+                );
+                ctx.s
+                    .messages
+                    .push((Duration::from_secs(at), Message::parse(&serde_json::to_vec(&n).unwrap()).unwrap()));
+            }
+            let mut rec = Recovery { expect, no_errors: true, pushes_pending: true, ..Recovery::default() };
+            rec.before_first_mutation(&ctx.s, &docs, Duration::from_secs(2));
+            let case = format!("severity {severity}, {expect:?}");
+            assert_eq!(rec.stable.len(), usize::from(stable), "{case}: {:?}", rec.unused);
+            assert_eq!(rec.no_errors, !contradicted, "{case}");
+            match &rec.contradicted {
+                Some(why) => assert!(
+                    contradicted
+                        && why.ends_with("in a publishDiagnostics labelled with version 1 before the first mutation"),
+                    "{case}: {why}"
+                ),
+                None => assert!(!contradicted, "{case}"),
+            }
+            if !stable {
+                assert_eq!(
+                    rec.unused,
+                    ["publishDiagnostics of seed.txt: the 2 publishDiagnostics labelled with version 1 before the \
+                      first mutation differed"],
+                    "{case}"
+                );
             }
         }
     }
