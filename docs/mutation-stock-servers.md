@@ -134,9 +134,9 @@ it. One run of each server with `--mutation-cases 100` gave:
 | texlab | fail | pass | error | N/E | skip | 3 | 2 s (case 2's crash) |
 | lua-language-server, basedpyright, marksman, ruff | pass | pass | pass | as with 10 | as with 10 | 100 | 3 to 32 s |
 
-All the new verdicts but gopls's D6 trace back to one behaviour: these servers don't end a line at a lone `\r`, as LSP 3.17 says
-they must. That shifts every line after the `\r`, so a later change's range names lines the server's copy doesn't
-have. lspcheck's changes are right under the specification's split (checked by replaying them under both splits), and
+All the new verdicts but gopls's D6 trace back to one behaviour: these servers don't end a line at a lone `\r`, as
+LSP 3.17 says they must. That shifts every line after the `\r`, so a later change's range names lines the server's
+copy doesn't have. lspcheck's changes are right under the specification's split (checked by replaying them under both splits), and
 its restoration is one change whose range covers the whole document, `(0,0)` to `(lines, 0)` in the specification's
 lines. Replaying case 30's four `didChange` notifications alone, with a small client, against each server:
 
@@ -178,10 +178,10 @@ each takes `recovery_timeout`, and when one fault desynchronizes the document, e
 
 - **Matrix: 10 cases**, as the design planned. Verdicts were the same in all four runs except gopls's D1 above, and
   the scenario took under 10 s for every server but lemminx. Ten cases already find texlab's crash (the same
-  lone-`\r` handling, reached in case 2). They don't reach case 30: a larger count would add the lone-`\r` findings above, but would cost 10 to 40 minutes per job for gopls,
-  rust-analyzer, clangd and terraform-ls, and no repeated runs at that count have shown those verdicts stable. If the
-  matrix should cover them, 40 cases (10 desynchronized cases, about 10 minutes each) is the smallest count that
-  does. Measure it before pinning.
+  lone-`\r` handling, reached in case 2). They don't reach case 30: a larger count would add the lone-`\r` findings
+  above, but would cost 10 to 40 minutes per job for gopls, rust-analyzer, clangd and terraform-ls, and no repeated
+  runs at that count have shown those verdicts stable. If the matrix should cover them, 40 cases (10 desynchronized
+  cases, about 10 minutes each) is the smallest count that does. Measure it before pinning.
 - **Default: keep 20.** For a server that recovers, 20 cases take seconds; for one that doesn't, each extra case adds
   `recovery_timeout`. The numbers don't call for a change in this PR. A user who wants more should pass
   `--mutation-cases` and expect minutes per desynchronized case.
