@@ -9,8 +9,8 @@ baselines, polls them after each restoration and judges M3, with `expect` and `n
 the first three failing or erroring cases are [run again alone](#step-6), and the report says whether each
 reproduced. Step 7 is in place: the stock example profiles have `[mutation]` sections,
 [measured](mutation-stock-servers.md) on the pinned servers, and the [matrix](../ci/stock-servers/README.md) runs a
-mutation job per server against its `.mutation.verdicts`. `--mutate` and its two flags are experimental and hidden
-from `--help`. See [how steps 3, 5 and 6 are built](#step-3) and the
+mutation job per server against its `.mutation.verdicts`. `--mutate` and its two flags are experimental and listed in
+`--help`. See [how steps 3, 5 and 6 are built](#step-3) and the
 [design status](design.md) for its place in the roadmap.
 
 ## Context

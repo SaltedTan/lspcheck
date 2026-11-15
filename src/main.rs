@@ -77,17 +77,18 @@ struct Cli {
     #[arg(long, default_value_t = 256, value_name = "MIB")]
     max_output_mib: usize,
 
-    /// Run the mutation scenario (M1 to M3). Hidden while it is
-    /// experimental.
-    #[arg(long, hide = true)]
+    /// Run the experimental mutation scenario (M1 to M3): seeded edits of the
+    /// profile's `[mutation].files`, else its `[document]` (M1 to M3 are SKIP
+    /// with neither).
+    #[arg(long)]
     mutate: bool,
 
     /// The mutation seed, instead of the profile's or a random one.
-    #[arg(long, hide = true, value_name = "N", requires = "mutate")]
+    #[arg(long, value_name = "N", requires = "mutate")]
     mutation_seed: Option<u64>,
 
     /// How many mutation cases to run, instead of the profile's or 20.
-    #[arg(long, hide = true, value_name = "N", requires = "mutate")]
+    #[arg(long, value_name = "N", requires = "mutate")]
     mutation_cases: Option<u64>,
 
     /// The server command and its arguments, after `--` (else the profile's command).
