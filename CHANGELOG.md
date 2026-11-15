@@ -2,55 +2,57 @@
 
 ## Unreleased
 
+## 0.5.0 (2026-11-16)
+
 ### Added
 
-- M1 to M3 (`POLICY`) are in the catalogue for experimental [seeded source mutation](docs/source-mutations.md).
-  Without `--mutate` they are `SKIP`, which doesn't affect the exit status, so reports gain three `SKIP` lines
-  and each stock-server `.verdicts` file three `skip` lines.
-- Profiles accept a `[mutation]` section, [validated](docs/source-mutations.md#profile-schema) with the rest of the
-  profile (a mistake in it is a usage error), and used only with `--mutate`.
-- An experimental `--mutate` runs the mutation scenario: seeded edits of the profile's seed files, requests about each
-  broken text, and the clean text restored after each case.
-  It judges M1 (the server survives) and M2 (every request is answered within `--timeout`); `--mutation-seed` and
-  `--mutation-cases` override the profile. The JSON report gains `"mutation"` (`null` when the scenario doesn't run),
-  the terminal header names the seed, and the scenario's transcript, `mutation.jsonl`, records each case's plan.
-  When the scenario stops early, `mutation.stopped` records the reason, including initialization and seed-file errors.
-  M2 preserves observed timeouts when the server exits during a later request in the same batch.
-  Unfinished client writes make overlapping reply windows inconclusive from the write's start.
-  The scenario now enforces its [written-bytes bound](docs/source-mutations.md#bounds) on automatic answers to the
-  server's requests.
-- Under `--mutate`, D1, D2, D6 and K1 also judge the mutation scenario's evidence under the
-  [extended-check rules](docs/source-mutations.md#verdict-rules). Each check's verdict combines with its own
-  scenario's, and the detail names the scenario and case. Default runs, and the stock-server baselines, don't change.
-- Under `--mutate`, M3 judges [recovery](docs/source-mutations.md#recovery) using stable baselines and the profile's
-  optional expectations. See its [verdict rules](docs/source-mutations.md#verdict-rules) for how it distinguishes
-  failures from inconclusive recovery. With `no_errors` and no `expect`, a publish labelled with version 1 read after
-  the first mutation that differs from the pushed baseline without an Error no longer makes the probe `ERROR`, and
-  publishes labelled with version 1 read before it that differ without an Error no longer leave pushed diagnostics
-  without a baseline (`N/E`); an Error in one is an `ERROR`, as at baseline.
-- Under `--mutate`, the first three failing or erroring cases are [run again alone](docs/source-mutations.md#step-6),
-  failing ones first, each in a fresh session from the same seed, within `run_timeout`. The JSON report's
-  `"mutation"` gains `"isolated"`, the terminal and Markdown reports a line per case, saying whether it reproduced
-  (or that the isolated run couldn't tell) and what in (for M2, each method the case left unanswered, except one
-  whose reply may have been in output lspcheck didn't inspect), and
-  `--transcripts` a `mutation-case-<k>.jsonl` for each. An isolated run judges nothing, so verdicts don't depend on it.
-- The 11 [example profiles](examples/profiles/README.md) the stock-server matrix runs gain a `[mutation]` section
-  with a lexicon for their language, and `[mutation.recovery].expect = "baseline"` where the recovery probes answer
-  from the text alone. A test checks that each validates and that its case budget fits its `run_timeout`. Their
-  behaviour under `--mutate` on the pinned releases is recorded in
-  [docs/mutation-stock-servers.md](docs/mutation-stock-servers.md). Default runs don't change.
-- The [stock-server matrix](ci/stock-servers/README.md) gains a mutation job per server: the same example profile with
-  `--mutate --mutation-seed 20261115 --mutation-cases 10`, compared against the new `<server>.mutation.verdicts`
-  files. Default jobs and their `.verdicts` files are unchanged. A workflow change, so the maintainer merges it.
+- Experimental [seeded source mutation](https://github.com/SaltedTan/lspcheck/blob/v0.5.0/docs/source-mutations.md). With a profile and `--mutate`, lspcheck
+  opens the profile's real source (its `[mutation].files`, else its `[document]`), breaks it with seeded, token-aware
+  edits, asks the server about each broken text, restores the clean text after each case and checks that the server
+  recovers. Three new `POLICY` checks judge it:
+  - **M1**: the server doesn't exit, or close its output, while its source is mutated or being restored.
+  - **M2**: every request about a mutated document gets a response (any result or error) within `--timeout`.
+  - **M3**: once the clean text is restored, the [recovery probes'](https://github.com/SaltedTan/lspcheck/blob/v0.5.0/docs/source-mutations.md#recovery) answers
+    return to the stable baselines taken before the first mutation. `[mutation.recovery]` can also require them to
+    equal the baseline (`expect = "baseline"`) or the restored text to have no Error diagnostic (`no_errors`).
+
+  Under `--mutate`, D1, D2, D6 and K1 also judge what the server says about the mutated texts
+  ([extended-check rules](https://github.com/SaltedTan/lspcheck/blob/v0.5.0/docs/source-mutations.md#verdict-rules)); each check's verdict combines with its own
+  scenario's, and the detail names the scenario and case.
+- `--mutate`, `--mutation-seed N` and `--mutation-cases N` run the scenario; the two flags override the profile. A
+  seed plans the same edits every time, and a seed chosen at random is reported, so a run can be repeated. The first
+  three failing or erroring cases are [run again alone](https://github.com/SaltedTan/lspcheck/blob/v0.5.0/docs/source-mutations.md#step-6), failing ones first, each
+  with a fresh server, and the report says whether each reproduced and what in. An isolated run judges nothing, so no
+  verdict depends on it.
+- Profiles accept a [`[mutation]` section](https://github.com/SaltedTan/lspcheck/blob/v0.5.0/docs/source-mutations.md#profile-schema): seed files, seed, case
+  count, operators, a lexicon for the language, the requests to ask, recovery probes and their expectations, and
+  timeouts (`run_timeout` defaults to an hour). It is validated with the rest of the profile, a mistake in it being a
+  usage error, and is inert without `--mutate`. Under `--mutate`, a case budget longer than `run_timeout` is a usage
+  error too, so a run never silently admits no case.
+- Reports: the JSON report gains `"mutation"` (`null` when the scenario doesn't run), with the seed, the cases planned
+  and run, `stopped` (why the run stopped early, if it did) and `isolated`; the terminal header names the seed, and the
+  terminal and Markdown reports give a line per isolated case. `--transcripts` writes `mutation.jsonl`, which
+  `replay` replays as it is, with a meta line recording each case's plan, and `mutation-case-<k>.jsonl` for each
+  isolated case.
+- The 11 [example profiles](https://github.com/SaltedTan/lspcheck/blob/v0.5.0/examples/profiles/README.md) the stock-server matrix runs gain a `[mutation]` section
+  with a lexicon for their language, and `expect = "baseline"` where the recovery probes answer from the text alone. A
+  test checks that each validates and fits its `run_timeout`. Their behaviour on the pinned releases is recorded in
+  [docs/mutation-stock-servers.md](https://github.com/SaltedTan/lspcheck/blob/v0.5.0/docs/mutation-stock-servers.md).
+- The [stock-server matrix](https://github.com/SaltedTan/lspcheck/blob/v0.5.0/ci/stock-servers/README.md) runs a mutation job per
+  server, `--mutate --mutation-seed 20261115 --mutation-cases 10`, compared against its `<server>.mutation.verdicts`.
 
 ### Changed
 
+- Without `--mutate`, M1 to M3 are `SKIP` ("mutation is off; pass --mutate"), which doesn't affect the exit status.
+  Reports gain three `SKIP` lines, and each stock-server `.verdicts` file three `skip` lines; no other verdict of a
+  default run changes.
 - Profile durations may also be given in hours, such as `"1h"`.
 
 ### Fixed
 
-- D6 in the documents scenario judges a `selectionRange` reply against every text it may describe (D1's candidate
-  rule), as the mutation scenario does, so a late reply about the changed, shorter text no longer fails.
+- D6 in the documents scenario judges a `selectionRange` reply against every text it may describe (D1's
+  [candidate rule](https://github.com/SaltedTan/lspcheck/blob/v0.5.0/docs/design.md#documents-and-positions)), so a lawful late reply about the changed, shorter text
+  no longer fails.
 
 ## 0.4.0 (2026-11-11)
 

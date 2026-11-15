@@ -419,9 +419,9 @@ every delivery as taking its full write deadline, so a server slow to read (back
 already reserved, not the run's. The budget is a worst case: with the example profiles' 30 s request timeout it is
 over ten minutes per case, though a case usually takes seconds, which is why `run_timeout` defaults to an hour. A
 configuration whose case budget exceeds `run_timeout` is a usage error naming both (exit status 2), checked under
-`--mutate` when there is a seed file, before the server starts, so a run never silently admits no case. The planned
-stock mutation profiles will each be checked by a test. If a case's budget runs out anyway, no further step starts,
-but the restoration is still sent, with its own write deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the
+`--mutate` when there is a seed file, before the server starts, so a run never silently admits no case. A test
+checks the stock example profiles' `[mutation]` sections against it. If a case's budget runs out anyway, no further
+step starts, but the restoration is still sent, with its own write deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the
 cases not run), so no case ever starts on a document lspcheck couldn't restore.
 
 The written-bytes bound is a cap, not a threshold: everything lspcheck writes in the scenario counts (the seed
