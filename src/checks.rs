@@ -4506,6 +4506,33 @@ const LAST_POLL_GAP: Duration = Duration::from_secs(2);
 /// The most recovery polls one case sends ([bounds](../docs/source-mutations.md#bounds)).
 const MAX_POLLS: u32 = 40;
 
+/// When a case may send its next recovery poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextPoll {
+    /// At this session time.
+    Due(Duration),
+    /// Not before `recovery_timeout` ends.
+    Deadline,
+    /// Never: [`MAX_POLLS`] were sent.
+    Spent,
+}
+
+/// When the poll after `polls` recovery polls is due: the first when the
+/// restoration was delivered, at `last`; each later one a gap after the
+/// last poll's replies were read, at `last`, [`FIRST_POLL_GAP`] after the
+/// first and doubling up to [`LAST_POLL_GAP`]. None is due at or after
+/// `bound`, the end of `recovery_timeout`, or after [`MAX_POLLS`].
+fn next_poll(polls: u32, last: Duration, bound: Duration) -> NextPoll {
+    if polls >= MAX_POLLS {
+        return NextPoll::Spent;
+    }
+    // Past a few doublings the gap is LAST_POLL_GAP; capping them keeps the
+    // product small.
+    let gap = |n: u32| (FIRST_POLL_GAP * 2u32.pow((n - 1).min(16))).min(LAST_POLL_GAP);
+    let due = if polls == 0 { last } else { last + gap(polls) };
+    if due < bound { NextPoll::Due(due) } else { NextPoll::Deadline }
+}
+
 /// Settles the server once the seed documents are open: waits until no
 /// work-done progress it began is unfinished and no `publishDiagnostics` or
 /// `$/progress` has arrived for [`SETTLE_QUIET`], within `timeout`
@@ -5102,19 +5129,26 @@ async fn recover(
             rec.push_read(&mut watches, &ctx.s.messages, docs, s.doc, docs[s.doc].version, index);
         }
     }
-    let (mut polls, mut gap, mut next, mut spent) = (0u32, FIRST_POLL_GAP, restored, false);
+    let (mut polls, mut last, mut spent) = (0u32, restored, false);
     let mut end = BatchEnd::default();
     loop {
         for (d, label, index) in rec.pushes.scan(&ctx.s.messages, docs, bound) {
             rec.push_read(&mut watches, &ctx.s.messages, docs, d, label, index);
         }
-        if rec.all_seen(&seen, &watches) || ctx.s.elapsed() >= bound {
+        // One reading of the clock decides both whether the bound has ended
+        // and whether a poll is due, so no poll is sent past either limit.
+        let now = ctx.s.elapsed();
+        if rec.all_seen(&seen, &watches) || now >= bound {
             break;
         }
         let pending: Vec<usize> = (0..n).filter(|&i| rec.stable[i].params.is_some() && seen[i].is_none()).collect();
-        spent |= !pending.is_empty() && polls == MAX_POLLS;
-        let until = if pending.is_empty() || spent { bound } else { next.min(bound) };
-        if ctx.s.elapsed() < until {
+        let step = if pending.is_empty() { NextPoll::Deadline } else { next_poll(polls, last, bound) };
+        spent |= step == NextPoll::Spent;
+        let until = match step {
+            NextPoll::Due(due) => due,
+            NextPoll::Deadline | NextPoll::Spent => bound,
+        };
+        if now < until {
             let alive = read_until(&mut ctx.s, until, |s| {
                 for (d, label, index) in rec.pushes.scan(&s.messages, docs, bound) {
                     rec.push_read(&mut watches, &s.messages, docs, d, label, index);
@@ -5157,8 +5191,7 @@ async fn recover(
         if end.lost.is_some() || end.capped.is_some() {
             break;
         }
-        next = ctx.s.elapsed() + gap;
-        gap = (gap * 2).min(LAST_POLL_GAP);
+        last = ctx.s.elapsed();
     }
     // Everything read by the end of the bound, for the pushed diagnostics.
     let drained = batch_stopped(&end).is_none() && ctx.s.absorb_all().await;
@@ -8994,6 +9027,38 @@ while header := sys.stdin.buffer.readline():
                 format!("unknown: {symbols} seen again; {hover} not judged alone: the isolated run stopped: it exited")
             )
         );
+    }
+
+    #[test]
+    fn recovery_polls_double_to_two_seconds_and_stop_at_forty() {
+        let ms = Duration::from_millis;
+        // Each poll's replies read as it is sent: the schedule alone decides.
+        let schedule = |bound: Duration| {
+            let mut sent: Vec<Duration> = Vec::new();
+            loop {
+                match next_poll(sent.len() as u32, sent.last().copied().unwrap_or_default(), bound) {
+                    NextPoll::Due(at) => sent.push(at),
+                    end => return (sent, end),
+                }
+            }
+        };
+        let gaps = |sent: &[Duration]| sent.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
+        // A bound polling never reaches: 40 polls, and no 41st.
+        let (sent, end) = schedule(Duration::from_secs(3600));
+        assert_eq!((sent.len(), end), (40, NextPoll::Spent));
+        assert_eq!(sent[0], Duration::ZERO);
+        let mut expected = vec![ms(250), ms(500), ms(1000)];
+        expected.resize(39, ms(2000));
+        assert_eq!(gaps(&sent), expected);
+        // The 40th poll is at 73.75 s; a 41st would be due at 75.75 s, inside
+        // a 76 s bound, and still isn't sent.
+        assert_eq!(sent[39], ms(73_750));
+        assert_eq!(schedule(Duration::from_secs(76)), (sent.clone(), NextPoll::Spent));
+        // A shorter bound stops polling first, and a poll due when it ends
+        // isn't sent.
+        assert_eq!(schedule(Duration::from_secs(3)), (vec![ms(0), ms(250), ms(750), ms(1750)], NextPoll::Deadline));
+        assert_eq!(schedule(ms(1750)), (vec![ms(0), ms(250), ms(750)], NextPoll::Deadline));
+        assert_eq!(schedule(ms(73_750)), (sent[..39].to_vec(), NextPoll::Deadline));
     }
 
     #[test]
