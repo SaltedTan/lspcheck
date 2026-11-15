@@ -3577,6 +3577,14 @@ fn a_late_baseline_publish_after_the_first_mutation_does_not_fail_m3() {
             "case 0: publishDiagnostics of main.lua: a publishDiagnostics labelled with version 1 read after the \
              first mutation differed from the baseline (it differs at params.diagnostics[*]: ",
         ),
+        // With expect, no_errors doesn't narrow the rule: a Warning that
+        // differs still puts the baseline in doubt.
+        (
+            "late-baseline-warning",
+            "expect = \"baseline\"\nno_errors = true",
+            "case 0: publishDiagnostics of main.lua: a publishDiagnostics labelled with version 1 read after the \
+             first mutation differed from the baseline (it differs at params.diagnostics[*]: ",
+        ),
         (
             "late-baseline-error",
             "no_errors = true",
