@@ -2642,6 +2642,16 @@ fn the_mutation_checks_are_skipped_and_dont_change_the_exit_status() {
 }
 
 #[test]
+fn help_lists_the_mutation_flags() {
+    let out = Command::new(LSPCHECK).arg("--help").output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let help = String::from_utf8_lossy(&out.stdout);
+    for flag in ["--mutate", "--mutation-seed <N>", "--mutation-cases <N>"] {
+        assert!(help.contains(flag), "{flag}: {help}");
+    }
+}
+
+#[test]
 fn a_bad_mutation_setting_is_a_usage_error_before_any_server_starts() {
     let (path, _keep) = profile(MUTATION_PROFILE);
     let path = path.to_str().unwrap();

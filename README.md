@@ -157,6 +157,7 @@ lspcheck --large-document-mib 8 -- my-server --stdio
 lspcheck --json report.json --transcripts out/ -- my-server
 lspcheck --junit report.xml --markdown summary.md -- my-server
 lspcheck --profile gopls.toml            # with a profile that names the server
+lspcheck --profile gopls.toml --mutate   # also edit its document and judge M1 to M3 (experimental)
 lspcheck list                            # every check, with its specification section
 ```
 
@@ -333,9 +334,9 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   [chooses positions from the document's text](docs/design.md#capabilities-and-robustness).
   See the [mutation reference](docs/source-mutations.md#profile-schema) for mutation seed selection.
 - **`[mutation]`** configures [seeded source mutation](docs/source-mutations.md#profile-schema). The section is
-  validated with the rest of the profile, and used only with `--mutate`, which is experimental and hidden from
-  `--help`: `lspcheck --profile p.toml --mutate [--mutation-seed N] [--mutation-cases N]` mutates the profile's seed
-  files and judges M1 to M3; D1, D2, D6 and K1 judge what the server says about the mutated texts too, and their
+  validated with the rest of the profile, and used only with `--mutate`, which is experimental:
+  `lspcheck --profile p.toml --mutate [--mutation-seed N] [--mutation-cases N]` mutates the profile's seed files and
+  judges M1 to M3; D1, D2, D6 and K1 judge what the server says about the mutated texts too, and their
   details name the scenario and case. Configure `[mutation.recovery]` using the
   [recovery rules](docs/source-mutations.md#recovery) and [profile schema](docs/source-mutations.md#profile-schema).
   See the [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
