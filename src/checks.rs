@@ -355,7 +355,9 @@ impl CheckResult {
                         None => failure
                             .pushed
                             .as_ref()
-                            .and_then(|p| p.unstable(&finish.messages))
+                            .and_then(|p| {
+                                p.unstable(&finish.messages, |from, to| finish.missed_output_within(from, to))
+                            })
                             .map(|why| format!("inconclusive, because {why}")),
                     };
                     match why {
@@ -377,7 +379,10 @@ impl CheckResult {
                     self.detail = format!("{why}: {}", self.detail);
                 }
             }
-            Recheck::Recovered { pushed, then } => match pushed.iter().find_map(|p| p.unstable(&finish.messages)) {
+            Recheck::Recovered { pushed, then } => match pushed
+                .iter()
+                .find_map(|p| p.unstable(&finish.messages, |from, to| finish.missed_output_within(from, to)))
+            {
                 Some(why) => {
                     self.verdict = Verdict::Error;
                     self.detail = format!("inconclusive, because {why}: {}", self.detail);
@@ -4274,7 +4279,7 @@ fn publish_label(m: &Message) -> Option<(&str, i64)> {
 /// A pushed-diagnostics baseline, as M3 holds every publish labelled with
 /// version 1 to it. Those read after the first mutation still describe the
 /// opened text, so one that differs shows the baseline wasn't stable,
-/// however late it was read.
+/// however late it was read, and one lspcheck missed may have differed.
 #[derive(Debug, Clone)]
 pub struct PushBaseline {
     label: String,
@@ -4287,8 +4292,13 @@ pub struct PushBaseline {
 
 impl PushBaseline {
     /// Why the publishes labelled with version 1 in `msgs` don't all show
-    /// the baseline, if they don't.
-    fn unstable(&self, msgs: &[(Duration, Message)]) -> Option<String> {
+    /// the baseline, or may not have, given what lspcheck missed of the
+    /// server's output since the document was opened (`missed_output_within`).
+    fn unstable(
+        &self,
+        msgs: &[(Duration, Message)],
+        missed_output_within: impl Fn(Duration, Duration) -> Option<String>,
+    ) -> Option<String> {
         let late = "a publishDiagnostics labelled with version 1 read after the first mutation";
         msgs.iter()
             .filter(|(at, m)| {
@@ -4321,6 +4331,15 @@ impl PushBaseline {
                     })
                     .unwrap_or_default();
                 Some(format!("{}: {late} differed from the baseline{shown}", self.label))
+            })
+            .or_else(|| {
+                missed_output_within(self.opened_at, Duration::MAX).map(|why| {
+                    format!(
+                        "{}: lspcheck may have missed a publishDiagnostics labelled with version 1 since the \
+                         document was opened, because {why}",
+                        self.label
+                    )
+                })
             })
     }
 }
@@ -5710,10 +5729,13 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
     let mut errors: Vec<String> = rec.contradicted.iter().cloned().collect();
     let mut slowest: Option<(Duration, u64, usize, bool)> = None;
     // A publish labelled with version 1 read after the first mutation that
-    // differs leaves the probe without a stable baseline, as if read before.
+    // differs, or one lspcheck may have missed, leaves the probe without a
+    // stable baseline, as if read before.
     let pushed: Vec<Option<PushBaseline>> = rec.stable.iter().map(|s| rec.push_baseline(s)).collect();
-    let unstable: Vec<Option<String>> =
-        pushed.iter().map(|p| p.as_ref().and_then(|p| p.unstable(&ctx.s.messages))).collect();
+    let unstable: Vec<Option<String>> = pushed
+        .iter()
+        .map(|p| p.as_ref().and_then(|p| p.unstable(&ctx.s.messages, |from, to| ctx.s.missed_output_within(from, to))))
+        .collect();
     for c in &rec.cases {
         for (i, outcome) in c.outcomes.iter().enumerate() {
             let stable = &rec.stable[i];
@@ -6910,21 +6932,25 @@ while header := sys.stdin.buffer.readline():
                 rec.cases.push(CaseRecovery { case, window, outcomes });
             }
             judge_m3(&mut ctx, &rec, None, None);
-            let mut m3 = ctx.results.pop().unwrap();
+            let m3 = ctx.results.pop().unwrap();
             assert_eq!(m3.verdict, if recovered { Verdict::Pass } else { Verdict::Fail });
             let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
-            finish.lost.push((Duration::from_millis(2001), Duration::from_secs(3), "a later frame was skipped".into()));
-            let mut later_only = m3.clone();
-            later_only.recheck(&finish);
-            assert_eq!(later_only.verdict, m3.verdict);
-            finish.lost.push((Duration::from_secs(1), Duration::from_secs(3), "a baseline publish was skipped".into()));
-            m3.recheck(&finish);
-            assert_eq!(m3.verdict, if independent_failure { Verdict::Fail } else { Verdict::Error });
-            if !independent_failure {
-                assert!(m3.detail.contains("a baseline publish was skipped"), "{}", m3.detail);
-            } else {
-                assert!(m3.detail.starts_with("case 0: textDocument/documentSymbol of seed.txt"), "{}", m3.detail);
-                assert!(m3.detail.ends_with("; and 1 more"), "{}", m3.detail);
+            // A frame skipped after the first mutation may have been a
+            // publish labelled with version 1, as one skipped before may have.
+            for (from, why) in [
+                (Duration::from_millis(2001), "a later frame was skipped"),
+                (Duration::from_secs(1), "a baseline publish was skipped"),
+            ] {
+                finish.lost = vec![(from, Duration::from_secs(3), why.into())];
+                let mut m3 = m3.clone();
+                m3.recheck(&finish);
+                assert_eq!(m3.verdict, if independent_failure { Verdict::Fail } else { Verdict::Error }, "{why}");
+                if !independent_failure {
+                    assert!(m3.detail.contains(why), "{}", m3.detail);
+                } else {
+                    assert!(m3.detail.starts_with("case 0: textDocument/documentSymbol of seed.txt"), "{}", m3.detail);
+                    assert!(m3.detail.ends_with("; and 1 more"), "{}", m3.detail);
+                }
             }
         }
     }

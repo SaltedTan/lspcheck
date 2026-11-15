@@ -3343,6 +3343,31 @@ fn a_late_baseline_publish_after_the_first_mutation_does_not_fail_m3() {
 }
 
 #[test]
+fn a_late_baseline_publish_lspcheck_skipped_does_not_fail_m3() {
+    // As late-baseline-warning, but the late publish labelled with version 1,
+    // sent on reading the first didChange, is in a frame past --max-frame-mib.
+    // lspcheck skips it, so it can't tell the baseline wasn't stable, and the
+    // Warning kept after the restoration mustn't fail M3.
+    let (path, _keep) =
+        recovery_profile("expect = \"baseline\"\nprobes = [\"publishDiagnostics\"]\nrecovery_timeout = \"3s\"");
+    let (r, _, _keep) = mutated_with(
+        &path,
+        &["late-baseline-in-skipped-frame"],
+        &["--mutation-cases", "1", "--max-frame-mib", "1", "--only", "M1,M2,M3"],
+    );
+    expect(&r, "M1", "pass");
+    expect(&r, "M3", "error");
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.starts_with(
+            "case 0: publishDiagnostics of main.lua: lspcheck may have missed a publishDiagnostics labelled with \
+             version 1 since the document was opened, because "
+        ),
+        "{m3}"
+    );
+}
+
+#[test]
 fn an_error_diagnostic_after_the_restoration_fails_m3_when_the_seed_has_none() {
     // Once unbalanced, the stand-in adds an Error diagnostic to every publish.
     let (path, _keep) = recovery_profile("no_errors = true\nrecovery_timeout = \"3s\"");

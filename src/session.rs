@@ -674,6 +674,13 @@ impl Session {
         incomplete_between(&ev.lost, [ev.stopped.as_ref(), self.own_limit.as_ref()], from, to)
     }
 
+    /// Why lspcheck may have missed some of what the server wrote to stdout
+    /// between `from` and `to`, if it may have.
+    pub fn missed_output_within(&self, from: Duration, to: Duration) -> Option<String> {
+        let ev = self.evidence.lock().expect("evidence lock");
+        incomplete_between(&ev.lost, [ev.stopped.as_ref(), None], from, to)
+    }
+
     /// Records everything the server has sent that was already read, without
     /// waiting for more and without answering its requests (for when
     /// lspcheck is done talking: an answer that can't be written mustn't keep

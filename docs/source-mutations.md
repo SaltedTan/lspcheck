@@ -96,7 +96,8 @@ extends is selected and not skipped by the profile.
    and at session end. A skipped frame that spans the first mutation can invalidate that baseline later; dependent
    verdicts become `ERROR`, with the inspection loss named, while independent observed failures still stand.
    Publishes labelled with version 1 read after the first mutation still describe the opened text, so they are held
-   to the baseline too, when judging M3 and at session end: if one differs after projection, that probe's outcomes
+   to the baseline too, when judging M3 and at session end: if one differs after projection, or lspcheck may have
+   missed one because it missed some of the server's output after the document's `didOpen`, that probe's outcomes
    become `ERROR` (an Error in it, under `no_errors`, contradicts the profile at baseline), and independent observed
    failures still stand.
 5. **Cases**, in order, while the run's budget lasts. Case *k* has its own RNG streams, so it doesn't depend on the
@@ -487,6 +488,7 @@ runner stalled for 3 s) tests something else, and is repeated.
 | `late-warning-in-skipped-frame` | lawful: on open, publish the diagnostics again with a Warning added, in a frame larger than `--max-frame-mib`, and keep the Warning | with `expect = "baseline"` and pushed diagnostics as the only probe, M3 `N/E`, never `FAIL`, whether that frame is read (the publishes differ) or skipped (one may have been missed) |
 | `late-baseline-warning` | lawful: on reading the first `didChange`, before applying it, publish version 1's diagnostics with a Warning added, and keep the Warning | with `expect = "baseline"` and pushed diagnostics as the only probe, nothing fails; M3 `ERROR`, naming the publish labelled with version 1 read after the first mutation |
 | `late-baseline-error` | lawful: as `late-baseline-warning`, with an Error | with `no_errors = true` and pushed diagnostics as the only probe, nothing fails; M3 `ERROR`: the profile and the server disagree at baseline |
+| `late-baseline-in-skipped-frame` | lawful: as `late-baseline-warning`, with the late publish in a frame larger than `--max-frame-mib` | with `expect = "baseline"`, pushed diagnostics as the only probe and that frame skipped, M3 `ERROR`, never `FAIL`, naming the publish lspcheck may have missed |
 | `errors-after-unbalanced` | once unbalanced, publish an Error diagnostic forever | M3 fails with `no_errors = true` |
 | `warning-after-unbalanced` | once unbalanced, publish an extra Warning forever | M3 fails with `expect = "baseline"` and pushed diagnostics as the only probe; passes with `no_errors = true` alone |
 | `malformed-recovery-diagnostics` | once unbalanced, publish `null` instead of a diagnostics array | M3 `ERROR`, including with `no_errors = true` |
