@@ -35,6 +35,9 @@
   from the text alone. A test checks that each validates and that its case budget fits its `run_timeout`. Their
   behaviour under `--mutate` on the pinned releases is recorded in
   [docs/mutation-stock-servers.md](docs/mutation-stock-servers.md). Default runs don't change.
+- The [stock-server matrix](ci/stock-servers/README.md) gains a mutation job per server: the same example profile with
+  `--mutate --mutation-seed 20261115 --mutation-cases 10`, compared against the new `<server>.mutation.verdicts`
+  files. Default jobs and their `.verdicts` files are unchanged. A workflow change, so the maintainer merges it.
 
 ### Changed
 

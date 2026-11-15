@@ -28,6 +28,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Every mutation job runs the same plan, so its verdicts are comparable
+  # across servers and runs; see ci/stock-servers/README.md.
+  MUTATION_SEED: "20261115"
+  MUTATION_CASES: "10"
   GO_VERSION: 1.27.3
   GO_SHA256: 65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
   GOPLS_VERSION: v0.24.0
@@ -55,13 +59,18 @@ env:
 
 jobs:
   check:
-    name: ${{ matrix.server }}
+    name: ${{ matrix.server }}${{ matrix.mode == 'mutation' && ' (mutation)' || '' }}
     strategy:
       fail-fast: false
       matrix:
         server: [gopls, rust-analyzer, lua-language-server, basedpyright, clangd, marksman, ruff, texlab, zls, terraform-ls, lemminx]
+        # A mutation job is the default job's run plus the mutation scenario,
+        # so the install steps serve both.
+        mode: [default, mutation]
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The scenario's bounds add its case budget (1055 s with these profiles)
+    # to a default run, which the record measured at under four minutes.
+    timeout-minutes: ${{ matrix.mode == 'mutation' && 45 || 30 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -189,24 +198,40 @@ jobs:
       - name: Run lspcheck
         env:
           SERVER: ${{ matrix.server }}
+          MODE: ${{ matrix.mode }}
         run: |
           mkdir "$RUNNER_TEMP/out"
+          args=(
+            --profile "examples/profiles/$SERVER.toml"
+            --json "$RUNNER_TEMP/out/report.json"
+            --markdown "$GITHUB_STEP_SUMMARY"
+            --transcripts "$RUNNER_TEMP/out/transcripts"
+          )
+          # The mutation job runs the default scenarios too; the pinned seed
+          # and count make its plan the same on every job and run.
+          if [ "$MODE" = mutation ]; then
+            args+=(--mutate --mutation-seed "$MUTATION_SEED" --mutation-cases "$MUTATION_CASES")
+          fi
           # The servers fail some checks, so the exit status says nothing here;
           # the next step compares verdicts. A missing report fails it.
-          lspcheck --profile "examples/profiles/$SERVER.toml" --json "$RUNNER_TEMP/out/report.json" \
-            --markdown "$GITHUB_STEP_SUMMARY" --transcripts "$RUNNER_TEMP/out/transcripts" || true
+          lspcheck "${args[@]}" || true
       - name: Compare verdicts with ci/stock-servers
         env:
           SERVER: ${{ matrix.server }}
+          MODE: ${{ matrix.mode }}
         run: |
-          if ! ci/stock-servers/compare "ci/stock-servers/$SERVER.verdicts" "$RUNNER_TEMP/out/report.json"; then
+          file="ci/stock-servers/$SERVER.verdicts"
+          if [ "$MODE" = mutation ]; then
+            file="ci/stock-servers/$SERVER.mutation.verdicts"
+          fi
+          if ! ci/stock-servers/compare "$file" "$RUNNER_TEMP/out/report.json"; then
             echo "::error::$SERVER's verdicts changed; see the diff above and ci/stock-servers/README.md"
             exit 1
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
-          name: stock-servers-${{ matrix.server }}
+          name: stock-servers-${{ matrix.server }}${{ matrix.mode == 'mutation' && '-mutation' || '' }}
           path: ${{ runner.temp }}/out
           if-no-files-found: warn
           retention-days: 14
