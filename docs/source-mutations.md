@@ -692,7 +692,8 @@ Step 6 builds [isolation](#reports-transcripts-and-reproduction). Where the rule
   checks (`mutation case 3 alone: reproduced: M2 FAIL`, then the transcript's path), and the Markdown report a list.
   JUnit is unchanged, and so is the schema id.
 - **Transcripts.** With `--transcripts DIR`, each isolated run writes `mutation-case-<k>.jsonl`, an ordinary session
-  transcript that `replay` replays, with a note naming the case. Without it, isolation still runs.
+  transcript that `replay` replays, with a note naming the case. Without it, isolation still runs. One that can't be
+  written leaves `transcript` `null` and says why in `detail`; the report and exit status are the main run's as ever.
 - Isolation is part of `--mutate`, with no flag of its own. It adds at most three sessions, each usually seconds
   long, and only to a run that found a trouble.
 

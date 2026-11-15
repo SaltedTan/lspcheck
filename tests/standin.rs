@@ -120,6 +120,9 @@ fn run_command_in(
     if let Ok(entries) = std::fs::read_dir(&transcripts) {
         for entry in entries {
             let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
             for line in std::fs::read_to_string(&path).unwrap().lines() {
                 let event = serde_json::from_str::<Value>(line)
                     .unwrap_or_else(|e| panic!("{}: bad transcript line {line}: {e}", path.display()));
@@ -2786,6 +2789,38 @@ fn mutation_server_exit_records_early_stop_and_fails_m1() {
         serde_json::json!([
             {"case": 0, "transcript": "mutation-case-0.jsonl", "reproduced": true, "detail": "reproduced: M1 FAIL"}
         ])
+    );
+}
+
+#[test]
+fn an_isolated_transcript_that_cannot_be_written_leaves_the_report_alone() {
+    // A directory where case 0's isolated transcript goes: the main run's
+    // transcripts are written, the isolated run's can't be.
+    let dir = tempfile::tempdir().unwrap();
+    let t = dir.path().join("t");
+    std::fs::create_dir_all(t.join("mutation-case-0.jsonl")).unwrap();
+    let profile = mutation_profile();
+    let server = [STANDIN, "--fault", "exit-on-unbalanced"];
+    let r = run_command_in(&["--profile", profile.as_str(), "--mutate"], &server, None, t.clone());
+    // The main run's verdicts and exit status, as without the directory.
+    expect(&r, "M1", "fail");
+    expect(&r, "M3", "error");
+    assert_eq!(r.status, 2, "{}", r.stdout);
+    assert!(t.join("mutation.jsonl").is_file());
+    let isolated = r.report["mutation"]["isolated"].as_array().unwrap();
+    assert_eq!(isolated.len(), 1, "{isolated:?}");
+    let i = &isolated[0];
+    assert_eq!((&i["case"], &i["transcript"], &i["reproduced"]), (&0.into(), &Value::Null, &true.into()), "{i}");
+    let why = i["detail"].as_str().unwrap();
+    let unwritten = format!(
+        "reproduced: M1 FAIL; its transcript couldn't be written: can't write {}: ",
+        t.join("mutation-case-0.jsonl").display()
+    );
+    assert!(why.starts_with(&unwritten), "{why}");
+    assert!(
+        r.stdout.contains("  mutation case 0 alone: reproduced: M1 FAIL; its transcript couldn't be written"),
+        "{}",
+        r.stdout
     );
 }
 

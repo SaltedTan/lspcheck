@@ -634,7 +634,7 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
                 Some(_) => {}
                 None if any_cross || any_extended || s.checks.iter().any(|c| judges(c)) => {
                     let mut run = run_scenario(s, cfg).await?;
-                    isolate_cases(cfg, &mut run, &judges).await?;
+                    isolate_cases(cfg, &mut run, &judges).await;
                     runs.push(run)
                 }
                 None => {}
@@ -685,10 +685,11 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
 /// a fresh session, and records in `run`'s summary whether the troubles were
 /// seen again ([step 6](../docs/source-mutations.md#step-6)). The isolated
 /// runs' own verdicts and observations are dropped, so no verdict depends
-/// on them. Errors only when a transcript can't be written.
-async fn isolate_cases(cfg: &Config, run: &mut ScenarioRun, judges: &impl Fn(&str) -> bool) -> Result<(), String> {
-    let (Some(summary), Some(settings)) = (&mut run.mutation, &cfg.mutation) else { return Ok(()) };
-    let Some(run_deadline) = summary.run_deadline else { return Ok(()) };
+/// on them, and a transcript that can't be written is noted in the case's
+/// detail.
+async fn isolate_cases(cfg: &Config, run: &mut ScenarioRun, judges: &impl Fn(&str) -> bool) {
+    let (Some(summary), Some(settings)) = (&mut run.mutation, &cfg.mutation) else { return };
+    let Some(run_deadline) = summary.run_deadline else { return };
     let mut cases: Vec<u64> = summary.troubles.iter().filter(|t| judges(t.check)).map(|t| t.case).collect();
     cases.sort_unstable();
     cases.dedup();
@@ -716,8 +717,8 @@ async fn isolate_cases(cfg: &Config, run: &mut ScenarioRun, judges: &impl Fn(&st
             continue;
         }
         let file = format!("mutation-case-{case}.jsonl");
-        let alone = run_session(scenario, cfg, Some(Isolate { start, run_deadline }), &file).await?;
-        let (reproduced, detail) = match &alone.mutation {
+        let (alone, unwritten) = run_session(scenario, cfg, Some(Isolate { start, run_deadline }), &file).await;
+        let (reproduced, mut detail) = match &alone.mutation {
             Some(m) if m.cases_run > 0 => compare_troubles(&main, &troubles_of(&m.troubles, case, judges)),
             Some(m) => {
                 let why = m.stopped.as_deref().unwrap_or("no case started");
@@ -725,10 +726,12 @@ async fn isolate_cases(cfg: &Config, run: &mut ScenarioRun, judges: &impl Fn(&st
             }
             None => (None, format!("not run: {}", alone.results.first().map_or("", |r| r.detail.as_str()))),
         };
+        if let Some(why) = unwritten {
+            detail.push_str(&format!("; its transcript couldn't be written: {why}"));
+        }
         let transcript = alone.transcript.is_some().then_some(file);
         summary.isolated.push(Isolated { case, transcript, reproduced, detail });
     }
-    Ok(())
 }
 
 /// `case`'s troubles in checks `judges` reports, each check and verdict
@@ -804,17 +807,21 @@ fn combine_extended(runs: &mut [ScenarioRun]) {
 
 /// Runs one scenario. Errors only when its transcript can't be written.
 async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<ScenarioRun, String> {
-    run_session(scenario, cfg, None, &format!("{}.jsonl", scenario.name)).await
+    match run_session(scenario, cfg, None, &format!("{}.jsonl", scenario.name)).await {
+        (run, None) => Ok(run),
+        (_, Some(why)) => Err(why),
+    }
 }
 
 /// Runs one scenario, or with `isolate` one case of the mutation scenario
-/// alone, writing its transcript as `file` in `--transcripts`.
+/// alone, writing its transcript as `file` in `--transcripts`; with the run,
+/// why its transcript couldn't be written, if it couldn't.
 async fn run_session(
     scenario: &'static Scenario,
     cfg: &Config,
     isolate: Option<Isolate>,
     file: &str,
-) -> Result<ScenarioRun, String> {
+) -> (ScenarioRun, Option<String>) {
     let name = scenario.name;
     let unstarted = |detail: String| ScenarioRun {
         name,
@@ -825,7 +832,7 @@ async fn run_session(
     };
     let workspace = match tempfile::Builder::new().prefix("lspcheck-").tempdir() {
         Ok(dir) => dir,
-        Err(e) => return Ok(unstarted(format!("could not create a workspace: {e}"))),
+        Err(e) => return (unstarted(format!("could not create a workspace: {e}")), None),
     };
     let root = workspace.path().to_path_buf();
     // The URIs lspcheck builds should match the ones a server derives from
@@ -834,7 +841,7 @@ async fn run_session(
     #[cfg(unix)]
     let root = root.canonicalize().unwrap_or(root);
     if let Err(e) = profile::populate(&root, &cfg.workspace) {
-        return Ok(unstarted(format!("could not copy the profile's files into the workspace: {e}")));
+        return (unstarted(format!("could not copy the profile's files into the workspace: {e}")), None);
     }
     let opts = Options {
         sentinel: cfg.sentinel.clone(),
@@ -851,7 +858,7 @@ async fn run_session(
     let session = match Session::start(&cmd, opts).await {
         Ok(s) => s,
         Err(e) => {
-            return Ok(unstarted(format!("could not start {}: {e}", cfg.server.display())));
+            return (unstarted(format!("could not start {}: {e}", cfg.server.display())), None);
         }
     };
     let mut ctx = Ctx {
@@ -950,16 +957,18 @@ async fn run_session(
     for r in &mut results {
         r.recheck(&finish);
     }
-    let transcript = match &cfg.transcripts {
+    let (transcript, unwritten) = match &cfg.transcripts {
         Some(dir) => {
             let path = dir.join(file);
-            transcript::write(&path, &finish.transcript).map_err(|e| format!("can't write {}: {e}", path.display()))?;
-            Some(path)
+            match transcript::write(&path, &finish.transcript) {
+                Ok(()) => (Some(path), None),
+                Err(e) => (None, Some(format!("can't write {}: {e}", path.display()))),
+            }
         }
-        None => None,
+        None => (None, None),
     };
     drop(workspace);
-    Ok(ScenarioRun { name, results, observed: Some(observations(finish, j3_exercise)), transcript, mutation })
+    (ScenarioRun { name, results, observed: Some(observations(finish, j3_exercise)), transcript, mutation }, unwritten)
 }
 
 fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observations {
