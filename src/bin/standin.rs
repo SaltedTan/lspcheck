@@ -2162,8 +2162,7 @@ struct Lingering {
     broken_once: bool,
     /// It was given a late Warning (late-warning-in-skipped-frame,
     /// late-baseline-warning, late-baseline-in-skipped-frame; an Error with
-    /// late-baseline-error), in a frame
-    /// padded past 2 MiB if `padded`.
+    /// late-baseline-error), in a frame padded past 2 MiB if `padded`.
     late: bool,
     padded: bool,
     /// Which publish of the session this is.
