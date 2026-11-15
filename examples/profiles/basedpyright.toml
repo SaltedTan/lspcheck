@@ -17,3 +17,19 @@ print(greet("world"))
 path = "main.py"
 language_id = "python"
 positions = ["1:5", "1:11", "5:7"]   # greet, name, the call to greet
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ["0x", "1e", 'f"{', '\', "lambda:", "**", ":="]
+
+[mutation.lexicon]
+line_comments = ["#"]
+strings = [
+  { open = '"""', close = '"""', escape = '\' },
+  { open = "'''", close = "'''", escape = '\' },
+  { open = '"', close = '"', escape = '\' },
+  { open = "'", close = "'", escape = '\' },
+]
+keywords = ["def", "return", "import", "from", "class", "if", "else", "lambda", "None", "pass"]
+# No [mutation.recovery] expect: diagnostics depend on the type stubs basedpyright loads, not only on the text, so a
+# recovery not seen stays ERROR rather than FAIL.

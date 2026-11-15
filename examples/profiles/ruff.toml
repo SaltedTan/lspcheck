@@ -20,3 +20,21 @@ print(greet("world"))
 path = "main.py"
 language_id = "python"
 positions = ["4:5", "4:11", "8:7"]   # greet, name, the call to greet
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ["0x", "1e", 'f"{', '\', "lambda:", "**", ":="]
+
+[mutation.lexicon]
+line_comments = ["#"]
+strings = [
+  { open = '"""', close = '"""', escape = '\' },
+  { open = "'''", close = "'''", escape = '\' },
+  { open = '"', close = '"', escape = '\' },
+  { open = "'", close = "'", escape = '\' },
+]
+keywords = ["def", "return", "import", "from", "class", "if", "else", "lambda", "None", "pass"]
+
+[mutation.recovery]
+# Its diagnostics are lint findings about the text alone (with fixed settings), so they return to the baseline.
+expect = "baseline"

@@ -28,3 +28,15 @@ func main() {
 path = "main.go"
 language_id = "go"
 positions = ["5:6", "5:12", "10:14"]   # greet, name, the call to greet
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ["0x", "1e", "'\\", ":=", "...", "func(", "<-"]
+
+[mutation.lexicon]
+line_comments = ["//"]
+block_comments = [["/*", "*/"]]
+strings = [{ open = '"', close = '"', escape = '\' }, { open = "'", close = "'", escape = '\' }, { open = "`", close = "`" }]
+keywords = ["package", "import", "func", "return", "var", "const", "type", "struct", "if", "else", "for", "range"]
+# No [mutation.recovery] expect: diagnostics depend on the module graph and standard library gopls loads, not only
+# on the text, so a recovery not seen stays ERROR rather than FAIL.

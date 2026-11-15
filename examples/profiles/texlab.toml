@@ -17,3 +17,17 @@ Hello, see Section~\\ref{sec:greeting}.
 path = "main.tex"
 language_id = "latex"
 positions = ["3:2", "3:26", "4:25"]   # section, the label, the reference
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ['\begin{', '\end{', '\verb|', '\\', '$', '\(', '%']
+
+[mutation.lexicon]
+line_comments = ["%"]
+strings = [{ open = "$", close = "$", escape = '\' }]   # inline math
+identifier_chars = '_@:\'   # so that a command, such as \label, and a key, such as sec:greeting, are one token each
+keywords = ['\documentclass', '\begin', '\end', '\section', '\label', '\ref']
+
+[mutation.recovery]
+# Its symbols and folding ranges come from the parsed file alone (no other files or build output), so they return to the baseline.
+expect = "baseline"

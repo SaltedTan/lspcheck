@@ -25,3 +25,15 @@ fn main() {
 path = "src/main.rs"
 language_id = "rust"
 positions = ["1:4", "1:10", "6:20"]   # greet, name, the call to greet
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ["0x", "1e", "r#\"", "'", "::<", "#[", "=>"]
+
+[mutation.lexicon]
+line_comments = ["//"]
+block_comments = [["/*", "*/"]]   # Rust's nest; the lexicon's don't, which only moves where edits land
+strings = [{ open = '"', close = '"', escape = '\' }]   # no '…': it would take lifetimes for characters
+keywords = ["fn", "let", "mut", "pub", "struct", "impl", "return", "match", "if", "else", "use"]
+# No [mutation.recovery] expect: diagnostics depend on the sysroot rust-analyzer loads in the background, not only on
+# the text, so a recovery not seen stays ERROR rather than FAIL.

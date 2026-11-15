@@ -17,3 +17,15 @@ print(greet("world"))
 path = "main.lua"
 language_id = "lua"
 positions = ["1:16", "1:22", "5:7"]   # greet, name, the call to greet
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ["0x", "1e", "..", "[==[", "::", "~="]
+
+[mutation.lexicon]
+line_comments = ["--"]
+block_comments = [["--[[", "]]"]]
+strings = [{ open = '"', close = '"', escape = '\' }, { open = "'", close = "'", escape = '\' }, { open = "[[", close = "]]" }]
+keywords = ["local", "function", "end", "return", "if", "then", "else", "nil"]
+# No [mutation.recovery] expect: lua-language-server sometimes labels the previous text's diagnostics with a new
+# version (see ci/stock-servers/lua-language-server.verdicts), so a recovery not seen stays ERROR rather than FAIL.

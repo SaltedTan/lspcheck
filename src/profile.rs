@@ -1866,6 +1866,49 @@ mod tests {
         assert!(seeds.iter().any(|&s| s != seeds[0]), "{seeds:?}");
     }
 
+    /// Every example profile with a `[mutation]` section validates, and its
+    /// case budget fits its `run_timeout` at the profile's request timeout,
+    /// both with its own case count and with the stock matrix's
+    /// `--mutation-cases 10`, so `--mutate` never refuses to start. Every
+    /// server of the stock matrix has one.
+    #[test]
+    fn the_example_mutation_sections_validate_and_fit_their_run() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(root.join("examples/profiles"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        let mut mutated = BTreeSet::new();
+        for path in &paths {
+            let p = load(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            if p.mutation.is_none() {
+                continue;
+            }
+            let request_timeout = p.request_timeout.unwrap_or_else(|| panic!("{}: no request_timeout", path.display()));
+            for cases in [None, Some(10)] {
+                let m = mutation_settings(&p, Some(20261115), cases, request_timeout)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                assert!(!m.seeds.is_empty(), "{}", path.display());
+                assert!(m.case_budget(request_timeout) <= m.run_timeout, "{}", path.display());
+                // The lexicon plans the matrix's cases.
+                let texts: Vec<String> = m.seeds.iter().map(|s| s.text.clone()).collect();
+                for case in 0..m.cases.min(10) {
+                    assert!(!mutation::plan_case(20261115, case, &texts, &m.planner).steps.is_empty());
+                }
+            }
+            mutated.insert(path.file_stem().unwrap().to_string_lossy().into_owned());
+        }
+        for entry in std::fs::read_dir(root.join("ci/stock-servers")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|x| x == "verdicts") {
+                let server = path.file_stem().unwrap().to_string_lossy().into_owned();
+                assert!(mutated.contains(&server), "examples/profiles/{server}.toml has no [mutation] section");
+            }
+        }
+    }
+
     #[test]
     fn a_command_path_is_relative_to_the_profile() {
         let p = parse_here("[server]\ncommand = [\"bin/server\", \"bin/arg\"]\n").unwrap();
