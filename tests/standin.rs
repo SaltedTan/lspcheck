@@ -3598,6 +3598,35 @@ fn a_late_baseline_publish_after_the_first_mutation_does_not_fail_m3() {
 }
 
 #[test]
+fn a_late_baseline_publish_with_only_a_warning_leaves_no_errors_judged() {
+    // As in a_late_baseline_publish_after_the_first_mutation_does_not_fail_m3,
+    // the stand-in publishes the opened text's diagnostics with a Warning
+    // added, labelled with version 1, after the first mutation, and keeps
+    // the Warning. Held only to no_errors, M3 asks whether the restored text
+    // has an Error, which a Warning says nothing about: it passes. One the
+    // late publish could have held, in a frame lspcheck skipped, still makes
+    // M3 an error.
+    let (path, _keep) =
+        recovery_profile("no_errors = true\nprobes = [\"publishDiagnostics\"]\nrecovery_timeout = \"3s\"");
+    let (r, _, _keep) = mutated_with(&path, &["late-baseline-warning"], &["--mutation-cases", "1"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+    let (r, _, _keep) = mutated_with(
+        &path,
+        &["late-baseline-in-skipped-frame"],
+        &["--mutation-cases", "1", "--max-frame-mib", "1", "--only", "M1,M2,M3"],
+    );
+    expect(&r, "M3", "error");
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.starts_with(
+            "case 0: publishDiagnostics of main.lua: lspcheck may have missed a publishDiagnostics labelled with \
+             version 1 since the document was opened, because "
+        ),
+        "{m3}"
+    );
+}
+
+#[test]
 fn a_late_baseline_publish_lspcheck_skipped_does_not_fail_m3() {
     // As late-baseline-warning, but the late publish labelled with version 1,
     // sent on reading the first didChange, is in a frame past --max-frame-mib.

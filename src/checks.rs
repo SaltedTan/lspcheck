@@ -4609,6 +4609,8 @@ fn publish_label(m: &Message) -> Option<(&str, i64)> {
 /// version 1 to it. Those read after the first mutation still describe the
 /// opened text, so one that differs shows the baseline wasn't stable,
 /// however late it was read, and one lspcheck missed may have differed.
+/// Held only to `no_errors`, M3 judges whether a text has an Error, so a
+/// publish that differs without one says nothing against it.
 #[derive(Debug, Clone)]
 pub struct PushBaseline {
     label: String,
@@ -4617,6 +4619,8 @@ pub struct PushBaseline {
     opened_at: Duration,
     baseline: Value,
     no_errors: bool,
+    /// Whether the profile expects the baseline back (`expect = "baseline"`).
+    expected: bool,
 }
 
 impl PushBaseline {
@@ -4641,15 +4645,18 @@ impl PushBaseline {
                 if projected == self.baseline {
                     return None;
                 }
-                if self.no_errors
-                    && let Some(error) = recovery::first_error(&projected)
-                {
-                    return Some(format!(
-                        "the profile and the server disagree before any mutation: mutation.recovery.no_errors says \
-                         the seed has no Error diagnostics, but {} has {} in {late}",
-                        self.label,
-                        metamodel::shorten_value(error)
-                    ));
+                if self.no_errors {
+                    if let Some(error) = recovery::first_error(&projected) {
+                        return Some(format!(
+                            "the profile and the server disagree before any mutation: mutation.recovery.no_errors \
+                             says the seed has no Error diagnostics, but {} has {} in {late}",
+                            self.label,
+                            metamodel::shorten_value(error)
+                        ));
+                    }
+                    if !self.expected {
+                        return None;
+                    }
                 }
                 let shown = recovery::difference(&self.baseline, &projected)
                     .map(|d| {
@@ -4848,6 +4855,7 @@ impl Recovery {
             opened_at: s.baseline_window?.0,
             baseline: s.baseline.clone(),
             no_errors: self.no_errors,
+            expected: self.expect == Expect::Baseline,
         })
     }
 
@@ -6150,8 +6158,9 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
     let mut recovered = Vec::new();
     let mut slowest: Option<(Duration, u64, usize, bool)> = None;
     // A publish labelled with version 1 read after the first mutation that
-    // differs, or one lspcheck may have missed, leaves the probe without a
-    // stable baseline, as if read before.
+    // differs (held only to no_errors, has an Error), or one lspcheck may
+    // have missed, leaves the probe without a stable baseline, as if read
+    // before.
     let pushed: Vec<Option<PushBaseline>> = rec.stable.iter().map(|s| rec.push_baseline(s)).collect();
     let unstable: Vec<Option<String>> = pushed
         .iter()
