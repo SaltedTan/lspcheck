@@ -23,6 +23,20 @@ pub fn mutation(runs: &[ScenarioRun]) -> Option<&MutationSummary> {
     runs.iter().find_map(|r| r.mutation.as_ref())
 }
 
+/// Each isolated mutation case's line, with its transcript's path when one
+/// was written next to the scenario's.
+fn isolated_lines(runs: &[ScenarioRun]) -> Vec<(String, Option<std::path::PathBuf>)> {
+    let Some(m) = mutation(runs) else { return Vec::new() };
+    let dir = runs.iter().find(|r| r.mutation.is_some()).and_then(|r| r.transcript.as_deref()?.parent());
+    m.isolated
+        .iter()
+        .map(|i| {
+            let path = i.transcript.as_ref().zip(dir).map(|(file, dir)| dir.join(file));
+            (format!("case {} alone: {}", i.case, i.detail), path)
+        })
+        .collect()
+}
+
 /// The process exit status for a run: 1 when a MUST check (or with `strict`,
 /// any check) failed, 2 when lspcheck itself hit an error, otherwise 0.
 pub fn exit_code(runs: &[ScenarioRun], strict: bool) -> i32 {
@@ -86,6 +100,12 @@ pub fn print_terminal(
             && let Some((label, path)) = transcript(r, runs)
         {
             writeln!(out, "                     {label}: {}", path.display())?;
+        }
+    }
+    for (line, path) in isolated_lines(runs) {
+        writeln!(out, "  mutation {line}")?;
+        if let Some(path) = path {
+            writeln!(out, "                     transcript: {}", path.display())?;
         }
     }
     writeln!(out, "{}", counts_line(&results))
@@ -269,6 +289,14 @@ pub fn markdown_report(server: &[String], runs: &[ScenarioRun]) -> String {
         out.push_str("\nTranscripts:\n\n");
         for (r, (label, path)) in failures {
             out.push_str(&format!("- {}: {label}: {}\n", r.id, code_span(&path.display().to_string())));
+        }
+    }
+    let isolated = isolated_lines(runs);
+    if !isolated.is_empty() {
+        out.push_str("\nMutation cases run alone (never a verdict):\n\n");
+        for (line, path) in isolated {
+            let path = path.map(|p| format!(" ({})", code_span(&p.display().to_string()))).unwrap_or_default();
+            out.push_str(&format!("- {}{path}\n", markdown_cell(&line)));
         }
     }
     out
