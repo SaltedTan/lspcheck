@@ -3,8 +3,8 @@
 **Status:** first measurement, 2026-11-15, of the `[mutation]` sections in the 11
 [example profiles](../examples/profiles/README.md) that the [stock-server matrix](../ci/stock-servers/README.md) runs
 ([design, step 7](source-mutations.md#implementation-plan)). It is the evidence for the matrix's
-`.mutation.verdicts` files, which a later change adds with the workflow job. The findings about these servers stay in
-this repository and are not reported to their projects.
+`.mutation.verdicts` files, which its [mutation jobs](../ci/stock-servers/README.md) compare against. The findings
+about these servers stay in this repository and are not reported to their projects.
 
 ## How it was run
 
@@ -210,7 +210,19 @@ server's `.verdicts`, and these:
 | lemminx | error | error | error | pass | not-exercised | pass | error |
 
 rust-analyzer's stock `D1` line has no alternative. The other stock alternatives (gopls's framing race,
-lua-language-server's diagnostics race, rust-analyzer's descendant) still apply and should be carried over. lemminx's
-job adds a minute for no evidence; running it is the maintainer's choice. The runner's toolchains differ from these
-(Go 1.27.3 for gopls; the runner's cargo and Node), so the first CI runs should be compared with this table before the
-files are recorded.
+lua-language-server's diagnostics race, rust-analyzer's descendant) still apply and were carried over. lemminx's job
+adds a minute for no evidence and runs anyway, for a uniform matrix; that is the maintainer's choice.
+
+## The matrix's first runs
+
+The 11 `.mutation.verdicts` files record the table above, with each default file's lines and alternatives carried over.
+The runner's toolchains differ from these measurements (Go 1.27.3 for gopls; the runner's cargo and Node), so the
+first runs of the matrix's mutation jobs were the check on the record. A verdict that differs from the table is
+evidence about the runner, not a baseline to accept without inspecting its transcript.
+
+The workflow ran three times on the change that added the jobs (2026-11-15, one `pull_request` run and two
+`workflow_dispatch` runs of the same commit). All 22 jobs passed each time: every mutation job's verdicts matched its
+file. gopls's D1 was `pass` in the runs inspected, and lua-language-server's documents-scenario D1 and D3 took both of
+their recorded values (`fail` in one run, `pass` in another), as in its default job; its mutation-scenario checks
+passed. A mutation job took 1 to 4 minutes, at most about a minute longer than its server's default job; lemminx's was
+the longest (about 4 minutes, its `initialize` timeouts).

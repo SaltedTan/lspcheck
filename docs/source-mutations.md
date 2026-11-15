@@ -7,9 +7,10 @@ the [implementation plan](#implementation-plan) are in place: the planner (`src/
 [written-bytes cap](#bounds). Step 5 is in place: the scenario settles, takes the [recovery probes'](#recovery)
 baselines, polls them after each restoration and judges M3, with `expect` and `no_errors`. Step 6 is in place:
 the first three failing or erroring cases are [run again alone](#step-6), and the report says whether each
-reproduced. Step 7's first half is in place: the stock example profiles have `[mutation]` sections,
-[measured](mutation-stock-servers.md) on the pinned servers; the matrix job is still to come. `--mutate` and its two
-flags are experimental and hidden from `--help`. See [how steps 3, 5 and 6 are built](#step-3) and the
+reproduced. Step 7 is in place: the stock example profiles have `[mutation]` sections,
+[measured](mutation-stock-servers.md) on the pinned servers, and the [matrix](../ci/stock-servers/README.md) runs a
+mutation job per server against its `.mutation.verdicts`. `--mutate` and its two flags are experimental and hidden
+from `--help`. See [how steps 3, 5 and 6 are built](#step-3) and the
 [design status](design.md) for its place in the roadmap.
 
 ## Context
@@ -527,9 +528,10 @@ minimal diffs would split a CR LF without the widening. Each regression test is 
 
 ### Stock servers
 
-The matrix would add one job per server: the same example profile, with its `[mutation]` section, run with
-`--mutate --mutation-seed <pinned> --mutation-cases 10`, compared against `<server>.mutation.verdicts`. Default runs and
-their `.verdicts` files gain only the [disabled-mutation `SKIP`s](#what-is-checked).
+The matrix has two jobs per server: the default one, and a mutation one that runs the same example profile, with its
+`[mutation]` section, with `--mutate --mutation-seed 20261115 --mutation-cases 10` (both pinned in the workflow's
+`env`, so every server runs the same plan), compared against `<server>.mutation.verdicts`. The two files are compared
+separately. Default runs and their `.verdicts` files gain only the [disabled-mutation `SKIP`s](#what-is-checked).
 
 Mutation brings timing into play, and the README's rule still holds: alternatives are only for races in the server
 itself. Known risks:
@@ -547,8 +549,8 @@ itself. Known risks:
   that flips because of them is a bug in lspcheck, fixed there, not listed.
 
 Run each server's job a few times before recording, as the README asks. The profiles' first measurement, with what
-each verdict rests on, is in [mutation-stock-servers.md](mutation-stock-servers.md). The workflow change needs the
-maintainer's merge, and any finding about these servers stays in this repository unless the maintainer decides
+each verdict rests on, is in [mutation-stock-servers.md](mutation-stock-servers.md). The workflow change is the
+maintainer's to merge, and any finding about these servers stays in this repository unless the maintainer decides
 otherwise.
 
 ## Consequences
@@ -578,8 +580,8 @@ Each step is one small pull request with its tests, docs and changelog entry whe
 5. **Recovery, M3.** Implemented: settle, stable baselines, projections, polling, `expect` and `no_errors`
    ([step 5](#step-5)); the recovery faults, lawful ones included.
 6. **Isolation.** Implemented: rerunning failing cases alone and writing their transcripts ([step 6](#step-6)).
-7. **Stock matrix.** `[mutation]` in the example profiles, a mutation job and `.mutation.verdicts` (a workflow change,
-   so the maintainer merges it).
+7. **Stock matrix.** Implemented: `[mutation]` in the example profiles, a mutation job per server and
+   `.mutation.verdicts` (a workflow change, so the maintainer merges it).
 8. **Minimisation**, if isolation shows it is wanted.
 
 ### Step 3

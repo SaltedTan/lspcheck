@@ -1872,7 +1872,8 @@ mod tests {
     /// refuses to start. Its lexicon recognises its own seed text: at least
     /// one of its keywords when it lists keywords, and a comment or string
     /// wherever the seed contains one of the delimiters it declares. Every
-    /// server of the stock matrix has one.
+    /// server of the stock matrix has one, and a mutation verdict file beside
+    /// its default one.
     #[test]
     fn the_example_mutation_sections_validate_and_fit_their_run() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1920,10 +1921,14 @@ mod tests {
         for entry in std::fs::read_dir(root.join("ci/stock-servers")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|x| x == "verdicts") {
-                // `gopls.verdicts`, and later `gopls.mutation.verdicts`, both name gopls.
+                // `gopls.verdicts`, and `gopls.mutation.verdicts`, both name gopls.
                 let name = path.file_name().unwrap().to_string_lossy().into_owned();
                 let server = name.split('.').next().unwrap().to_string();
                 assert!(mutated.contains(&server), "examples/profiles/{server}.toml has no [mutation] section");
+                // The matrix runs each server's mutation job too, and only CI
+                // would otherwise notice a baseline it doesn't have.
+                let mutation = root.join("ci/stock-servers").join(format!("{server}.mutation.verdicts"));
+                assert!(mutation.is_file(), "{} is missing", mutation.display());
             }
         }
     }

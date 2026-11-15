@@ -1,0 +1,50 @@
+# gopls may exit after `exit` with a frame's header written and its body not: F1 then fails on
+# what it saw, and J1, J3, J5, J7 and K2 are inconclusive about that frame. Seen in CI, and in 2 of 3
+# local runs of K2's baseline (2026-11-09).
+F1 pass|fail
+F2 pass
+F3 pass
+F4 pass
+F5 pass
+F6 pass
+F7 pass
+F8 pass
+J1 pass|error
+J2 fail
+J3 pass|error
+J4 pass
+J5 pass|error
+J6 pass
+J7 pass|error
+L1 fail
+L2 pass
+L3 pass
+L4 pass
+L5 fail
+L6 pass
+L7 pass
+L8 pass
+L9 pass
+C1 pass
+C2 pass
+C3 pass
+# gopls publishes diagnostics for only some versions of a changed document. In the mutation scenario its only
+# informative D1 positions are in the publish for case 3's version 10: D1 passes when that publish is read
+# before the next version is sent, and is not-exercised when gopls publishes nothing for that version. Both
+# verdicts are right for what lspcheck saw, and LSP doesn't require a publish for every version. Seen in one of
+# four local runs of 10 cases, the one under load (2026-11-15).
+D1 pass|not-exercised
+D2 pass
+D3 not-exercised
+D4 pass
+D5 not-exercised
+D6 pass
+K1 pass
+K2 pass|error
+R1 fail
+R2 pass
+R3 pass
+R4 fail
+M1 pass
+M2 pass
+M3 pass
