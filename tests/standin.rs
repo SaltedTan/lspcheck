@@ -3155,32 +3155,52 @@ fn answers_that_never_return_to_the_baseline_are_an_error_unless_the_profile_exp
 
 #[test]
 fn a_recovery_just_before_the_deadline_is_seen_by_the_terminal_probe() {
-    // The stand-in answers the first four documentSymbol requests after each
-    // restoration with [], then as usual. lspcheck polls at 0, 0.25, 0.75 and
-    // 1.75 s after the restoration (the next would be at 3.75 s), so with a
-    // 3.7 s recovery_timeout the terminal probe, written after the deadline,
-    // is the fifth request and sees the baseline. A runner too slow to send
-    // all four polls within 3.7 s says nothing either way, so that run is
-    // repeated.
-    let (path, _keep) = recovery_profile("expect = \"baseline\"\nrecovery_timeout = \"3700ms\"");
-    for _ in 0..5 {
-        let (r, t, _keep) = mutated_with(&path, &["recover-before-deadline"], &["--mutation-cases", "1"]);
-        let sent = recorded_messages(&t.join("mutation.jsonl"), "out");
-        let restored = sent.iter().rposition(|m| m["method"] == "textDocument/didChange").unwrap();
-        let probes = sent[restored..].iter().filter(|m| m["method"] == "textDocument/documentSymbol").count();
-        if probes < 5 {
+    // After the restoration, the stand-in answers the first documentSymbol
+    // with [], 2 s late, as a server would that recovered while it worked on
+    // a request it read before. lspcheck reads that answer only after the
+    // 1 s recovery_timeout, so its next request, the terminal probe, is
+    // written after the deadline and sees the baseline.
+    let (path, _keep) = recovery_profile("expect = \"baseline\"\nrecovery_timeout = \"1s\"");
+    let (r, t, _keep) = mutated_with(&path, &["recover-before-deadline"], &["--mutation-cases", "1"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.contains(
+            " s after the restoration (textDocument/documentSymbol of main.lua in case 0, seen by its terminal probe)"
+        ),
+        "{m3}"
+    );
+    // When lspcheck began writing each documentSymbol after the restoration,
+    // which began before the restoration was delivered.
+    let sent = sent_at(&t.join("mutation.jsonl"));
+    let restored = sent.iter().rposition(|(_, m)| m["method"] == "textDocument/didChange").unwrap();
+    let probes: Vec<f64> = sent[restored..]
+        .iter()
+        .filter(|(_, m)| m["method"] == "textDocument/documentSymbol")
+        .map(|(t, _)| *t)
+        .collect();
+    assert_eq!(probes.len(), 2, "a poll, then the terminal probe: {probes:?}");
+    assert!(probes[1] >= sent[restored].0 + 1000.0, "the terminal probe was written before the deadline: {probes:?}");
+}
+
+/// Each message lspcheck sent, with when it began writing it (ms).
+fn sent_at(transcript: &std::path::Path) -> Vec<(f64, Value)> {
+    let mut reader = FrameReader::default();
+    let mut sent = Vec::new();
+    for event in std::fs::read_to_string(transcript).unwrap().lines() {
+        let event: Value = serde_json::from_str(event).unwrap();
+        if event["dir"] != "out" {
             continue;
         }
-        assert_eq!(probes, 5, "{}", r.stdout);
-        passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
-        let m3 = detail(&r, "M3");
-        assert!(
-            m3.contains(" s after the restoration (textDocument/documentSymbol of main.lua in case 0, seen by its terminal probe)"),
-            "{m3}"
-        );
-        return;
+        for chunk in reader.feed(event["data"].as_str().unwrap().as_bytes()) {
+            if let Chunk::Frame { body, .. } = chunk
+                && let Ok(m) = serde_json::from_slice(&body)
+            {
+                sent.push((event["t_ms"].as_f64().unwrap(), m));
+            }
+        }
     }
-    panic!("lspcheck never sent four polls within the 3.7 s recovery_timeout in 5 runs");
+    sent
 }
 
 #[test]
@@ -3203,6 +3223,64 @@ fn a_recovered_answer_in_a_frame_lspcheck_skipped_is_an_error_not_a_failure() {
         "{m3}"
     );
     assert_eq!(r.status, 2, "{}", r.stdout);
+}
+
+#[test]
+fn an_exit_during_the_terminal_probes_leaves_the_case_unjudged() {
+    // After the restoration, the stand-in answers documentSymbol and
+    // foldingRange with [], the first documentSymbol 2 s late, past the 1 s
+    // recovery_timeout, so the next of each is its terminal probe. It answers
+    // documentSymbol's and exits on reading foldingRange's. The case stopped
+    // before it was done, so the difference documentSymbol's shows can't
+    // fail M3; the exit is M1's.
+    let (path, _keep) = recovery_profile(
+        "expect = \"baseline\"\nprobes = [\"textDocument/documentSymbol\", \"textDocument/foldingRange\"]\n\
+         recovery_timeout = \"1s\"",
+    );
+    let (r, _, _keep) =
+        mutated_with(&path, &["exit-during-terminal-probes"], &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "fail");
+    expect(&r, "M3", "error");
+    let m3 = detail(&r, "M3");
+    assert!(
+        m3.starts_with("case 0: textDocument/documentSymbol of main.lua: the server exited with ")
+            && m3.contains(
+                " during the terminal probes of case 0, so this isn't a failure (its terminal probe's answer differs "
+            ),
+        "{m3}"
+    );
+}
+
+#[test]
+fn a_pushed_baseline_with_a_publish_lspcheck_skipped_is_not_used() {
+    // When the seed is opened, the stand-in publishes its diagnostics, then
+    // again with a Warning added, in a frame past 2 MiB, and keeps the
+    // Warning. Read in full, the two differ, so neither is a baseline; with
+    // the second skipped (--max-frame-mib 1), lspcheck can't tell that they
+    // do, so it mustn't take the first as the baseline and fail M3 when the
+    // Warning stays after the restoration.
+    let (path, _keep) =
+        recovery_profile("expect = \"baseline\"\nprobes = [\"publishDiagnostics\"]\nrecovery_timeout = \"1s\"");
+    for (max_frame, why) in [
+        (
+            "64",
+            "publishDiagnostics of main.lua: the 2 publishDiagnostics labelled with version 1 before the first mutation differed",
+        ),
+        (
+            "1",
+            "publishDiagnostics of main.lua: lspcheck may have missed a publishDiagnostics before the first mutation, because ",
+        ),
+    ] {
+        let (r, _, _keep) = mutated_with(
+            &path,
+            &["late-warning-in-skipped-frame"],
+            &["--mutation-cases", "1", "--max-frame-mib", max_frame, "--only", "M1,M2,M3"],
+        );
+        expect(&r, "M1", "pass");
+        expect(&r, "M3", "not-exercised");
+        let m3 = detail(&r, "M3");
+        assert!(m3.starts_with(&format!("no recovery probe had a stable baseline: {why}")), "{m3}");
+    }
 }
 
 #[test]

@@ -455,7 +455,8 @@ The stand-in gains bracket tracking: it counts unmatched `()[]{}` in each open d
 unmatched bracket, and answers `documentSymbol` from its words as now. A test profile in `tests/fixtures/` holds a
 seed with brackets, strings, a comment and non-ASCII text, and uses only `unbalance-bracket` with a fixed seed, so every
 case breaks the balance and restoring it repairs it. The faults react to the text, never to time, so no test depends on
-a window. Lawful faults count replies, not milliseconds.
+a window. Lawful faults count replies, not milliseconds. Two hold one reply for 2 s, longer than their test's
+`recovery_timeout`: a delay only makes it later, so lspcheck always reads it after the deadline.
 
 | Fault | Effect | Test |
 |---|---|---|
@@ -465,10 +466,12 @@ a window. Lawful faults count replies, not milliseconds.
 | `configure-on-shutdown` | before the `shutdown` reply, ask `workspace/configuration` for 256 items of section `big` | M1 and M2 pass: the withheld answer changes no M verdict, and `exit` follows `shutdown` |
 | `close-output-mid-restoration` | Unix only: partway through reading a large document's restoration, send 20,000 requests and close stdout, then read nothing more after it | M1 `ERROR` (the end of output is queued behind requests lspcheck can't answer before shutdown), never `PASS` |
 | `late-wrong-count` | answer one `selectionRange` with `[]` after more than 64 later versions | D6 fails from the mutation scenario, on the entry count alone (M2 fails too, as for `selection-from-later-text`) |
-| `recover-before-deadline` | lawful: after restoration, answer the first four `documentSymbol` requests with `[]`, then with the baseline | nothing fails with `expect = "baseline"` under the test's fixed poll schedule: the terminal probe sees the baseline |
+| `recover-before-deadline` | lawful: after restoration, answer the first `documentSymbol` request with `[]` 2 s late, then with the baseline | nothing fails with `expect = "baseline"` and a 1 s `recovery_timeout`: the terminal probe, written after the deadline, sees the baseline |
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails |
 | `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |
 | `recovery-in-skipped-frame` | after restoration, answer the first poll with `[]`, then send the recovered answer in a frame larger than `--max-frame-mib` | M3 `ERROR` with `expect = "baseline"`, never `FAIL` |
+| `exit-during-terminal-probes` | after restoration, answer `documentSymbol` and `foldingRange` with `[]`, the first `documentSymbol` 2 s late, and exit on reading the second `foldingRange`, a terminal probe | M1 fails; M3 `ERROR`, never `FAIL`, though the terminal `documentSymbol` differs |
+| `late-warning-in-skipped-frame` | lawful: on open, publish the diagnostics again with a Warning added, in a frame larger than `--max-frame-mib`, and keep the Warning | with `expect = "baseline"` and pushed diagnostics as the only probe, M3 `N/E`, never `FAIL`, whether that frame is read (the publishes differ) or skipped (one may have been missed) |
 | `errors-after-unbalanced` | once unbalanced, publish an Error diagnostic forever | M3 fails with `no_errors = true` |
 | `warning-after-unbalanced` | once unbalanced, publish an extra Warning forever | M3 fails with `expect = "baseline"` and pushed diagnostics as the only probe; passes with `no_errors = true` alone |
 | `malformed-recovery-diagnostics` | once unbalanced, publish `null` instead of a diagnostics array | M3 `ERROR`, including with `no_errors = true` |

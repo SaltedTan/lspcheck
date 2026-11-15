@@ -4302,12 +4302,20 @@ impl Recovery {
     /// Takes the pushed diagnostics' baselines just before the first
     /// mutation: for each seed document, the publishes labelled with version
     /// 1 read since it was opened; if they are all equal after projection,
-    /// the last. Then holds the profile's `no_errors` to every diagnostics
-    /// baseline.
-    fn before_first_mutation(&mut self, msgs: &[(Duration, Message)], docs: &[SeedDoc]) {
+    /// and lspcheck missed nothing since, the last. Then holds the profile's
+    /// `no_errors` to every diagnostics baseline.
+    fn before_first_mutation(&mut self, s: &Session, docs: &[SeedDoc]) {
+        let msgs = &s.messages;
         if std::mem::take(&mut self.pushes_pending) {
             for (d, doc) in docs.iter().enumerate() {
                 let label = format!("{} of {}", profile::Probe::PublishDiagnostics.name(), doc.name);
+                // A publish lspcheck missed may have differed from those it read.
+                if let Some(why) = s.incomplete_within(doc.version_at, s.elapsed()) {
+                    self.unused.push(format!(
+                        "{label}: lspcheck may have missed a publishDiagnostics before the first mutation, because {why}"
+                    ));
+                    continue;
+                }
                 let publishes: Option<Vec<Value>> = msgs
                     .iter()
                     .filter(|(at, m)| *at >= doc.version_at && labelled_publish(m, docs) == Some((d, 1)))
@@ -4650,11 +4658,7 @@ async fn recover(
         next = ctx.s.elapsed() + gap;
         gap = (gap * 2).min(LAST_POLL_GAP);
     }
-    let stopped = match (&end.lost, &end.capped) {
-        (Some(Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) | Lost::AfterWithheld(why)), _)
-        | (None, Some(why)) => Some(why.clone()),
-        (None, None) => None,
-    };
+    let stopped = batch_stopped(&end);
     // Everything read by the end of the bound, for the pushed diagnostics.
     let drained = stopped.is_none() && ctx.s.absorb_all().await;
     for (d, label, index) in rec.pushes.scan(&ctx.s.messages, docs, bound) {
@@ -4680,11 +4684,13 @@ async fn recover(
             }
         }
     }
-    let unwritten = match (&end.lost, &end.capped) {
-        (Some(Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) | Lost::AfterWithheld(why)), _)
-        | (None, Some(why)) => why.clone(),
-        (None, None) => "lspcheck stopped".into(),
+    // A stop during the terminal probes leaves the case unjudged: what the
+    // server would have said next is unknown, so no difference fails it.
+    let interrupted = match (&stopped, batch_stopped(&end)) {
+        (None, Some(why)) => Err(format!("{why} during the terminal probes of case {k}")),
+        _ => Ok(()),
     };
+    let unwritten = batch_stopped(&end).unwrap_or_else(|| "lspcheck stopped".into());
     let t = seconds(rec.timeout);
     let polled = format!(
         "lspcheck polled {polls} time(s) in the {} s before it sent the terminal probe",
@@ -4722,7 +4728,7 @@ async fn recover(
                                      recovery_timeout ended"
                                 ))
                             } else {
-                                Ok(())
+                                interrupted.clone()
                             };
                             rec.differs(
                                 i,
@@ -4774,7 +4780,7 @@ async fn recover(
                             terminal: false,
                         },
                         (false, Some(m)) => ProbeEnd::Recovered { after: m.saturating_sub(restored), terminal: false },
-                        _ => rec.differs(i, k, &deciding, &projected, (at, bound), Ok(()), &read),
+                        _ => rec.differs(i, k, &deciding, &projected, (at, bound), interrupted.clone(), &read),
                     }
                 }
             }
@@ -4783,6 +4789,15 @@ async fn recover(
     }
     rec.cases.push(CaseRecovery { case: k, window: (restored, ctx.s.elapsed()), outcomes });
     end
+}
+
+/// Why a batch stopped the case it was part of, if it did.
+fn batch_stopped(end: &BatchEnd) -> Option<String> {
+    match (&end.lost, &end.capped) {
+        (Some(Lost::Gone(why) | Lost::Uninspected(why) | Lost::Undelivered(why) | Lost::AfterWithheld(why)), _)
+        | (None, Some(why)) => Some(why.clone()),
+        (None, None) => None,
+    }
 }
 
 /// A duration in seconds, to the millisecond.
@@ -5145,7 +5160,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 break;
             }
             if first_change.is_none() {
-                rec.before_first_mutation(&ctx.s.messages, &docs);
+                rec.before_first_mutation(&ctx.s, &docs);
             }
             let change_at = ctx.s.elapsed();
             ext.record(&ctx.s, &asked, d, change_at, *version, after.clone());
@@ -6411,8 +6426,13 @@ mod tests {
 
     #[cfg(unix)]
     async fn mutation_test_ctx(cfg: &Config, max_output: usize) -> Ctx<'_> {
+        mutation_test_ctx_with(cfg, Options { max_output, ..Options::default() }).await
+    }
+
+    #[cfg(unix)]
+    async fn mutation_test_ctx_with(cfg: &Config, options: Options) -> Ctx<'_> {
         Ctx {
-            s: Session::start(&cfg.server, Options { max_output, ..Options::default() }).await.unwrap(),
+            s: Session::start(&cfg.server, options).await.unwrap(),
             cfg,
             root: PathBuf::new(),
             results: Vec::new(),
@@ -6446,6 +6466,9 @@ while header := sys.stdin.buffer.readline():
     if sys.argv[1] == 'bound' and count > 1:
         pending = request
         continue
+    if sys.argv[1] == 'skip' and count == 3:
+        body = json.dumps({'jsonrpc': '2.0', 'method': 'window/logMessage', 'params': {'type': 4, 'message': 'x' * 4096}}).encode()
+        sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
     invalid = (sys.argv[1] == 'retry' and count == 1) or (sys.argv[1] == 'invalid' and count == 3)
     reply(request, {'kind': 'full', 'items': None if invalid else []} if method == 'textDocument/diagnostic' else [])
 "#;
@@ -6518,6 +6541,40 @@ while header := sys.stdin.buffer.readline():
         assert!(matches!(&rec.cases[0].outcomes[0], ProbeEnd::Unseen(why) if why.contains("malformed")));
         judge_m3(&mut ctx, &rec, None, None);
         assert_eq!(ctx.results.iter().find(|r| r.id == "M3").unwrap().verdict, Verdict::Error);
+        ctx.s.notify("exit", None).await.unwrap();
+        ctx.s.finish(Duration::from_millis(200)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_seen_with_a_frame_skipped_in_its_window_is_an_error() {
+        // The first poll's answer recovers, but a frame lspcheck skipped for
+        // its size came before it: it might have said otherwise.
+        let cfg = recovery_test_config("skip");
+        let mut ctx =
+            mutation_test_ctx_with(&cfg, Options { max_output: 1 << 20, max_body: 1024, ..Options::default() }).await;
+        let mut rec = Recovery { expect: Expect::Baseline, timeout: Duration::from_secs(3), ..Recovery::default() };
+        let docs = recovery_test_docs();
+        let mut asked = Vec::new();
+        take_baseline(
+            &mut ctx,
+            &mut rec,
+            &json!({"documentSymbolProvider": true}),
+            &docs,
+            &[profile::Probe::DocumentSymbol],
+            Encoding::Utf16,
+            &mut asked,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(rec.stable.len(), 1);
+        let restored = ctx.s.elapsed();
+        recover(&mut ctx, &mut rec, &docs, &mut asked, 0, (restored, restored)).await;
+        assert!(matches!(rec.cases[0].outcomes[0], ProbeEnd::Recovered { terminal: false, .. }));
+        judge_m3(&mut ctx, &rec, None, None);
+        let m3 = ctx.results.iter().find(|r| r.id == "M3").unwrap();
+        assert_eq!(m3.verdict, Verdict::Error);
+        assert!(m3.detail.starts_with("nothing failed, but lspcheck may have missed evidence in a recovery window"));
         ctx.s.notify("exit", None).await.unwrap();
         ctx.s.finish(Duration::from_millis(200)).await;
     }

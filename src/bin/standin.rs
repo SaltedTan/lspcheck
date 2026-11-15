@@ -248,8 +248,8 @@ const FAULTS: &[(&str, &str)] = &[
     ),
     (
         "recover-before-deadline",
-        "lawful: after each restoration of a document's opened text, answer its first four documentSymbol requests \
-         with [], then as usual",
+        "lawful: after each restoration of a document's opened text, answer its first documentSymbol request with \
+         [] 2 s late, then as usual",
     ),
     (
         "slow-recovery",
@@ -261,6 +261,16 @@ const FAULTS: &[(&str, &str)] = &[
         "recovery-in-skipped-frame",
         "after each restoration of a document's opened text, answer its first documentSymbol request with [], and \
          every later one as usual, padded past 2 MiB",
+    ),
+    (
+        "exit-during-terminal-probes",
+        "after each restoration of a document's opened text, answer its documentSymbol and foldingRange requests \
+         with [], the first documentSymbol 2 s late, and exit on reading the second foldingRange",
+    ),
+    (
+        "late-warning-in-skipped-frame",
+        "lawful: after publishing a document's diagnostics when it is opened, publish them again with a Warning \
+         added, in a frame padded past 2 MiB, and add that Warning to every later publish about it",
     ),
     (
         "errors-after-unbalanced",
@@ -487,11 +497,14 @@ fn main() {
     // text, and whether they were published again.
     let mut first_change: HashMap<String, (i64, String, bool)> = HashMap::new();
     // For the recovery faults: each document's text when opened; how many
-    // documentSymbol requests about it were read since its text was last
-    // restored to that, while it is; the documents whose brackets were ever
-    // unbalanced; and how many documentSymbol answers and publishes so far.
+    // documentSymbol and foldingRange requests about it were read since its
+    // text was last restored to that, while it is; the documents whose
+    // brackets were ever unbalanced, or that were given a late Warning; and
+    // how many documentSymbol answers and publishes so far.
     let mut opened: HashMap<String, String> = HashMap::new();
     let mut since_restored: HashMap<String, usize> = HashMap::new();
+    let mut folds_since_restored: HashMap<String, usize> = HashMap::new();
+    let mut late: HashSet<String> = HashSet::new();
     let mut broken: HashSet<String> = HashSet::new();
     let (mut symbol_answers, mut publishes) = (0usize, 0u64);
     loop {
@@ -727,8 +740,19 @@ fn main() {
                         label = None;
                     }
                     publishes += 1;
-                    let lingering = Lingering { broken_once: broken.contains(uri), publishes };
-                    publish_diagnostics(&mut out, &faults, units, uri, text, label, lingering);
+                    let lingering = Lingering {
+                        broken_once: broken.contains(uri),
+                        late: late.contains(uri),
+                        padded: false,
+                        publishes,
+                    };
+                    publish_diagnostics(&mut out, &faults, units, uri, text, label.clone(), lingering);
+                    if fault("late-warning-in-skipped-frame") {
+                        late.insert(uri.to_string());
+                        publishes += 1;
+                        let lingering = Lingering { late: true, padded: true, publishes, ..lingering };
+                        publish_diagnostics(&mut out, &faults, units, uri, text, label, lingering);
+                    }
                 }
                 if fault("big-frame-on-open") {
                     let text = "x".repeat(2 * 1024 * 1024);
@@ -791,8 +815,10 @@ fn main() {
                 }
                 if opened.get(uri) != Some(text) {
                     since_restored.remove(uri);
+                    folds_since_restored.remove(uri);
                 } else if old_text != *text {
                     since_restored.insert(uri.to_string(), 0);
+                    folds_since_restored.insert(uri.to_string(), 0);
                 }
                 if unbalanced && fault("exit-on-unbalanced") {
                     eprintln!("standin: exit-on-unbalanced");
@@ -825,7 +851,12 @@ fn main() {
                         let stale =
                             if fault("stale-unversioned-diagnostics") { None } else { Some(json!(previous_version)) };
                         publishes += 1;
-                        let lingering = Lingering { broken_once: broken.contains(uri), publishes };
+                        let lingering = Lingering {
+                            broken_once: broken.contains(uri),
+                            late: late.contains(uri),
+                            padded: false,
+                            publishes,
+                        };
                         publish_diagnostics(&mut out, &faults, units, uri, &old_text, stale, lingering);
                     }
                     // ignore-changes and mislabelled-diagnostics publish the
@@ -836,7 +867,12 @@ fn main() {
                         label = None;
                     }
                     publishes += 1;
-                    let lingering = Lingering { broken_once: broken.contains(uri), publishes };
+                    let lingering = Lingering {
+                        broken_once: broken.contains(uri),
+                        late: late.contains(uri),
+                        padded: false,
+                        publishes,
+                    };
                     publish_diagnostics(&mut out, &faults, units, uri, publish_text, label, lingering);
                 }
                 if fault("codepoint-positions-after-change") {
@@ -884,7 +920,12 @@ fn main() {
                         *again = true;
                         eprintln!("standin: published version {first} again at version {version}");
                         publishes += 1;
-                        let lingering = Lingering { broken_once: broken.contains(uri), publishes };
+                        let lingering = Lingering {
+                            broken_once: broken.contains(uri),
+                            late: late.contains(uri),
+                            padded: false,
+                            publishes,
+                        };
                         publish_diagnostics(&mut out, &faults, units, uri, first_text, Some(json!(*first)), lingering);
                     }
                 }
@@ -1549,20 +1590,47 @@ fn main() {
                     (None, Some(t)) => document_answer(&method, &params, &t, units, split, &faults),
                     _ => Value::Null,
                 };
+                let uri = msg.pointer("/params/textDocument/uri").and_then(Value::as_str);
+                let mut nth = None;
                 if method == "textDocument/documentSymbol"
-                    && let Some(uri) = msg.pointer("/params/textDocument/uri").and_then(Value::as_str)
+                    && let Some(uri) = uri
                     && let Some(t) = text
                 {
                     symbol_answers += 1;
-                    let state = SymbolState {
-                        nth: since_restored.get_mut(uri).map(|n| {
-                            *n += 1;
-                            *n
-                        }),
-                        broken_once: broken.contains(uri),
-                        answers: symbol_answers,
-                    };
+                    nth = since_restored.get_mut(uri).map(|n| {
+                        *n += 1;
+                        *n
+                    });
+                    let state = SymbolState { nth, broken_once: broken.contains(uri), answers: symbol_answers };
                     result = recovery_symbols(result, t, units, split, &faults, state);
+                }
+                if method == "textDocument/foldingRange"
+                    && let Some(uri) = uri
+                {
+                    nth = folds_since_restored.get_mut(uri).map(|n| {
+                        *n += 1;
+                        *n
+                    });
+                }
+                // Late enough that lspcheck's first recovery poll is
+                // answered after a recovery_timeout under 2 s, however fast
+                // it runs, so the next request is its terminal probe.
+                if method == "textDocument/documentSymbol"
+                    && nth == Some(1)
+                    && (fault("recover-before-deadline") || fault("exit-during-terminal-probes"))
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                if fault("exit-during-terminal-probes")
+                    && let Some(n) = nth
+                {
+                    // lspcheck polls both together, so the second of each is
+                    // its terminal probe.
+                    if method == "textDocument/foldingRange" && n == 2 {
+                        eprintln!("standin: exit-during-terminal-probes");
+                        std::process::exit(0);
+                    }
+                    result = json!([]);
                 }
                 out.frame(&ok(&id, result));
                 if method == "textDocument/documentSymbol" && fault("invalid-duplicate-symbols") {
@@ -2000,7 +2068,7 @@ fn recovery_symbols(
         return json!([]);
     }
     if let Some(n) = state.nth
-        && ((fault("recover-before-deadline") && n <= 4)
+        && ((fault("recover-before-deadline") && n == 1)
             || (fault("slow-recovery") && n <= 3)
             || (fault("recovery-in-skipped-frame") && n == 1))
     {
@@ -2071,6 +2139,10 @@ fn shuffled_symbols(text: &str, units: Units, split: LineSplit, answer: usize) -
 struct Lingering {
     /// Its brackets were unbalanced once.
     broken_once: bool,
+    /// It was given a late Warning (late-warning-in-skipped-frame), in a
+    /// frame padded past 2 MiB if `padded`.
+    late: bool,
+    padded: bool,
     /// Which publish of the session this is.
     publishes: u64,
 }
@@ -2139,6 +2211,12 @@ fn publish_diagnostics<W: Write>(
     if lingering.broken_once && fault("warning-after-unbalanced") {
         diagnostics
             .push(json!({"range": range(0, 0, 0, 0), "severity": 2, "source": "standin", "message": "still odd"}));
+    }
+    if lingering.late {
+        // The message isn't part of what recovery compares, so padding it
+        // leaves the Warning the same.
+        let message = if lingering.padded { "x".repeat(2 * 1024 * 1024 + 1) } else { "on reflection".into() };
+        diagnostics.push(json!({"range": range(0, 0, 0, 0), "severity": 2, "source": "standin", "message": message}));
     }
     if fault("positions-in-data") {
         for d in &mut diagnostics {
