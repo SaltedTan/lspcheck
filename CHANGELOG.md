@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- M3 rechecks pushed-baseline evidence after recovery and at session end, so a skipped frame spanning the first
+  mutation makes dependent verdicts inconclusive instead of producing a false failure.
 - M3 rejects malformed diagnostic evidence, checks recovery when generated edits restore the seed without an
   extra write, and caps baseline requests at the absolute `settle_timeout` deadline.
 - D6 in the documents scenario judges a `selectionRange` reply against every text it may describe (D1's candidate

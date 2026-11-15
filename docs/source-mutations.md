@@ -92,6 +92,9 @@ extends is selected and not skipped by the profile.
    read before the first mutation. If there is at least one and all of them are equal after projection, the last is the
    baseline; if they differ, or none arrived, pushed diagnostics aren't used (and `no_errors` can only be established
    from a pull report).
+   The evidence window from each document's `didOpen` to the first mutation's write is rechecked when judging M3
+   and at session end. A skipped frame that spans the first mutation can invalidate that baseline later; dependent
+   verdicts become `ERROR`, with the inspection loss named, while independent observed failures still stand.
 5. **Cases**, in order, while the run's budget lasts. Case *k* has its own RNG streams, so it doesn't depend on the
    cases before it or on the server's timing. Each step applies one to three mutations to one document, sends them in
    one `didChange`, then sends the step's requests (default four) without waiting between them, and waits for each

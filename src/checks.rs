@@ -307,16 +307,36 @@ pub struct CheckResult {
 }
 
 /// A verdict's alternative if lspcheck turns out to have missed something
-/// between `from` and `to`. [`MISSED`] in `detail` stands for the reason.
+/// in at least one window of every group. [`MISSED`] in `detail` stands for the reason.
 #[derive(Debug, Clone)]
 pub struct Recheck {
-    pub from: Duration,
-    pub to: Duration,
-    /// Further windows: something missed in any of them counts too.
-    pub also: Vec<(Duration, Duration)>,
+    pub windows: Vec<Vec<(Duration, Duration)>>,
     pub output_only: bool,
     pub verdict: Verdict,
     pub detail: String,
+}
+
+impl CheckResult {
+    fn recheck(&mut self, finish: &Finish) {
+        let Some(again) = self.unless_missed.take() else { return };
+        let mut first = None;
+        for windows in &again.windows {
+            let Some(why) = windows.iter().find_map(|&(from, to)| {
+                if again.output_only {
+                    finish.missed_output_within(from, to)
+                } else {
+                    finish.incomplete_within(from, to)
+                }
+            }) else {
+                return;
+            };
+            first.get_or_insert(why);
+        }
+        if let Some(why) = first {
+            self.verdict = again.verdict;
+            self.detail = again.detail.replace(MISSED, &why);
+        }
+    }
 }
 
 /// Where a [`Recheck`]'s detail gives the reason something was missed.
@@ -719,14 +739,7 @@ async fn run_scenario(scenario: &'static Scenario, cfg: &Config) -> Result<Scena
     // A verdict reached during the session that assumed nothing was missed
     // in its window, judged again now that everything read is known.
     for r in &mut results {
-        let Some(again) = r.unless_missed.take() else { continue };
-        let missed = std::iter::once((again.from, again.to)).chain(again.also).find_map(|(from, to)| {
-            if again.output_only { finish.missed_output_within(from, to) } else { finish.incomplete_within(from, to) }
-        });
-        if let Some(why) = missed {
-            r.verdict = again.verdict;
-            r.detail = again.detail.replace(MISSED, &why);
-        }
+        r.recheck(&finish);
     }
     let transcript = match &cfg.transcripts {
         Some(dir) => {
@@ -855,7 +868,7 @@ impl Ctx<'_> {
         let r = self.results.last_mut().expect("just reported");
         if r.verdict != verdict {
             r.unless_missed =
-                Some(Recheck { from, to, also: Vec::new(), output_only: false, verdict, detail: detail.into() });
+                Some(Recheck { windows: vec![vec![(from, to)]], output_only: false, verdict, detail: detail.into() });
         }
     }
 
@@ -3177,9 +3190,7 @@ fn still_running(ctx: &mut Ctx<'_>, id: &'static str) {
     ctx.fail(id, format!("still running {waited} s after exit"));
     let r = ctx.results.last_mut().expect("just reported");
     r.unless_missed = Some(Recheck {
-        from: Duration::ZERO,
-        to,
-        also: Vec::new(),
+        windows: vec![vec![(Duration::ZERO, to)]],
         output_only: true,
         verdict: Verdict::Error,
         detail: format!(
@@ -4210,6 +4221,7 @@ struct Stable {
     params: Option<Value>,
     /// Its answer at baseline, projected.
     baseline: Value,
+    baseline_window: Option<(Duration, Duration)>,
 }
 
 /// The labelled `publishDiagnostics` read about each seed document: for
@@ -4304,13 +4316,13 @@ impl Recovery {
     /// 1 read since it was opened; if they are all equal after projection,
     /// and lspcheck missed nothing since, the last. Then holds the profile's
     /// `no_errors` to every diagnostics baseline.
-    fn before_first_mutation(&mut self, s: &Session, docs: &[SeedDoc]) {
+    fn before_first_mutation(&mut self, s: &Session, docs: &[SeedDoc], until: Duration) {
         let msgs = &s.messages;
         if std::mem::take(&mut self.pushes_pending) {
             for (d, doc) in docs.iter().enumerate() {
                 let label = format!("{} of {}", profile::Probe::PublishDiagnostics.name(), doc.name);
                 // A publish lspcheck missed may have differed from those it read.
-                if let Some(why) = s.incomplete_within(doc.version_at, s.elapsed()) {
+                if let Some(why) = s.incomplete_within(doc.version_at, until) {
                     self.unused.push(format!(
                         "{label}: lspcheck may have missed a publishDiagnostics before the first mutation, because {why}"
                     ));
@@ -4341,6 +4353,7 @@ impl Recovery {
                         label,
                         params: None,
                         baseline: last.clone(),
+                        baseline_window: Some((doc.version_at, until)),
                     }),
                 }
             }
@@ -4559,9 +4572,14 @@ async fn take_baseline(
     for a in asking {
         let label = format!("{} of {}", a.probe.name(), docs[a.doc].name);
         match (a.stable, a.last) {
-            (true, Some(baseline)) => {
-                rec.stable.push(Stable { doc: a.doc, probe: a.probe, label, params: Some(a.params), baseline })
-            }
+            (true, Some(baseline)) => rec.stable.push(Stable {
+                doc: a.doc,
+                probe: a.probe,
+                label,
+                params: Some(a.params),
+                baseline,
+                baseline_window: None,
+            }),
             _ => rec.unused.push(format!("{label}: {}", a.why)),
         }
     }
@@ -5159,10 +5177,10 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 capped = Some(why);
                 break;
             }
-            if first_change.is_none() {
-                rec.before_first_mutation(&ctx.s, &docs);
-            }
             let change_at = ctx.s.elapsed();
+            if first_change.is_none() {
+                rec.before_first_mutation(&ctx.s, &docs, change_at);
+            }
             ext.record(&ctx.s, &asked, d, change_at, *version, after.clone());
             if let Err(e) = ctx.s.notify("textDocument/didChange", Some(params.clone())).await {
                 lost = Some((lost_after_write(ctx, "a didChange", &e).await, place));
@@ -5554,6 +5572,14 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
     let mut slowest: Option<(Duration, u64, usize, bool)> = None;
     for c in &rec.cases {
         for (i, outcome) in c.outcomes.iter().enumerate() {
+            let stable = &rec.stable[i];
+            if let Some(why) = stable.baseline_window.and_then(|(from, to)| ctx.s.incomplete_within(from, to)) {
+                errors.push(format!(
+                    "case {}: {}: lspcheck may have missed a publishDiagnostics before the first mutation, because {why}",
+                    c.case, stable.label
+                ));
+                continue;
+            }
             match outcome {
                 ProbeEnd::Recovered { after, terminal } => {
                     if slowest.is_none_or(|(t, ..)| *after > t) {
@@ -5563,7 +5589,7 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
                 // A failure rests on nothing having superseded the deciding answer.
                 ProbeEnd::Failed { detail, from, to } => match ctx.s.incomplete_within(*from, *to) {
                     Some(why) => errors.push(format!("inconclusive, because {why}: {detail}")),
-                    None => fails.push((detail, *from, *to)),
+                    None => fails.push((detail, std::iter::once((*from, *to)).chain(stable.baseline_window).collect())),
                 },
                 ProbeEnd::Unseen(why) => errors.push(why.clone()),
             }
@@ -5575,8 +5601,16 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
     errors.extend(capped.map(str::to_owned));
     let more = |n: usize| if n > 1 { format!("; and {} more", n - 1) } else { String::new() };
     if let Some((detail, ..)) = fails.first() {
-        ctx.fail("M3", format!("{detail}{}", more(fails.len())));
-        ctx.results.last_mut().expect("just reported").absent_at = fails.iter().map(|(_, f, t)| (*f, *t)).collect();
+        let detail = format!("{detail}{}", more(fails.len()));
+        ctx.fail("M3", detail.clone());
+        ctx.results.last_mut().expect("just reported").unless_missed = Some(Recheck {
+            windows: fails.into_iter().map(|(_, windows)| windows).collect(),
+            output_only: false,
+            verdict: Verdict::Error,
+            detail: format!(
+                "inconclusive, because {MISSED}; a baseline or recovery window may be incomplete: {detail}"
+            ),
+        });
         return;
     }
     if let Some(first) = errors.first() {
@@ -5598,17 +5632,23 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
     // A recovery seen stands, but what lspcheck missed in a recovery window
     // could have been a failure.
     let unless = |why: &str| {
-        format!("nothing failed, but lspcheck may have missed evidence in a recovery window, because {why}: {pass}")
+        format!(
+            "nothing failed, but lspcheck may have missed evidence in a recovery window or pushed baseline, because {why}: {pass}"
+        )
     };
-    match rec.cases.iter().find_map(|c| ctx.s.incomplete_within(c.window.0, c.window.1)) {
+    let windows: Vec<_> =
+        rec.cases.iter().map(|c| c.window).chain(rec.stable.iter().filter_map(|s| s.baseline_window)).collect();
+    match windows.iter().find_map(|&(from, to)| ctx.s.incomplete_within(from, to)) {
         Some(why) => ctx.report("M3", Verdict::Error, unless(&why)),
         None => {
             ctx.pass_with("M3", pass.clone());
-            let (from, to) = rec.cases[0].window;
-            let also = rec.cases[1..].iter().map(|c| c.window).collect();
             let r = ctx.results.last_mut().expect("just reported");
-            r.unless_missed =
-                Some(Recheck { from, to, also, output_only: false, verdict: Verdict::Error, detail: unless(MISSED) });
+            r.unless_missed = Some(Recheck {
+                windows: vec![windows],
+                output_only: false,
+                verdict: Verdict::Error,
+                detail: unless(MISSED),
+            });
         }
     }
 }
@@ -6488,6 +6528,68 @@ while header := sys.stdin.buffer.readline():
             version: 1,
             version_at: Duration::ZERO,
         }]
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_pushed_baseline_is_rechecked_after_judgment() {
+        for (recovered, independent_failure) in [(false, false), (false, true), (true, false)] {
+            let cfg = mutation_test_config("exit 0");
+            let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+            let docs = recovery_test_docs();
+            let publish = message::notification(
+                PUBLISH_DIAGNOSTICS,
+                Some(json!({"uri": docs[0].uri, "version": 1, "diagnostics": []})),
+            );
+            ctx.s.messages.push((Duration::ZERO, Message::parse(&serde_json::to_vec(&publish).unwrap()).unwrap()));
+            let mut rec = Recovery { expect: Expect::Baseline, pushes_pending: true, ..Recovery::default() };
+            rec.before_first_mutation(&ctx.s, &docs, Duration::from_secs(2));
+            assert_eq!(rec.stable.len(), 1);
+            if independent_failure {
+                rec.stable.push(Stable {
+                    doc: 0,
+                    probe: profile::Probe::DocumentSymbol,
+                    label: "textDocument/documentSymbol of seed.txt".into(),
+                    params: Some(json!({"textDocument": {"uri": docs[0].uri}})),
+                    baseline: json!([]),
+                    baseline_window: None,
+                });
+            }
+            for case in 0..2 {
+                let window = (Duration::from_secs(4 + case * 2), Duration::from_secs(5 + case * 2));
+                let mut outcomes = vec![if recovered {
+                    ProbeEnd::Recovered { after: Duration::ZERO, terminal: false }
+                } else {
+                    rec.differs(0, case, "the last publish", &json!([{"severity": 2}]), window, Ok(()), "read in full")
+                }];
+                if independent_failure {
+                    outcomes.push(rec.differs(
+                        1,
+                        case,
+                        "the terminal answer",
+                        &json!([{}]),
+                        window,
+                        Ok(()),
+                        "read in full",
+                    ));
+                }
+                rec.cases.push(CaseRecovery { case, window, outcomes });
+            }
+            judge_m3(&mut ctx, &rec, None, None);
+            let mut m3 = ctx.results.pop().unwrap();
+            assert_eq!(m3.verdict, if recovered { Verdict::Pass } else { Verdict::Fail });
+            let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
+            finish.lost.push((Duration::from_millis(2001), Duration::from_secs(3), "a later frame was skipped".into()));
+            let mut later_only = m3.clone();
+            later_only.recheck(&finish);
+            assert_eq!(later_only.verdict, m3.verdict);
+            finish.lost.push((Duration::from_secs(1), Duration::from_secs(3), "a baseline publish was skipped".into()));
+            m3.recheck(&finish);
+            assert_eq!(m3.verdict, if independent_failure { Verdict::Fail } else { Verdict::Error });
+            if !independent_failure {
+                assert!(m3.detail.contains("a baseline publish was skipped"), "{}", m3.detail);
+            }
+        }
     }
 
     #[cfg(unix)]
