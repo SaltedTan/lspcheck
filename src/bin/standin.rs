@@ -249,7 +249,7 @@ const FAULTS: &[(&str, &str)] = &[
     (
         "recover-before-deadline",
         "lawful: after each restoration of a document's opened text, answer its first documentSymbol request with \
-         [] 2 s late, then as usual",
+         [] 4 s late, then as usual",
     ),
     (
         "slow-recovery",
@@ -265,7 +265,7 @@ const FAULTS: &[(&str, &str)] = &[
     (
         "exit-during-terminal-probes",
         "after each restoration of a document's opened text, answer its documentSymbol and foldingRange requests \
-         with [], the first documentSymbol 2 s late, and exit on reading the second foldingRange",
+         with [], the first documentSymbol 4 s late, and exit on reading the second foldingRange",
     ),
     (
         "late-warning-in-skipped-frame",
@@ -1613,13 +1613,14 @@ fn main() {
                     });
                 }
                 // Late enough that lspcheck's first recovery poll is
-                // answered after a recovery_timeout under 2 s, however fast
-                // it runs, so the next request is its terminal probe.
+                // answered after a recovery_timeout under 4 s, however fast
+                // it runs, so the next request is its terminal probe. (Under
+                // the default 10 s --timeout the tests use, so M2 still passes.)
                 if method == "textDocument/documentSymbol"
                     && nth == Some(1)
                     && (fault("recover-before-deadline") || fault("exit-during-terminal-probes"))
                 {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    std::thread::sleep(std::time::Duration::from_secs(4));
                 }
                 if fault("exit-during-terminal-probes")
                     && let Some(n) = nth

@@ -3156,31 +3156,48 @@ fn answers_that_never_return_to_the_baseline_are_an_error_unless_the_profile_exp
 #[test]
 fn a_recovery_just_before_the_deadline_is_seen_by_the_terminal_probe() {
     // After the restoration, the stand-in answers the first documentSymbol
-    // with [], 2 s late, as a server would that recovered while it worked on
+    // with [], 4 s late, as a server would that recovered while it worked on
     // a request it read before. lspcheck reads that answer only after the
-    // 1 s recovery_timeout, so its next request, the terminal probe, is
+    // 3 s recovery_timeout, so its next request, the terminal probe, is
     // written after the deadline and sees the baseline.
-    let (path, _keep) = recovery_profile("expect = \"baseline\"\nrecovery_timeout = \"1s\"");
-    let (r, t, _keep) = mutated_with(&path, &["recover-before-deadline"], &["--mutation-cases", "1"]);
-    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
-    let m3 = detail(&r, "M3");
-    assert!(
-        m3.contains(
-            " s after the restoration (textDocument/documentSymbol of main.lua in case 0, seen by its terminal probe)"
-        ),
-        "{m3}"
-    );
-    // When lspcheck began writing each documentSymbol after the restoration,
-    // which began before the restoration was delivered.
-    let sent = sent_at(&t.join("mutation.jsonl"));
+    let (path, _keep) = recovery_profile("expect = \"baseline\"\nrecovery_timeout = \"3s\"");
+    for _ in 0..3 {
+        let (r, t, _keep) = mutated_with(&path, &["recover-before-deadline"], &["--mutation-cases", "1"]);
+        let Some(probes) = poll_then_terminal(&t.join("mutation.jsonl"), "textDocument/documentSymbol", 3000.0) else {
+            continue;
+        };
+        assert_eq!(probes.len(), 2, "a poll, then the terminal probe: {probes:?}");
+        passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+        let m3 = detail(&r, "M3");
+        assert!(
+            m3.contains(
+                " s after the restoration (textDocument/documentSymbol of main.lua in case 0, seen by its terminal probe)"
+            ),
+            "{m3}"
+        );
+        return;
+    }
+    panic!("lspcheck never wrote its first recovery poll within the 3 s recovery_timeout in 3 runs");
+}
+
+/// When lspcheck began writing each `method` request after the last
+/// restoration (ms), if the first began before `deadline_ms` after the
+/// restoration and the second after it: a poll, then the terminal probe.
+/// `None` when the first came after the deadline (a runner stalled for that
+/// long), which tests something else; it panics if the second came before.
+fn poll_then_terminal(transcript: &std::path::Path, method: &str, deadline_ms: f64) -> Option<Vec<f64>> {
+    let sent = sent_at(transcript);
     let restored = sent.iter().rposition(|(_, m)| m["method"] == "textDocument/didChange").unwrap();
-    let probes: Vec<f64> = sent[restored..]
-        .iter()
-        .filter(|(_, m)| m["method"] == "textDocument/documentSymbol")
-        .map(|(t, _)| *t)
-        .collect();
-    assert_eq!(probes.len(), 2, "a poll, then the terminal probe: {probes:?}");
-    assert!(probes[1] >= sent[restored].0 + 1000.0, "the terminal probe was written before the deadline: {probes:?}");
+    let at = sent[restored].0;
+    let probes: Vec<f64> = sent[restored..].iter().filter(|(_, m)| m["method"] == method).map(|(t, _)| *t).collect();
+    if probes.first().is_none_or(|first| *first >= at + deadline_ms) {
+        return None;
+    }
+    assert!(
+        probes.len() >= 2 && probes[1] >= at + deadline_ms,
+        "the terminal probe came before the deadline: {probes:?}"
+    );
+    Some(probes)
 }
 
 /// Each message lspcheck sent, with when it began writing it (ms).
@@ -3228,27 +3245,34 @@ fn a_recovered_answer_in_a_frame_lspcheck_skipped_is_an_error_not_a_failure() {
 #[test]
 fn an_exit_during_the_terminal_probes_leaves_the_case_unjudged() {
     // After the restoration, the stand-in answers documentSymbol and
-    // foldingRange with [], the first documentSymbol 2 s late, past the 1 s
+    // foldingRange with [], the first documentSymbol 4 s late, past the 3 s
     // recovery_timeout, so the next of each is its terminal probe. It answers
     // documentSymbol's and exits on reading foldingRange's. The case stopped
     // before it was done, so the difference documentSymbol's shows can't
     // fail M3; the exit is M1's.
     let (path, _keep) = recovery_profile(
         "expect = \"baseline\"\nprobes = [\"textDocument/documentSymbol\", \"textDocument/foldingRange\"]\n\
-         recovery_timeout = \"1s\"",
+         recovery_timeout = \"3s\"",
     );
-    let (r, _, _keep) =
-        mutated_with(&path, &["exit-during-terminal-probes"], &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
-    expect(&r, "M1", "fail");
-    expect(&r, "M3", "error");
-    let m3 = detail(&r, "M3");
-    assert!(
-        m3.starts_with("case 0: textDocument/documentSymbol of main.lua: the server exited with ")
-            && m3.contains(
-                " during the terminal probes of case 0, so this isn't a failure (its terminal probe's answer differs "
-            ),
-        "{m3}"
-    );
+    for _ in 0..3 {
+        let (r, t, _keep) =
+            mutated_with(&path, &["exit-during-terminal-probes"], &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+        if poll_then_terminal(&t.join("mutation.jsonl"), "textDocument/documentSymbol", 3000.0).is_none() {
+            continue;
+        }
+        expect(&r, "M1", "fail");
+        expect(&r, "M3", "error");
+        let m3 = detail(&r, "M3");
+        assert!(
+            m3.starts_with("case 0: textDocument/documentSymbol of main.lua: the server exited with ")
+                && m3.contains(
+                    " during the terminal probes of case 0, so this isn't a failure (its terminal probe's answer differs "
+                ),
+            "{m3}"
+        );
+        return;
+    }
+    panic!("lspcheck never wrote its first recovery poll within the 3 s recovery_timeout in 3 runs");
 }
 
 #[test]
