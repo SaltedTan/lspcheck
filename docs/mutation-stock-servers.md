@@ -134,11 +134,12 @@ it. One run of each server with `--mutation-cases 100` gave:
 | texlab | fail | pass | error | N/E | skip | 3 | 2 s (case 2's crash) |
 | lua-language-server, basedpyright, marksman, ruff | pass | pass | pass | as with 10 | as with 10 | 100 | 3 to 32 s |
 
-All the new verdicts but gopls's D6 and terraform-ls's D1 trace back to one behaviour: these servers don't end a
-line at a lone `\r`, as LSP 3.17 says they must. That shifts every line after the `\r`, so a later change's range names lines the server's
-copy doesn't have. lspcheck's changes are right under the specification's split (checked by replaying them under both splits), and
-its restoration is one change whose range covers the whole document, `(0,0)` to `(lines, 0)` in the specification's
-lines. Replaying case 30's four `didChange` notifications alone, with a small client, against each server:
+All the new verdicts but gopls's D6 and terraform-ls's D1 trace back to one behaviour: these servers don't end a line at
+a lone `\r`, as LSP 3.17 says they must. That shifts every line after the `\r`, so a later change's range names lines
+the server's copy doesn't have. lspcheck's changes are right under the specification's split (checked by replaying them
+under both splits), and its restoration is one change whose range covers the whole document, `(0,0)` to `(lines, 0)` in
+the specification's lines. Replaying case 30's four `didChange` notifications alone, with a small client, against each
+server:
 
 - **gopls** and **rust-analyzer** silently drop a change whose range ends past their last line. The restoration is
   dropped and the document stays as it was, so documentSymbol answers one line short (gopls: `greet` 4–5 instead of
@@ -174,9 +175,9 @@ None of these is an lspcheck bug. They do show two costs worth knowing before ch
 ## Case counts
 
 When the server keeps up, a case takes milliseconds; basedpyright's take 0.46 s on average and up to 2 s (4 s under
-load), most of it waiting for its pushed diagnostics to return to the baseline.
-Ten cases add at most 5 s to a run on a quiet machine (about 7 s for basedpyright under load), and 100 cases at most
-32 s. The cost that matters is a case that doesn't recover: each takes `recovery_timeout`, and when one fault desynchronizes the document, every later case does.
+load), most of it waiting for its pushed diagnostics to return to the baseline. Ten cases add at most 5 s to a run on a
+quiet machine (about 7 s for basedpyright under load), and 100 cases at most 32 s. The cost that matters is a case that
+doesn't recover: each takes `recovery_timeout`, and when one fault desynchronizes the document, every later case does.
 
 - **Matrix: 10 cases**, as the design planned. Verdicts were the same in all four runs except gopls's D1 above, and
   the scenario took under 10 s for every server but lemminx. Ten cases already find texlab's crash (the same
