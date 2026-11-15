@@ -134,8 +134,8 @@ it. One run of each server with `--mutation-cases 100` gave:
 | texlab | fail | pass | error | N/E | skip | 3 | 2 s (case 2's crash) |
 | lua-language-server, basedpyright, marksman, ruff | pass | pass | pass | as with 10 | as with 10 | 100 | 3 to 32 s |
 
-All the new verdicts but gopls's D6 trace back to one behaviour: these servers don't end a line at a lone `\r`, as
-LSP 3.17 says they must. That shifts every line after the `\r`, so a later change's range names lines the server's
+All the new verdicts but gopls's D6 and terraform-ls's D1 trace back to one behaviour: these servers don't end a
+line at a lone `\r`, as LSP 3.17 says they must. That shifts every line after the `\r`, so a later change's range names lines the server's
 copy doesn't have. lspcheck's changes are right under the specification's split (checked by replaying them under both splits), and
 its restoration is one change whose range covers the whole document, `(0,0)` to `(lines, 0)` in the specification's
 lines. Replaying case 30's four `didChange` notifications alone, with a small client, against each server:
@@ -156,9 +156,11 @@ lines. Replaying case 30's four `didChange` notifications alone, with a small cl
 - **zls** fails D6 in case 60, where the text has only lone `\r` line ends, so zls sees one line of 193 characters,
   and answers `(0,0)-(0,193)` for the position `(3,37)`. In case 78 the text has one lone `\r`, so zls's whole
   document ends at `(8,0)` and the specification's at `(9,0)`, the position asked about (both reproduced alone).
-- **gopls** fails D6 in cases 24, 45 and 59, each reproduced alone. The position is the document's end, on the empty
-  line after its twelfth and last line end (`(12,0)`), and gopls's widest selection range stops at the last `}`
-  (`(11,1)`). No lone `\r` is involved: this is the only new finding that isn't the line split.
+- **gopls** fails D6 in cases 24, 45 and 59, each reproduced alone. In each the position is the document's end, on
+  the empty line after its last line end, and gopls's widest selection range stops before it: in case 24 the position
+  is `(12,0)` and the range ends at the last `}`, `(11,1)`; in case 45 (`(10,0)`) an unterminated string stops it at
+  `(5,17)`; in case 59 (`(10,0)`) it ends at `(9,1)`. No lone `\r` is involved: with terraform-ls's D1, these are the
+  only new findings that aren't the line split.
 
 None of these is an lspcheck bug. They do show two costs worth knowing before choosing counts:
 
@@ -173,18 +175,18 @@ None of these is an lspcheck bug. They do show two costs worth knowing before ch
 
 When the server keeps up, a case takes milliseconds; basedpyright's take 0.46 s on average and up to 2 s (4 s under
 load), most of it waiting for its pushed diagnostics to return to the baseline.
-Ten cases add at most 5 s to a run, and 100 cases at most 30 s. The cost that matters is a case that doesn't recover:
-each takes `recovery_timeout`, and when one fault desynchronizes the document, every later case does.
+Ten cases add at most 5 s to a run on a quiet machine (about 7 s for basedpyright under load), and 100 cases at most
+32 s. The cost that matters is a case that doesn't recover: each takes `recovery_timeout`, and when one fault desynchronizes the document, every later case does.
 
 - **Matrix: 10 cases**, as the design planned. Verdicts were the same in all four runs except gopls's D1 above, and
   the scenario took under 10 s for every server but lemminx. Ten cases already find texlab's crash (the same
   lone-`\r` handling, reached in case 2). They don't reach case 30: a larger count would add the lone-`\r` findings
   above, but would cost 10 to 40 minutes per job for gopls, rust-analyzer, clangd and terraform-ls, and no repeated
   runs at that count have shown those verdicts stable. If the matrix should cover them, 40 cases (10 desynchronized
-  cases, about 10 minutes each) is the smallest count that does. Measure it before pinning.
+  cases at 60 s each, about 10 minutes per job) is the smallest count that does. Measure it before pinning.
 - **Default: keep 20.** For a server that recovers, 20 cases take seconds; for one that doesn't, each extra case adds
   `recovery_timeout`. The numbers don't call for a change in this PR. A user who wants more should pass
-  `--mutation-cases` and expect minutes per desynchronized case.
+  `--mutation-cases` and expect a minute per desynchronized case.
 
 ## What to pin in `.mutation.verdicts`
 

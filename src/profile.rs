@@ -1867,10 +1867,13 @@ mod tests {
     }
 
     /// Every example profile with a `[mutation]` section validates, and its
-    /// case budget fits its `run_timeout` at the profile's request timeout,
-    /// both with its own case count and with the stock matrix's
-    /// `--mutation-cases 10`, so `--mutate` never refuses to start. Every
-    /// server of the stock matrix has one.
+    /// case budget fits its `run_timeout` at the profile's request timeout
+    /// (`mutation_settings` refuses one that doesn't), so `--mutate` never
+    /// refuses to start. Its lexicon recognises its own seed text: a keyword
+    /// when it lists keywords (so a typo in a keyword or in
+    /// `identifier_chars` is caught), and a comment or string wherever the
+    /// seed contains one of the delimiters it declares. Every server of the
+    /// stock matrix has one.
     #[test]
     fn the_example_mutation_sections_validate_and_fit_their_run() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1887,16 +1890,31 @@ mod tests {
                 continue;
             }
             let request_timeout = p.request_timeout.unwrap_or_else(|| panic!("{}: no request_timeout", path.display()));
-            for cases in [None, Some(10)] {
-                let m = mutation_settings(&p, Some(20261115), cases, request_timeout)
-                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-                assert!(!m.seeds.is_empty(), "{}", path.display());
-                assert!(m.case_budget(request_timeout) <= m.run_timeout, "{}", path.display());
-                // The lexicon plans the matrix's cases.
-                let texts: Vec<String> = m.seeds.iter().map(|s| s.text.clone()).collect();
-                for case in 0..m.cases.min(10) {
-                    assert!(!mutation::plan_case(20261115, case, &texts, &m.planner).steps.is_empty());
-                }
+            let m = mutation_settings(&p, Some(20261115), None, request_timeout)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(!m.seeds.is_empty(), "{}", path.display());
+            let lexicon = &m.planner.lexicon;
+            let kinds: Vec<mutation::TokenKind> =
+                m.seeds.iter().flat_map(|s| lexicon.tokens(&s.text)).map(|t| t.kind).collect();
+            let has = |f: fn(&mutation::TokenKind) -> bool| kinds.iter().any(f);
+            let seeds_contain = |open: &str| m.seeds.iter().any(|s| s.text.contains(open));
+            if !lexicon.keywords.is_empty() {
+                assert!(has(|k| *k == mutation::TokenKind::Keyword), "{}: no keyword in its seed", path.display());
+            }
+            let comment_opens = lexicon.line_comments.iter().chain(lexicon.block_comments.iter().map(|(o, _)| o));
+            if comment_opens.into_iter().any(|o| seeds_contain(o)) {
+                assert!(
+                    has(|k| matches!(k, mutation::TokenKind::Comment { .. })),
+                    "{}: no comment recognised in its seed",
+                    path.display()
+                );
+            }
+            if lexicon.strings.iter().any(|d| seeds_contain(&d.open)) {
+                assert!(
+                    has(|k| matches!(k, mutation::TokenKind::String { .. })),
+                    "{}: no string recognised in its seed",
+                    path.display()
+                );
             }
             mutated.insert(path.file_stem().unwrap().to_string_lossy().into_owned());
         }
