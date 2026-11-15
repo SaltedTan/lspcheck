@@ -539,8 +539,9 @@ pub struct MutationSummary {
     /// The checks each case's own evidence failed or made an error.
     #[serde(skip)]
     pub troubles: Vec<Trouble>,
-    /// M3's passes, by case and probe: never a trouble, but they tell an
-    /// isolated run's probe it judged from one it couldn't.
+    /// M3's passes, by case and probe, and its errors for recoveries seen
+    /// with evidence lspcheck may have missed: never a trouble, but they tell
+    /// an isolated run's probe it judged from one it couldn't, and why.
     #[serde(skip)]
     pub recovered: Vec<Trouble>,
     /// Where each case that started began, by case number.
@@ -774,9 +775,7 @@ async fn isolate_cases(cfg: &Config, run: &mut ScenarioRun, judges: &impl Fn(&st
         let file = format!("mutation-case-{case}.jsonl");
         let (alone, unwritten) = run_session(scenario, cfg, Some(Isolate { start, run_deadline }), &file).await;
         let (reproduced, mut detail) = match &alone.mutation {
-            Some(m) if m.cases_run > 0 => {
-                compare_troubles(case, &troubles_of(&summary.troubles, case, judges), m, judges)
-            }
+            Some(m) if m.cases_run > 0 => compare_troubles(case, &summary.troubles, m, judges),
             Some(m) => {
                 let why = m.stopped.as_deref().unwrap_or("no case started");
                 (None, format!("not run: the isolated run stopped before the case: {why}"))
@@ -805,24 +804,26 @@ fn troubles_of<'a>(troubles: &'a [Trouble], case: u64, judges: &impl Fn(&str) ->
 }
 
 /// Whether the isolated run `alone` saw again every trouble the main run saw
-/// in case `case` (`main`, from [`troubles_of`]), and a line saying which it
-/// saw, naming what each was seen in. A trouble not seen again that the
+/// in case `case` (among `troubles`, the main run's), and a line saying which
+/// it saw, naming what each was seen in. A trouble not seen again that the
 /// isolated run couldn't judge leaves the answer unknown, unless another,
 /// judged, wasn't seen either.
 fn compare_troubles(
     case: u64,
-    main: &[&Trouble],
+    troubles: &[Trouble],
     alone: &MutationSummary,
     judges: &impl Fn(&str) -> bool,
 ) -> (Option<bool>, String) {
+    let main = troubles_of(troubles, case, judges);
     let again = troubles_of(&alone.troubles, case, judges);
     let label = |t: &Trouble| format!("{} {} in {}", t.check(), t.verdict().label(), t.what);
     let (mut seen, mut unseen, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
-    for t in main {
-        match again.iter().find(|a| (a.check(), a.verdict()) == (t.check(), t.verdict())) {
-            Some(a) if a.what == t.what => seen.push(label(t)),
+    for &t in &main {
+        let same = |a: &&Trouble| a.case == case && (a.check(), a.verdict()) == (t.check(), t.verdict());
+        match alone.troubles.iter().find(same) {
+            Some(_) if alone.troubles.iter().filter(same).any(|a| a.what == t.what) => seen.push(label(t)),
             Some(a) => seen.push(format!("{}, alone in {}", label(t), a.what)),
-            None => match unjudged(t, main, alone) {
+            None => match unjudged(t, troubles, alone) {
                 Some(why) => unknown.push(format!("{} not judged alone: {why}", label(t))),
                 None => unseen.push(format!("{} not seen again", label(t))),
             },
@@ -856,17 +857,20 @@ fn compare_troubles(
 }
 
 /// Why the isolated run `alone` couldn't judge trouble `t` of the main run's
-/// troubles in its case, `main`, if it couldn't. M3 is judged per probe: an
-/// isolated run judged it if one of the probes the main run's trouble of
-/// the same verdict named passed or failed there, after the end-of-session
+/// troubles, `main`, if it couldn't. M3 is judged per probe: an isolated run
+/// judged it if one of the probes the main run's troubles of the same case
+/// and verdict named passed or failed there, after the end-of-session
 /// rechecks. Any other check is judged unless the isolated run stopped.
-fn unjudged(t: &Trouble, main: &[&Trouble], alone: &MutationSummary) -> Option<String> {
+fn unjudged(t: &Trouble, main: &[Trouble], alone: &MutationSummary) -> Option<String> {
     let stopped = alone.stopped.as_ref().map(|why| format!("the isolated run stopped: {why}"));
     if t.check() != "M3" {
         return stopped;
     }
-    let probes: Vec<&str> =
-        main.iter().filter(|m| (m.check(), m.verdict()) == (t.check(), t.verdict())).map(|m| m.what.as_str()).collect();
+    let probes: Vec<&str> = main
+        .iter()
+        .filter(|m| m.case == t.case && (m.check(), m.verdict()) == (t.check(), t.verdict()))
+        .map(|m| m.what.as_str())
+        .collect();
     let mut outcomes = alone
         .troubles
         .iter()
@@ -6158,6 +6162,8 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
                             }),
                         });
                         recovered.push(t);
+                    } else {
+                        recovered.push(Trouble::new(c.case, "M3", Verdict::Error, &stable.label));
                     }
                 }
                 // A failure rests on nothing having superseded the deciding answer.
@@ -8889,7 +8895,6 @@ while header := sys.stdin.buffer.readline():
         let t = |check: &str, verdict, what: &str| Trouble::new(0, check, verdict, what);
         let all = |_: &str| true;
         let main = [t("M2", Fail, "textDocument/hover"), t("M3", Fail, "documentSymbol of a")];
-        let main: Vec<&Trouble> = main.iter().collect();
         let compare = |troubles: Vec<Trouble>, recovered: Vec<Trouble>, stopped: Option<&str>| {
             let alone = MutationSummary {
                 troubles,
@@ -8951,6 +8956,40 @@ while header := sys.stdin.buffer.readline():
                 None,
                 format!("unknown: {symbols} seen again; {hover} not judged alone: the isolated run stopped: it exited")
             )
+        );
+    }
+
+    #[test]
+    fn an_isolated_case_judges_m3_by_every_probe_the_main_run_failed() {
+        use Verdict::{Error, Fail, Pass};
+        let t = |case, check: &str, verdict, what: &str| Trouble::new(case, check, verdict, what);
+        let all = |_: &str| true;
+        let (pd, ds) = ("publishDiagnostics of a", "documentSymbol of a");
+        // Alone, documentSymbol recovered and publishDiagnostics had no stable
+        // baseline: a probe the main run failed was judged and recovered, so
+        // the case isn't reproduced, whichever probe the main run listed first.
+        let alone = MutationSummary { recovered: vec![t(1, "M3", Pass, ds)], ..MutationSummary::default() };
+        for main in [[t(1, "M3", Fail, pd), t(1, "M3", Fail, ds)], [t(1, "M3", Fail, ds), t(1, "M3", Fail, pd)]] {
+            let (reproduced, detail) = compare_troubles(1, &main, &alone, &all);
+            assert_eq!(reproduced, Some(false), "{detail}");
+        }
+        // Another case's probes don't count.
+        let main = [t(1, "M3", Fail, pd), t(2, "M3", Fail, ds)];
+        assert_eq!(compare_troubles(1, &main, &alone, &all).0, None);
+        // A trouble the isolated run saw in the main run's own probe is named
+        // as seen there, though it also saw it in another first.
+        let main = [t(1, "M3", Fail, pd), t(1, "M3", Fail, ds)];
+        let alone = MutationSummary {
+            troubles: vec![t(1, "M3", Fail, ds), t(1, "M3", Fail, pd)],
+            ..MutationSummary::default()
+        };
+        assert_eq!(compare_troubles(1, &main, &alone, &all), (Some(true), format!("reproduced: M3 FAIL in {pd}")));
+        // A recovery seen with evidence lspcheck may have missed is named so.
+        let main = [t(1, "M3", Fail, pd)];
+        let alone = MutationSummary { recovered: vec![t(1, "M3", Error, pd)], ..MutationSummary::default() };
+        assert_eq!(
+            compare_troubles(1, &main, &alone, &all),
+            (None, format!("unknown: M3 FAIL in {pd} not judged alone: {pd} was inconclusive"))
         );
     }
 }
