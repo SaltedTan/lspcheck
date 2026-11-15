@@ -28,8 +28,8 @@
 - Under `--mutate`, the first three failing or erroring cases are [run again alone](docs/source-mutations.md#step-6),
   failing ones first, each in a fresh session from the same seed, within `run_timeout`. The JSON report's
   `"mutation"` gains `"isolated"`, the terminal and Markdown reports a line per case, saying whether it reproduced
-  (or that the isolated run couldn't tell) and what in, and `--transcripts`
-  a `mutation-case-<k>.jsonl` for each. An isolated run judges nothing, so verdicts don't depend on it.
+  (or that the isolated run couldn't tell) and what in (for M2, each method the case left unanswered), and
+  `--transcripts` a `mutation-case-<k>.jsonl` for each. An isolated run judges nothing, so verdicts don't depend on it.
 - The 11 [example profiles](examples/profiles/README.md) the stock-server matrix runs gain a `[mutation]` section
   with a lexicon for their language, and `[mutation.recovery].expect = "baseline"` where the recovery probes answer
   from the text alone. A test checks that each validates and that its case budget fits its `run_timeout`. Their

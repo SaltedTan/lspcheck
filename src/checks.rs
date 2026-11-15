@@ -585,6 +585,22 @@ impl Trouble {
     }
 }
 
+/// How many methods an M2 trouble names before "and N more".
+const NAMED_METHODS: usize = 3;
+
+/// `methods`, for a trouble's `what`: "a", "a and b", "a, b and c", or the
+/// first [`NAMED_METHODS`] and how many more.
+fn name_methods(methods: &[&str]) -> String {
+    match methods {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        _ if methods.len() > NAMED_METHODS => {
+            format!("{} and {} more", methods[..NAMED_METHODS].join(", "), methods.len() - NAMED_METHODS)
+        }
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 /// What carries over into case `case` from the cases before it: the request
 /// round robin's cursor and each document's version.
 #[derive(Debug, Clone, PartialEq)]
@@ -5858,13 +5874,14 @@ async fn leave_mutation(
     // couldn't deliver or inspect. One pending when the server went is M1's.
     // As for M2's verdict, a case's failure carries each of its unanswered
     // requests' waits, and is an error if lspcheck may have missed a reply
-    // in every one.
+    // in every one, and names each method left unanswered.
+    let failed = |case: u64| move |t: &Trouble| t.case == case && t.check() == "M2" && t.verdict() == Verdict::Fail;
+    let mut unanswered: Vec<(u64, Vec<&str>)> = Vec::new();
     for r in asked {
         let Some(case) = r.case else { continue };
         match r.outcome {
             StepOutcome::Unanswered => {
-                let failed = |t: &Trouble| t.case == case && t.check() == "M2" && t.verdict() == Verdict::Fail;
-                let t = match summary.troubles.iter().position(failed) {
+                let t = match summary.troubles.iter().position(failed(case)) {
                     Some(i) => &mut summary.troubles[i],
                     None => {
                         summary.troubles.push(Trouble::new(case, "M2", Verdict::Fail, r.method));
@@ -5872,11 +5889,21 @@ async fn leave_mutation(
                     }
                 };
                 t.result.absent_at.push((r.at, r.deadline_at));
+                match unanswered.iter_mut().find(|(c, _)| *c == case) {
+                    Some((_, methods)) if !methods.contains(&r.method) => methods.push(r.method),
+                    Some(_) => {}
+                    None => unanswered.push((case, vec![r.method])),
+                }
             }
             StepOutcome::Undelivered(_) | StepOutcome::Uninspected(_) => {
                 summary.troubles.push(Trouble::new(case, "M2", Verdict::Error, r.method));
             }
             StepOutcome::Answered(_) | StepOutcome::Gone => {}
+        }
+    }
+    for (case, methods) in unanswered {
+        if let Some(t) = summary.troubles.iter_mut().find(|t| failed(case)(t)) {
+            t.what = name_methods(&methods);
         }
     }
     ctx.mutation = Some(summary);
@@ -8958,6 +8985,14 @@ while header := sys.stdin.buffer.readline():
                 format!("unknown: {symbols} seen again; {hover} not judged alone: the isolated run stopped: it exited")
             )
         );
+    }
+
+    #[test]
+    fn an_m2_trouble_names_up_to_three_methods() {
+        assert_eq!(name_methods(&["a"]), "a");
+        assert_eq!(name_methods(&["a", "b"]), "a and b");
+        assert_eq!(name_methods(&["a", "b", "c"]), "a, b and c");
+        assert_eq!(name_methods(&["a", "b", "c", "d", "e"]), "a, b, c and 2 more");
     }
 
     #[test]

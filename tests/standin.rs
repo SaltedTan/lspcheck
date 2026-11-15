@@ -2878,6 +2878,11 @@ fn recorded_changes(transcript: &std::path::Path, version: i64) -> Vec<(i64, Val
         .collect()
 }
 
+/// The methods case 3 leaves unanswered under
+/// `ignore-while-extra-square-bracket`, in the order they were sent.
+const CASE_3_UNANSWERED: &str =
+    "textDocument/selectionRange, textDocument/documentSymbol and textDocument/foldingRange";
+
 #[test]
 fn a_failing_case_is_run_again_alone_and_reproduces() {
     // Only case 3 inserts a `[`, and the stand-in ignores requests while a
@@ -2894,14 +2899,14 @@ fn a_failing_case_is_run_again_alone_and_reproduces() {
         serde_json::json!([
             {
                 "case": 3, "transcript": "mutation-case-3.jsonl", "reproduced": true,
-                "detail": "reproduced: M2 FAIL in textDocument/selectionRange"
+                "detail": format!("reproduced: M2 FAIL in {CASE_3_UNANSWERED}")
             }
         ])
     );
     let alone = t.join("mutation-case-3.jsonl");
     assert!(
         r.stdout.contains(&format!(
-            "  mutation case 3 alone: reproduced: M2 FAIL in textDocument/selectionRange\n{}transcript: {}",
+            "  mutation case 3 alone: reproduced: M2 FAIL in {CASE_3_UNANSWERED}\n{}transcript: {}",
             " ".repeat(21),
             alone.display()
         )),
@@ -2952,7 +2957,8 @@ fn a_failing_case_is_run_again_alone_and_reproduces() {
 fn a_case_that_fails_only_in_the_whole_run_is_not_reproduced_alone() {
     // The stand-in ignores requests after the session's fourth didChange,
     // case 1's first step. Alone, case 1 sends two: its failure is the
-    // whole run's, and stays a failure.
+    // whole run's, and stays a failure. Its two requests have different
+    // methods, and the isolation line names both.
     let (r, _, _keep) = mutated(&["ignore-after-fourth-change"], &["--timeout", "2", "--only", "M1,M2,M3"]);
     expect(&r, "M2", "fail");
     assert!(detail(&r, "M2").contains("in case 1 got no response within 2 s (--timeout)"), "{}", detail(&r, "M2"));
@@ -2960,7 +2966,7 @@ fn a_case_that_fails_only_in_the_whole_run_is_not_reproduced_alone() {
         r.report["mutation"]["isolated"],
         serde_json::json!([{
             "case": 1, "transcript": "mutation-case-1.jsonl", "reproduced": false,
-            "detail": "not reproduced: M2 FAIL in textDocument/foldingRange not seen again"
+            "detail": "not reproduced: M2 FAIL in textDocument/foldingRange and workspace/symbol not seen again"
         }])
     );
 }
@@ -2983,9 +2989,15 @@ fn cases_with_a_failure_are_run_alone_before_cases_with_only_errors() {
         .iter()
         .map(|i| (i["case"].as_u64().unwrap(), i["detail"].as_str().unwrap()))
         .collect();
+    // Alone, the oversized answer goes to case 3's workspace/symbol request,
+    // which joins the methods it left unanswered.
+    let alone = "textDocument/selectionRange, textDocument/documentSymbol, textDocument/foldingRange and 1 more";
     assert_eq!(
         isolated,
-        [(3, "reproduced: M2 FAIL in textDocument/selectionRange"), (0, "reproduced: M2 ERROR in textDocument/hover")]
+        [
+            (3, format!("reproduced: M2 FAIL in {CASE_3_UNANSWERED}, alone in {alone}").as_str()),
+            (0, "reproduced: M2 ERROR in textDocument/hover")
+        ]
     );
 }
 

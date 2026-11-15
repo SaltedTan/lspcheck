@@ -698,10 +698,12 @@ Step 6 builds [isolation](#reports-transcripts-and-reproduction). Where the rule
   wasn't. Any other check is judged unless the isolated run stopped (lost the server, or the written-bytes cap).
   `reproduced` combines them like a logical and: `true` when every trouble was seen again, `false` when one that was
   judged wasn't, and otherwise `null`. The detail names each trouble with what it was seen in (a request's method, a
-  probe, or the step during which the server was lost), and the isolated run's when it saw it only elsewhere:
-  `reproduced: M2 FAIL in textDocument/hover, alone in textDocument/foldingRange`, `not reproduced: M2 FAIL in
-  textDocument/hover not seen again`, `unknown: M3 FAIL in publishDiagnostics of main.lua not judged alone: no stable
-  baseline for publishDiagnostics of main.lua`, then what only the isolated run saw.
+  probe, or the step during which the server was lost), and the isolated run's when it saw it only elsewhere (an M2
+  failure names each method the case left unanswered, in the order sent and without repeats, up to three and then
+  how many more): `reproduced: M2 FAIL in textDocument/hover, alone in textDocument/foldingRange`, `not reproduced:
+  M2 FAIL in textDocument/hover and workspace/symbol not seen again`, `unknown: M3 FAIL in publishDiagnostics of
+  main.lua not judged alone: no stable baseline for publishDiagnostics of main.lua`, then what only the isolated run
+  saw.
 - **When it can't run.** An isolated run starts only while the run's deadline (`run_timeout` from the end of the main
   run's baseline) leaves the startup timeout, twice `settle_timeout` and one case budget, and it keeps that deadline,
   so its case is admitted by the same rule as any other. Each isolated session has its own 64 MiB written-bytes cap.
