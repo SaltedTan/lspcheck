@@ -68,9 +68,13 @@ jobs:
         # so the install steps serve both.
         mode: [default, mutation]
     runs-on: ubuntu-24.04
-    # The scenario's bounds add its case budget (1055 s with these profiles)
-    # to a default run, which the record measured at under four minutes.
-    timeout-minutes: ${{ matrix.mode == 'mutation' && 45 || 30 }}
+    # Each mutation case is bounded by its case budget (1055 s with these
+    # profiles), and the whole scenario, isolated reruns included, by
+    # [mutation].run_timeout (1 h by default; the profiles don't override it).
+    # 75 minutes leaves room for the build, the default scenarios and a full
+    # run_timeout, so the report and transcripts still upload. The record
+    # measured the scenario at under 10 s for every server but lemminx (a minute).
+    timeout-minutes: ${{ matrix.mode == 'mutation' && 75 || 30 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
