@@ -341,6 +341,7 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   Incomplete inspection before the first mutation makes a pushed-diagnostics baseline unusable, including when
   the missing evidence becomes known later; dependent recovery verdicts become `ERROR`.
   A stop detected while draining recovery output or completing terminal probes also leaves that case unjudged.
+  M3's failure description and count include only failures with evidence that survives the final recheck.
   See the [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
   [implementation status](docs/source-mutations.md) for what is implemented so far, including the
   [written-bytes bound on automatic answers](docs/source-mutations.md#bounds). The JSON `mutation.stopped`

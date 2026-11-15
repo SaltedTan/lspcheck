@@ -283,6 +283,8 @@ A fully evidenced failure takes precedence over errors in other cases or probes.
   difference after projection (a path and both values, shortened like K2's) and how long lspcheck polled. Unlike a
   position inside a character, this failure rests on nothing having superseded the last answer, so missed evidence
   after it, or polling stopped by the poll budget before the bound, makes it `ERROR`, never `FAIL`.
+  The final session recheck removes failures with incomplete evidence before selecting the description and counting
+  the remaining failures; if none remain, the verdict becomes `ERROR`.
 - *error:* without a stated expectation, a probe didn't return to its baseline within `recovery_timeout`
   ("not seen to recover within 20 s; lspcheck's bound, not a protocol rule: set `[mutation.recovery].expect` if the
   answers are fixed"); with a stable probe, a stop during a case (an exit, closed output, an undeliverable write or

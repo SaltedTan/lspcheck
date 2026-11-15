@@ -307,34 +307,56 @@ pub struct CheckResult {
 }
 
 /// A verdict's alternative if lspcheck turns out to have missed something
-/// in at least one window of every group. [`MISSED`] in `detail` stands for the reason.
+/// in its evidence windows. [`MISSED`] in `detail` stands for the reason.
 #[derive(Debug, Clone)]
-pub struct Recheck {
-    pub windows: Vec<Vec<(Duration, Duration)>>,
-    pub output_only: bool,
-    pub verdict: Verdict,
+pub enum Recheck {
+    UnlessMissed { windows: Vec<(Duration, Duration)>, output_only: bool, verdict: Verdict, detail: String },
+    Failures(Vec<RecoveryFailure>),
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveryFailure {
     pub detail: String,
+    pub windows: Vec<(Duration, Duration)>,
 }
 
 impl CheckResult {
     fn recheck(&mut self, finish: &Finish) {
         let Some(again) = self.unless_missed.take() else { return };
-        let mut first = None;
-        for windows in &again.windows {
-            let Some(why) = windows.iter().find_map(|&(from, to)| {
-                if again.output_only {
-                    finish.missed_output_within(from, to)
-                } else {
-                    finish.incomplete_within(from, to)
+        match again {
+            Recheck::UnlessMissed { windows, output_only, verdict, detail } => {
+                if let Some(why) = windows.iter().find_map(|&(from, to)| {
+                    if output_only { finish.missed_output_within(from, to) } else { finish.incomplete_within(from, to) }
+                }) {
+                    self.verdict = verdict;
+                    self.detail = detail.replace(MISSED, &why);
                 }
-            }) else {
-                return;
-            };
-            first.get_or_insert(why);
-        }
-        if let Some(why) = first {
-            self.verdict = again.verdict;
-            self.detail = again.detail.replace(MISSED, &why);
+            }
+            Recheck::Failures(mut failures) => {
+                let mut first = None;
+                failures.retain(|failure| {
+                    match failure.windows.iter().find_map(|&(from, to)| finish.incomplete_within(from, to)) {
+                        Some(why) => {
+                            first.get_or_insert(why);
+                            false
+                        }
+                        None => true,
+                    }
+                });
+                if let Some(failure) = failures.first() {
+                    self.detail = format!(
+                        "{}{}",
+                        failure.detail,
+                        if failures.len() > 1 { format!("; and {} more", failures.len() - 1) } else { String::new() }
+                    );
+                } else if let Some(why) = first {
+                    self.verdict = Verdict::Error;
+                    self.detail = format!(
+                        "inconclusive, because {why}; a baseline or recovery window may be incomplete: {}",
+                        self.detail
+                    );
+                }
+            }
         }
     }
 }
@@ -867,8 +889,12 @@ impl Ctx<'_> {
     fn unless_missed(&mut self, from: Duration, to: Duration, verdict: Verdict, detail: impl Into<String>) {
         let r = self.results.last_mut().expect("just reported");
         if r.verdict != verdict {
-            r.unless_missed =
-                Some(Recheck { windows: vec![vec![(from, to)]], output_only: false, verdict, detail: detail.into() });
+            r.unless_missed = Some(Recheck::UnlessMissed {
+                windows: vec![(from, to)],
+                output_only: false,
+                verdict,
+                detail: detail.into(),
+            });
         }
     }
 
@@ -3189,8 +3215,8 @@ fn still_running(ctx: &mut Ctx<'_>, id: &'static str) {
     let to = ctx.s.elapsed();
     ctx.fail(id, format!("still running {waited} s after exit"));
     let r = ctx.results.last_mut().expect("just reported");
-    r.unless_missed = Some(Recheck {
-        windows: vec![vec![(Duration::ZERO, to)]],
+    r.unless_missed = Some(Recheck::UnlessMissed {
+        windows: vec![(Duration::ZERO, to)],
         output_only: true,
         verdict: Verdict::Error,
         detail: format!(
@@ -5600,7 +5626,10 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
                 // A failure rests on nothing having superseded the deciding answer.
                 ProbeEnd::Failed { detail, from, to } => match ctx.s.incomplete_within(*from, *to) {
                     Some(why) => errors.push(format!("inconclusive, because {why}: {detail}")),
-                    None => fails.push((detail, std::iter::once((*from, *to)).chain(stable.baseline_window).collect())),
+                    None => fails.push(RecoveryFailure {
+                        detail: detail.clone(),
+                        windows: std::iter::once((*from, *to)).chain(stable.baseline_window).collect(),
+                    }),
                 },
                 ProbeEnd::Unseen(why) => errors.push(why.clone()),
             }
@@ -5611,17 +5640,9 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
     }
     errors.extend(capped.map(str::to_owned));
     let more = |n: usize| if n > 1 { format!("; and {} more", n - 1) } else { String::new() };
-    if let Some((detail, ..)) = fails.first() {
-        let detail = format!("{detail}{}", more(fails.len()));
-        ctx.fail("M3", detail.clone());
-        ctx.results.last_mut().expect("just reported").unless_missed = Some(Recheck {
-            windows: fails.into_iter().map(|(_, windows)| windows).collect(),
-            output_only: false,
-            verdict: Verdict::Error,
-            detail: format!(
-                "inconclusive, because {MISSED}; a baseline or recovery window may be incomplete: {detail}"
-            ),
-        });
+    if let Some(failure) = fails.first() {
+        ctx.fail("M3", format!("{}{}", failure.detail, more(fails.len())));
+        ctx.results.last_mut().expect("just reported").unless_missed = Some(Recheck::Failures(fails));
         return;
     }
     if let Some(first) = errors.first() {
@@ -5654,8 +5675,8 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
         None => {
             ctx.pass_with("M3", pass.clone());
             let r = ctx.results.last_mut().expect("just reported");
-            r.unless_missed = Some(Recheck {
-                windows: vec![windows],
+            r.unless_missed = Some(Recheck::UnlessMissed {
+                windows,
                 output_only: false,
                 verdict: Verdict::Error,
                 detail: unless(MISSED),
@@ -6666,6 +6687,70 @@ while header := sys.stdin.buffer.readline():
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
+    async fn recovery_recheck_reports_only_surviving_failures() {
+        let cfg = mutation_test_config("exit 0");
+        let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+        let mut rec = Recovery { expect: Expect::Baseline, ..Recovery::default() };
+        for probe in [profile::Probe::DocumentSymbol, profile::Probe::FoldingRange] {
+            rec.stable.push(Stable {
+                doc: 0,
+                probe,
+                label: format!("{} of seed.txt", probe.name()),
+                params: Some(json!({"textDocument": {"uri": "file:///seed.txt"}})),
+                baseline: json!([]),
+                baseline_window: None,
+            });
+        }
+        rec.cases.push(CaseRecovery {
+            case: 0,
+            window: (Duration::ZERO, Duration::from_secs(6)),
+            outcomes: vec![
+                ProbeEnd::Failed {
+                    detail: "case 0: document symbols differ".into(),
+                    from: Duration::from_secs(1),
+                    to: Duration::from_secs(2),
+                },
+                ProbeEnd::Failed {
+                    detail: "case 0: folding ranges differ".into(),
+                    from: Duration::from_secs(4),
+                    to: Duration::from_secs(5),
+                },
+            ],
+        });
+        judge_m3(&mut ctx, &rec, None, None);
+        let m3 = ctx.results.pop().unwrap();
+        assert_eq!(m3.verdict, Verdict::Fail);
+        assert_eq!(m3.detail, "case 0: document symbols differ; and 1 more");
+        let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
+        for (lost, expected) in [
+            (vec![], Some("case 0: document symbols differ; and 1 more")),
+            (vec![(2, 3)], Some("case 0: folding ranges differ")),
+            (vec![(5, 6)], Some("case 0: document symbols differ")),
+            (vec![(2, 3), (5, 6)], None),
+        ] {
+            finish.lost = lost
+                .into_iter()
+                .map(|(from, to)| {
+                    (Duration::from_secs(from), Duration::from_secs(to), "an unfinished frame was lost".into())
+                })
+                .collect();
+            let mut rechecked = m3.clone();
+            rechecked.recheck(&finish);
+            match expected {
+                Some(detail) => {
+                    assert_eq!(rechecked.verdict, Verdict::Fail);
+                    assert_eq!(rechecked.detail, detail);
+                }
+                None => {
+                    assert_eq!(rechecked.verdict, Verdict::Error);
+                    assert!(rechecked.detail.contains("an unfinished frame was lost"));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
     async fn recovery_pushed_baseline_is_rechecked_after_judgment() {
         for (recovered, independent_failure) in [(false, false), (false, true), (true, false)] {
             let cfg = mutation_test_config("exit 0");
@@ -6722,6 +6807,9 @@ while header := sys.stdin.buffer.readline():
             assert_eq!(m3.verdict, if independent_failure { Verdict::Fail } else { Verdict::Error });
             if !independent_failure {
                 assert!(m3.detail.contains("a baseline publish was skipped"), "{}", m3.detail);
+            } else {
+                assert!(m3.detail.starts_with("case 0: textDocument/documentSymbol of seed.txt"), "{}", m3.detail);
+                assert!(m3.detail.ends_with("; and 1 more"), "{}", m3.detail);
             }
         }
     }

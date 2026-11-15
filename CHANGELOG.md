@@ -32,6 +32,7 @@
 
 ### Fixed
 
+- M3 rebuilds its failure description and count from the failures whose evidence survives the final recheck.
 - M3 rechecks stops after the recovery drain and terminal probes, keeping interrupted cases inconclusive and
   preserving failures from earlier completed cases.
 - M3 rechecks pushed-baseline evidence after recovery and at session end, so a skipped frame spanning the first
