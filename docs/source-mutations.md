@@ -239,7 +239,9 @@ A failure needs a deciding answer about the restored text that contradicts an ex
 the mutations. It also needs complete evidence: the terminal probe delivered and answered (for pushed
 diagnostics, the whole bound read), and nothing missed in lspcheck's reading of the server's output (a skipped or
 cut-short frame) between the deciding answer and its end (for a pull, from the terminal probe's write to its answer;
-for a push, from that publish to the end of the bound). Anything less, including polling stopped early by lspcheck's
+for a push, from that publish to the end of the bound). A pushed-diagnostics verdict also needs every publish labelled
+with version 1 since the document's `didOpen` to match the baseline after projection, and nothing missed in the
+server's output from that `didOpen` to the session's end. Anything less, including polling stopped early by lspcheck's
 poll budget or a terminal probe left unanswered, makes M3 `ERROR` for that case, with what was missing named. That is
 seen evidence, which is what `FAIL` needs. Without a stated expectation, the same
 observation is reported as `ERROR` with the difference shown, and the profile's author decides.
@@ -294,11 +296,14 @@ A fully evidenced failure takes precedence over errors in other cases or probes.
   ("not seen to recover within 20 s; lspcheck's bound, not a protocol rule: set `[mutation.recovery].expect` if the
   answers are fixed"); with a stable probe, a stop during a case (an exit, closed output, an undeliverable write or
   the written-bytes cap) left its recovery unjudged; a stated expectation was contradicted at baseline; malformed
-  diagnostic evidence arrived during recovery; or nothing failed but evidence was missed in a recovery window.
+  diagnostic evidence arrived during recovery; a publish labelled with version 1 since `didOpen` differed from a pushed
+  baseline, or lspcheck missed some of the server's output from `didOpen` to the session's end, which makes that
+  probe's outcomes `ERROR` whether they failed or recovered; or nothing failed but evidence was missed in a recovery
+  window.
   Stop state is refreshed after draining recovery output and after the terminal probes, including when no terminal
   request was needed. Earlier completed cases' observed failures still stand.
-- *pass:* every case that reached restoration recovered. The detail gives the cases, the probes used and the slowest
-  recovery time.
+- *pass:* every case that reached restoration recovered, and each pushed baseline held as above, to the session's
+  end. The detail gives the cases, the probes used and the slowest recovery time.
 
 **Extended checks.** In the mutation scenario, D1 judges positions about the seed documents from their `didOpen`
 until lspcheck stops waiting for `shutdown`'s reply (or its write fails), with
