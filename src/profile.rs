@@ -1903,7 +1903,9 @@ mod tests {
         for entry in std::fs::read_dir(root.join("ci/stock-servers")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|x| x == "verdicts") {
-                let server = path.file_stem().unwrap().to_string_lossy().into_owned();
+                // `gopls.verdicts`, and later `gopls.mutation.verdicts`, both name gopls.
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let server = name.split('.').next().unwrap().to_string();
                 assert!(mutated.contains(&server), "examples/profiles/{server}.toml has no [mutation] section");
             }
         }
