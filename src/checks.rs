@@ -4668,6 +4668,9 @@ pub struct PushBaseline {
     uri: String,
     /// When lspcheck began writing the document's `didOpen`.
     opened_at: Duration,
+    /// When the baseline was taken, at the first mutation: the publishes
+    /// read before it were judged then.
+    taken_at: Duration,
     baseline: Value,
     no_errors: bool,
     /// Whether the profile expects the baseline back (`expect = "baseline"`).
@@ -4675,9 +4678,12 @@ pub struct PushBaseline {
 }
 
 impl PushBaseline {
-    /// Why the publishes labelled with version 1 in `msgs` don't all show
-    /// the baseline, or may not have, given what lspcheck missed of the
-    /// server's output since the document was opened (`missed_output_within`).
+    /// Why the publishes labelled with version 1 in `msgs` read after the
+    /// baseline was taken don't all show it, or may not have, given what
+    /// lspcheck missed of the server's output since the document was opened
+    /// (`missed_output_within`). Those read before were judged when it was
+    /// taken: held only to `no_errors` they may differ, and an Error in one
+    /// is already the disagreement before any mutation.
     fn unstable(
         &self,
         msgs: &[(Duration, Message)],
@@ -4686,7 +4692,7 @@ impl PushBaseline {
         let late = "a publishDiagnostics labelled with version 1 read after the first mutation";
         msgs.iter()
             .filter(|(at, m)| {
-                *at >= self.opened_at
+                *at >= self.taken_at
                     && publish_label(m).is_some_and(|(uri, label)| label == 1 && documents::same_uri(&self.uri, uri))
             })
             .find_map(|(_, m)| {
@@ -4920,6 +4926,7 @@ impl Recovery {
             label: s.label.clone(),
             uri: self.uris.get(s.doc)?.clone(),
             opened_at: s.baseline_window?.0,
+            taken_at: s.baseline_window?.1,
             baseline: s.baseline.clone(),
             no_errors: self.no_errors,
             expected: self.expect == Expect::Baseline,
@@ -7459,6 +7466,11 @@ while header := sys.stdin.buffer.readline():
                       first mutation differed"],
                     "{case}"
                 );
+            } else {
+                // The publishes judged at the baseline aren't judged again as
+                // if read after the first mutation.
+                let push = rec.push_baseline(&rec.stable[0]).unwrap();
+                assert_eq!(push.unstable(&ctx.s.messages, |_, _| None), None, "{case}");
             }
         }
     }
