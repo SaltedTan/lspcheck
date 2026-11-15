@@ -217,6 +217,12 @@ adds a minute for no evidence and runs anyway, for a uniform matrix; that is the
 
 The 11 `.mutation.verdicts` files record the table above, with each default file's lines and alternatives carried over.
 The runner's toolchains differ from these measurements (Go 1.27.3 for gopls; the runner's cargo and Node), so the
-first runs of the matrix's mutation jobs are the check on the record: compare each job's transcript artifact with the
-table, and record here what they showed. A verdict that differs from the table is evidence about the runner, not a
-baseline to accept without inspecting its transcript.
+first runs of the matrix's mutation jobs were the check on the record. A verdict that differs from the table is
+evidence about the runner, not a baseline to accept without inspecting its transcript.
+
+The workflow ran three times on the change that added the jobs (2026-11-15, one `pull_request` run and two
+`workflow_dispatch` runs of the same commit). All 22 jobs passed each time: every mutation job's verdicts matched its
+file. gopls's D1 was `pass` in the runs inspected, and lua-language-server's documents-scenario D1 and D3 took both of
+their recorded values (`fail` in one run, `pass` in another), as in its default job; its mutation-scenario checks
+passed. A mutation job took 1 to 4 minutes, at most about a minute longer than its server's default job; lemminx's was
+the longest (about 4 minutes, its `initialize` timeouts).
