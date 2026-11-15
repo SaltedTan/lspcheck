@@ -94,9 +94,9 @@ extends is selected and not skipped by the profile.
    and the absolute baseline deadline. Pushed diagnostics are a notification, never
    requested, and a lawful server may publish once per version: their baseline is the publishes labelled with version 1
    read before the first mutation. If there is at least one and all of them are equal after projection, the last is the
-   baseline; if they differ (held only to `no_errors`, if one has an Error; see [step 5](#step-5)), or none arrived,
-   pushed diagnostics aren't used (and `no_errors` can only be established
-   from a pull report).
+   baseline. Held only to `no_errors`, they need only agree that there is no Error: the last is the baseline even if
+   they differ, and an Error in any of them is the `ERROR` of [step 5](#step-5). Otherwise, if they differ, or if none
+   arrived, pushed diagnostics aren't used (and `no_errors` can only be established from a pull report).
    The evidence window from each document's `didOpen` to the first mutation's write is rechecked when judging M3
    and at session end. A skipped frame that spans the first mutation can invalidate that baseline later; dependent
    verdicts become `ERROR`, with the inspection loss named, while independent observed failures still stand.
