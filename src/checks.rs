@@ -585,6 +585,22 @@ impl Trouble {
     }
 }
 
+/// How many methods an M2 trouble names before "and N more".
+const NAMED_METHODS: usize = 3;
+
+/// `methods`, for a trouble's `what`: "a", "a and b", "a, b and c", or the
+/// first [`NAMED_METHODS`] and how many more.
+fn name_methods(methods: &[&str]) -> String {
+    match methods {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        _ if methods.len() > NAMED_METHODS => {
+            format!("{} and {} more", methods[..NAMED_METHODS].join(", "), methods.len() - NAMED_METHODS)
+        }
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 /// What carries over into case `case` from the cases before it: the request
 /// round robin's cursor and each document's version.
 #[derive(Debug, Clone, PartialEq)]
@@ -4490,6 +4506,33 @@ const LAST_POLL_GAP: Duration = Duration::from_secs(2);
 /// The most recovery polls one case sends ([bounds](../docs/source-mutations.md#bounds)).
 const MAX_POLLS: u32 = 40;
 
+/// When a case may send its next recovery poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextPoll {
+    /// At this session time.
+    Due(Duration),
+    /// Not before `recovery_timeout` ends.
+    Deadline,
+    /// Never: [`MAX_POLLS`] were sent.
+    Spent,
+}
+
+/// When the poll after `polls` recovery polls is due: the first when the
+/// restoration was delivered, at `last`; each later one a gap after the
+/// last poll's replies were read, at `last`, [`FIRST_POLL_GAP`] after the
+/// first and doubling up to [`LAST_POLL_GAP`]. None is due at or after
+/// `bound`, the end of `recovery_timeout`, or after [`MAX_POLLS`].
+fn next_poll(polls: u32, last: Duration, bound: Duration) -> NextPoll {
+    if polls >= MAX_POLLS {
+        return NextPoll::Spent;
+    }
+    // Past a few doublings the gap is LAST_POLL_GAP; capping them keeps the
+    // product small.
+    let gap = |n: u32| (FIRST_POLL_GAP * 2u32.pow((n - 1).min(16))).min(LAST_POLL_GAP);
+    let due = if polls == 0 { last } else { last + gap(polls) };
+    if due < bound { NextPoll::Due(due) } else { NextPoll::Deadline }
+}
+
 /// Settles the server once the seed documents are open: waits until no
 /// work-done progress it began is unfinished and no `publishDiagnostics` or
 /// `$/progress` has arrived for [`SETTLE_QUIET`], within `timeout`
@@ -4593,6 +4636,8 @@ fn publish_label(m: &Message) -> Option<(&str, i64)> {
 /// version 1 to it. Those read after the first mutation still describe the
 /// opened text, so one that differs shows the baseline wasn't stable,
 /// however late it was read, and one lspcheck missed may have differed.
+/// Held only to `no_errors`, M3 judges whether a text has an Error, so a
+/// publish that differs without one says nothing against it.
 #[derive(Debug, Clone)]
 pub struct PushBaseline {
     label: String,
@@ -4601,6 +4646,8 @@ pub struct PushBaseline {
     opened_at: Duration,
     baseline: Value,
     no_errors: bool,
+    /// Whether the profile expects the baseline back (`expect = "baseline"`).
+    expected: bool,
 }
 
 impl PushBaseline {
@@ -4625,15 +4672,18 @@ impl PushBaseline {
                 if projected == self.baseline {
                     return None;
                 }
-                if self.no_errors
-                    && let Some(error) = recovery::first_error(&projected)
-                {
-                    return Some(format!(
-                        "the profile and the server disagree before any mutation: mutation.recovery.no_errors says \
-                         the seed has no Error diagnostics, but {} has {} in {late}",
-                        self.label,
-                        metamodel::shorten_value(error)
-                    ));
+                if self.no_errors {
+                    if let Some(error) = recovery::first_error(&projected) {
+                        return Some(format!(
+                            "the profile and the server disagree before any mutation: mutation.recovery.no_errors \
+                             says the seed has no Error diagnostics, but {} has {} in {late}",
+                            self.label,
+                            metamodel::shorten_value(error)
+                        ));
+                    }
+                    if !self.expected {
+                        return None;
+                    }
                 }
                 let shown = recovery::difference(&self.baseline, &projected)
                     .map(|d| {
@@ -4832,6 +4882,7 @@ impl Recovery {
             opened_at: s.baseline_window?.0,
             baseline: s.baseline.clone(),
             no_errors: self.no_errors,
+            expected: self.expect == Expect::Baseline,
         })
     }
 
@@ -5078,19 +5129,26 @@ async fn recover(
             rec.push_read(&mut watches, &ctx.s.messages, docs, s.doc, docs[s.doc].version, index);
         }
     }
-    let (mut polls, mut gap, mut next, mut spent) = (0u32, FIRST_POLL_GAP, restored, false);
+    let (mut polls, mut last, mut spent) = (0u32, restored, false);
     let mut end = BatchEnd::default();
     loop {
         for (d, label, index) in rec.pushes.scan(&ctx.s.messages, docs, bound) {
             rec.push_read(&mut watches, &ctx.s.messages, docs, d, label, index);
         }
-        if rec.all_seen(&seen, &watches) || ctx.s.elapsed() >= bound {
+        // One reading of the clock decides both whether the bound has ended
+        // and whether a poll is due, so no poll is sent past either limit.
+        let now = ctx.s.elapsed();
+        if rec.all_seen(&seen, &watches) || now >= bound {
             break;
         }
         let pending: Vec<usize> = (0..n).filter(|&i| rec.stable[i].params.is_some() && seen[i].is_none()).collect();
-        spent |= !pending.is_empty() && polls == MAX_POLLS;
-        let until = if pending.is_empty() || spent { bound } else { next.min(bound) };
-        if ctx.s.elapsed() < until {
+        let step = if pending.is_empty() { NextPoll::Deadline } else { next_poll(polls, last, bound) };
+        spent |= step == NextPoll::Spent;
+        let until = match step {
+            NextPoll::Due(due) => due,
+            NextPoll::Deadline | NextPoll::Spent => bound,
+        };
+        if now < until {
             let alive = read_until(&mut ctx.s, until, |s| {
                 for (d, label, index) in rec.pushes.scan(&s.messages, docs, bound) {
                     rec.push_read(&mut watches, &s.messages, docs, d, label, index);
@@ -5133,8 +5191,7 @@ async fn recover(
         if end.lost.is_some() || end.capped.is_some() {
             break;
         }
-        next = ctx.s.elapsed() + gap;
-        gap = (gap * 2).min(LAST_POLL_GAP);
+        last = ctx.s.elapsed();
     }
     // Everything read by the end of the bound, for the pushed diagnostics.
     let drained = batch_stopped(&end).is_none() && ctx.s.absorb_all().await;
@@ -5858,13 +5915,14 @@ async fn leave_mutation(
     // couldn't deliver or inspect. One pending when the server went is M1's.
     // As for M2's verdict, a case's failure carries each of its unanswered
     // requests' waits, and is an error if lspcheck may have missed a reply
-    // in every one.
+    // in every one, and names each method left unanswered.
+    let failed = |case: u64| move |t: &Trouble| t.case == case && t.check() == "M2" && t.verdict() == Verdict::Fail;
+    let mut unanswered: Vec<(u64, Vec<&str>)> = Vec::new();
     for r in asked {
         let Some(case) = r.case else { continue };
         match r.outcome {
             StepOutcome::Unanswered => {
-                let failed = |t: &Trouble| t.case == case && t.check() == "M2" && t.verdict() == Verdict::Fail;
-                let t = match summary.troubles.iter().position(failed) {
+                let t = match summary.troubles.iter().position(failed(case)) {
                     Some(i) => &mut summary.troubles[i],
                     None => {
                         summary.troubles.push(Trouble::new(case, "M2", Verdict::Fail, r.method));
@@ -5872,11 +5930,21 @@ async fn leave_mutation(
                     }
                 };
                 t.result.absent_at.push((r.at, r.deadline_at));
+                match unanswered.iter_mut().find(|(c, _)| *c == case) {
+                    Some((_, methods)) if !methods.contains(&r.method) => methods.push(r.method),
+                    Some(_) => {}
+                    None => unanswered.push((case, vec![r.method])),
+                }
             }
             StepOutcome::Undelivered(_) | StepOutcome::Uninspected(_) => {
                 summary.troubles.push(Trouble::new(case, "M2", Verdict::Error, r.method));
             }
             StepOutcome::Answered(_) | StepOutcome::Gone => {}
+        }
+    }
+    for (case, methods) in unanswered {
+        if let Some(t) = summary.troubles.iter_mut().find(|t| failed(case)(t)) {
+            t.what = name_methods(&methods);
         }
     }
     ctx.mutation = Some(summary);
@@ -6123,8 +6191,9 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
     let mut recovered = Vec::new();
     let mut slowest: Option<(Duration, u64, usize, bool)> = None;
     // A publish labelled with version 1 read after the first mutation that
-    // differs, or one lspcheck may have missed, leaves the probe without a
-    // stable baseline, as if read before.
+    // differs (held only to no_errors, has an Error), or one lspcheck may
+    // have missed, leaves the probe without a stable baseline, as if read
+    // before.
     let pushed: Vec<Option<PushBaseline>> = rec.stable.iter().map(|s| rec.push_baseline(s)).collect();
     let unstable: Vec<Option<String>> = pushed
         .iter()
@@ -8958,6 +9027,46 @@ while header := sys.stdin.buffer.readline():
                 format!("unknown: {symbols} seen again; {hover} not judged alone: the isolated run stopped: it exited")
             )
         );
+    }
+
+    #[test]
+    fn recovery_polls_double_to_two_seconds_and_stop_at_forty() {
+        let ms = Duration::from_millis;
+        // Each poll's replies read as it is sent: the schedule alone decides.
+        let schedule = |bound: Duration| {
+            let mut sent: Vec<Duration> = Vec::new();
+            loop {
+                match next_poll(sent.len() as u32, sent.last().copied().unwrap_or_default(), bound) {
+                    NextPoll::Due(at) => sent.push(at),
+                    end => return (sent, end),
+                }
+            }
+        };
+        let gaps = |sent: &[Duration]| sent.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
+        // A bound polling never reaches: 40 polls, and no 41st.
+        let (sent, end) = schedule(Duration::from_secs(3600));
+        assert_eq!((sent.len(), end), (40, NextPoll::Spent));
+        assert_eq!(sent[0], Duration::ZERO);
+        let mut expected = vec![ms(250), ms(500), ms(1000)];
+        expected.resize(39, ms(2000));
+        assert_eq!(gaps(&sent), expected);
+        // The 40th poll is at 73.75 s; a 41st would be due at 75.75 s, inside
+        // a 76 s bound, and still isn't sent.
+        assert_eq!(sent[39], ms(73_750));
+        assert_eq!(schedule(Duration::from_secs(76)), (sent.clone(), NextPoll::Spent));
+        // A shorter bound stops polling first, and a poll due when it ends
+        // isn't sent.
+        assert_eq!(schedule(Duration::from_secs(3)), (vec![ms(0), ms(250), ms(750), ms(1750)], NextPoll::Deadline));
+        assert_eq!(schedule(ms(1750)), (vec![ms(0), ms(250), ms(750)], NextPoll::Deadline));
+        assert_eq!(schedule(ms(73_750)), (sent[..39].to_vec(), NextPoll::Deadline));
+    }
+
+    #[test]
+    fn an_m2_trouble_names_up_to_three_methods() {
+        assert_eq!(name_methods(&["a"]), "a");
+        assert_eq!(name_methods(&["a", "b"]), "a and b");
+        assert_eq!(name_methods(&["a", "b", "c"]), "a, b and c");
+        assert_eq!(name_methods(&["a", "b", "c", "d", "e"]), "a, b, c and 2 more");
     }
 
     #[test]

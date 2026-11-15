@@ -244,8 +244,9 @@ the mutations. It also needs complete evidence: the terminal probe delivered and
 diagnostics, the whole bound read), and nothing missed in lspcheck's reading of the server's output (a skipped or
 cut-short frame) between the deciding answer and its end (for a pull, from the terminal probe's write to its answer;
 for a push, from that publish to the end of the bound). A pushed-diagnostics verdict also needs every publish labelled
-with version 1 since the document's `didOpen` to match the baseline after projection, and nothing missed in the
-server's output from that `didOpen` to the session's end. Anything less, including polling stopped early by lspcheck's
+with version 1 since the document's `didOpen` to match the baseline after projection (held only to `no_errors`, to
+have no Error; see [step 5](#step-5)), and nothing missed in the server's output from that `didOpen` to the session's
+end. Anything less, including polling stopped early by lspcheck's
 poll budget or a terminal probe left unanswered, makes M3 `ERROR` for that case, with what was missing named. That is
 seen evidence, which is what `FAIL` needs. Without a stated expectation, the same
 observation is reported as `ERROR` with the difference shown, and the profile's author decides.
@@ -301,9 +302,9 @@ A fully evidenced failure takes precedence over errors in other cases or probes.
   answers are fixed"); with a stable probe, a stop during a case (an exit, closed output, an undeliverable write or
   the written-bytes cap) left its recovery unjudged; a stated expectation was contradicted at baseline; malformed
   diagnostic evidence arrived during recovery; a publish labelled with version 1 since `didOpen` differed from a pushed
-  baseline, or lspcheck missed some of the server's output from `didOpen` to the session's end, which makes that
-  probe's outcomes `ERROR` whether they failed or recovered; or nothing failed but evidence was missed in a recovery
-  window.
+  baseline (held only to `no_errors`, had an Error), or lspcheck missed some of the server's output from `didOpen`
+  to the session's end, which makes that probe's outcomes `ERROR` whether they failed or recovered; or nothing failed
+  but evidence was missed in a recovery window.
   Stop state is refreshed after draining recovery output and after the terminal probes, including when no terminal
   request was needed. Earlier completed cases' observed failures still stand.
 - *pass:* every case that reached restoration recovered, and each pushed baseline held as above, to the session's
@@ -643,7 +644,11 @@ Step 5 builds [Recovery](#recovery) and M3 as above. Where the rules leave a cho
   Malformed pushed diagnostics before the first mutation leave that probe without a stable baseline.
 - `no_errors = true` without `expect` makes "recovered" mean "no Error diagnostic" for the diagnostics probes, so a
   lingering Warning passes; with `expect = "baseline"` both must hold. `documentSymbol` and `foldingRange` are
-  compared with their baseline either way.
+  compared with their baseline either way. Without `expect`, a publish labelled with version 1 read after `didOpen`
+  that differs from the pushed baseline but has no Error (an Error has `severity` 1; a diagnostic without a
+  severity isn't one) leaves the probe judged as usual, since `no_errors` is all M3 holds the text to. One with an
+  Error contradicts `no_errors` at baseline, and output lspcheck missed from `didOpen` on may have held one, so
+  either still makes the probe's outcomes `ERROR`.
 - A pushed-diagnostics probe recovers on the first publish labelled with the restored version whose projection equals
   the baseline (for an unmutated document, the latest one read before the restoration counts). With `no_errors`, its
   publishes are read to the end of `recovery_timeout`, and the last decides, so each case takes the whole bound.
@@ -698,10 +703,12 @@ Step 6 builds [isolation](#reports-transcripts-and-reproduction). Where the rule
   wasn't. Any other check is judged unless the isolated run stopped (lost the server, or the written-bytes cap).
   `reproduced` combines them like a logical and: `true` when every trouble was seen again, `false` when one that was
   judged wasn't, and otherwise `null`. The detail names each trouble with what it was seen in (a request's method, a
-  probe, or the step during which the server was lost), and the isolated run's when it saw it only elsewhere:
-  `reproduced: M2 FAIL in textDocument/hover, alone in textDocument/foldingRange`, `not reproduced: M2 FAIL in
-  textDocument/hover not seen again`, `unknown: M3 FAIL in publishDiagnostics of main.lua not judged alone: no stable
-  baseline for publishDiagnostics of main.lua`, then what only the isolated run saw.
+  probe, or the step during which the server was lost), and the isolated run's when it saw it only elsewhere (an M2
+  failure names each method the case left unanswered, in the order sent and without repeats, up to three and then
+  how many more): `reproduced: M2 FAIL in textDocument/hover, alone in textDocument/foldingRange`, `not reproduced:
+  M2 FAIL in textDocument/hover and workspace/symbol not seen again`, `unknown: M3 FAIL in publishDiagnostics of
+  main.lua not judged alone: no stable baseline for publishDiagnostics of main.lua`, then what only the isolated run
+  saw.
 - **When it can't run.** An isolated run starts only while the run's deadline (`run_timeout` from the end of the main
   run's baseline) leaves the startup timeout, twice `settle_timeout` and one case budget, and it keeps that deadline,
   so its case is admitted by the same rule as any other. Each isolated session has its own 64 MiB written-bytes cap.
