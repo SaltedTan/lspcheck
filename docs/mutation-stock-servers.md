@@ -41,9 +41,10 @@ character, extra identifier characters where the language has them (`-` in Terra
 LaTeX, so that `\label` and `sec:greeting` are single tokens), brackets (`<>` alone for XML), keywords and a few
 malformed fragments for the `fragment` operator. Every profile keeps the default operators, cases, steps, requests and
 bounds. No server needed an operator left out. The test `the_example_mutation_sections_validate_and_fit_their_run`
-(in `src/profile.rs`) checks that each section validates, that the lexicon plans the matrix's cases, and that the case
-budget (1055 s at the profiles' 30 s request timeout) fits the default one-hour `run_timeout`, with the profile's own
-case count and with `--mutation-cases 10`.
+(in `src/profile.rs`) checks that each section validates and that its case budget (1055 s at the profiles' 30 s
+request timeout) fits the default one-hour `run_timeout`. It also checks that the lexicon recognises at least one of
+its keywords in the profile's seed text, and a comment or a string wherever the seed contains a delimiter the lexicon
+declares, and that every server of the stock matrix has a section.
 
 `[mutation.recovery].expect = "baseline"` is stated only where every probe the server uses answers from the text
 alone: marksman (headings), zls without zig (parsed file), terraform-ls (parsed file), ruff (lint diagnostics) and

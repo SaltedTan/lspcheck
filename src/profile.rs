@@ -1869,11 +1869,10 @@ mod tests {
     /// Every example profile with a `[mutation]` section validates, and its
     /// case budget fits its `run_timeout` at the profile's request timeout
     /// (`mutation_settings` refuses one that doesn't), so `--mutate` never
-    /// refuses to start. Its lexicon recognises its own seed text: a keyword
-    /// when it lists keywords (so a typo in a keyword or in
-    /// `identifier_chars` is caught), and a comment or string wherever the
-    /// seed contains one of the delimiters it declares. Every server of the
-    /// stock matrix has one.
+    /// refuses to start. Its lexicon recognises its own seed text: at least
+    /// one of its keywords when it lists keywords, and a comment or string
+    /// wherever the seed contains one of the delimiters it declares. Every
+    /// server of the stock matrix has one.
     #[test]
     fn the_example_mutation_sections_validate_and_fit_their_run() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));

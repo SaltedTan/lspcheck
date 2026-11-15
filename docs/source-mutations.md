@@ -735,7 +735,7 @@ The proposal left these questions open; the maintainer settled them on 2026-11-1
   don't change.
 - **`--strict` covers the M checks** like every other `POLICY` check: no exception to explain.
 - **The default case count stays 20.** Step 7 [measured it on the stock servers](mutation-stock-servers.md#case-counts)
-  and found no reason to change it; the matrix runs 10 cases.
+  and found no reason to change it; the matrix is to run 10 cases, as measured.
 - **No lexicon presets yet.** Profiles spell out their lexicon. If the stock profiles in step 7 repeat the same tables,
   presets can be added then, as data.
 - **Servers that take no changes stay skipped.** Mutating them by `didClose` and `didOpen` would test a different thing
