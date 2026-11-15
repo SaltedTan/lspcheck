@@ -6,6 +6,7 @@ Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 [mutation implementation status](source-mutations.md) for current behavior and the
 [implementation plan](source-mutations.md#implementation-plan) for the remaining steps.
 M3 rechecks pushed-baseline evidence through session end, including frames spanning the first mutation.
+It refreshes each case's stop state after the recovery drain and terminal probes before judging recovery.
 D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios.
 See the [changelog](../CHANGELOG.md) for changes by release.
 

@@ -340,6 +340,7 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   [recovery rules](docs/source-mutations.md#recovery) and [profile schema](docs/source-mutations.md#profile-schema).
   Incomplete inspection before the first mutation makes a pushed-diagnostics baseline unusable, including when
   the missing evidence becomes known later; dependent recovery verdicts become `ERROR`.
+  A stop detected while draining recovery output or completing terminal probes also leaves that case unjudged.
   See the [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
   [implementation status](docs/source-mutations.md) for what is implemented so far, including the
   [written-bytes bound on automatic answers](docs/source-mutations.md#bounds). The JSON `mutation.stopped`

@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- M3 rechecks stops after the recovery drain and terminal probes, keeping interrupted cases inconclusive and
+  preserving failures from earlier completed cases.
 - M3 rechecks pushed-baseline evidence after recovery and at session end, so a skipped frame spanning the first
   mutation makes dependent verdicts inconclusive instead of producing a false failure.
 - M3 rejects malformed diagnostic evidence, checks recovery when generated edits restore the seed without an

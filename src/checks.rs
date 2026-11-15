@@ -4676,9 +4676,10 @@ async fn recover(
         next = ctx.s.elapsed() + gap;
         gap = (gap * 2).min(LAST_POLL_GAP);
     }
-    let stopped = batch_stopped(&end);
     // Everything read by the end of the bound, for the pushed diagnostics.
-    let drained = stopped.is_none() && ctx.s.absorb_all().await;
+    let drained = batch_stopped(&end).is_none() && ctx.s.absorb_all().await;
+    refresh_recovery_stop(ctx, &mut end, &format!("the recovery drain of case {k}")).await;
+    let stopped = batch_stopped(&end);
     for (d, label, index) in rec.pushes.scan(&ctx.s.messages, docs, bound) {
         rec.push_read(&mut watches, &ctx.s.messages, docs, d, label, index);
     }
@@ -4702,6 +4703,7 @@ async fn recover(
             }
         }
     }
+    refresh_recovery_stop(ctx, &mut end, &format!("the terminal probes of case {k}")).await;
     // A stop during the terminal probes leaves the case unjudged: what the
     // server would have said next is unknown, so no difference fails it.
     let interrupted = match (&stopped, batch_stopped(&end)) {
@@ -4807,6 +4809,15 @@ async fn recover(
     }
     rec.cases.push(CaseRecovery { case: k, window: (restored, ctx.s.elapsed()), outcomes });
     end
+}
+
+async fn refresh_recovery_stop(ctx: &mut Ctx<'_>, end: &mut BatchEnd, place: &str) {
+    if end.lost.is_none() && (ctx.s.stdout_closed() || !ctx.s.is_alive() || ctx.s.stopped_reading().is_some()) {
+        end.lost = Some(lost_output(ctx).await);
+    }
+    if end.capped.is_none() {
+        end.capped = answers_capped(&ctx.s, 0, place);
+    }
 }
 
 /// Why a batch stopped the case it was part of, if it did.
@@ -6528,6 +6539,129 @@ while header := sys.stdin.buffer.readline():
             version: 1,
             version_at: Duration::ZERO,
         }]
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_drain_refreshes_stop_state_before_judging() {
+        let script = r#"import json, os, sys
+def send(value):
+    body = json.dumps(value).encode()
+    sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
+    sys.stdout.buffer.flush()
+while header := sys.stdin.buffer.readline():
+    length = int(header.split(b':')[1])
+    assert sys.stdin.buffer.readline() == b'\r\n'
+    request = json.loads(sys.stdin.buffer.read(length))
+    if request['method'] == 'exit':
+        break
+    if request['method'] == 'lspcheck/emit':
+        diagnostics = [] if sys.argv[2] == 'clean' else [{
+            'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 1}},
+            'severity': 1, 'message': 'lingering error'
+        }]
+        send({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics', 'params': {
+            'uri': 'file:///seed.txt', 'version': 2, 'diagnostics': diagnostics
+        }})
+        continue
+    assert request['method'] == 'lspcheck/stop'
+    if sys.argv[1] == 'exit':
+        break
+    if sys.argv[1] == 'close':
+        os.close(1)
+    if sys.argv[1] == 'inspection':
+        sys.stdout.buffer.write(b'x' * 4096)
+        sys.stdout.buffer.flush()
+    if sys.argv[1] == 'withheld':
+        send({'jsonrpc': '2.0', 'id': 99, 'method': 'workspace/configuration', 'params': {'items': [{}]}})
+"#;
+        for (mode, clean, expected) in [
+            ("exit", false, Verdict::Error),
+            ("exit", true, Verdict::Error),
+            ("close", false, Verdict::Error),
+            ("inspection", false, Verdict::Error),
+            ("withheld", false, Verdict::Error),
+            ("active", false, Verdict::Fail),
+            ("active", true, Verdict::Pass),
+        ] {
+            let mut cfg = mutation_test_config("exit 0");
+            cfg.exit_timeout = Duration::ZERO;
+            cfg.server = ServerCommand::new(&[
+                "python3".into(),
+                "-I".into(),
+                "-c".into(),
+                script.into(),
+                mode.into(),
+                if clean { "clean".into() } else { "error".into() },
+            ]);
+            let mut ctx = mutation_test_ctx(&cfg, 1024).await;
+            let mut docs = recovery_test_docs();
+            docs[0].version = 2;
+            let mut rec = Recovery { no_errors: true, ..Recovery::default() };
+            rec.stable.push(Stable {
+                doc: 0,
+                probe: profile::Probe::PublishDiagnostics,
+                label: "publishDiagnostics of seed.txt".into(),
+                params: None,
+                baseline: json!([]),
+                baseline_window: None,
+            });
+            ctx.s.notify("lspcheck/emit", None).await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            assert!(matches!(ctx.s.recv(deadline).await, Recv::Message(m) if m.method() == Some(PUBLISH_DIAGNOSTICS)));
+            ctx.s.notify("lspcheck/stop", None).await.unwrap();
+            match mode {
+                "exit" => {
+                    assert!(ctx.s.wait_exit(deadline).await.is_some());
+                    assert!(!ctx.s.stdout_closed());
+                }
+                "close" | "inspection" => {
+                    ctx.s.drain(deadline).await;
+                    assert!(ctx.s.stdout_closed());
+                    assert!(ctx.s.is_alive());
+                    assert_eq!(ctx.s.stopped_reading().is_some(), mode == "inspection");
+                }
+                "withheld" => {
+                    ctx.s.cap_answers(ctx.s.bytes_written(), 0);
+                    assert!(
+                        matches!(ctx.s.recv(deadline).await, Recv::Message(m) if m.method() == Some("workspace/configuration"))
+                    );
+                    assert!(ctx.s.answer_withheld().is_some());
+                }
+                _ => {}
+            }
+            let restored = ctx.s.elapsed();
+            let end = recover(&mut ctx, &mut rec, &docs, &mut Vec::new(), 1, (Duration::ZERO, restored)).await;
+            let stopped = batch_stopped(&end);
+            judge_m3(&mut ctx, &rec, stopped.as_deref(), end.capped.as_deref());
+            assert_eq!(ctx.results.last().unwrap().verdict, expected, "{mode}: {}", ctx.results.last().unwrap().detail);
+            assert_eq!(stopped.is_some(), expected == Verdict::Error, "{mode}");
+            if expected == Verdict::Error {
+                assert!(matches!(&rec.cases[0].outcomes[0], ProbeEnd::Unseen(_)), "{mode}");
+            }
+            if expected == Verdict::Error {
+                rec.cases.insert(
+                    0,
+                    CaseRecovery {
+                        case: 0,
+                        window: (Duration::ZERO, Duration::ZERO),
+                        outcomes: vec![ProbeEnd::Failed {
+                            detail: "case 0: an earlier completed recovery failed".into(),
+                            from: Duration::ZERO,
+                            to: Duration::ZERO,
+                        }],
+                    },
+                );
+                judge_m3(&mut ctx, &rec, stopped.as_deref(), end.capped.as_deref());
+                assert_eq!(ctx.results.last().unwrap().verdict, Verdict::Fail, "{mode}");
+                assert!(ctx.results.last().unwrap().detail.starts_with("case 0:"));
+            }
+            if ctx.s.is_alive() {
+                ctx.s.notify("exit", None).await.unwrap();
+                assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
+            }
+            ctx.s.finish(Duration::from_millis(200)).await;
+        }
     }
 
     #[cfg(unix)]

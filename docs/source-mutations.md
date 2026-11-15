@@ -288,6 +288,8 @@ A fully evidenced failure takes precedence over errors in other cases or probes.
   answers are fixed"); with a stable probe, a stop during a case (an exit, closed output, an undeliverable write or
   the written-bytes cap) left its recovery unjudged; a stated expectation was contradicted at baseline; malformed
   diagnostic evidence arrived during recovery; or nothing failed but evidence was missed in a recovery window.
+  Stop state is refreshed after draining recovery output and after the terminal probes, including when no terminal
+  request was needed. Earlier completed cases' observed failures still stand.
 - *pass:* every case that reached restoration recovered. The detail gives the cases, the probes used and the slowest
   recovery time.
 
