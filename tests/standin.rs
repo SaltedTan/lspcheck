@@ -2694,9 +2694,13 @@ fn the_clean_standin_survives_mutation() {
     assert_eq!(r.status, 0, "{}", r.stdout);
     assert_eq!(
         r.report["mutation"],
-        serde_json::json!({"seed": 20261111, "format": 1, "cases": 4, "cases_run": 4, "stopped": null})
+        serde_json::json!({
+            "seed": 20261111, "format": 1, "cases": 4, "cases_run": 4, "stopped": null, "isolated": []
+        })
     );
     assert!(r.stdout.lines().next().unwrap().ends_with("— mutation seed 20261111, 4 cases"), "{}", r.stdout);
+    // Nothing failed, so no case was run again alone.
+    assert!(!t.join("mutation-case-0.jsonl").exists() && !r.stdout.contains(" alone: "), "{}", r.stdout);
     let m2 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M2").unwrap()["detail"];
     assert!(m2.as_str().unwrap().contains("got a response; none with an error"), "{m2}");
     // M3 passed on evidence: every probe the stand-in offers had a stable
@@ -2752,7 +2756,7 @@ fn the_seed_and_case_flags_override_the_profile() {
     let (r, t, _keep) = mutated(&[], &["--mutation-seed", "7", "--mutation-cases", "1", "--only", "M1,M2,M3"]);
     assert_eq!(
         r.report["mutation"],
-        serde_json::json!({"seed": 7, "format": 1, "cases": 1, "cases_run": 1, "stopped": null})
+        serde_json::json!({"seed": 7, "format": 1, "cases": 1, "cases_run": 1, "stopped": null, "isolated": []})
     );
     expect(&r, "M1", "pass");
     let plans = recorded_plans(&t);
@@ -2775,6 +2779,14 @@ fn mutation_server_exit_records_early_stop_and_fails_m1() {
     expect(&r, "M3", "error");
     let m3 = detail(&r, "M3");
     assert!(m3.starts_with(&format!("the run stopped before every case's recovery was judged: {m1}; ")), "{m3}");
+    // Run alone, case 0 makes the server exit again. M3's error is the
+    // run's, not the case's.
+    assert_eq!(
+        r.report["mutation"]["isolated"],
+        serde_json::json!([
+            {"case": 0, "transcript": "mutation-case-0.jsonl", "reproduced": true, "detail": "reproduced: M1 FAIL"}
+        ])
+    );
 }
 
 #[test]
@@ -2787,11 +2799,115 @@ fn output_past_the_budget_while_mutated_makes_m1_an_error_not_a_failure() {
 
 #[test]
 fn a_request_left_unanswered_after_a_mutation_fails_m2() {
-    let (r, _, _keep) = mutated(&["ignore-while-unbalanced"], &["--timeout", "2", "--only", "M1,M2"]);
+    let (r, t, _keep) = mutated(&["ignore-while-unbalanced"], &["--timeout", "2", "--only", "M1,M2"]);
     expect(&r, "M1", "pass");
     expect(&r, "M2", "fail");
     let m2 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M2").unwrap()["detail"];
     assert!(m2.as_str().unwrap().contains("in case 0 got no response within 2 s (--timeout)"), "{m2}");
+    // Every case fails M2; only the first three are run again alone.
+    let isolated = r.report["mutation"]["isolated"].as_array().unwrap();
+    assert_eq!(isolated.iter().map(|i| i["case"].as_u64().unwrap()).collect::<Vec<_>>(), [0, 1, 2]);
+    for i in isolated {
+        assert_eq!((&i["reproduced"], &i["detail"]), (&true.into(), &"reproduced: M2 FAIL".into()), "{i}");
+        assert!(t.join(i["transcript"].as_str().unwrap()).exists(), "{i}");
+    }
+    assert!(!t.join("mutation-case-3.jsonl").exists());
+}
+
+/// The versions and content changes of the `didChange` notifications a
+/// transcript records, from `version` on. Each session has its own
+/// workspace, so the URIs differ.
+fn recorded_changes(transcript: &std::path::Path, version: i64) -> Vec<(i64, Value)> {
+    recorded_messages(transcript, "out")
+        .into_iter()
+        .filter(|m| m["method"] == "textDocument/didChange")
+        .map(|m| (m["params"]["textDocument"]["version"].as_i64().unwrap(), m["params"]["contentChanges"].clone()))
+        .filter(|(v, _)| *v >= version)
+        .collect()
+}
+
+#[test]
+fn a_failing_case_is_run_again_alone_and_reproduces() {
+    // Only case 3 inserts a `[`, and the stand-in ignores requests while a
+    // document has more `[` than `]`: case 3 alone fails M2.
+    let fault = "ignore-while-extra-square-bracket";
+    let args = ["--timeout", "2", "--only", "M1,M2,M3"];
+    let (r, t, _keep) = mutated(&[fault], &args);
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "fail");
+    expect(&r, "M3", "pass");
+    assert!(detail(&r, "M2").contains("in case 3 got no response within 2 s (--timeout)"), "{}", detail(&r, "M2"));
+    assert_eq!(
+        r.report["mutation"]["isolated"],
+        serde_json::json!([
+            {"case": 3, "transcript": "mutation-case-3.jsonl", "reproduced": true, "detail": "reproduced: M2 FAIL"}
+        ])
+    );
+    let alone = t.join("mutation-case-3.jsonl");
+    assert!(
+        r.stdout.contains(&format!(
+            "  mutation case 3 alone: reproduced: M2 FAIL\n{}transcript: {}",
+            " ".repeat(21),
+            alone.display()
+        )),
+        "{}",
+        r.stdout
+    );
+    // The isolated run plans case 3 as the main run did and sends the same
+    // didChange notifications, versions included; and only those.
+    let plans = recorded_plans(&t);
+    let case_3: Vec<&Value> = plans.iter().filter(|p| p["case"] == 3).collect();
+    let alone_plans: Vec<Value> = std::fs::read_to_string(&alone)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter_map(|v| v.get("mutation").cloned())
+        .collect();
+    assert_eq!(alone_plans.iter().collect::<Vec<_>>(), case_3);
+    let first = case_3[0]["steps"][0]["version"].as_i64().unwrap();
+    assert_eq!(recorded_changes(&alone, 0), recorded_changes(&t.join("mutation.jsonl"), first));
+    // With no room left in the run for an isolated run, it isn't run, and the
+    // verdicts are those of the run that isolated case 3. The case budget
+    // with a 2 s timeout is 53 s; an isolated run may take the startup
+    // timeout, twice the 5 min settle timeout and that budget.
+    let (path, _keep) = mutation_variant(&[
+        ("[mutation]\n", "[mutation]\nrun_timeout = \"353s\"\n"),
+        ("[mutation.lexicon]", "[mutation.recovery]\nsettle_timeout = \"5m\"\n\n[mutation.lexicon]"),
+    ]);
+    let (cramped, cramped_t, _keep) = mutated_with(&path, &[fault], &args);
+    assert_eq!(cramped.verdicts, r.verdicts, "{}", cramped.stdout);
+    assert_eq!(detail(&cramped, "M2"), detail(&r, "M2"));
+    assert_eq!(cramped.report["mutation"]["cases_run"], 4);
+    let isolated = &cramped.report["mutation"]["isolated"];
+    assert_eq!(
+        (&isolated[0]["case"], &isolated[0]["transcript"], &isolated[0]["reproduced"]),
+        (&3.into(), &Value::Null, &Value::Null),
+        "{isolated}"
+    );
+    let why = isolated[0]["detail"].as_str().unwrap();
+    assert!(
+        why.starts_with("not run: mutation.run_timeout left ")
+            && why.ends_with(" s, less than the 658 s an isolated run may take"),
+        "{why}"
+    );
+    assert!(!cramped_t.join("mutation-case-3.jsonl").exists());
+}
+
+#[test]
+fn a_case_that_fails_only_in_the_whole_run_is_not_reproduced_alone() {
+    // The stand-in ignores requests after the session's fourth didChange,
+    // case 1's first step. Alone, case 1 sends two: its failure is the
+    // whole run's, and stays a failure.
+    let (r, _, _keep) = mutated(&["ignore-after-fourth-change"], &["--timeout", "2", "--only", "M1,M2,M3"]);
+    expect(&r, "M2", "fail");
+    assert!(detail(&r, "M2").contains("in case 1 got no response within 2 s (--timeout)"), "{}", detail(&r, "M2"));
+    assert_eq!(
+        r.report["mutation"]["isolated"],
+        serde_json::json!([{
+            "case": 1, "transcript": "mutation-case-1.jsonl", "reproduced": false,
+            "detail": "not reproduced: M2 FAIL not seen again"
+        }])
+    );
 }
 
 #[test]
@@ -2959,10 +3075,16 @@ fn a_diagnostics_version_never_sent_in_the_mutation_scenario_fails_d2() {
     // The stand-in labels diagnostics with its own counter. With one seed
     // document it would match the versions sent; with two, it runs ahead of
     // each. The documents scenario fails D2 too; the detail shows the
-    // mutation scenario's failure.
+    // mutation scenario's failure. Its publishes never return to their
+    // baseline, so pushed diagnostics aren't a recovery probe here: each
+    // case, and each case run again alone, would wait out recovery_timeout.
     let (path, _keep) = mutation_variant(&[
         ("files = { \"main.lua\" = \"\"\"", "files = { \"other.lua\" = \"local x = (1)\\n\", \"main.lua\" = \"\"\""),
         ("[mutation]\n", "[mutation]\nfiles = [\"main.lua\", \"other.lua\"]\n"),
+        (
+            "[mutation.lexicon]",
+            "[mutation.recovery]\nprobes = [\"textDocument/documentSymbol\", \"textDocument/foldingRange\"]\n\n[mutation.lexicon]",
+        ),
     ]);
     let (r, _, _keep) = mutated_with(&path, &["diagnostics-own-version"], &[]);
     expect(&r, "D2", "fail");
@@ -3531,12 +3653,17 @@ fn an_end_of_output_lspcheck_couldnt_read_before_shutdown_makes_m1_an_error() {
     // The restoration of a 200 KiB document fills the pipe. Partway through
     // it the server stops reading, sends requests and closes stdout, so the
     // end of output is queued behind requests lspcheck can't answer before
-    // shutdown. Unread, it is neither a pass nor a failure.
+    // shutdown. Unread, it is neither a pass nor a failure. Each answer
+    // lspcheck can't write waits out its write deadline, so the session takes
+    // over a minute; the run's deadline leaves no room to run the case again
+    // alone (that needs twice the 5 min settle timeout), which keeps the test
+    // inside the watchdog.
     let text = format!("hello (world) {}", "a".repeat(200 * 1024));
     let (path, _dir) = profile(&format!(
         "[workspace]\nfiles = {{ \"main.txt\" = \"{text}\" }}\n[document]\npath = 'main.txt'\n\
          language_id = 'plaintext'\n[mutation]\nseed = 20261111\ncases = 1\nsteps = 1\n\
-         operators = ['unbalance-bracket']\nrequests_per_step = 1\nmax_document_kib = 1024\n"
+         operators = ['unbalance-bracket']\nrequests_per_step = 1\nmax_document_kib = 1024\nrun_timeout = '60s'\n\
+         [mutation.recovery]\nsettle_timeout = '5m'\n"
     ));
     let (r, _, _keep) = run_with_transcripts(
         &["--fault", "close-output-mid-restoration"],
@@ -3545,6 +3672,9 @@ fn an_end_of_output_lspcheck_couldnt_read_before_shutdown_makes_m1_an_error() {
     expect(&r, "M1", "error");
     let m1 = &r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == "M1").unwrap()["detail"];
     assert!(m1.as_str().unwrap().contains("couldn't finish reading"), "{m1}");
+    let isolated = &r.report["mutation"]["isolated"][0];
+    assert_eq!((&isolated["case"], &isolated["reproduced"]), (&0.into(), &Value::Null), "{isolated}");
+    assert!(isolated["detail"].as_str().unwrap().starts_with("not run: mutation.run_timeout left "), "{isolated}");
 }
 
 #[test]

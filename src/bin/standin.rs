@@ -213,6 +213,14 @@ const FAULTS: &[(&str, &str)] = &[
     ("configure-on-shutdown", "before the shutdown reply, ask workspace/configuration for 256 items of section `big`"),
     ("ignore-while-unbalanced", "never answer a request about a document whose brackets are unbalanced"),
     (
+        "ignore-while-extra-square-bracket",
+        "never answer a request about a document with more `[` than `]` (the mutation fixture's case 3 alone)",
+    ),
+    (
+        "ignore-after-fourth-change",
+        "never answer a request read after the fourth didChange of the session and before the fifth",
+    ),
+    (
         "close-output-mid-restoration",
         "when a second message over 128 KiB begins (the didChange restoring a large opened document), send 20,000 \
          workspace/configuration requests and close stdout, then read the rest of that message and nothing more, but \
@@ -495,6 +503,8 @@ fn main() {
     let mut negotiated_units = Units::Utf16;
     // For diagnostics-own-version: the stand-in's own diagnostics counter.
     let mut own_version = 0i64;
+    // For ignore-after-fourth-change: the didChange notifications read.
+    let mut changes_read = 0u64;
     // For late-wrong-count, selection-from-later-text and
     // selection-from-changed-text: the selectionRange request held (its id,
     // params, document and that document's version), and whether one was.
@@ -784,6 +794,9 @@ fn main() {
                         &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
                     );
                 }
+            }
+            if method == "textDocument/didChange" {
+                changes_read += 1;
             }
             if method == "textDocument/didChange" && fault("inflated-on-change") {
                 out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
@@ -1093,6 +1106,16 @@ fn main() {
             .and_then(|u| docs.get(u))
             .is_some_and(|(text, _)| !unmatched_brackets(text, units, split).is_empty());
         if unbalanced && fault("ignore-while-unbalanced") {
+            continue;
+        }
+        let extra_square = msg
+            .pointer("/params/textDocument/uri")
+            .and_then(Value::as_str)
+            .and_then(|u| docs.get(u))
+            .is_some_and(|(text, _)| text.matches('[').count() > text.matches(']').count());
+        if (extra_square && fault("ignore-while-extra-square-bracket"))
+            || (changes_read == 4 && fault("ignore-after-fourth-change"))
+        {
             continue;
         }
         if unbalanced && fault("content-modified-while-unbalanced") {

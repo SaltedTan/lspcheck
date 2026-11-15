@@ -5,9 +5,10 @@ the [implementation plan](#implementation-plan) are in place: the planner (`src/
 `[mutation]` section, and the scenario, which judges M1 and M2. Step 4 is in place too: D1, D2, D6 and K1 are
 [extended](#verdict-rules) to the scenario, and answers to the server's own requests are held to the
 [written-bytes cap](#bounds). Step 5 is in place: the scenario settles, takes the [recovery probes'](#recovery)
-baselines, polls them after each restoration and judges M3, with `expect` and `no_errors`. `--mutate` and its two
-flags are experimental and hidden from `--help`. See [how steps 3 and 5 are built](#step-3) and the
-[design status](design.md) for its place in the roadmap.
+baselines, polls them after each restoration and judges M3, with `expect` and `no_errors`. Step 6 is in place:
+the first three failing or erroring cases are [run again alone](#step-6), and the report says whether each
+reproduced. `--mutate` and its two flags are experimental and hidden from `--help`. See
+[how steps 3, 5 and 6 are built](#step-3) and the [design status](design.md) for its place in the roadmap.
 
 ## Context
 
@@ -457,7 +458,7 @@ Each edit records the SHA-256 of its inserted text, with `fallback: true` when i
 Inserted text up to 64 characters is recorded in `inserted`; longer text uses its UTF-8 byte count in `inserted_bytes`
 and its first 64 characters in `inserted_prefix`. The full text is in the recorded `didChange`.
 
-A whole session can be long, so a later step adds **isolation**: after the run, for each of the first three failing
+A whole session can be long, so [step 6](#step-6) adds **isolation**: after the run, for each of the first three failing
 or erroring cases, lspcheck runs that case alone in a fresh session (open, settle, baseline, the case's steps, restore,
 probe), from the same seed, and writes `mutation-case-17.jsonl`. The report says whether the failure reproduced. An
 isolation run judges nothing, like `replay`: the verdicts come from the main run alone, so they can't depend on
@@ -486,7 +487,9 @@ runner stalled for 3 s) tests something else, and is repeated.
 | `close-output-mid-restoration` | Unix only: partway through reading a large document's restoration, send 20,000 requests and close stdout, then read nothing more after it | M1 `ERROR` (the end of output is queued behind requests lspcheck can't answer before shutdown), never `PASS` |
 | `late-wrong-count` | answer one `selectionRange` with `[]` after more than 64 later versions | D6 fails from the mutation scenario, on the entry count alone (M2 fails too, as for `selection-from-later-text`) |
 | `recover-before-deadline` | lawful: after restoration, answer the first `documentSymbol` request with `[]` 4 s late, then with the baseline | nothing fails with `expect = "baseline"` and a 3 s `recovery_timeout`: the terminal probe, written after the deadline, sees the baseline |
-| `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails |
+| `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails; only the first three of its four failing cases are [isolated](#step-6) |
+| `ignore-while-extra-square-bracket` | don't answer requests about a document with more `[` than `]` (in the fixture, case 3 alone) | M2 fails; case 3 is isolated and reproduced; with too little of `run_timeout` left it isn't run, and the verdicts are the same |
+| `ignore-after-fourth-change` | don't answer requests read after the session's fourth `didChange` and before its fifth (case 1's first step) | M2 fails; case 1 is isolated and not reproduced, and M2 still fails |
 | `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |
 | `recovery-in-skipped-frame` | after restoration, answer the first poll with `[]`, then send the recovered answer in a frame larger than `--max-frame-mib` | M3 `ERROR` with `expect = "baseline"`, never `FAIL` |
 | `exit-during-terminal-probes` | after restoration, answer `documentSymbol` and `foldingRange` with `[]`, the first `documentSymbol` 4 s late, and exit on reading the second `foldingRange`, a terminal probe | M1 fails; M3 `ERROR`, never `FAIL`, though the terminal `documentSymbol` differs |
@@ -567,7 +570,7 @@ Each step is one small pull request with its tests, docs and changelog entry whe
    [extended checks](#verdict-rules), with their [stand-in faults](#stand-in-faults-and-tests).
 5. **Recovery, M3.** Implemented: settle, stable baselines, projections, polling, `expect` and `no_errors`
    ([step 5](#step-5)); the recovery faults, lawful ones included.
-6. **Isolation.** Rerunning failing cases alone and writing their transcripts.
+6. **Isolation.** Implemented: rerunning failing cases alone and writing their transcripts ([step 6](#step-6)).
 7. **Stock matrix.** `[mutation]` in the example profiles, a mutation job and `.mutation.verdicts` (a workflow change,
    so the maintainer merges it).
 8. **Minimisation**, if isolation shows it is wanted.
@@ -642,6 +645,56 @@ Step 5 builds [Recovery](#recovery) and M3 as above. Where the rules leave a cho
 - Polls are sent when due, never two at once: poll *n* + 1 waits for poll *n*'s replies, then for the gap. A poll still
   waiting when `recovery_timeout` ends keeps its own `--timeout` deadline; the case budget counts that last poll's
   writes and replies, so it can't overrun the case or `run_timeout`.
+
+### Step 6
+
+Step 6 builds [isolation](#reports-transcripts-and-reproduction). Where the rules leave a choice, it makes these:
+
+- **Which cases.** A case is failing or erroring when its own evidence fails a check, or leaves it unknown, before
+  the end-of-session rechecks. These name a case:
+  - M1: the case during which lspcheck lost the server (an exit, closed output, stopped inspection, an undeliverable
+    write, or an exit after an answer was withheld), with M1's verdict, `FAIL` or `ERROR`.
+  - M2: a step request or recovery poll of the case left unanswered (`FAIL`), or that lspcheck couldn't deliver or
+    fully inspect (`ERROR`). A request pending when the server went is M1's.
+  - M3: a probe of the case seen not to recover under a stated expectation (`FAIL`, or `ERROR` when evidence was
+    missed in its window), or not seen to recover (`ERROR`). An outcome made `ERROR` by its baseline (a pushed
+    baseline contradicted or possibly missed) names no case, nor do the run's own errors: `no_errors` contradicted,
+    a stop before every case's recovery was judged, the written-bytes cap.
+  - D1, D2, D6 and K1, always `FAIL`: a position inside a character in a reply to the case's requests or in a publish
+    read during the case; a publish read during the case that D2 fails on its own; a finding in a `selectionRange`
+    reply to the case's requests; MethodNotFound to one of the case's requests.
+
+  Only checks the run reports count (`--only` and the profile's skips apply). A case with several troubles counts
+  once, and the first three by case number are isolated.
+- **What carries over.** The plan is a pure function of the seed, the case and the clean texts, so the isolated run
+  plans the case byte for byte. Two things carry over between cases in the main run: the cursor of the requests'
+  round robin, and the documents' versions. The isolated run starts the cursor where the case started it, and sends
+  the versions the case sent: after `didOpen` at version 1, a document the case changes goes straight to the
+  version after the one it had when the case began (LSP versions need only increase). The case's `didChange`
+  notifications are then the main run's, except for the workspace's URI; a document the case doesn't change stays
+  at version 1. The server's own state can't carry over: what it cached or remembers of earlier cases, and its
+  timing.
+- **Reproduced.** An isolated run is the scenario's own code (open, settle, baseline, the case's steps, restoration,
+  recovery and `shutdown`) with one case, and its troubles are gathered the same way. Like `replay`, it judges
+  nothing: its verdicts and observations reach no report, no cross-cutting check and no exit status. The case
+  reproduced when every check and verdict the main run's troubles in it named is seen again; the detail says which
+  were and which weren't, and what only the isolated run saw. M3 is judged only with a stable baseline, so if the
+  isolated run has none, M3's trouble isn't seen again.
+- **When it can't run.** An isolated run starts only while the run's deadline (`run_timeout` from the end of the main
+  run's baseline) leaves the startup timeout, twice `settle_timeout` and one case budget, and it keeps that deadline,
+  so its case is admitted by the same rule as any other. Each isolated session has its own 64 MiB written-bytes cap.
+  When there isn't room, when the session can't start, or when it stops before the case starts (`initialize`
+  failed, the server exited during the baseline, the case wasn't admitted), `reproduced` is `null` and the detail
+  says `not run:` and why, never "not reproduced".
+- **Report.** `"mutation"` gains `"isolated"`, always present, empty when no case had a trouble: one
+  `{"case", "transcript", "reproduced", "detail"}` per case, where `transcript` is the file's name in `--transcripts`
+  or `null`, and `reproduced` is `true`, `false` or `null`. The terminal report adds a line per case after the
+  checks (`mutation case 3 alone: reproduced: M2 FAIL`, then the transcript's path), and the Markdown report a list.
+  JUnit is unchanged, and so is the schema id.
+- **Transcripts.** With `--transcripts DIR`, each isolated run writes `mutation-case-<k>.jsonl`, an ordinary session
+  transcript that `replay` replays, with a note naming the case. Without it, isolation still runs.
+- Isolation is part of `--mutate`, with no flag of its own. It adds at most three sessions, each usually seconds
+  long, and only to a run that found a trouble.
 
 ## Decisions
 
