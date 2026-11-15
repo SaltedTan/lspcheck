@@ -2990,8 +2990,10 @@ fn cases_with_a_failure_are_run_alone_before_cases_with_only_errors() {
         .map(|i| (i["case"].as_u64().unwrap(), i["detail"].as_str().unwrap()))
         .collect();
     // Alone, the oversized answer goes to case 3's workspace/symbol request,
-    // which joins the methods it left unanswered.
-    let alone = "textDocument/selectionRange, textDocument/documentSymbol, textDocument/foldingRange and 1 more";
+    // sent in the same batch as foldingRange. lspcheck skipped the frame, so
+    // either may have been answered in it: the label leaves both out and
+    // names only the methods whose waits it read in full.
+    let alone = "textDocument/selectionRange and textDocument/documentSymbol";
     assert_eq!(
         isolated,
         [
@@ -3560,6 +3562,33 @@ fn a_pushed_baseline_with_a_publish_lspcheck_skipped_is_not_used() {
         let m3 = detail(&r, "M3");
         assert!(m3.starts_with(&format!("no recovery probe had a stable baseline: {why}")), "{m3}");
     }
+}
+
+#[test]
+fn baseline_publishes_that_differ_by_a_warning_leave_no_errors_judged() {
+    // On reading the seed's didOpen, the stand-in publishes its diagnostics,
+    // then again with a Warning added, and keeps the Warning: lspcheck reads
+    // both before it writes the first mutation. Held only to no_errors, M3
+    // asks whether the restored text has an Error, which the Warning says
+    // nothing about, as for a late publish: the baseline is used, and M3
+    // passes. With expect, the publishes must agree, so nothing changes:
+    // pushed diagnostics have no stable baseline.
+    let (path, _keep) =
+        recovery_profile("no_errors = true\nprobes = [\"publishDiagnostics\"]\nrecovery_timeout = \"3s\"");
+    let (r, _, _keep) = mutated_with(&path, &["second-baseline-warning"], &["--mutation-cases", "1"]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+    let (path, _keep) = recovery_profile(
+        "expect = \"baseline\"\nno_errors = true\nprobes = [\"publishDiagnostics\"]\nrecovery_timeout = \"3s\"",
+    );
+    let (r, _, _keep) =
+        mutated_with(&path, &["second-baseline-warning"], &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M3", "not-exercised");
+    assert_eq!(
+        detail(&r, "M3"),
+        "no recovery probe had a stable baseline: publishDiagnostics of main.lua: the 2 publishDiagnostics labelled \
+         with version 1 before the first mutation differed"
+    );
 }
 
 #[test]

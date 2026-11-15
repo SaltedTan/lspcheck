@@ -25,11 +25,14 @@
 - Under `--mutate`, M3 judges [recovery](docs/source-mutations.md#recovery) using stable baselines and the profile's
   optional expectations. See its [verdict rules](docs/source-mutations.md#verdict-rules) for how it distinguishes
   failures from inconclusive recovery. With `no_errors` and no `expect`, a publish labelled with version 1 read after
-  the first mutation that differs from the pushed baseline without an Error no longer makes the probe `ERROR`.
+  the first mutation that differs from the pushed baseline without an Error no longer makes the probe `ERROR`, and
+  publishes labelled with version 1 read before it that differ without an Error no longer leave pushed diagnostics
+  without a baseline (`N/E`); an Error in one is an `ERROR`, as at baseline.
 - Under `--mutate`, the first three failing or erroring cases are [run again alone](docs/source-mutations.md#step-6),
   failing ones first, each in a fresh session from the same seed, within `run_timeout`. The JSON report's
   `"mutation"` gains `"isolated"`, the terminal and Markdown reports a line per case, saying whether it reproduced
-  (or that the isolated run couldn't tell) and what in (for M2, each method the case left unanswered), and
+  (or that the isolated run couldn't tell) and what in (for M2, each method the case left unanswered, except one
+  whose reply may have been in output lspcheck didn't inspect), and
   `--transcripts` a `mutation-case-<k>.jsonl` for each. An isolated run judges nothing, so verdicts don't depend on it.
 - The 11 [example profiles](examples/profiles/README.md) the stock-server matrix runs gain a `[mutation]` section
   with a lexicon for their language, and `[mutation.recovery].expect = "baseline"` where the recovery probes answer

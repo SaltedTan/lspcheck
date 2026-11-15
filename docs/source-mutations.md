@@ -94,8 +94,9 @@ extends is selected and not skipped by the profile.
    and the absolute baseline deadline. Pushed diagnostics are a notification, never
    requested, and a lawful server may publish once per version: their baseline is the publishes labelled with version 1
    read before the first mutation. If there is at least one and all of them are equal after projection, the last is the
-   baseline; if they differ, or none arrived, pushed diagnostics aren't used (and `no_errors` can only be established
-   from a pull report).
+   baseline. Held only to `no_errors`, they need only agree that there is no Error: the last is the baseline even if
+   they differ, and an Error in any of them is the `ERROR` of [step 5](#step-5). Otherwise, if they differ, or if none
+   arrived, pushed diagnostics aren't used (and `no_errors` can only be established from a pull report).
    The evidence window from each document's `didOpen` to the first mutation's write is rechecked when judging M3
    and at session end. A skipped frame that spans the first mutation can invalidate that baseline later; dependent
    verdicts become `ERROR`, with the inspection loss named, while independent observed failures still stand.
@@ -500,6 +501,7 @@ runner stalled for 3 s) tests something else, and is repeated.
 | `recovery-in-skipped-frame` | after restoration, answer the first poll with `[]`, then send the recovered answer in a frame larger than `--max-frame-mib` | M3 `ERROR` with `expect = "baseline"`, never `FAIL`; case 0's troubles, main and alone, are `M2 ERROR` and `M3 ERROR` |
 | `exit-during-terminal-probes` | after restoration, answer `documentSymbol` and `foldingRange` with `[]`, the first `documentSymbol` 4 s late, and exit on reading the second `foldingRange`, a terminal probe | M1 fails; M3 `ERROR`, never `FAIL`, though the terminal `documentSymbol` differs |
 | `late-warning-in-skipped-frame` | lawful: on open, publish the diagnostics again with a Warning added, in a frame larger than `--max-frame-mib`, and keep the Warning | with `expect = "baseline"` and pushed diagnostics as the only probe, M3 `N/E`, never `FAIL`, whether that frame is read (the publishes differ) or skipped (one may have been missed) |
+| `second-baseline-warning` | lawful: as `late-warning-in-skipped-frame`, with the second publish in a frame of its usual size | with `no_errors = true` and pushed diagnostics as the only probe, nothing fails and M3 passes; with `expect = "baseline"` added, M3 `N/E` (the publishes differ) |
 | `late-baseline-warning` | lawful: on reading the first `didChange`, before applying it, publish version 1's diagnostics with a Warning added, and keep the Warning | with `expect = "baseline"` and pushed diagnostics as the only probe, nothing fails; M3 `ERROR`, naming the publish labelled with version 1 read after the first mutation |
 | `late-baseline-error` | lawful: as `late-baseline-warning`, with an Error | with `no_errors = true` and pushed diagnostics as the only probe, nothing fails; M3 `ERROR`: the profile and the server disagree at baseline |
 | `late-baseline-in-skipped-frame` | lawful: as `late-baseline-warning`, with the late publish in a frame larger than `--max-frame-mib` | with `expect = "baseline"`, pushed diagnostics as the only probe and that frame skipped, M3 `ERROR`, never `FAIL`, naming the publish lspcheck may have missed |
@@ -644,11 +646,13 @@ Step 5 builds [Recovery](#recovery) and M3 as above. Where the rules leave a cho
   Malformed pushed diagnostics before the first mutation leave that probe without a stable baseline.
 - `no_errors = true` without `expect` makes "recovered" mean "no Error diagnostic" for the diagnostics probes, so a
   lingering Warning passes; with `expect = "baseline"` both must hold. `documentSymbol` and `foldingRange` are
-  compared with their baseline either way. Without `expect`, a publish labelled with version 1 read after `didOpen`
-  that differs from the pushed baseline but has no Error (an Error has `severity` 1; a diagnostic without a
-  severity isn't one) leaves the probe judged as usual, since `no_errors` is all M3 holds the text to. One with an
-  Error contradicts `no_errors` at baseline, and output lspcheck missed from `didOpen` on may have held one, so
-  either still makes the probe's outcomes `ERROR`.
+  compared with their baseline either way. Without `expect`, the publishes labelled with version 1 read after
+  `didOpen` need only agree that there is no Error (an Error has `severity` 1; a diagnostic without a severity
+  isn't one), since `no_errors` is all M3 holds the text to: those read before the first mutation that differ
+  without one still give the pushed baseline, the last of them, and one read later that differs from it without one
+  leaves the probe judged as usual. An Error in any of them contradicts `no_errors` before any mutation, and output
+  lspcheck missed from `didOpen` on may have held one, so either still makes the probe's outcomes `ERROR`. With
+  `expect`, they must all equal the baseline.
 - A pushed-diagnostics probe recovers on the first publish labelled with the restored version whose projection equals
   the baseline (for an unmutated document, the latest one read before the restoration counts). With `no_errors`, its
   publishes are read to the end of `recovery_timeout`, and the last decides, so each case takes the whole bound.
@@ -705,10 +709,11 @@ Step 6 builds [isolation](#reports-transcripts-and-reproduction). Where the rule
   judged wasn't, and otherwise `null`. The detail names each trouble with what it was seen in (a request's method, a
   probe, or the step during which the server was lost), and the isolated run's when it saw it only elsewhere (an M2
   failure names each method the case left unanswered, in the order sent and without repeats, up to three and then
-  how many more): `reproduced: M2 FAIL in textDocument/hover, alone in textDocument/foldingRange`, `not reproduced:
-  M2 FAIL in textDocument/hover and workspace/symbol not seen again`, `unknown: M3 FAIL in publishDiagnostics of
-  main.lua not judged alone: no stable baseline for publishDiagnostics of main.lua`, then what only the isolated run
-  saw.
+  how many more, leaving out a method whose every wait had output lspcheck didn't inspect, since its reply may have
+  been there; an M2 error names them all): `reproduced: M2 FAIL in textDocument/hover, alone in
+  textDocument/foldingRange`, `not reproduced: M2 FAIL in textDocument/hover and workspace/symbol not seen again`,
+  `unknown: M3 FAIL in publishDiagnostics of main.lua not judged alone: no stable baseline for publishDiagnostics of
+  main.lua`, then what only the isolated run saw.
 - **When it can't run.** An isolated run starts only while the run's deadline (`run_timeout` from the end of the main
   run's baseline) leaves the startup timeout, twice `settle_timeout` and one case budget, and it keeps that deadline,
   so its case is admitted by the same rule as any other. Each isolated session has its own 64 MiB written-bytes cap.
