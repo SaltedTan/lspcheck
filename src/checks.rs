@@ -820,10 +820,11 @@ fn compare_troubles(
     let (mut seen, mut unseen, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
     for &t in &main {
         let same = |a: &&Trouble| a.case == case && (a.check(), a.verdict()) == (t.check(), t.verdict());
-        match alone.troubles.iter().find(same) {
-            Some(_) if alone.troubles.iter().filter(same).any(|a| a.what == t.what) => seen.push(label(t)),
-            Some(a) => seen.push(format!("{}, alone in {}", label(t), a.what)),
-            None => match unjudged(t, troubles, alone) {
+        let both = troubles.iter().filter(same).find(|m| alone.troubles.iter().filter(same).any(|a| a.what == m.what));
+        match (both, alone.troubles.iter().find(same)) {
+            (Some(m), _) => seen.push(label(m)),
+            (None, Some(a)) => seen.push(format!("{}, alone in {}", label(t), a.what)),
+            (None, None) => match unjudged(t, troubles, alone) {
                 Some(why) => unknown.push(format!("{} not judged alone: {why}", label(t))),
                 None => unseen.push(format!("{} not seen again", label(t))),
             },
@@ -8984,6 +8985,9 @@ while header := sys.stdin.buffer.readline():
             ..MutationSummary::default()
         };
         assert_eq!(compare_troubles(1, &main, &alone, &all), (Some(true), format!("reproduced: M3 FAIL in {pd}")));
+        // Or in the main run's later probe only: named there, not as elsewhere.
+        let alone = MutationSummary { troubles: vec![t(1, "M3", Fail, ds)], ..MutationSummary::default() };
+        assert_eq!(compare_troubles(1, &main, &alone, &all), (Some(true), format!("reproduced: M3 FAIL in {ds}")));
         // A recovery seen with evidence lspcheck may have missed is named so.
         let main = [t(1, "M3", Fail, pd)];
         let alone = MutationSummary { recovered: vec![t(1, "M3", Error, pd)], ..MutationSummary::default() };
