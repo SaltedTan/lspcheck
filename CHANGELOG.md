@@ -26,8 +26,9 @@
   optional expectations. See its [verdict rules](docs/source-mutations.md#verdict-rules) for how it distinguishes
   failures from inconclusive recovery.
 - Under `--mutate`, the first three failing or erroring cases are [run again alone](docs/source-mutations.md#step-6),
-  each in a fresh session from the same seed, within `run_timeout`. The JSON report's `"mutation"` gains
-  `"isolated"`, the terminal and Markdown reports a line per case, saying whether it reproduced, and `--transcripts`
+  failing ones first, each in a fresh session from the same seed, within `run_timeout`. The JSON report's
+  `"mutation"` gains `"isolated"`, the terminal and Markdown reports a line per case, saying whether it reproduced
+  (or that the isolated run couldn't tell) and what in, and `--transcripts`
   a `mutation-case-<k>.jsonl` for each. An isolated run judges nothing, so verdicts don't depend on it.
 
 ### Changed

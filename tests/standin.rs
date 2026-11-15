@@ -2787,7 +2787,10 @@ fn mutation_server_exit_records_early_stop_and_fails_m1() {
     assert_eq!(
         r.report["mutation"]["isolated"],
         serde_json::json!([
-            {"case": 0, "transcript": "mutation-case-0.jsonl", "reproduced": true, "detail": "reproduced: M1 FAIL"}
+            {
+                "case": 0, "transcript": "mutation-case-0.jsonl", "reproduced": true,
+                "detail": "reproduced: M1 FAIL in case 0, step 1 (unbalance-bracket at 108)"
+            }
         ])
     );
 }
@@ -2813,12 +2816,15 @@ fn an_isolated_transcript_that_cannot_be_written_leaves_the_report_alone() {
     assert_eq!((&i["case"], &i["transcript"], &i["reproduced"]), (&0.into(), &Value::Null, &true.into()), "{i}");
     let why = i["detail"].as_str().unwrap();
     let unwritten = format!(
-        "reproduced: M1 FAIL; its transcript couldn't be written: can't write {}: ",
+        "reproduced: M1 FAIL in case 0, step 1 (unbalance-bracket at 108); its transcript couldn't be written: can't write {}: ",
         t.join("mutation-case-0.jsonl").display()
     );
     assert!(why.starts_with(&unwritten), "{why}");
     assert!(
-        r.stdout.contains("  mutation case 0 alone: reproduced: M1 FAIL; its transcript couldn't be written"),
+        r.stdout.contains(&format!(
+            "  mutation case 0 alone: {}; its transcript couldn't be written",
+            "reproduced: M1 FAIL in case 0, step 1 (unbalance-bracket at 108)"
+        )),
         "{}",
         r.stdout
     );
@@ -2843,7 +2849,8 @@ fn a_request_left_unanswered_after_a_mutation_fails_m2() {
     let isolated = r.report["mutation"]["isolated"].as_array().unwrap();
     assert_eq!(isolated.iter().map(|i| i["case"].as_u64().unwrap()).collect::<Vec<_>>(), [0, 1, 2]);
     for i in isolated {
-        assert_eq!((&i["reproduced"], &i["detail"]), (&true.into(), &"reproduced: M2 FAIL".into()), "{i}");
+        assert_eq!(i["reproduced"], true, "{i}");
+        assert!(i["detail"].as_str().unwrap().starts_with("reproduced: M2 FAIL in textDocument/"), "{i}");
         assert!(t.join(i["transcript"].as_str().unwrap()).exists(), "{i}");
     }
     assert!(!t.join("mutation-case-3.jsonl").exists());
@@ -2875,13 +2882,16 @@ fn a_failing_case_is_run_again_alone_and_reproduces() {
     assert_eq!(
         r.report["mutation"]["isolated"],
         serde_json::json!([
-            {"case": 3, "transcript": "mutation-case-3.jsonl", "reproduced": true, "detail": "reproduced: M2 FAIL"}
+            {
+                "case": 3, "transcript": "mutation-case-3.jsonl", "reproduced": true,
+                "detail": "reproduced: M2 FAIL in textDocument/selectionRange"
+            }
         ])
     );
     let alone = t.join("mutation-case-3.jsonl");
     assert!(
         r.stdout.contains(&format!(
-            "  mutation case 3 alone: reproduced: M2 FAIL\n{}transcript: {}",
+            "  mutation case 3 alone: reproduced: M2 FAIL in textDocument/selectionRange\n{}transcript: {}",
             " ".repeat(21),
             alone.display()
         )),
@@ -2940,8 +2950,67 @@ fn a_case_that_fails_only_in_the_whole_run_is_not_reproduced_alone() {
         r.report["mutation"]["isolated"],
         serde_json::json!([{
             "case": 1, "transcript": "mutation-case-1.jsonl", "reproduced": false,
-            "detail": "not reproduced: M2 FAIL not seen again"
+            "detail": "not reproduced: M2 FAIL in textDocument/foldingRange not seen again"
         }])
+    );
+}
+
+#[test]
+fn cases_with_a_failure_are_run_alone_before_cases_with_only_errors() {
+    // The stand-in answers the first request after the first didChange, in
+    // case 0, with a frame past --max-frame-mib: lspcheck may have missed
+    // the answer, so case 0's M2 trouble is an error. Case 3 fails M2, as in
+    // a_failing_case_is_run_again_alone_and_reproduces, and is run alone first.
+    let (r, _, _keep) = mutated(
+        &["oversized-after-first-change", "ignore-while-extra-square-bracket"],
+        &["--max-frame-mib", "1", "--timeout", "2", "--only", "M1,M2"],
+    );
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "fail");
+    let isolated: Vec<(u64, &str)> = r.report["mutation"]["isolated"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["case"].as_u64().unwrap(), i["detail"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        isolated,
+        [(3, "reproduced: M2 FAIL in textDocument/selectionRange"), (0, "reproduced: M2 ERROR in textDocument/hover")]
+    );
+}
+
+#[test]
+fn a_case_without_a_stable_baseline_alone_is_not_known_to_reproduce() {
+    // Once unbalanced, the stand-in adds a Warning to every publish, so with
+    // `expect = "baseline"` each case fails M3 on pushed diagnostics. On a
+    // didChange more than one version on, which only a case run alone after
+    // others sends, it also publishes the opened text's diagnostics, labelled
+    // with version 1, with a Warning added. Case 0 alone reproduces; case 1
+    // alone has no stable baseline for pushed diagnostics, so M3 isn't judged
+    // there, and whether it reproduced is unknown, not "not reproduced".
+    let (path, _keep) =
+        recovery_profile("expect = \"baseline\"\nprobes = [\"publishDiagnostics\"]\nrecovery_timeout = \"1s\"");
+    let (r, _, _keep) = mutated_with(
+        &path,
+        &["warning-after-unbalanced", "late-baseline-on-version-jump"],
+        &["--mutation-cases", "2", "--only", "M1,M2,M3"],
+    );
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+    expect(&r, "M3", "fail");
+    assert_eq!(
+        r.report["mutation"]["isolated"],
+        serde_json::json!([
+            {
+                "case": 0, "transcript": "mutation-case-0.jsonl", "reproduced": true,
+                "detail": "reproduced: M3 FAIL in publishDiagnostics of main.lua"
+            },
+            {
+                "case": 1, "transcript": "mutation-case-1.jsonl", "reproduced": null,
+                "detail": "unknown: M3 FAIL in publishDiagnostics of main.lua not judged alone: no stable baseline for \
+                           publishDiagnostics of main.lua"
+            }
+        ])
     );
 }
 
@@ -3397,6 +3466,13 @@ fn a_recovered_answer_in_a_frame_lspcheck_skipped_is_an_error_not_a_failure() {
         "{m3}"
     );
     assert_eq!(r.status, 2, "{}", r.stdout);
+    // The case's own troubles are settled as the verdicts are: M2's replies
+    // may be in the skipped frames, so its trouble is an error, never a
+    // failure, in the main run and alone.
+    assert_eq!(
+        r.report["mutation"]["isolated"][0]["detail"],
+        "reproduced: M2 ERROR in textDocument/documentSymbol; M3 ERROR in textDocument/documentSymbol of main.lua"
+    );
 }
 
 #[test]

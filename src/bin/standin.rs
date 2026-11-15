@@ -221,6 +221,11 @@ const FAULTS: &[(&str, &str)] = &[
         "never answer a request read after the fourth didChange of the session and before the fifth",
     ),
     (
+        "oversized-after-first-change",
+        "answer the first request answered after the session's first didChange with an error whose message is \
+         padded past 2 MiB",
+    ),
+    (
         "close-output-mid-restoration",
         "when a second message over 128 KiB begins (the didChange restoring a large opened document), send 20,000 \
          workspace/configuration requests and close stdout, then read the rest of that message and nothing more, but \
@@ -287,6 +292,11 @@ const FAULTS: &[(&str, &str)] = &[
     ),
     ("late-baseline-error", "lawful: as late-baseline-warning, with an Error instead of the Warning"),
     ("late-baseline-in-skipped-frame", "lawful: as late-baseline-warning, with the late publish padded past 2 MiB"),
+    (
+        "late-baseline-on-version-jump",
+        "lawful: as late-baseline-warning, but on reading a didChange whose version is more than one past the \
+         document's (as a mutation case run alone sends), whichever didChange it is",
+    ),
     (
         "errors-after-unbalanced",
         "once a document's brackets were unbalanced, add an Error diagnostic to every publish about it",
@@ -503,8 +513,10 @@ fn main() {
     let mut negotiated_units = Units::Utf16;
     // For diagnostics-own-version: the stand-in's own diagnostics counter.
     let mut own_version = 0i64;
-    // For ignore-after-fourth-change: the didChange notifications read.
+    // For ignore-after-fourth-change and oversized-after-first-change: the
+    // didChange notifications read, and whether the padded answer was sent.
     let mut changes_read = 0u64;
+    let mut padded_answer = false;
     // For late-wrong-count, selection-from-later-text and
     // selection-from-changed-text: the selectionRange request held (its id,
     // params, document and that document's version), and whether one was.
@@ -813,10 +825,12 @@ fn main() {
                 let old_text = text.clone();
                 // Version 1's analysis finishing late: lspcheck reads this
                 // only after it has written the first mutation.
-                if (fault("late-baseline-warning")
+                let jumped = fault("late-baseline-on-version-jump") && version > previous_version + 1;
+                if ((fault("late-baseline-warning")
                     || fault("late-baseline-error")
                     || fault("late-baseline-in-skipped-frame"))
                     && previous_version == 1
+                    || jumped)
                     && late.insert(uri.to_string())
                 {
                     publishes += 1;
@@ -1116,6 +1130,11 @@ fn main() {
         if (extra_square && fault("ignore-while-extra-square-bracket"))
             || (changes_read == 4 && fault("ignore-after-fourth-change"))
         {
+            continue;
+        }
+        if changes_read > 0 && !padded_answer && fault("oversized-after-first-change") {
+            padded_answer = true;
+            out.frame(&err(&id, -32603, &"x".repeat(2 * 1024 * 1024 + 1)));
             continue;
         }
         if unbalanced && fault("content-modified-while-unbalanced") {

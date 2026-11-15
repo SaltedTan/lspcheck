@@ -490,13 +490,15 @@ runner stalled for 3 s) tests something else, and is repeated.
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails; only the first three of its four failing cases are [isolated](#step-6) |
 | `ignore-while-extra-square-bracket` | don't answer requests about a document with more `[` than `]` (in the fixture, case 3 alone) | M2 fails; case 3 is isolated and reproduced; with too little of `run_timeout` left it isn't run, and the verdicts are the same |
 | `ignore-after-fourth-change` | don't answer requests read after the session's fourth `didChange` and before its fifth (case 1's first step) | M2 fails; case 1 is isolated and not reproduced, and M2 still fails |
+| `oversized-after-first-change` | answer the first request answered after the first `didChange` with an error padded past 2 MiB | with `--max-frame-mib 1` and `ignore-while-extra-square-bracket`, case 0's trouble is `M2 ERROR`; case 3, with `M2 FAIL`, is isolated first |
 | `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |
-| `recovery-in-skipped-frame` | after restoration, answer the first poll with `[]`, then send the recovered answer in a frame larger than `--max-frame-mib` | M3 `ERROR` with `expect = "baseline"`, never `FAIL` |
+| `recovery-in-skipped-frame` | after restoration, answer the first poll with `[]`, then send the recovered answer in a frame larger than `--max-frame-mib` | M3 `ERROR` with `expect = "baseline"`, never `FAIL`; case 0's troubles, main and alone, are `M2 ERROR` and `M3 ERROR` |
 | `exit-during-terminal-probes` | after restoration, answer `documentSymbol` and `foldingRange` with `[]`, the first `documentSymbol` 4 s late, and exit on reading the second `foldingRange`, a terminal probe | M1 fails; M3 `ERROR`, never `FAIL`, though the terminal `documentSymbol` differs |
 | `late-warning-in-skipped-frame` | lawful: on open, publish the diagnostics again with a Warning added, in a frame larger than `--max-frame-mib`, and keep the Warning | with `expect = "baseline"` and pushed diagnostics as the only probe, M3 `N/E`, never `FAIL`, whether that frame is read (the publishes differ) or skipped (one may have been missed) |
 | `late-baseline-warning` | lawful: on reading the first `didChange`, before applying it, publish version 1's diagnostics with a Warning added, and keep the Warning | with `expect = "baseline"` and pushed diagnostics as the only probe, nothing fails; M3 `ERROR`, naming the publish labelled with version 1 read after the first mutation |
 | `late-baseline-error` | lawful: as `late-baseline-warning`, with an Error | with `no_errors = true` and pushed diagnostics as the only probe, nothing fails; M3 `ERROR`: the profile and the server disagree at baseline |
 | `late-baseline-in-skipped-frame` | lawful: as `late-baseline-warning`, with the late publish in a frame larger than `--max-frame-mib` | with `expect = "baseline"`, pushed diagnostics as the only probe and that frame skipped, M3 `ERROR`, never `FAIL`, naming the publish lspcheck may have missed |
+| `late-baseline-on-version-jump` | lawful: as `late-baseline-warning`, on a `didChange` more than one version on, which only an isolated case sends | with `warning-after-unbalanced`, `expect = "baseline"` and pushed diagnostics, M3 fails; case 0 alone reproduces, and case 1 alone has no stable baseline, so `reproduced` is `null`, not `false` |
 | `errors-after-unbalanced` | once unbalanced, publish an Error diagnostic forever | M3 fails with `no_errors = true` |
 | `warning-after-unbalanced` | once unbalanced, publish an extra Warning forever | M3 fails with `expect = "baseline"` and pushed diagnostics as the only probe; passes with `no_errors = true` alone |
 | `malformed-recovery-diagnostics` | once unbalanced, publish `null` instead of a diagnostics array | M3 `ERROR`, including with `no_errors = true` |
@@ -650,8 +652,8 @@ Step 5 builds [Recovery](#recovery) and M3 as above. Where the rules leave a cho
 
 Step 6 builds [isolation](#reports-transcripts-and-reproduction). Where the rules leave a choice, it makes these:
 
-- **Which cases.** A case is failing or erroring when its own evidence fails a check, or leaves it unknown, before
-  the end-of-session rechecks. These name a case:
+- **Which cases.** A case is failing or erroring when its own evidence fails a check, or leaves it unknown. These
+  name a case:
   - M1: the case during which lspcheck lost the server (an exit, closed output, stopped inspection, an undeliverable
     write, or an exit after an answer was withheld), with M1's verdict, `FAIL` or `ERROR`.
   - M2: a step request or recovery poll of the case left unanswered (`FAIL`), or that lspcheck couldn't deliver or
@@ -664,8 +666,13 @@ Step 6 builds [isolation](#reports-transcripts-and-reproduction). Where the rule
     read during the case; a publish read during the case that D2 fails on its own; a finding in a `selectionRange`
     reply to the case's requests; MethodNotFound to one of the case's requests.
 
-  Only checks the run reports count (`--only` and the profile's skips apply). A case with several troubles counts
-  once, and the first three by case number are isolated.
+  Each trouble is settled when the session ends by the rules that settle the reported verdicts: M2's failure in a
+  case carries each of the case's unanswered requests' waits, and becomes `ERROR` if lspcheck may have missed a
+  reply in every one; M3's failure becomes `ERROR` if a baseline or recovery window turns out incomplete, or its
+  pushed baseline unstable; M1's is M1's verdict. D1, D2, D6 and K1 fail only on what lspcheck saw, which stands.
+  So a case never shows `M2 FAIL` when M2 reports `ERROR` for that reason. Only checks the run reports count
+  (`--only` and the profile's skips apply). A case with several troubles counts once. Three are isolated: those
+  with a `FAIL` first, by case number, then those with only an `ERROR`.
 - **What carries over.** The plan is a pure function of the seed, the case and the clean texts, so the isolated run
   plans the case byte for byte. Two things carry over between cases in the main run: the cursor of the requests'
   round robin, and the documents' versions. The isolated run starts the cursor where the case started it, and sends
@@ -676,10 +683,18 @@ Step 6 builds [isolation](#reports-transcripts-and-reproduction). Where the rule
   timing.
 - **Reproduced.** An isolated run is the scenario's own code (open, settle, baseline, the case's steps, restoration,
   recovery and `shutdown`) with one case, and its troubles are gathered the same way. Like `replay`, it judges
-  nothing: its verdicts and observations reach no report, no cross-cutting check and no exit status. The case
-  reproduced when every check and verdict the main run's troubles in it named is seen again; the detail says which
-  were and which weren't, and what only the isolated run saw. M3 is judged only with a stable baseline, so if the
-  isolated run has none, M3's trouble isn't seen again.
+  nothing: its verdicts and observations reach no report, no cross-cutting check and no exit status. A trouble is
+  seen again when the isolated run has one of the same check and verdict in the case, on any request; one not seen
+  again was judged and missed unless the isolated run couldn't judge its check. M3 is judged per probe: the
+  isolated run judged it if one of the probes the main run's trouble named passed or failed there, after the
+  end-of-session rechecks; with no stable baseline for it, or an inconclusive outcome, it wasn't. Any other check
+  is judged unless the isolated run stopped (lost the server, or the written-bytes cap). `reproduced` combines them
+  like a logical and: `true` when every trouble was seen again, `false` when one that was judged wasn't, and
+  otherwise `null`. The detail names each trouble with what it was seen in (a request's method, a probe, or the
+  step during which the server was lost), and the isolated run's when it differs: `reproduced: M2 FAIL in
+  textDocument/hover, alone in textDocument/foldingRange`, `not reproduced: M2 FAIL in textDocument/hover not seen
+  again`, `unknown: M3 FAIL in publishDiagnostics of main.lua not judged alone: no stable baseline for
+  publishDiagnostics of main.lua`, then what only the isolated run saw.
 - **When it can't run.** An isolated run starts only while the run's deadline (`run_timeout` from the end of the main
   run's baseline) leaves the startup timeout, twice `settle_timeout` and one case budget, and it keeps that deadline,
   so its case is admitted by the same rule as any other. Each isolated session has its own 64 MiB written-bytes cap.
@@ -689,7 +704,8 @@ Step 6 builds [isolation](#reports-transcripts-and-reproduction). Where the rule
 - **Report.** `"mutation"` gains `"isolated"`, always present, empty when no case had a trouble: one
   `{"case", "transcript", "reproduced", "detail"}` per case, where `transcript` is the file's name in `--transcripts`
   or `null`, and `reproduced` is `true`, `false` or `null`. The terminal report adds a line per case after the
-  checks (`mutation case 3 alone: reproduced: M2 FAIL`, then the transcript's path), and the Markdown report a list.
+  checks (`mutation case 3 alone: reproduced: M2 FAIL in textDocument/selectionRange`, then the transcript's path),
+  and the Markdown report a list.
   JUnit is unchanged, and so is the schema id.
 - **Transcripts.** With `--transcripts DIR`, each isolated run writes `mutation-case-<k>.jsonl`, an ordinary session
   transcript that `replay` replays, with a note naming the case. Without it, isolation still runs. One that can't be
