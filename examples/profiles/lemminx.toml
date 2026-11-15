@@ -16,3 +16,15 @@ request_timeout = "30s"
 path = "greeting.xml"
 language_id = "xml"
 positions = ["2:2", "2:11", "3:4"]   # greeting, its attribute, name
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ["</", "/>", "<!--", "<![CDATA[", "?>", "&", "&#x;", "&lt"]
+
+[mutation.lexicon]
+block_comments = [["<!--", "-->"], ["<![CDATA[", "]]>"], ["<?", "?>"]]
+strings = [{ open = '"', close = '"' }, { open = "'", close = "'" }]
+identifier_chars = "_-.:"
+brackets = ["<>"]
+# lemminx 0.11 never answers an initialize whose client capabilities include textDocument.moniker, which K1 and the
+# mutation scenario send, so with it M1 to M3 are ERROR (see docs/mutation-stock-servers.md).

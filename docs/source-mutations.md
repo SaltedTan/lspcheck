@@ -7,8 +7,10 @@ the [implementation plan](#implementation-plan) are in place: the planner (`src/
 [written-bytes cap](#bounds). Step 5 is in place: the scenario settles, takes the [recovery probes'](#recovery)
 baselines, polls them after each restoration and judges M3, with `expect` and `no_errors`. Step 6 is in place:
 the first three failing or erroring cases are [run again alone](#step-6), and the report says whether each
-reproduced. `--mutate` and its two flags are experimental and hidden from `--help`. See
-[how steps 3, 5 and 6 are built](#step-3) and the [design status](design.md) for its place in the roadmap.
+reproduced. Step 7's first half is in place: the stock example profiles have `[mutation]` sections,
+[measured](mutation-stock-servers.md) on the pinned servers; the matrix job is still to come. `--mutate` and its two
+flags are experimental and hidden from `--help`. See [how steps 3, 5 and 6 are built](#step-3) and the
+[design status](design.md) for its place in the roadmap.
 
 ## Context
 
@@ -369,7 +371,8 @@ expect = "observe"             # or "baseline"
 no_errors = true               # default false
 ```
 
-That example, added to [`lua-language-server.toml`](../examples/profiles/lua-language-server.toml), mutates `main.lua`.
+That example mutates `main.lua`; [`lua-language-server.toml`](../examples/profiles/lua-language-server.toml) uses a
+lexicon like it and the defaults for the rest.
 Validation refuses: a seed file the workspace doesn't provide or that isn't UTF-8; a seed larger than
 `max_document_kib`; no seed file and no `[document]`; an unknown operator, probe or method; a `requests` method that
 isn't in K1's table; `steps`, `cases` or `requests_per_step` out of range; an empty delimiter; a bracket entry that
@@ -543,8 +546,10 @@ itself. Known risks:
 - **lspcheck's own timing.** The recovery poll interval and the settle quiet period are lspcheck's choices. A verdict
   that flips because of them is a bug in lspcheck, fixed there, not listed.
 
-Run each server's job a few times before recording, as the README asks. The workflow change needs the maintainer's
-merge, and any finding about these servers stays in this repository unless the maintainer decides otherwise.
+Run each server's job a few times before recording, as the README asks. The profiles' first measurement, with what
+each verdict rests on, is in [mutation-stock-servers.md](mutation-stock-servers.md). The workflow change needs the
+maintainer's merge, and any finding about these servers stays in this repository unless the maintainer decides
+otherwise.
 
 ## Consequences
 
@@ -729,8 +734,8 @@ The proposal left these questions open; the maintainer settled them on 2026-11-1
   the scenario and case, so a failure found only under `--mutate` is clear, and default runs (and the stock baselines)
   don't change.
 - **`--strict` covers the M checks** like every other `POLICY` check: no exception to explain.
-- **The default case count stays 20** for now. Step 7 measures it on the stock servers and sets the default (and the
-  matrix's count) from those timings before a release ships `--mutate`.
+- **The default case count stays 20.** Step 7 [measured it on the stock servers](mutation-stock-servers.md#case-counts)
+  and found no reason to change it; the matrix is to run 10 cases, as measured.
 - **No lexicon presets yet.** Profiles spell out their lexicon. If the stock profiles in step 7 repeat the same tables,
   presets can be added then, as data.
 - **Servers that take no changes stay skipped.** Mutating them by `didClose` and `didOpen` would test a different thing

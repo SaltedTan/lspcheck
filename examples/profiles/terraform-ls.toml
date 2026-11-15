@@ -20,3 +20,18 @@ output "greeting" {
 path = "main.tf"
 language_id = "terraform"
 positions = ["1:11", "6:9", "7:25"]   # the variable, the output, the reference to name
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ["${", "%{", "<<EOF", "0x", "=>", "...", "[for"]
+
+[mutation.lexicon]
+line_comments = ["#", "//"]
+block_comments = [["/*", "*/"]]
+strings = [{ open = '"', close = '"', escape = '\' }]
+identifier_chars = "_-"
+keywords = ["variable", "output", "resource", "data", "locals", "module", "type", "default", "value", "string"]
+
+[mutation.recovery]
+# Its document symbols come from the parsed file alone, so they return to the baseline.
+expect = "baseline"

@@ -19,3 +19,17 @@ Hello, world.
 path = "README.md"
 language_id = "markdown"
 positions = ["1:3", "3:6", "5:4"]   # heading, the link, the target heading
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ["[", "](", "](#", "[[", "# ", "```", "<!--"]
+
+[mutation.lexicon]
+block_comments = [["<!--", "-->"]]
+strings = [{ open = "`", close = "`" }]   # code spans
+identifier_chars = "_-"
+brackets = ["()", "[]"]
+
+[mutation.recovery]
+# Its document symbols are its headings, read from the text alone, so they return to the baseline.
+expect = "baseline"

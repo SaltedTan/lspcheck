@@ -1866,6 +1866,68 @@ mod tests {
         assert!(seeds.iter().any(|&s| s != seeds[0]), "{seeds:?}");
     }
 
+    /// Every example profile with a `[mutation]` section validates, and its
+    /// case budget fits its `run_timeout` at the profile's request timeout
+    /// (`mutation_settings` refuses one that doesn't), so `--mutate` never
+    /// refuses to start. Its lexicon recognises its own seed text: at least
+    /// one of its keywords when it lists keywords, and a comment or string
+    /// wherever the seed contains one of the delimiters it declares. Every
+    /// server of the stock matrix has one.
+    #[test]
+    fn the_example_mutation_sections_validate_and_fit_their_run() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(root.join("examples/profiles"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        let mut mutated = BTreeSet::new();
+        for path in &paths {
+            let p = load(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            if p.mutation.is_none() {
+                continue;
+            }
+            let request_timeout = p.request_timeout.unwrap_or_else(|| panic!("{}: no request_timeout", path.display()));
+            let m = mutation_settings(&p, Some(20261115), None, request_timeout)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(!m.seeds.is_empty(), "{}", path.display());
+            let lexicon = &m.planner.lexicon;
+            let kinds: Vec<mutation::TokenKind> =
+                m.seeds.iter().flat_map(|s| lexicon.tokens(&s.text)).map(|t| t.kind).collect();
+            let has = |f: fn(&mutation::TokenKind) -> bool| kinds.iter().any(f);
+            let seeds_contain = |open: &str| m.seeds.iter().any(|s| s.text.contains(open));
+            if !lexicon.keywords.is_empty() {
+                assert!(has(|k| *k == mutation::TokenKind::Keyword), "{}: no keyword in its seed", path.display());
+            }
+            let comment_opens = lexicon.line_comments.iter().chain(lexicon.block_comments.iter().map(|(o, _)| o));
+            if comment_opens.into_iter().any(|o| seeds_contain(o)) {
+                assert!(
+                    has(|k| matches!(k, mutation::TokenKind::Comment { .. })),
+                    "{}: no comment recognised in its seed",
+                    path.display()
+                );
+            }
+            if lexicon.strings.iter().any(|d| seeds_contain(&d.open)) {
+                assert!(
+                    has(|k| matches!(k, mutation::TokenKind::String { .. })),
+                    "{}: no string recognised in its seed",
+                    path.display()
+                );
+            }
+            mutated.insert(path.file_stem().unwrap().to_string_lossy().into_owned());
+        }
+        for entry in std::fs::read_dir(root.join("ci/stock-servers")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|x| x == "verdicts") {
+                // `gopls.verdicts`, and later `gopls.mutation.verdicts`, both name gopls.
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let server = name.split('.').next().unwrap().to_string();
+                assert!(mutated.contains(&server), "examples/profiles/{server}.toml has no [mutation] section");
+            }
+        }
+    }
+
     #[test]
     fn a_command_path_is_relative_to_the_profile() {
         let p = parse_here("[server]\ncommand = [\"bin/server\", \"bin/arg\"]\n").unwrap();

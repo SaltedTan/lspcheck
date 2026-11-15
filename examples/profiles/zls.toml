@@ -21,3 +21,16 @@ pub fn main() void {
 path = "main.zig"
 language_id = "zig"
 positions = ["3:4", "3:10", "8:32"]   # greet, name, the call to greet
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ["0x", "1e", "@import(", ".{", '\\', "orelse", "'\\"]
+
+[mutation.lexicon]
+line_comments = ["//"]
+strings = [{ open = '"', close = '"', escape = '\' }, { open = "'", close = "'", escape = '\' }]
+keywords = ["const", "var", "fn", "pub", "return", "void", "if", "else", "try", "comptime"]
+
+[mutation.recovery]
+# Without zig on PATH, zls answers from the parsed file alone, so its symbols and folding ranges return to the baseline.
+expect = "baseline"

@@ -25,3 +25,15 @@ int main(void) {
 path = "main.c"
 language_id = "c"
 positions = ["3:20", "3:38", "8:8"]   # greet, name, the call to greet
+
+# Used only by the experimental `--mutate`; see docs/source-mutations.md. The lexicon only steers where edits land.
+[mutation]
+fragments = ["0x", "1e", "#if", "'\\", "->", "??", "#define"]
+
+[mutation.lexicon]
+line_comments = ["//"]
+block_comments = [["/*", "*/"]]
+strings = [{ open = '"', close = '"', escape = '\' }, { open = "'", close = "'", escape = '\' }]
+keywords = ["static", "const", "char", "int", "return", "void", "if", "else", "struct", "include"]
+# No [mutation.recovery] expect: diagnostics depend on the system headers clangd parses, not only on the text, so a
+# recovery not seen stays ERROR rather than FAIL.

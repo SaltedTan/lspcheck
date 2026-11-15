@@ -36,6 +36,17 @@ lspcheck --profile examples/profiles/gopls.toml --only K1
 lspcheck --profile examples/profiles/gopls.toml -- ~/go/bin/gopls serve   # another binary
 ```
 
+The 11 profiles the stock-server matrix runs also have a `[mutation]` section for the experimental
+[seeded source mutation](../../docs/source-mutations.md) scenario, which is used only with `--mutate` and changes
+nothing otherwise. Each spells out a lexicon for its language (comments, strings and their escapes, keywords and a few
+malformed fragments) and keeps the default operators. Where the server's recovery probes answer from the text alone,
+`[mutation.recovery]` states `expect = "baseline"`; elsewhere a comment says why it doesn't.
+[docs/mutation-stock-servers.md](../../docs/mutation-stock-servers.md) records how they behaved.
+
+```sh
+lspcheck --profile examples/profiles/zls.toml --mutate --mutation-seed 20261115 --mutation-cases 10
+```
+
 They give generous timeouts, since a server may index the project before it answers. A server still loading its
 workspace may answer with empty results or errors other than MethodNotFound; K1 accepts those and lists the error
 codes in its detail. The [stock-server CI matrix](../../ci/stock-servers/README.md) documents which profiles it runs.
