@@ -78,7 +78,8 @@ struct Cli {
     max_output_mib: usize,
 
     /// Run the experimental mutation scenario (M1 to M3): seeded edits of the
-    /// profile's `[mutation]` files, else its `[document]`.
+    /// profile's `[mutation].files`, else its `[document]` (M1 to M3 are SKIP
+    /// with neither).
     #[arg(long)]
     mutate: bool,
 
