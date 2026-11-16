@@ -385,16 +385,12 @@ impl CheckResult {
 
     /// Names, in a failure's detail, the first request whose wait lspcheck
     /// read in full, counts the other such requests, and says how many may
-    /// have been answered in output it skipped. Nothing unless the detail was
-    /// reported with per-window wording and some window was incomplete: the
-    /// detail as reported already names the first request then, and is right.
+    /// have been answered in output it skipped. Only for a detail reported
+    /// with per-window wording, and only when some wait, but not every one,
+    /// was incomplete: when none was, the detail as reported is right.
     fn name_absent_read(&mut self, missed: &[Option<String>]) {
         let Some(wording) = &self.absent_detail else { return };
-        // The detail as reported already names the first request when no
-        // window could hide a reply.
-        if missed.iter().all(Option::is_none) {
-            return;
-        }
+        let Some(why) = missed.iter().flatten().next() else { return };
         let Some(first) = missed.iter().position(Option::is_none) else { return };
         debug_assert_eq!(wording.each.len(), missed.len(), "one label per absent window");
         let mut detail = format!("{}{}", wording.each[first], wording.suffix);
@@ -402,12 +398,10 @@ impl CheckResult {
         if read > 1 {
             detail.push_str(&format!(" and {} more", read - 1));
         }
-        if let Some(why) = missed.iter().flatten().next() {
-            detail.push_str(&format!(
-                "; {} more may have been answered in output lspcheck skipped: {why}",
-                missed.len() - read
-            ));
-        }
+        detail.push_str(&format!(
+            "; {} more may have been answered in output lspcheck skipped: {why}",
+            missed.len() - read
+        ));
         self.detail = detail;
     }
 
