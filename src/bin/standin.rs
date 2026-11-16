@@ -61,6 +61,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("string-id-to-number", "reply to a request whose id is a string of digits with that number as id"),
     ("mangles-odd-ids", "drop non-ASCII characters from string request ids before replying"),
     ("drops-negative-ids", "never answer a request with a negative integer id"),
+    ("oversized-reply-to-id-zero", "answer the odd-id probe with id 0 with a frame over 2 MiB"),
     ("accepts-wrong-params", "answer a request with wrongly typed params with result null"),
     ("dies-on-wrong-params", "exit when a request arrives with wrongly typed params"),
     ("wrong-params-other-code", "lawful: answer wrongly typed params with InternalError (-32603)"),
@@ -1432,6 +1433,10 @@ fn main() {
         }
         if method == "workspace/symbol" && holds {
             deferred = Some(id.clone());
+            continue;
+        }
+        if fault("oversized-reply-to-id-zero") && method == "lspcheck/probe" && id == json!(0) {
+            out.frame(&err(&id, -32601, &"x".repeat(2 * 1024 * 1024 + 1)));
             continue;
         }
         if fault("drops-negative-ids") && id.as_i64().is_some_and(|n| n < 0) {

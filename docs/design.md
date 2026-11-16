@@ -529,8 +529,9 @@ one at a time: `0`, `-1`, `2147483647`, `-2147483648`, `""`, a 1000-character AS
 write stops the sequence. It passes only when every request gets a response with its exact id (a result or an error is
 acceptable). Only delivered requests with no exact-id response can fail R4. The detail names unanswered ids and any
 unmatched response ids seen; long strings are truncated. Each unanswered request retains its own wait window for
-the evidence recheck after cleanup; any fully inspected window establishes a failure. If every such window has
-incomplete evidence, the verdict is `ERROR`. Initialization or delivery failure is also `ERROR` unless an earlier
+the evidence recheck after cleanup; any fully inspected window establishes a failure, and the detail then lists only
+the ids whose windows were fully inspected and says how many others may have been answered unseen, and why. If every
+such window has incomplete evidence, the verdict is `ERROR`. Initialization or delivery failure is also `ERROR` unless an earlier
 delivered request establishes a failure. J1 and J2 independently judge mismatched ids under their `MUST` rules.
 Numeric ids stay within LSP 3.17's signed 32-bit range, so `2^53` is deliberately excluded.
 
