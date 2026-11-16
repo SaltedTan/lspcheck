@@ -297,6 +297,12 @@ pub struct CheckResult {
     /// A failure seen directly has no windows.
     #[serde(skip)]
     pub absent_at: Vec<(Duration, Duration)>,
+    /// For a failure because expected replies never arrived: what each window
+    /// in `absent_at` was waiting for, and how the detail is worded, so
+    /// settling can name one whose wait lspcheck read in full when another
+    /// may have hidden a reply. Parallel to `absent_at`.
+    #[serde(skip)]
+    pub absent_detail: Option<AbsentDetail>,
     /// For a verdict reached during the session on the assumption that
     /// lspcheck missed nothing in a window: what it would have been
     /// otherwise. Checked again when the session has ended and everything
@@ -304,6 +310,16 @@ pub struct CheckResult {
     /// may turn out to have been cut short.
     #[serde(skip)]
     pub unless_missed: Option<Recheck>,
+}
+
+/// How a failure about replies that never arrived is worded: a label for each
+/// window in [`CheckResult::absent_at`], in the same order, and what follows
+/// the label. [`CheckResult::settle`] rebuilds the detail from it when only
+/// some of the windows were incomplete.
+#[derive(Debug, Clone)]
+pub struct AbsentDetail {
+    pub each: Vec<String>,
+    pub suffix: String,
 }
 
 /// A verdict's alternative if lspcheck turns out to have missed something
@@ -337,24 +353,62 @@ impl CheckResult {
     /// Judges a verdict reached during the session again, now that
     /// everything read is known.
     fn settle(&mut self, finish: &Finish) {
-        // A failure because something never arrived might be explained by
-        // evidence lspcheck didn't see while it waited: frames it skipped or
-        // couldn't read after it sent what should have been answered (a log
-        // line loses nothing, so it doesn't count), or, from any time before
-        // it stopped waiting, reading that stopped or its own side of the
-        // conversation failing. A failure seen directly, such as a wrong
-        // result, stands, and so does one whose wait had nothing go unseen.
-        if self.verdict == Verdict::Fail && !self.absent_at.is_empty() {
-            let missed: Option<Vec<_>> =
-                self.absent_at.iter().map(|&(since, waited)| finish.incomplete_within(since, waited)).collect();
-            if let Some(reasons) = missed {
-                self.verdict = Verdict::Error;
-                self.detail = format!("inconclusive, because {}: {}", reasons[0], self.detail);
-            }
-        }
+        self.settle_absent(|from, to| finish.incomplete_within(from, to));
         // A verdict reached during the session that assumed nothing was
         // missed in its window.
         self.recheck(finish);
+    }
+
+    /// The half of [`settle`](Self::settle) for a failure because expected
+    /// replies never arrived, given why a window may have been incomplete.
+    /// Such a failure might be explained by evidence lspcheck didn't see while
+    /// it waited: frames it skipped or couldn't read after it sent what should
+    /// have been answered (a log line loses nothing, so it doesn't count), or,
+    /// from any time before it stopped waiting, reading that stopped or its
+    /// own side of the conversation failing. A failure seen directly, such as
+    /// a wrong result, stands, and so does one whose wait had nothing go
+    /// unseen. Only when every wait could hide a reply is it an error.
+    fn settle_absent(&mut self, incomplete: impl Fn(Duration, Duration) -> Option<String>) {
+        if self.verdict != Verdict::Fail || self.absent_at.is_empty() {
+            return;
+        }
+        let missed: Vec<Option<String>> =
+            self.absent_at.iter().map(|&(since, waited)| incomplete(since, waited)).collect();
+        if missed.iter().all(Option::is_some) {
+            let reasons: Vec<String> = missed.into_iter().flatten().collect();
+            self.verdict = Verdict::Error;
+            self.detail = format!("inconclusive, because {}: {}", reasons[0], self.detail);
+            return;
+        }
+        self.name_absent_read(&missed);
+    }
+
+    /// Names, in a failure's detail, the first request whose wait lspcheck
+    /// read in full, counts the other such requests, and says how many may
+    /// have been answered in output it skipped. Nothing unless the detail was
+    /// reported with per-window wording and some window was incomplete: the
+    /// detail as reported already names the first request then, and is right.
+    fn name_absent_read(&mut self, missed: &[Option<String>]) {
+        let Some(wording) = &self.absent_detail else { return };
+        // The detail as reported already names the first request when no
+        // window could hide a reply.
+        if missed.iter().all(Option::is_none) {
+            return;
+        }
+        let Some(first) = missed.iter().position(Option::is_none) else { return };
+        debug_assert_eq!(wording.each.len(), missed.len(), "one label per absent window");
+        let mut detail = format!("{}{}", wording.each[first], wording.suffix);
+        let read = missed.iter().filter(|missed| missed.is_none()).count();
+        if read > 1 {
+            detail.push_str(&format!(" and {} more", read - 1));
+        }
+        if let Some(why) = missed.iter().flatten().next() {
+            detail.push_str(&format!(
+                "; {} more may have been answered in output lspcheck skipped: {why}",
+                missed.len() - read
+            ));
+        }
+        self.detail = detail;
     }
 
     fn recheck(&mut self, finish: &Finish) {
@@ -1154,6 +1208,7 @@ fn result(scenario: &'static str, id: &str, verdict: Verdict, detail: impl Into<
         detail: detail.into(),
         scenario,
         absent_at: Vec::new(),
+        absent_detail: None,
         unless_missed: None,
     }
 }
@@ -6133,26 +6188,31 @@ fn judge_m1(
 /// M2: every request delivered after a mutation got a response within
 /// `--timeout`. A request pending when the server exited is M1's. A run the
 /// written-bytes cap stopped early (`capped`) can still fail, but not pass.
+/// A failure's detail is settled with the verdict, so it names a request whose
+/// wait lspcheck read in full whenever one of them may have hidden a reply.
 fn judge_m2(ctx: &mut Ctx<'_>, asked: &[StepRequest], capped: Option<&str>) {
     // The baseline's probes were sent before the first mutation.
     let asked: Vec<&StepRequest> = asked.iter().filter(|r| r.case.is_some()).collect();
     let unanswered: Vec<&StepRequest> =
         asked.iter().copied().filter(|r| matches!(r.outcome, StepOutcome::Unanswered)).collect();
     if let Some(first) = unanswered.first() {
+        let suffix = format!(" got no response within {} s (--timeout)", seconds(ctx.cfg.request_timeout));
         let more = if unanswered.len() > 1 { format!(" and {} more", unanswered.len() - 1) } else { String::new() };
         ctx.fail_absent_between(
             "M2",
             first.at,
             first.deadline_at,
-            format!(
-                "{} in {} got no response within {} s (--timeout){more}",
-                first.method,
-                first.place(),
-                seconds(ctx.cfg.request_timeout)
-            ),
+            format!("{} in {}{suffix}{more}", first.method, first.place()),
         );
         let windows: Vec<(Duration, Duration)> = unanswered[1..].iter().map(|r| (r.at, r.deadline_at)).collect();
-        ctx.results.last_mut().expect("just reported").absent_at.extend(windows);
+        let r = ctx.results.last_mut().expect("just reported");
+        r.absent_at.extend(windows);
+        // Settling rebuilds the detail, naming the first request whose wait
+        // lspcheck read in full if another may have hidden a reply.
+        r.absent_detail = Some(AbsentDetail {
+            each: unanswered.iter().map(|r| format!("{} in {}", r.method, r.place())).collect(),
+            suffix,
+        });
         return;
     }
     let trouble = asked.iter().find_map(|r| match &r.outcome {
@@ -7098,6 +7158,54 @@ pub fn file_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failure about replies that never arrived, settled: it names a
+    /// request whose wait lspcheck read in full and counts the others it read
+    /// in full, since one whose wait it didn't may have been answered in
+    /// output it skipped.
+    #[test]
+    fn settling_an_absent_failure_names_only_waits_lspcheck_read_in_full() {
+        let failure = |labels: &[&str]| CheckResult {
+            absent_at: (1..=labels.len() as u64)
+                .map(|n| (Duration::from_secs(n), Duration::from_secs(n + 1)))
+                .collect(),
+            absent_detail: Some(AbsentDetail {
+                each: labels.iter().map(|label| (*label).to_string()).collect(),
+                suffix: " got no response within 2 s (--timeout)".into(),
+            }),
+            ..result("mutation", "M2", Verdict::Fail, "as reported")
+        };
+        // A window that began at an odd second is one lspcheck may have
+        // missed a reply in.
+        let missed = |from: Duration, _: Duration| (from.as_secs() % 2 == 1).then(|| "a frame was skipped".to_string());
+        let labels = [
+            "textDocument/hover in case 0",
+            "textDocument/selectionRange in case 3",
+            "textDocument/documentSymbol in case 3",
+            "textDocument/foldingRange in case 3",
+        ];
+        // Some windows incomplete: still a failure, naming the first one read
+        // in full, then the other one read in full, and counting the two that
+        // may have hidden a reply.
+        let mut r = failure(&labels);
+        r.settle_absent(missed);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(
+            r.detail,
+            "textDocument/selectionRange in case 3 got no response within 2 s (--timeout) and 1 more; \
+             2 more may have been answered in output lspcheck skipped: a frame was skipped"
+        );
+        // Every window read in full: the detail as reported stands.
+        let mut r = failure(&labels);
+        r.settle_absent(|_, _| None);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.detail, "as reported");
+        // Every window may have hidden a reply: an error, as before.
+        let mut r = failure(&labels);
+        r.settle_absent(|_, _| Some("a frame was skipped".into()));
+        assert_eq!(r.verdict, Verdict::Error);
+        assert_eq!(r.detail, "inconclusive, because a frame was skipped: as reported");
+    }
 
     #[test]
     fn mutation_no_case_starts_without_its_whole_budget_left() {
