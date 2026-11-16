@@ -1212,6 +1212,30 @@ fn odd_id_failures_survive_later_unreadable_output() {
 }
 
 #[test]
+fn r4_lists_only_ids_whose_waits_were_read_in_full() {
+    // The reply to id 0 is a frame lspcheck skips, so it may have been
+    // answered; the negative ids' waits come later, with nothing skipped, so
+    // R4 still fails, and its detail lists the negative ids as unanswered and
+    // id 0 as possibly answered unseen. The stand-in
+    // sends the frame on reading the request, and lspcheck has the default
+    // 5 s --timeout to skip it, so it can't spill into the later waits.
+    let r = run(
+        &["--fault", "oversized-reply-to-id-zero", "--fault", "drops-negative-ids"],
+        &["--max-frame-mib", "1", "--only", "R4"],
+    );
+    expect(&r, "R4", "fail");
+    let r4 = detail(&r, "R4");
+    assert!(
+        r4.starts_with(
+            "delivered request id(s) -1, -2147483648 got no response with the exact id; \
+             id(s) 0 may have been answered unseen, because a "
+        ),
+        "{r4}"
+    );
+    assert!(r4.contains("inspection limit (--max-frame-mib)"), "{r4}");
+}
+
+#[test]
 fn a_skipped_frame_before_exit_makes_r1_r2_r3_inconclusive() {
     // The plain request after the wrongly typed one is answered in a frame
     // over the limit, then the server exits: the skipped frame may have held
