@@ -1215,7 +1215,8 @@ fn odd_id_failures_survive_later_unreadable_output() {
 fn r4_lists_only_ids_whose_waits_were_read_in_full() {
     // The reply to id 0 is a frame lspcheck skips, so it may have been
     // answered; the negative ids' waits come later, with nothing skipped, so
-    // R4 still fails, and its detail lists only the negative ids. The stand-in
+    // R4 still fails, and its detail lists the negative ids as unanswered and
+    // id 0 as possibly answered unseen. The stand-in
     // sends the frame on reading the request, and lspcheck has the default
     // 5 s --timeout to skip it, so it can't spill into the later waits.
     let r = run(
@@ -1227,7 +1228,7 @@ fn r4_lists_only_ids_whose_waits_were_read_in_full() {
     assert!(
         r4.starts_with(
             "delivered request id(s) -1, -2147483648 got no response with the exact id; \
-             1 other may have been answered unseen, because a "
+             id(s) 0 may have been answered unseen, because a "
         ),
         "{r4}"
     );

@@ -299,8 +299,8 @@ pub struct CheckResult {
     pub absent_at: Vec<(Duration, Duration)>,
     /// For a failure because expected replies never arrived: what each window
     /// in `absent_at` was waiting for, and how the detail is worded, so
-    /// settling can name one whose wait lspcheck read in full when another
-    /// may have hidden a reply. Parallel to `absent_at`.
+    /// settling can name only requests whose waits lspcheck read in full when
+    /// another's may have hidden a reply. Parallel to `absent_at`.
     #[serde(skip)]
     pub absent_detail: Option<AbsentDetail>,
     /// For a verdict reached during the session on the assumption that
@@ -320,26 +320,29 @@ pub struct CheckResult {
 #[derive(Debug, Clone)]
 pub struct AbsentDetail {
     pub each: Vec<String>,
-    /// Whether the detail lists every label, or names the first and counts
-    /// the rest ("and N more").
-    pub list_all: bool,
-    /// What comes before the labels, and right after them.
-    pub before: String,
+    /// What follows the labels read in full.
     pub after: String,
-    /// What ends the detail, after what is said about the waits that may have
-    /// hidden a reply.
-    pub tail: String,
+    pub naming: AbsentNaming,
+}
+
+/// How an [`AbsentDetail`] names its labels.
+#[derive(Debug, Clone)]
+pub enum AbsentNaming {
+    /// "<label><after> and N more; K others may have been answered unseen,
+    /// because …": the first label read in full, and the rest counted.
+    First,
+    /// "<before><label>, <label><after>; <unseen><label> may have been
+    /// answered unseen, because …<tail>": every label, in both lists.
+    All { before: String, unseen: String, tail: String },
 }
 
 impl AbsentDetail {
-    /// Names the first label and counts the rest: "<label><after> and N more".
     pub fn first(each: Vec<String>, after: String) -> Self {
-        AbsentDetail { each, list_all: false, before: String::new(), after, tail: String::new() }
+        AbsentDetail { each, after, naming: AbsentNaming::First }
     }
 
-    /// Lists every label: "<before><label>, <label><after><tail>".
-    pub fn all(each: Vec<String>, before: String, after: String, tail: String) -> Self {
-        AbsentDetail { each, list_all: true, before, after, tail }
+    pub fn all(each: Vec<String>, before: String, after: String, unseen: String, tail: String) -> Self {
+        AbsentDetail { each, after, naming: AbsentNaming::All { before, unseen, tail } }
     }
 }
 
@@ -405,31 +408,33 @@ impl CheckResult {
     }
 
     /// Names, in a failure's detail, the requests whose waits lspcheck read in
-    /// full (the first and how many more, or each), and says how many others
-    /// may have been answered unseen, and why. Only for a detail reported with
-    /// a label for each wait, and only when some wait, but not every one, was
-    /// incomplete: when none was, the detail as reported is right. Labels that
-    /// don't match the waits leave the detail as reported rather than name the
-    /// wrong request.
+    /// full (the first and how many more, or each), and the others, which may
+    /// have been answered unseen (how many, or each), and why. Only for a
+    /// detail reported with a label for each wait, and only when some wait,
+    /// but not every one, was incomplete: when none was, the detail as
+    /// reported is right. Labels that don't match the waits leave the detail
+    /// as reported rather than name the wrong request.
     fn name_absent_read(&mut self, missed: &[Option<String>]) {
         let Some(wording) = self.absent_detail.as_ref().filter(|w| w.each.len() == missed.len()) else { return };
         let Some(why) = missed.iter().flatten().next() else { return };
-        let read: Vec<&str> =
-            wording.each.iter().zip(missed).filter(|(_, missed)| missed.is_none()).map(|(l, _)| l.as_str()).collect();
+        let (read, unseen): (Vec<_>, Vec<_>) =
+            wording.each.iter().zip(missed).partition(|(_, missed)| missed.is_none());
+        let read: Vec<&str> = read.into_iter().map(|(label, _)| label.as_str()).collect();
+        let unseen: Vec<&str> = unseen.into_iter().map(|(label, _)| label.as_str()).collect();
         let Some(first) = read.first() else { return };
-        let AbsentDetail { before, after, tail, .. } = wording;
-        let named = if wording.list_all {
-            format!("{before}{}{after}", read.join(", "))
-        } else if read.len() > 1 {
-            format!("{before}{first}{after} and {} more", read.len() - 1)
-        } else {
-            format!("{before}{first}{after}")
+        let after = &wording.after;
+        self.detail = match &wording.naming {
+            AbsentNaming::First => {
+                let more = if read.len() > 1 { format!(" and {} more", read.len() - 1) } else { String::new() };
+                let others = if unseen.len() == 1 { "1 other".to_string() } else { format!("{} others", unseen.len()) };
+                format!("{first}{after}{more}; {others} may have been answered unseen, because {why}")
+            }
+            AbsentNaming::All { before, unseen: noun, tail } => format!(
+                "{before}{}{after}; {noun}{} may have been answered unseen, because {why}{tail}",
+                read.join(", "),
+                unseen.join(", ")
+            ),
         };
-        let others = match missed.len() - read.len() {
-            1 => "1 other".to_string(),
-            n => format!("{n} others"),
-        };
-        self.detail = format!("{named}; {others} may have been answered unseen, because {why}{tail}");
     }
 
     fn recheck(&mut self, finish: &Finish) {
@@ -1720,7 +1725,7 @@ async fn odd_ids(ctx: &mut Ctx<'_>) -> bool {
         r.absent_at = missing_windows;
         // Settling lists only the ids whose waits lspcheck read in full if
         // another's may have hidden a reply.
-        r.absent_detail = Some(AbsentDetail::all(missing, before.into(), after.into(), tail));
+        r.absent_detail = Some(AbsentDetail::all(missing, before.into(), after.into(), "id(s) ".into(), tail));
         return true;
     }
     if !undelivered.is_empty() {
@@ -7237,6 +7242,7 @@ mod tests {
                 each,
                 "delivered request id(s) ".into(),
                 " got no response with the exact id".into(),
+                "id(s) ".into(),
                 "; the server exited".into(),
             )),
             ..failure(&labels)
@@ -7245,7 +7251,7 @@ mod tests {
         assert_eq!(
             r.detail,
             "delivered request id(s) -1, -2147483648 got no response with the exact id; \
-             2 others may have been answered unseen, because a frame was skipped; the server exited"
+             id(s) 0, 2147483647 may have been answered unseen, because a frame was skipped; the server exited"
         );
         // Without a label for each window, as for checks that don't label
         // them, the detail as reported stands.

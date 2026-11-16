@@ -7,9 +7,9 @@
 - Under `--mutate`, when some of M2's unanswered requests may have been answered in output lspcheck didn't see, its
   failure detail now names and counts only the requests whose waits it saw in full, and says how many others may have
   been answered, and why. The verdict is unchanged.
-- R4's failure detail does the same: when the reply to some unanswered odd-id request may have been in output lspcheck
-  didn't see, it lists only the ids whose waits it saw in full, and says how many others may have been answered, and
-  why. The verdict is unchanged.
+- Likewise, when the reply to some of R4's unanswered odd-id requests may have been in output lspcheck didn't see, its
+  failure detail lists as unanswered only the ids whose waits it saw in full, and the others as possibly answered,
+  with why. The verdict is unchanged.
 
 ## 0.5.0 (2026-11-16)
 
