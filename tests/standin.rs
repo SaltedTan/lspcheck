@@ -2991,13 +2991,13 @@ fn cases_with_a_failure_are_run_alone_before_cases_with_only_errors() {
         .collect();
     // M2's own detail names a request whose wait lspcheck read in full: case
     // 3's selectionRange, the first such, then the two other requests read in
-    // full, and it says the hover may have been answered in the frame it
-    // skipped rather than claiming the hover went unanswered.
+    // full, and it says the hover may have been answered in the frame
+    // lspcheck skipped rather than claiming the hover went unanswered.
     let m2 = detail(&r, "M2");
     assert!(
         m2.starts_with(
             "textDocument/selectionRange in case 3 got no response within 2 s (--timeout) and 2 more; \
-             1 more may have been answered in output lspcheck skipped: "
+             1 other may have been answered unseen, because a "
         ),
         "{m2}"
     );

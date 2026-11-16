@@ -315,7 +315,8 @@ pub struct CheckResult {
 /// How a failure about replies that never arrived is worded: a label for each
 /// window in [`CheckResult::absent_at`], in the same order, and what follows
 /// the label. [`CheckResult::settle`] rebuilds the detail from it when only
-/// some of the windows were incomplete.
+/// some of the windows were incomplete, and leaves the detail as reported if
+/// the labels and windows differ in number.
 #[derive(Debug, Clone)]
 pub struct AbsentDetail {
     pub each: Vec<String>,
@@ -384,24 +385,26 @@ impl CheckResult {
     }
 
     /// Names, in a failure's detail, the first request whose wait lspcheck
-    /// read in full, counts the other such requests, and says how many may
-    /// have been answered in output it skipped. Only for a detail reported
-    /// with per-window wording, and only when some wait, but not every one,
-    /// was incomplete: when none was, the detail as reported is right.
+    /// read in full, counts the other such requests, and says how many others
+    /// may have been answered unseen, and why. Only for a detail reported with
+    /// a label for each wait, and only when some wait, but not every one, was
+    /// incomplete: when none was, the detail as reported is right. Labels that
+    /// don't match the waits leave the detail as reported rather than name the
+    /// wrong request.
     fn name_absent_read(&mut self, missed: &[Option<String>]) {
-        let Some(wording) = &self.absent_detail else { return };
+        let Some(wording) = self.absent_detail.as_ref().filter(|w| w.each.len() == missed.len()) else { return };
         let Some(why) = missed.iter().flatten().next() else { return };
         let Some(first) = missed.iter().position(Option::is_none) else { return };
-        debug_assert_eq!(wording.each.len(), missed.len(), "one label per absent window");
         let mut detail = format!("{}{}", wording.each[first], wording.suffix);
         let read = missed.iter().filter(|missed| missed.is_none()).count();
         if read > 1 {
             detail.push_str(&format!(" and {} more", read - 1));
         }
-        detail.push_str(&format!(
-            "; {} more may have been answered in output lspcheck skipped: {why}",
-            missed.len() - read
-        ));
+        let others = match missed.len() - read {
+            1 => "1 other".to_string(),
+            n => format!("{n} others"),
+        };
+        detail.push_str(&format!("; {others} may have been answered unseen, because {why}"));
         self.detail = detail;
     }
 
@@ -7155,8 +7158,7 @@ mod tests {
 
     /// A failure about replies that never arrived, settled: it names a
     /// request whose wait lspcheck read in full and counts the others it read
-    /// in full, since one whose wait it didn't may have been answered in
-    /// output it skipped.
+    /// in full, since one whose wait it didn't may have been answered unseen.
     #[test]
     fn settling_an_absent_failure_names_only_waits_lspcheck_read_in_full() {
         let failure = |labels: &[&str]| CheckResult {
@@ -7187,8 +7189,23 @@ mod tests {
         assert_eq!(
             r.detail,
             "textDocument/selectionRange in case 3 got no response within 2 s (--timeout) and 1 more; \
-             2 more may have been answered in output lspcheck skipped: a frame was skipped"
+             2 others may have been answered unseen, because a frame was skipped"
         );
+        // Only one window read in full: no "and N more".
+        let mut r = failure(&labels[..2]);
+        r.settle_absent(missed);
+        assert_eq!(
+            r.detail,
+            "textDocument/selectionRange in case 3 got no response within 2 s (--timeout); \
+             1 other may have been answered unseen, because a frame was skipped"
+        );
+        // Without a label for each window, as for every check but M2, the
+        // detail as reported stands.
+        for absent_detail in [None, Some(AbsentDetail { each: vec!["one label".into()], suffix: String::new() })] {
+            let mut r = CheckResult { absent_detail, ..failure(&labels) };
+            r.settle_absent(missed);
+            assert_eq!((r.verdict, r.detail.as_str()), (Verdict::Fail, "as reported"));
+        }
         // Every window read in full: the detail as reported stands.
         let mut r = failure(&labels);
         r.settle_absent(|_, _| None);

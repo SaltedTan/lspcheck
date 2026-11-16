@@ -4,9 +4,9 @@
 
 ### Fixed
 
-- Under `--mutate`, M2's failure detail names a request whose reply lspcheck could have read in full: when some
-  unanswered requests' waits had output it skipped, it now names the first such request it read in full, counts the
-  others it read in full, and says how many may have been answered in the skipped output. The verdict is unchanged.
+- Under `--mutate`, when some of M2's unanswered requests may have been answered in output lspcheck didn't see, its
+  failure detail now names and counts only the requests whose waits it saw in full, and says how many others may have
+  been answered, and why. The verdict is unchanged.
 
 ## 0.5.0 (2026-11-16)
 
