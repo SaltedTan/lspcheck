@@ -277,8 +277,10 @@ step because earlier answers used its room.
 **M2.** Judges every delivered request of the scenario after the first mutation: the step requests and the recovery
 polls.
 - *fail:* a delivered request had no response by its deadline (`--timeout` from when its write began). Each goes
-  through `fail_absent_between`, so missed evidence in its window makes it `ERROR`. A request still pending when the
-  server exited is M1's, not M2's.
+  through `fail_absent_between`, so missed evidence in every such request's window makes it `ERROR`. When only some
+  windows missed evidence it stays `FAIL`, and the detail names and counts only the requests whose waits lspcheck read
+  in full, then says how many others may have been answered unseen, and why. A request still pending when the server
+  exited is M1's, not M2's.
 - *error:* a request couldn't be delivered; or a request's wait was cut short by a budget of lspcheck's (see Bounds),
   which can only happen when lspcheck itself is slow.
 - *not-exercised:* no request was delivered after a mutation.
