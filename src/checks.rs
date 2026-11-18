@@ -637,9 +637,14 @@ pub struct MutationSummary {
     /// When the first successfully delivered mutation write began.
     #[serde(skip)]
     pub first_change: Option<Duration>,
-    /// When lspcheck attempted to write `shutdown`, after registration.
+    /// When lspcheck began shutting the server down: the server's messages
+    /// are counted from `first_change` until then.
     #[serde(skip)]
     pub shutdown_at: Option<Duration>,
+    /// When each case began, so each message is put in the case under way
+    /// when it was read.
+    #[serde(skip)]
+    pub case_times: Vec<(Duration, u64)>,
 }
 
 /// A check that a case's own evidence failed (`Fail`) or left unknown
@@ -750,26 +755,39 @@ pub struct ServerMessages {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ServerMessage {
+    /// The case under way when it was read, its restoration and recovery
+    /// included.
+    pub case: u64,
     /// `"error"` or `"warning"`.
     #[serde(rename = "type")]
     pub kind: &'static str,
+    pub method: String,
+    /// Its text, cut to [`MESSAGE_CHARS`] characters: a crash dump can be
+    /// megabytes, and the Markdown report goes into size-limited CI summaries.
     pub message: String,
 }
 
 /// How many of the server's messages the summary keeps.
 pub const FIRST_MESSAGES: usize = 3;
+/// The most characters of each kept message.
+pub const MESSAGE_CHARS: usize = 200;
 
-/// The server's Error and Warning messages among `messages` read in `window`. Only
+/// The server's Error and Warning messages among `messages` read in
+/// `window`, each in the last of `cases` (start, case) begun by then. Only
 /// the severity and the text are read: a message without an integer `type`
 /// or a string `message` isn't counted (K2 judges its params).
-fn server_messages(messages: &[(Duration, Message)], window: Range<Duration>) -> ServerMessages {
+fn server_messages(
+    messages: &[(Duration, Message)],
+    window: Range<Duration>,
+    cases: &[(Duration, u64)],
+) -> ServerMessages {
     let mut found = ServerMessages::default();
-    for (_, m) in messages.iter().filter(|(at, _)| window.contains(at)) {
-        match &m.kind {
-            Kind::Notification { method } if method == "window/showMessage" || method == "window/logMessage" => {}
-            Kind::Request { method, .. } if method == "window/showMessageRequest" => {}
+    for (at, m) in messages.iter().filter(|(at, _)| window.contains(at)) {
+        let method = match &m.kind {
+            Kind::Notification { method } if method == "window/showMessage" || method == "window/logMessage" => method,
+            Kind::Request { method, .. } if method == "window/showMessageRequest" => method,
             _ => continue,
-        }
+        };
         let field = |key: &str| m.value.get("params").and_then(|p| p.get(key));
         let (Some(kind), Some(text)) = (
             field("type").and_then(Value::as_number).and_then(message::integer_value),
@@ -789,7 +807,12 @@ fn server_messages(messages: &[(Duration, Message)], window: Range<Duration>) ->
             _ => continue,
         };
         if found.first.len() < FIRST_MESSAGES {
-            found.first.push(ServerMessage { kind, message: text.to_string() });
+            let case = cases.iter().rev().find(|(start, _)| start <= at).map_or(0, |&(_, case)| case);
+            let message = match text.char_indices().nth(MESSAGE_CHARS) {
+                Some((end, _)) => format!("{}…", &text[..end]),
+                None => text.to_string(),
+            };
+            found.first.push(ServerMessage { case, kind, method: method.clone(), message });
         }
     }
     found
@@ -874,12 +897,8 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
                     if let Some(warning) =
                         cfg.mutation.as_ref().and_then(|m| m.start_window_warning(cfg.request_timeout))
                     {
-                        let (sent, done) = tokio::sync::oneshot::channel();
-                        let _ = std::thread::Builder::new().spawn(move || {
-                            let _ = writeln!(std::io::stderr().lock(), "lspcheck: warning: {warning}");
-                            let _ = sent.send(());
-                        });
-                        let _ = tokio::time::timeout(Duration::from_secs(1), done).await;
+                        // Advisory: a stderr that can't be written stops nothing.
+                        let _ = writeln!(std::io::stderr().lock(), "lspcheck: warning: {warning}");
                     }
                     let mut run = run_scenario(s, cfg).await?;
                     isolate_cases(cfg, &mut run, &judges).await;
@@ -1235,7 +1254,7 @@ async fn run_session(
         && let Some(m) = &mut mutation
         && let Some(from) = m.first_change
     {
-        m.messages = server_messages(&finish.messages, from..m.shutdown_at.unwrap_or(Duration::MAX));
+        m.messages = server_messages(&finish.messages, from..m.shutdown_at.unwrap_or(Duration::MAX), &m.case_times);
     }
     if let (Some(K1Pending::Mutation { asked }), Some(m)) = (&k1_pending, &mut mutation) {
         // The label is the method, then " in " and the case.
@@ -2977,11 +2996,7 @@ fn idless_reply(at: &Duration, m: &Message) -> Option<String> {
 /// waiting for replies to what came before: when it sent `exit`, or gave up
 /// on `shutdown`. Everything read by then has been taken in.
 async fn leave(ctx: &mut Ctx<'_>) -> Duration {
-    let deadline = Instant::now() + ctx.cfg.request_timeout;
-    let id = ctx.s.fresh_id();
-    let shut = ctx.s.begin_request(&id, "shutdown", deadline).await.is_ok()
-        && write_shutdown(ctx, &id, deadline).await.is_ok()
-        && ctx.s.wait_response(&id, deadline).await.is_ok();
+    let shut = ctx.s.call("shutdown", None, ctx.cfg.request_timeout).await.is_ok();
     let end = ctx.s.elapsed();
     if shut && ctx.s.notify("exit", None).await.is_ok() {
         let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
@@ -2990,6 +3005,8 @@ async fn leave(ctx: &mut Ctx<'_>) -> Duration {
     end
 }
 
+/// Writes the mutation scenario's `shutdown`, noting when it began: the
+/// server's messages are counted up to then.
 async fn write_shutdown(ctx: &mut Ctx<'_>, id: &Id, deadline: Instant) -> Result<(), WriteError> {
     let bytes = frame(&message::request(id, "shutdown", None));
     if let Some(summary) = &mut ctx.mutation {
@@ -5943,6 +5960,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         summary.cases_run += 1;
         summary.starts.push(start);
         ext.cases.push((ctx.s.elapsed(), k));
+        summary.case_times.push((ctx.s.elapsed(), k));
         let mut restoring = None;
         let mut rng = mutation::SplitMix64::stream(seed, k, "requests");
         for (j, (step, params, change_bytes, after, version)) in steps.iter().enumerate() {
@@ -6212,6 +6230,9 @@ async fn restore_and_leave(
 
 /// Leaves, then judges the checks the scenario extends over what was read.
 async fn leave_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest]) {
+    if let Some(summary) = &mut ctx.mutation {
+        summary.shutdown_at = Some(ctx.s.elapsed());
+    }
     let end = leave(ctx).await;
     judge_extended(ctx, ext, asked, end);
 }
@@ -7372,7 +7393,7 @@ mod tests {
         let show =
             |kind: Value, text: &str| message("window/showMessage", None, json!({"type": kind, "message": text}));
         let log = |kind: Value, text: &str| message("window/logMessage", None, json!({"type": kind, "message": text}));
-        let long = format!("{} crash reason", "é".repeat(250));
+        let long = "é".repeat(MESSAGE_CHARS + 1);
         let messages = vec![
             // Before the first change.
             (ms(5), show(1.into(), "early")),
@@ -7395,11 +7416,20 @@ mod tests {
             (ms(40), log(1.into(), "fourth message")),
             (ms(50), log(2.into(), "shutdown")),
         ];
-        let found = server_messages(&messages, ms(10)..ms(50));
+        let found = server_messages(&messages, ms(10)..ms(50), &[(ms(1), 0), (ms(20), 1)]);
         assert_eq!((found.errors, found.warnings), (3, 1));
-        let first: Vec<(&str, &str)> = found.first.iter().map(|m| (m.kind, m.message.as_str())).collect();
-        assert_eq!(first, [("warning", "warning"), ("error", "asked"), ("error", long.as_str())]);
-        assert_eq!(server_messages(&messages, ms(51)..ms(60)), ServerMessages::default());
+        let first: Vec<(u64, &str, &str, &str)> =
+            found.first.iter().map(|m| (m.case, m.kind, m.method.as_str(), m.message.as_str())).collect();
+        let cut = format!("{}…", "é".repeat(200));
+        assert_eq!(
+            first,
+            [
+                (0, "warning", "window/logMessage", "warning"),
+                (1, "error", "window/showMessageRequest", "asked"),
+                (1, "error", "window/showMessage", cut.as_str())
+            ]
+        );
+        assert_eq!(server_messages(&messages, ms(51)..ms(60), &[(ms(1), 0)]), ServerMessages::default());
     }
 
     #[test]

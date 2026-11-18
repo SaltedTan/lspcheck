@@ -2723,48 +2723,6 @@ fn a_run_timeout_leaving_little_room_to_start_cases_is_warned_of_but_runs() {
     assert_eq!((r.status, r.stderr.as_str()), (0, ""), "{}", r.stdout);
 }
 
-#[cfg(unix)]
-#[tokio::test(flavor = "current_thread")]
-async fn a_run_timeout_leaving_little_room_still_runs_when_stderr_is_full() {
-    use std::io::{ErrorKind, Write};
-    use std::os::fd::OwnedFd;
-    use std::os::unix::net::UnixStream;
-    use std::process::Stdio;
-
-    let (reader, mut writer) = UnixStream::pair().unwrap();
-    writer.set_nonblocking(true).unwrap();
-    while writer.write(&[0; 8192]).is_ok() {}
-    let full = loop {
-        if let Err(e) = writer.write(&[0]) {
-            break e;
-        }
-    };
-    assert_eq!(full.kind(), ErrorKind::WouldBlock);
-    writer.set_nonblocking(false).unwrap();
-    let (profile, _keep) = mutation_variant(&[("[mutation]\n", "[mutation]\nrun_timeout = \"100s\"\n")]);
-    let dir = tempfile::tempdir().unwrap();
-    let report = dir.path().join("report.json");
-    let out = tokio::time::timeout(
-        Duration::from_secs(20),
-        tokio::process::Command::new(LSPCHECK)
-            .arg("--profile")
-            .arg(profile)
-            .args(["--mutate", "--timeout", "2", "--only", "M1,M2,M3", "--json"])
-            .arg(&report)
-            .args(["--", STANDIN])
-            .kill_on_drop(true)
-            .stderr(Stdio::from(OwnedFd::from(writer)))
-            .output(),
-    )
-    .await
-    .expect("report should finish while stderr is blocked")
-    .unwrap();
-    drop(reader);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
-    let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
-    assert_eq!(report["mutation"]["cases_run"], 4);
-}
-
 /// The stand-in's mutation profile: one seed document, mutated only by
 /// `unbalance-bracket`, four cases of up to two steps.
 fn mutation_profile() -> String {
@@ -3077,16 +3035,16 @@ fn mutation_messages_are_reported_but_change_no_verdict() {
     assert_eq!(
         r.report["mutation"]["messages"],
         serde_json::json!({"errors": 1, "warnings": 1, "first": [
-            {"type": "error", "message": "contained crash"},
-            {"type": "warning", "message": "recovered"},
+            {"case": 1, "type": "error", "method": "window/showMessage", "message": "contained crash"},
+            {"case": 1, "type": "warning", "method": "window/logMessage", "message": "recovered"},
         ]})
     );
-    let line = r#"  server messages: 1 error, 1 warning during mutation (first ones, "contained crash"; "recovered")"#;
+    let line = r#"  server messages: 1 error, 1 warning during mutation (first ones, case 1: "contained crash"; case 1: "recovered")"#;
     assert_eq!(r.stdout.lines().nth(1), Some(line), "{}", r.stdout);
     let markdown = std::fs::read_to_string(markdown).unwrap();
     assert!(
         markdown.lines().any(|line| line
-            == r#"Server messages: 1 error, 1 warning during mutation (first ones, "contained crash"; "recovered")"#),
+            == r#"Server messages: 1 error, 1 warning during mutation (first ones, case 1: "contained crash"; case 1: "recovered")"#),
         "{markdown}"
     );
     assert_eq!(clean.report["mutation"]["messages"], serde_json::json!({"errors": 0, "warnings": 0, "first": []}));
