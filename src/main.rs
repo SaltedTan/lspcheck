@@ -211,9 +211,6 @@ fn main() {
     let mutation = if cli.mutate {
         match profile::mutation_settings(&p, cli.mutation_seed, cli.mutation_cases, request_timeout) {
             Ok(mut settings) => {
-                if let Some(warning) = settings.start_window_warning(request_timeout) {
-                    eprintln!("lspcheck: warning: {warning}");
-                }
                 settings.seed.get_or_insert_with(profile::random_seed);
                 Some(settings)
             }

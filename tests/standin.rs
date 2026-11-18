@@ -3037,7 +3037,7 @@ fn the_servers_error_and_warning_messages_are_reported_but_change_no_verdict() {
             {"case": 1, "type": "warning", "method": "window/logMessage", "message": "recovered"},
         ]})
     );
-    let line = r#"  server messages: 1 error, 1 warning during mutation (first, case 1: "contained crash")"#;
+    let line = r#"  server messages: 1 error, 1 warning during mutation (first ones, case 1: "contained crash"; case 1: "recovered")"#;
     assert_eq!(r.stdout.lines().nth(1), Some(line), "{}", r.stdout);
     assert_eq!(clean.report["mutation"]["messages"], serde_json::json!({"errors": 0, "warnings": 0, "first": []}));
     assert!(!clean.stdout.contains("server messages"), "{}", clean.stdout);

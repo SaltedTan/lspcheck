@@ -27,6 +27,7 @@ use crate::transport;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -633,6 +634,13 @@ pub struct MutationSummary {
     /// The run's deadline, once the baseline was taken.
     #[serde(skip)]
     pub run_deadline: Option<Instant>,
+    /// When the first mutation's `didChange` was written, and when each case
+    /// began: the server's messages are counted from the first and each is
+    /// put in the case under way when it was read.
+    #[serde(skip)]
+    pub first_change: Option<Duration>,
+    #[serde(skip)]
+    pub case_times: Vec<(Duration, u64)>,
 }
 
 /// A check that a case's own evidence failed (`Fail`) or left unknown
@@ -734,8 +742,8 @@ pub const ISOLATED_CASES: usize = 3;
 
 /// The Error (type 1) and Warning (type 2) messages the server sent in
 /// `window/showMessage`, `window/logMessage` and `window/showMessageRequest`
-/// from the first mutation's `didChange` until lspcheck began shutting down
-/// (M1's window), counted and the first few kept.
+/// from the first mutation's `didChange` to the end of the session, counted
+/// and the first few kept.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ServerMessages {
     pub errors: u64,
@@ -763,8 +771,9 @@ pub const FIRST_MESSAGES: usize = 3;
 pub const MESSAGE_CHARS: usize = 200;
 
 /// The server's Error and Warning messages among `messages` read from
-/// `from` on, each in the last of `cases` (start, case) begun by then.
-/// Malformed params are K2's to judge, and aren't counted.
+/// `from` on, each in the last of `cases` (start, case) begun by then. Only
+/// the severity and the text are read: a message without an integer `type`
+/// or a string `message` isn't counted (K2 judges its params).
 fn server_messages(messages: &[(Duration, Message)], from: Duration, cases: &[(Duration, u64)]) -> ServerMessages {
     let mut found = ServerMessages::default();
     for (at, m) in messages.iter().filter(|(at, _)| *at >= from) {
@@ -774,9 +783,10 @@ fn server_messages(messages: &[(Duration, Message)], from: Duration, cases: &[(D
             _ => continue,
         };
         let field = |key: &str| m.value.get("params").and_then(|p| p.get(key));
-        let (Some(kind), Some(text)) =
-            (field("type").and_then(Value::as_i64), field("message").and_then(Value::as_str))
-        else {
+        let (Some(kind), Some(text)) = (
+            field("type").and_then(Value::as_number).and_then(message::integer_value),
+            field("message").and_then(Value::as_str),
+        ) else {
             continue;
         };
         let Some(&(_, case)) = cases.iter().rev().find(|(start, _)| start <= at) else { continue };
@@ -878,6 +888,12 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
                 }),
                 Some(_) => {}
                 None if any_cross || any_extended || s.checks.iter().any(|c| judges(c)) => {
+                    if let Some(warning) =
+                        cfg.mutation.as_ref().and_then(|m| m.start_window_warning(cfg.request_timeout))
+                    {
+                        // Advisory: a stderr that can't be written stops nothing.
+                        let _ = writeln!(std::io::stderr().lock(), "lspcheck: warning: {warning}");
+                    }
                     let mut run = run_scenario(s, cfg).await?;
                     isolate_cases(cfg, &mut run, &judges).await;
                     runs.push(run)
@@ -1228,6 +1244,13 @@ async fn run_session(
     }
     let Ctx { s, mut results, j3_exercise, k1_pending, mut mutation, .. } = ctx;
     let finish = s.finish(cfg.leftover_grace).await;
+    // Everything the server sent has been read by now, its messages during
+    // the restorations and shutdown included.
+    if let Some(m) = &mut mutation
+        && let Some(from) = m.first_change
+    {
+        m.messages = server_messages(&finish.messages, from, &m.case_times);
+    }
     if let (Some(K1Pending::Mutation { asked }), Some(m)) = (&k1_pending, &mut mutation) {
         // The label is the method, then " in " and the case.
         let troubles = k1_not_found(asked, &finish).into_iter().filter_map(|(_, _, label, case)| {
@@ -5919,6 +5942,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         summary.cases_run += 1;
         summary.starts.push(start);
         ext.cases.push((ctx.s.elapsed(), k));
+        summary.case_times.push((ctx.s.elapsed(), k));
         let mut restoring = None;
         let mut rng = mutation::SplitMix64::stream(seed, k, "requests");
         for (j, (step, params, change_bytes, after, version)) in steps.iter().enumerate() {
@@ -5954,6 +5978,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 break 'cases;
             }
             first_change.get_or_insert(change_at);
+            summary.first_change.get_or_insert(change_at);
             docs[d].current = after.clone();
             docs[d].version = *version;
             docs[d].version_at = change_at;
@@ -6082,9 +6107,6 @@ async fn leave_mutation(
     // Everything already read is taken in before M1 is judged: an end of
     // output queued behind it would otherwise go unseen.
     let drained = ctx.s.absorb_all().await;
-    if let Some(from) = first_change {
-        summary.messages = server_messages(&ctx.s.messages, from, &ext.cases);
-    }
     let id = ctx.s.fresh_id();
     let deadline = Instant::now() + ctx.cfg.request_timeout;
     let registered = ctx.s.begin_request(&id, "shutdown", deadline).await;

@@ -423,8 +423,8 @@ over ten minutes per case, though a case usually takes seconds, which is why `ru
 configuration whose case budget exceeds `run_timeout` is a usage error naming both (exit status 2), checked under
 `--mutate` when there is a seed file, before the server starts, so a run never silently admits no case. One that
 leaves less than a minute beyond the case budget starts cases only in the run's first seconds, so a slow machine may
-run fewer cases than asked with every verdict passing; for more than one case, `--mutate` then prints a warning to
-stderr before the server starts, naming both, and the run, its report and its exit status are unchanged. A test
+run fewer cases than asked with every verdict passing; `--mutate` then prints a warning to stderr just before the
+mutation scenario starts, naming both, and the run, its report and its exit status are unchanged. A test
 checks the stock example profiles' `[mutation]` sections against both. If a case's budget runs out anyway, no further
 step starts, but the restoration is still sent, with its own write deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the
 cases not run), so no case ever starts on a document lspcheck couldn't restore.
@@ -463,12 +463,14 @@ A server may report a contained crash only as a message, which is lawful and jud
 also counts the server's Error (type 1) and Warning (type 2) messages: `"messages": {"errors": 1, "warnings": 1,
 "first": [{"case": 3, "type": "error", "method": "window/showMessage", "message": "…"}]}`, always present. It counts
 every `window/showMessage`, `window/logMessage` and `window/showMessageRequest` of either type read from the first
-mutation's `didChange` until lspcheck begins shutting down (M1's window), and keeps the first three, each message cut
-to 200 characters; one with malformed params is K2's to judge and isn't counted. `case` is the case under way when
-the message was read, so one read during a case's restoration or recovery is that case's; the isolated runs aren't
-counted. When there is at least one, the terminal report adds `server messages: 1 error, 1 warning during mutation
-(first, case 3: "…")` below its header, and the Markdown summary adds the same line above its counts. No verdict
-depends on them.
+mutation's `didChange` to the end of the session (shutdown included, since a server may report a crash only then),
+and keeps the first three, each message cut to 200 characters. Only `type` and `message` are read: a message without
+an integer `type` or a string `message` isn't counted, and K2 judges the rest of its params. A message in a frame
+lspcheck skipped (larger than `--max-frame-mib`) isn't seen, so isn't counted. `case` is the case under way when the
+message was read, so one read during a case's restoration or recovery, or after the last case, is that case's; the
+isolated runs aren't counted. When there is at least one, the terminal report adds `server messages: 1 error, 1
+warning during mutation (first, case 3: "…")` below its header, quoting each kept message, and the Markdown summary
+adds the same line above its counts. No verdict depends on them.
 
 The scenario's transcript, `mutation.jsonl`, is an ordinary session transcript, so `lspcheck replay mutation.jsonl --
 SERVER` replays it as it is: the workspace line recreates the seed files, and every `didChange`, request and poll is

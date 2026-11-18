@@ -352,23 +352,27 @@ impl Mutation {
     /// [`START_WINDOW_WARNING`] beyond one case's budget. A case starts only
     /// while its whole budget fits in what is left of the run, so such a run
     /// starts cases only in its first seconds, and on a slow machine runs
-    /// fewer than asked with every verdict still passing. `None` with no seed
-    /// file (M1 to M3 are skipped) or a single case, which always starts.
+    /// fewer than asked with every verdict still passing (even a single case
+    /// may not start when its budget leaves no room). `None` with no seed
+    /// file, when M1 to M3 are skipped.
     pub fn start_window_warning(&self, request_timeout: Duration) -> Option<String> {
         let budget = self.case_budget(request_timeout);
         let window = self.run_timeout.saturating_sub(budget);
-        if self.seeds.is_empty() || self.cases < 2 || window >= START_WINDOW_WARNING {
+        if self.seeds.is_empty() || window >= START_WINDOW_WARNING {
             return None;
         }
+        let asked = match self.cases {
+            1 => "the 1 case".to_string(),
+            n => format!("the {n} cases"),
+        };
         Some(format!(
             "mutation.run_timeout of {} leaves {} in which a case can start (a case may take up to {} with a \
-             request timeout of {}), so a slow machine may run fewer than the {} cases asked; raise run_timeout (at \
+             request timeout of {}), so a slow machine may run fewer than {asked} asked; raise run_timeout (at \
              most 4h), or lower mutation.steps, mutation.requests_per_step or the request timeout",
             seconds(self.run_timeout),
             seconds(window),
             seconds(budget),
             seconds(request_timeout),
-            self.cases
         ))
     }
 }
@@ -1887,14 +1891,15 @@ mod tests {
              with a request timeout of 30 s), so a slow machine may run fewer than the 20 cases asked; raise \
              run_timeout (at most 4h), or lower mutation.steps, mutation.requests_per_step or the request timeout"
         );
-        // Exactly a minute is enough; so is a budget that just fits, for one case.
+        // Exactly a minute is enough.
         let p = parse_here(&format!("{LUA}[mutation]\nrun_timeout = \"1115s\"\n")).unwrap();
         assert_eq!(mutation_settings(&p, None, None, secs(30)).unwrap().start_window_warning(secs(30)), None);
         let p = parse_here(&format!("{LUA}[mutation]\nrun_timeout = \"1055s\"\n")).unwrap();
         let m = mutation_settings(&p, None, None, secs(30)).unwrap();
         assert!(m.start_window_warning(secs(30)).unwrap().contains(" leaves 0 s "));
+        // Even one case may not start in no time at all.
         let m = mutation_settings(&p, None, Some(1), secs(30)).unwrap();
-        assert_eq!(m.start_window_warning(secs(30)), None);
+        assert!(m.start_window_warning(secs(30)).unwrap().contains(" fewer than the 1 case asked; "));
         // Nothing to mutate: M1 to M3 are skipped.
         let mut m = Mutation::defaults(Vec::new());
         m.run_timeout = secs(60);

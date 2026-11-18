@@ -41,7 +41,9 @@ fn isolated_lines(runs: &[ScenarioRun]) -> Vec<(String, Option<std::path::PathBu
 /// messages: ", when the server sent an Error or Warning message.
 fn server_messages(runs: &[ScenarioRun]) -> Option<String> {
     let m = &mutation(runs)?.messages;
-    let first = m.first.first()?;
+    if m.first.is_empty() {
+        return None;
+    }
     let count = |n: u64, what: &str| match n {
         0 => None,
         1 => Some(format!("1 {what}")),
@@ -49,7 +51,9 @@ fn server_messages(runs: &[ScenarioRun]) -> Option<String> {
     };
     let counts: Vec<String> = [count(m.errors, "error"), count(m.warnings, "warning")].into_iter().flatten().collect();
     // Debug quoting escapes the server's line breaks and control characters.
-    Some(format!("{} during mutation (first, case {}: {:?})", counts.join(", "), first.case, first.message))
+    let quotes: Vec<String> = m.first.iter().map(|q| format!("case {}: {:?}", q.case, q.message)).collect();
+    let first = if quotes.len() == 1 { "first" } else { "first ones" };
+    Some(format!("{} during mutation ({first}, {})", counts.join(", "), quotes.join("; ")))
 }
 
 /// The process exit status for a run: 1 when a MUST check (or with `strict`,
@@ -694,8 +698,24 @@ mod tests {
             "{markdown}"
         );
         summary.messages.errors = 0;
+        run.mutation = Some(summary.clone());
+        assert!(
+            line(std::slice::from_ref(&run))
+                .0
+                .contains("  server messages: 1 warning during mutation (first, case 3: ")
+        );
+        // Every kept message is quoted.
+        summary.messages.first.push(checks::ServerMessage {
+            case: 4,
+            kind: "warning",
+            method: "window/logMessage".into(),
+            message: "again".into(),
+        });
         run.mutation = Some(summary);
-        assert!(line(&[run]).0.contains("  server messages: 1 warning during mutation (first, case 3: "));
+        assert!(
+            line(&[run]).0.contains(r#"(first ones, case 3: "crashed | \"here\"\nstack"; case 4: "again")"#),
+            "every kept message is quoted"
+        );
     }
 
     #[test]
