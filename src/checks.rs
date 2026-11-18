@@ -27,6 +27,8 @@ use crate::transport;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -616,6 +618,8 @@ pub struct MutationSummary {
     /// The first failing or erroring cases, each run again alone
     /// ([step 6](../docs/source-mutations.md#step-6)). Never a verdict.
     pub isolated: Vec<Isolated>,
+    /// Informational server message counts and samples from the main run.
+    pub messages: ServerMessages,
     /// The checks each case's own evidence failed or made an error.
     #[serde(skip)]
     pub troubles: Vec<Trouble>,
@@ -630,6 +634,17 @@ pub struct MutationSummary {
     /// The run's deadline, once the baseline was taken.
     #[serde(skip)]
     pub run_deadline: Option<Instant>,
+    /// When the first successfully delivered mutation write began.
+    #[serde(skip)]
+    pub first_change: Option<Duration>,
+    /// When lspcheck began shutting the server down: the server's messages
+    /// are counted from `first_change` until then.
+    #[serde(skip)]
+    pub shutdown_at: Option<Duration>,
+    /// When each case began, so each message is put in the case under way
+    /// when it was read.
+    #[serde(skip)]
+    pub case_times: Vec<(Duration, u64)>,
 }
 
 /// A check that a case's own evidence failed (`Fail`) or left unknown
@@ -729,6 +744,80 @@ pub struct Isolated {
 /// How many failing or erroring cases are run again alone.
 pub const ISOLATED_CASES: usize = 3;
 
+/// Counts and samples of the server's Error and Warning messages.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ServerMessages {
+    pub errors: u64,
+    pub warnings: u64,
+    /// The first [`FIRST_MESSAGES`], in the order read.
+    pub first: Vec<ServerMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ServerMessage {
+    /// The case under way when it was read, its restoration and recovery
+    /// included.
+    pub case: u64,
+    /// `"error"` or `"warning"`.
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub method: String,
+    /// Its text, cut to [`MESSAGE_CHARS`] characters: a crash dump can be
+    /// megabytes, and the Markdown report goes into size-limited CI summaries.
+    pub message: String,
+}
+
+/// How many of the server's messages the summary keeps.
+pub const FIRST_MESSAGES: usize = 3;
+/// The most characters of each kept message.
+pub const MESSAGE_CHARS: usize = 200;
+
+/// The server's Error and Warning messages among `messages` read in
+/// `window`, each in the last of `cases` (start, case) begun by then. Only
+/// the severity and the text are read: a message without an integer `type`
+/// or a string `message` isn't counted (K2 judges its params).
+fn server_messages(
+    messages: &[(Duration, Message)],
+    window: Range<Duration>,
+    cases: &[(Duration, u64)],
+) -> ServerMessages {
+    let mut found = ServerMessages::default();
+    for (at, m) in messages.iter().filter(|(at, _)| window.contains(at)) {
+        let method = match &m.kind {
+            Kind::Notification { method } if method == "window/showMessage" || method == "window/logMessage" => method,
+            Kind::Request { method, .. } if method == "window/showMessageRequest" => method,
+            _ => continue,
+        };
+        let field = |key: &str| m.value.get("params").and_then(|p| p.get(key));
+        let (Some(kind), Some(text)) = (
+            field("type").and_then(Value::as_number).and_then(message::integer_value),
+            field("message").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let kind = match kind {
+            1 => {
+                found.errors += 1;
+                "error"
+            }
+            2 => {
+                found.warnings += 1;
+                "warning"
+            }
+            _ => continue,
+        };
+        if found.first.len() < FIRST_MESSAGES {
+            let case = cases.iter().rev().find(|(start, _)| start <= at).map_or(0, |&(_, case)| case);
+            let message = match text.char_indices().nth(MESSAGE_CHARS) {
+                Some((end, _)) => format!("{}…", &text[..end]),
+                None => text.to_string(),
+            };
+            found.first.push(ServerMessage { case, kind, method: method.clone(), message });
+        }
+    }
+    found
+}
+
 /// An isolated run of one case: the case, what carried over into it, and
 /// the main run's deadline, which it keeps.
 #[derive(Debug, Clone)]
@@ -805,6 +894,12 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
                 }),
                 Some(_) => {}
                 None if any_cross || any_extended || s.checks.iter().any(|c| judges(c)) => {
+                    if let Some(warning) =
+                        cfg.mutation.as_ref().and_then(|m| m.start_window_warning(cfg.request_timeout))
+                    {
+                        // Advisory: a stderr that can't be written stops nothing.
+                        let _ = writeln!(std::io::stderr().lock(), "lspcheck: warning: {warning}");
+                    }
                     let mut run = run_scenario(s, cfg).await?;
                     isolate_cases(cfg, &mut run, &judges).await;
                     runs.push(run)
@@ -1153,8 +1248,17 @@ async fn run_session(
         MUTATION => mutation_scenario(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
-    let Ctx { s, mut results, j3_exercise, k1_pending, mut mutation, .. } = ctx;
+    let Ctx { s, mut results, j3_exercise, k1_pending, mut mutation, isolate, .. } = ctx;
+    // A scenario that stopped without beginning a shutdown counts the
+    // server's messages up to its cleanup, not during it.
+    let stopping = s.elapsed();
     let finish = s.finish(cfg.leftover_grace).await;
+    if isolate.is_none()
+        && let Some(m) = &mut mutation
+        && let Some(from) = m.first_change
+    {
+        m.messages = server_messages(&finish.messages, from..m.shutdown_at.unwrap_or(stopping), &m.case_times);
+    }
     if let (Some(K1Pending::Mutation { asked }), Some(m)) = (&k1_pending, &mut mutation) {
         // The label is the method, then " in " and the case.
         let troubles = k1_not_found(asked, &finish).into_iter().filter_map(|(_, _, label, case)| {
@@ -5703,7 +5807,6 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
     // where it started in the main run.
     let mut cursor = isolate.as_ref().map_or(0, |i| i.start.cursor);
     let mut asked: Vec<StepRequest> = Vec::new();
-    let mut first_change: Option<Duration> = None;
     let mut versions = 0u64;
     let mut lost: Option<(Lost, String)> = None;
     let mut cut_short = 0u64;
@@ -5846,6 +5949,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         summary.cases_run += 1;
         summary.starts.push(start);
         ext.cases.push((ctx.s.elapsed(), k));
+        summary.case_times.push((ctx.s.elapsed(), k));
         let mut restoring = None;
         let mut rng = mutation::SplitMix64::stream(seed, k, "requests");
         for (j, (step, params, change_bytes, after, version)) in steps.iter().enumerate() {
@@ -5859,7 +5963,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 capped = Some(why);
                 break;
             }
-            if first_change.is_none() && (ctx.s.output_closed().await || !ctx.s.is_alive()) {
+            if summary.first_change.is_none() && (ctx.s.output_closed().await || !ctx.s.is_alive()) {
                 lost = Some((lost_output(ctx).await, place));
                 break 'cases;
             }
@@ -5872,7 +5976,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 break;
             }
             let change_at = ctx.s.elapsed();
-            if first_change.is_none() {
+            if summary.first_change.is_none() {
                 rec.before_first_mutation(&ctx.s, &docs, change_at);
             }
             ext.record(&ctx.s, &asked, d, change_at, *version, after.clone());
@@ -5880,7 +5984,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
                 lost = Some((lost_after_write(ctx, "a didChange", &e).await, place));
                 break 'cases;
             }
-            first_change.get_or_insert(change_at);
+            summary.first_change.get_or_insert(change_at);
             docs[d].current = after.clone();
             docs[d].version = *version;
             docs[d].version_at = change_at;
@@ -5972,7 +6076,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         ctx.s.note(format!("{cut_short} case(s) ran out of their budget before their last step"));
     }
     let lost_in = last_case.zip(lost.as_ref()).filter(|_| !lost_before).map(|(case, (_, place))| (case, place.clone()));
-    leave_mutation(ctx, summary, first_change, versions, lost, &asked, capped.as_deref(), &mut ext, &rec).await;
+    leave_mutation(ctx, summary, versions, lost, &asked, capped.as_deref(), &mut ext, &rec).await;
     // M1's trouble is the case during which the server was lost, with M1's
     // result, settled as M1 is.
     if let Some((case, place)) = lost_in
@@ -5992,7 +6096,6 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
 async fn leave_mutation(
     ctx: &mut Ctx<'_>,
     mut summary: MutationSummary,
-    first_change: Option<Duration>,
     versions: u64,
     mut lost: Option<(Lost, String)>,
     asked: &[StepRequest],
@@ -6009,6 +6112,9 @@ async fn leave_mutation(
     // Everything already read is taken in before M1 is judged: an end of
     // output queued behind it would otherwise go unseen.
     let drained = ctx.s.absorb_all().await;
+    // lspcheck begins shutting down here: the server's messages are counted
+    // up to now.
+    summary.shutdown_at = Some(ctx.s.elapsed());
     let id = ctx.s.fresh_id();
     let deadline = Instant::now() + ctx.cfg.request_timeout;
     let registered = ctx.s.begin_request(&id, "shutdown", deadline).await;
@@ -6043,7 +6149,7 @@ async fn leave_mutation(
             None => why.clone(),
         });
     }
-    judge_m1(ctx, &summary, first_change, versions, lost, capped.is_some());
+    judge_m1(ctx, &summary, versions, lost, capped.is_some());
     // M2's troubles: each case's requests left unanswered, or that lspcheck
     // couldn't deliver or inspect. One pending when the server went is M1's.
     // As for M2's verdict, a case's failure carries each of its unanswered
@@ -6118,6 +6224,9 @@ async fn restore_and_leave(
 
 /// Leaves, then judges the checks the scenario extends over what was read.
 async fn leave_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest]) {
+    if let Some(summary) = &mut ctx.mutation {
+        summary.shutdown_at = Some(ctx.s.elapsed());
+    }
     let end = leave(ctx).await;
     judge_extended(ctx, ext, asked, end);
 }
@@ -6173,16 +6282,9 @@ const SELECTION_RANGE: &str = "textDocument/selectionRange";
 /// mutation's `didChange` was fully written and before `shutdown`. A run
 /// the written-bytes cap stopped early (`capped`) can still fail, but not
 /// pass: the cases it didn't run are unjudged.
-fn judge_m1(
-    ctx: &mut Ctx<'_>,
-    summary: &MutationSummary,
-    first_change: Option<Duration>,
-    versions: u64,
-    lost: Option<(Lost, String)>,
-    capped: bool,
-) {
+fn judge_m1(ctx: &mut Ctx<'_>, summary: &MutationSummary, versions: u64, lost: Option<(Lost, String)>, capped: bool) {
     let stopped = summary.stopped.as_ref().map(|why| format!("; no further case started: {why}")).unwrap_or_default();
-    match (lost, first_change) {
+    match (lost, summary.first_change) {
         (Some((Lost::Gone(why), place)), Some(_)) => ctx.fail("M1", format!("{why} during {place}")),
         (Some((Lost::Gone(why), _)), None) => {
             ctx.report("M1", Verdict::Error, format!("before the first mutation: {why}"));
@@ -7273,6 +7375,58 @@ mod tests {
     }
 
     #[test]
+    fn mutation_messages_use_exact_severity_in_the_mutation_window() {
+        let ms = Duration::from_millis;
+        let message = |method: &str, id: Option<u64>, params: Value| {
+            let mut v = json!({"jsonrpc": "2.0", "method": method, "params": params});
+            if let Some(id) = id {
+                v["id"] = id.into();
+            }
+            Message::classify(v)
+        };
+        let show =
+            |kind: Value, text: &str| message("window/showMessage", None, json!({"type": kind, "message": text}));
+        let log = |kind: Value, text: &str| message("window/logMessage", None, json!({"type": kind, "message": text}));
+        let long = "é".repeat(MESSAGE_CHARS + 1);
+        let messages = vec![
+            // Before the first change.
+            (ms(5), show(1.into(), "early")),
+            (ms(10), log(serde_json::from_str("2e0").unwrap(), "warning")),
+            // Info and Log, malformed params, and a showMessage sent as a request.
+            (ms(11), log(3.into(), "info")),
+            (ms(12), log(4.into(), "log")),
+            (ms(13), show("1".into(), "a string type")),
+            (ms(14), message("window/showMessage", None, json!({"type": 1}))),
+            (ms(15), message("window/showMessage", Some(7), json!({"type": 1, "message": "a request"}))),
+            (
+                ms(20),
+                message(
+                    "window/showMessageRequest",
+                    Some(8),
+                    serde_json::from_str(r#"{"type":1.0,"message":"asked"}"#).unwrap(),
+                ),
+            ),
+            (ms(30), show(serde_json::from_str("1e0").unwrap(), &long)),
+            (ms(40), log(1.into(), "fourth message")),
+            (ms(50), log(2.into(), "shutdown")),
+        ];
+        let found = server_messages(&messages, ms(10)..ms(50), &[(ms(1), 0), (ms(20), 1)]);
+        assert_eq!((found.errors, found.warnings), (3, 1));
+        let first: Vec<(u64, &str, &str, &str)> =
+            found.first.iter().map(|m| (m.case, m.kind, m.method.as_str(), m.message.as_str())).collect();
+        let cut = format!("{}…", "é".repeat(200));
+        assert_eq!(
+            first,
+            [
+                (0, "warning", "window/logMessage", "warning"),
+                (1, "error", "window/showMessageRequest", "asked"),
+                (1, "error", "window/showMessage", cut.as_str())
+            ]
+        );
+        assert_eq!(server_messages(&messages, ms(51)..ms(60), &[(ms(1), 0)]), ServerMessages::default());
+    }
+
+    #[test]
     fn mutation_no_case_starts_without_its_whole_budget_left() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/standin-mutation.toml");
         let settings = profile::load(&fixture).unwrap().mutation.unwrap();
@@ -8022,9 +8176,15 @@ while header := sys.stdin.buffer.readline():
             let cfg = mutation_test_config("exit 0");
             let mut ctx = mutation_test_ctx(&cfg, 1024).await;
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
-            let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, ..MutationSummary::default() };
-            leave_mutation(&mut ctx, summary, first_change, 1, None, &[], None, &mut unopened(), &Recovery::default())
-                .await;
+            let summary = MutationSummary {
+                seed: 1,
+                format: 1,
+                cases: 1,
+                cases_run: 1,
+                first_change,
+                ..MutationSummary::default()
+            };
+            leave_mutation(&mut ctx, summary, 1, None, &[], None, &mut unopened(), &Recovery::default()).await;
             assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, expected);
             assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::NotExercised);
             ctx.s.finish(Duration::from_millis(200)).await;
@@ -8046,21 +8206,16 @@ while header := sys.stdin.buffer.readline():
                 } else {
                     assert!(ctx.s.is_alive());
                 }
-                let summary =
-                    MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, ..MutationSummary::default() };
-                let lost = Some((Lost::Undelivered("failed write".into()), "restoring case 0".into()));
-                leave_mutation(
-                    &mut ctx,
-                    summary,
+                let summary = MutationSummary {
+                    seed: 1,
+                    format: 1,
+                    cases: 1,
+                    cases_run: 1,
                     first_change,
-                    1,
-                    lost,
-                    &[],
-                    None,
-                    &mut unopened(),
-                    &Recovery::default(),
-                )
-                .await;
+                    ..MutationSummary::default()
+                };
+                let lost = Some((Lost::Undelivered("failed write".into()), "restoring case 0".into()));
+                leave_mutation(&mut ctx, summary, 1, lost, &[], None, &mut unopened(), &Recovery::default()).await;
                 let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
                 assert_eq!(m1.verdict, expected, "{}", m1.detail);
                 if first_change.is_some() {
@@ -8084,20 +8239,16 @@ while header := sys.stdin.buffer.readline():
             assert!(ctx.s.stopped_reading().is_some());
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
             let place = if lost.is_some() { "case 0, step 1" } else { "the cases and their restorations" };
-            let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, ..MutationSummary::default() };
+            let summary = MutationSummary {
+                seed: 1,
+                format: 1,
+                cases: 1,
+                cases_run: 1,
+                first_change: Some(Duration::ZERO),
+                ..MutationSummary::default()
+            };
             let lost = lost.map(|how| (how, place.into()));
-            leave_mutation(
-                &mut ctx,
-                summary,
-                Some(Duration::ZERO),
-                1,
-                lost,
-                &[],
-                None,
-                &mut unopened(),
-                &Recovery::default(),
-            )
-            .await;
+            leave_mutation(&mut ctx, summary, 1, lost, &[], None, &mut unopened(), &Recovery::default()).await;
             let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
             assert_eq!(m1.verdict, Verdict::Error, "{}", m1.detail);
             assert!(
@@ -8127,19 +8278,15 @@ while header := sys.stdin.buffer.readline():
             assert!(ctx.s.answer_withheld().is_some());
             assert!(ctx.s.wait_exit(Instant::now() + Duration::from_secs(5)).await.is_some());
             let lost = seen_before.then(|| (Lost::Gone("the server exited with status 0".into()), "case 0".into()));
-            let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, ..MutationSummary::default() };
-            leave_mutation(
-                &mut ctx,
-                summary,
-                Some(Duration::ZERO),
-                1,
-                lost,
-                &[],
-                None,
-                &mut unopened(),
-                &Recovery::default(),
-            )
-            .await;
+            let summary = MutationSummary {
+                seed: 1,
+                format: 1,
+                cases: 1,
+                cases_run: 1,
+                first_change: Some(Duration::ZERO),
+                ..MutationSummary::default()
+            };
+            leave_mutation(&mut ctx, summary, 1, lost, &[], None, &mut unopened(), &Recovery::default()).await;
             let m1 = ctx.results.iter().find(|r| r.id == "M1").unwrap();
             assert_eq!(m1.verdict, expected, "{}", m1.detail);
             if !seen_before {
@@ -8187,9 +8334,15 @@ while header := sys.stdin.buffer.readline():
                 deadline_at: at + Duration::from_secs(5),
                 outcome: StepOutcome::Answered(None),
             }];
-            let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, ..MutationSummary::default() };
-            leave_mutation(&mut ctx, summary, Some(at), 1, None, &asked, None, &mut unopened(), &Recovery::default())
-                .await;
+            let summary = MutationSummary {
+                seed: 1,
+                format: 1,
+                cases: 1,
+                cases_run: 1,
+                first_change: Some(at),
+                ..MutationSummary::default()
+            };
+            leave_mutation(&mut ctx, summary, 1, None, &asked, None, &mut unopened(), &Recovery::default()).await;
             let withheld = ctx.s.answer_withheld().is_some();
             let finish = ctx.s.finish(Duration::from_millis(200)).await;
             for id in ["M1", "M2"] {
@@ -8226,11 +8379,17 @@ while header := sys.stdin.buffer.readline():
             let withheld = ctx.s.answer_withheld().is_some();
             let after_withheld = matches!(how, Lost::AfterWithheld(_));
             let gone = matches!(how, Lost::Gone(_));
-            let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, ..MutationSummary::default() };
+            let summary = MutationSummary {
+                seed: 1,
+                format: 1,
+                cases: 1,
+                cases_run: 1,
+                first_change: Some(Duration::ZERO),
+                ..MutationSummary::default()
+            };
             leave_mutation(
                 &mut ctx,
                 summary,
-                Some(Duration::ZERO),
                 1,
                 Some((how, "case 0".into())),
                 &[],
@@ -8341,10 +8500,15 @@ send({'jsonrpc': '2.0', 'id': held, 'error': {'code': int(sys.argv[1]), 'message
                 if ordinary_leave {
                     leave_extended(&mut ctx, &mut ext, &asked).await;
                 } else {
-                    let summary =
-                        MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, ..MutationSummary::default() };
-                    leave_mutation(&mut ctx, summary, Some(at), 1, None, &asked, None, &mut ext, &Recovery::default())
-                        .await;
+                    let summary = MutationSummary {
+                        seed: 1,
+                        format: 1,
+                        cases: 1,
+                        cases_run: 1,
+                        first_change: Some(at),
+                        ..MutationSummary::default()
+                    };
+                    leave_mutation(&mut ctx, summary, 1, None, &asked, None, &mut ext, &Recovery::default()).await;
                 }
                 assert!(!ctx.s.messages.iter().any(|(_, m)| k1_outcome(m) == capabilities::Outcome::Error(code)));
                 let pending = ctx.k1_pending.take();
@@ -8400,7 +8564,7 @@ signal.pause()
             outcome: StepOutcome::Unanswered,
         }];
         let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, ..MutationSummary::default() };
-        leave_mutation(&mut ctx, summary, None, 1, None, &asked, None, &mut ext, &Recovery::default()).await;
+        leave_mutation(&mut ctx, summary, 1, None, &asked, None, &mut ext, &Recovery::default()).await;
         let results = ctx.results;
         ctx.s.finish(Duration::from_millis(200)).await;
         for id in ["D1", "D2", "D6"] {
@@ -8425,19 +8589,15 @@ signal.pause()
             deadline_at: Duration::from_secs(1),
             outcome: StepOutcome::Unanswered,
         }];
-        let summary = MutationSummary { seed: 1, format: 1, cases: 1, cases_run: 1, ..MutationSummary::default() };
-        leave_mutation(
-            &mut ctx,
-            summary,
-            Some(Duration::ZERO),
-            1,
-            None,
-            &asked,
-            None,
-            &mut unopened(),
-            &Recovery::default(),
-        )
-        .await;
+        let summary = MutationSummary {
+            seed: 1,
+            format: 1,
+            cases: 1,
+            cases_run: 1,
+            first_change: Some(Duration::ZERO),
+            ..MutationSummary::default()
+        };
+        leave_mutation(&mut ctx, summary, 1, None, &asked, None, &mut unopened(), &Recovery::default()).await;
         assert_eq!(ctx.results.iter().find(|r| r.id == "M1").unwrap().verdict, Verdict::Fail);
         assert_eq!(ctx.results.iter().find(|r| r.id == "M2").unwrap().verdict, Verdict::Fail);
         assert_eq!(asked[0].outcome, StepOutcome::Unanswered);

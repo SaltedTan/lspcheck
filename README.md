@@ -342,7 +342,10 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   See the [mutation reference](docs/source-mutations.md#verdict-rules) for verdicts and
   [implementation status](docs/source-mutations.md) for what is implemented so far, including the
   [written-bytes bound on automatic answers](docs/source-mutations.md#bounds). The JSON `mutation.stopped`
-  field records why the scenario stopped early, including initialization and seed-file errors.
+  field records why the scenario stopped early, including initialization and seed-file errors, and
+  `mutation.messages` counts the Error and Warning messages the server showed or logged during the cases, with the
+  first three, [never a verdict](docs/source-mutations.md#reports-transcripts-and-reproduction). A `run_timeout`
+  that leaves less than a minute in which cases can start is [warned of](docs/source-mutations.md#bounds) on stderr.
   An observed request timeout still fails M2 if the server exits later in the same batch.
   Reply windows interrupted by an unfinished client write are `ERROR`.
 - **Errors.** The profile is read and checked before any server starts. An unknown section or key, a value of the wrong

@@ -421,10 +421,16 @@ every delivery as taking its full write deadline, so a server slow to read (back
 already reserved, not the run's. The budget is a worst case: with the example profiles' 30 s request timeout it is
 over ten minutes per case, though a case usually takes seconds, which is why `run_timeout` defaults to an hour. A
 configuration whose case budget exceeds `run_timeout` is a usage error naming both (exit status 2), checked under
-`--mutate` when there is a seed file, before the server starts, so a run never silently admits no case. A test
-checks the stock example profiles' `[mutation]` sections against it. If a case's budget runs out anyway, no further
-step starts, but the restoration is still sent, with its own write deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the
-cases not run), so no case ever starts on a document lspcheck couldn't restore.
+`--mutate` when there is a seed file, before the server starts, so a run never silently admits no case. One that
+leaves less than a minute beyond the case budget starts cases only in the run's first seconds, so a slow machine may
+run fewer cases than asked with every verdict passing (with no time left beyond it, even the first case may not
+start); `--mutate` then prints a warning to stderr just before the mutation scenario starts, naming both, and the
+run, its report and its exit status are unchanged. A test checks the stock example profiles' `[mutation]` sections
+against both.
+
+If a case's budget runs out anyway, no further step starts, but the restoration is still sent, with its own write
+deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the cases not run), so no case ever
+starts on a document lspcheck couldn't restore.
 
 The written-bytes bound is a cap, not a threshold: everything lspcheck writes in the scenario counts (the seed
 `didOpen`s, baseline probes, every `didChange`, request, poll and answer to a server request, and `shutdown` and
@@ -455,6 +461,22 @@ on the cases it judged, but not pass: a cap stop makes it `ERROR`.
 The JSON report gains a top-level `"mutation"`: `null` when the scenario didn't run, or the seed, the format, the
 cases planned and run, and why the run stopped early, if it did. The terminal header adds
 `— mutation seed 20261109, 20 cases`. The schema id is unchanged, as when `"profile"` was added.
+
+A server may report a contained crash only as a message, which is lawful and judged by nothing, so the summary
+also counts the server's Error (type 1) and Warning (type 2) messages: `"messages": {"errors": 1, "warnings": 0,
+"first": [{"case": 3, "type": "error", "method": "window/showMessage", "message": "…"}]}`, always present. It counts
+every `window/showMessage`, `window/logMessage` and `window/showMessageRequest` of either type read in the main run
+from the first mutation's `didChange` until lspcheck begins shutting the server down (or, for a run that stops
+without doing so, until its cleanup), and keeps the first three,
+each message cut to 200 characters (a crash dump can be megabytes, and the Markdown report often goes into a
+size-limited CI summary). Only `type` and `message` are read: a message without an integer `type` or a string
+`message` isn't counted, and K2 judges the rest of its params. A message in a frame lspcheck skipped (larger than
+`--max-frame-mib`) isn't seen, so isn't counted. `case` is the case under way when the message was read, so one read
+during a case's restoration or recovery is that case's; the isolated runs aren't counted. When there is at least one,
+the terminal report adds `server messages: 1 error during mutation (first, case 3, window/showMessage: "…")` below
+its header,
+quoting each kept message, and the Markdown summary adds the same line above its counts. No verdict depends on
+them.
 
 The scenario's transcript, `mutation.jsonl`, is an ordinary session transcript, so `lspcheck replay mutation.jsonl --
 SERVER` replays it as it is: the workspace line recreates the seed files, and every `didChange`, request and poll is
@@ -497,6 +519,7 @@ runner stalled for 3 s) tests something else, and is repeated.
 | `recover-before-deadline` | lawful: after restoration, answer the first `documentSymbol` request with `[]` 4 s late, then with the baseline | nothing fails with `expect = "baseline"` and a 3 s `recovery_timeout`: the terminal probe, written after the deadline, sees the baseline |
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails; only the first three of its four failing cases are [isolated](#step-6) |
 | `ignore-while-extra-square-bracket` | don't answer requests about a document with more `[` than `]` (in the fixture, case 3 alone) | M2 fails; case 3 is isolated and reproduced; with too little of `run_timeout` left it isn't run, and the verdicts are the same |
+| `mutation-error-message` | lawful: on the session's fourth `didChange` (case 1's first step), show an Error message and log a Warning, and log a Warning before answering initialize and on shutdown | every verdict is the clean run's; `"mutation"."messages"` counts 1 error and 1 warning, both in case 1 (the other two Warnings aren't counted) |
 | `ignore-after-fourth-change` | don't answer requests read after the session's fourth `didChange` and before its fifth (case 1's first step) | M2 fails; case 1 is isolated and not reproduced, and M2 still fails |
 | `oversized-after-first-change` | answer the first request answered after the first `didChange` with an error padded past 2 MiB | with `--max-frame-mib 1` and `ignore-while-extra-square-bracket`, case 0's trouble is `M2 ERROR`; case 3, with `M2 FAIL`, is isolated first |
 | `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |

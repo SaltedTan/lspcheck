@@ -37,6 +37,26 @@ fn isolated_lines(runs: &[ScenarioRun]) -> Vec<(String, Option<std::path::PathBu
         .collect()
 }
 
+/// What the mutation run's server messages line says after "server
+/// messages: ", when the server sent an Error or Warning message.
+fn server_messages(runs: &[ScenarioRun]) -> Option<String> {
+    let m = &mutation(runs)?.messages;
+    if m.first.is_empty() {
+        return None;
+    }
+    let count = |n: u64, what: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {what}")),
+        n => Some(format!("{n} {what}s")),
+    };
+    let counts: Vec<String> = [count(m.errors, "error"), count(m.warnings, "warning")].into_iter().flatten().collect();
+    // Debug quoting escapes the server's line breaks and control characters.
+    let quotes: Vec<String> =
+        m.first.iter().map(|q| format!("case {}, {}: {:?}", q.case, q.method, q.message)).collect();
+    let first = if quotes.len() == 1 { "first" } else { "first ones" };
+    Some(format!("{} during mutation ({first}, {})", counts.join(", "), quotes.join("; ")))
+}
+
 /// The process exit status for a run: 1 when a MUST check (or with `strict`,
 /// any check) failed, 2 when lspcheck itself hit an error, otherwise 0.
 pub fn exit_code(runs: &[ScenarioRun], strict: bool) -> i32 {
@@ -89,6 +109,9 @@ pub fn print_terminal(
         header.push_str(&format!(" — mutation seed {}, {} cases", m.seed, m.cases));
     }
     writeln!(out, "{header}")?;
+    if let Some(line) = server_messages(runs) {
+        writeln!(out, "  server messages: {line}")?;
+    }
     let results = ordered(runs);
     for r in &results {
         let c = checks::info(r.id);
@@ -260,6 +283,9 @@ pub fn markdown_report(server: &[String], runs: &[ScenarioRun]) -> String {
         std::env::consts::OS,
         std::env::consts::ARCH,
     ));
+    if let Some(line) = server_messages(runs) {
+        out.push_str(&format!("Server messages: {}\n\n", markdown_cell(&line)));
+    }
     out.push_str(&counts_line(&results));
     out.push_str("\n\n| Verdict | Check | Basis | Title | Detail |\n| --- | --- | --- | --- | --- |\n");
 
@@ -634,6 +660,63 @@ mod tests {
             markdown_report(&["python3".into(), "-c".into(), "print('ready')\r\n\n# server`script".into()], &[run]);
         assert!(text.contains("Server: ``python3 -c print('ready')\\r\\n\\n# server`script`` · "), "{text}");
         assert!(text.contains("- L7: transcript: ``evidence\\r\\n\\n# path`name.jsonl``\n"), "{text}");
+    }
+
+    #[test]
+    fn mutation_messages_are_one_line_shown_only_when_there_are_some() {
+        let mut run = scenario(vec![result("M1", Verdict::Pass, "")]);
+        let mut summary = MutationSummary { seed: 7, cases: 4, ..MutationSummary::default() };
+        run.mutation = Some(summary.clone());
+        let line = |runs: &[ScenarioRun]| {
+            let mut terminal = Vec::new();
+            print_terminal(&mut terminal, "x", None, runs).unwrap();
+            (String::from_utf8(terminal).unwrap(), markdown_report(&server(), runs))
+        };
+        let (terminal, markdown) = line(std::slice::from_ref(&run));
+        assert!(!terminal.contains("server messages") && !markdown.contains("Server messages"), "{terminal}");
+        summary.messages = checks::ServerMessages {
+            errors: 2,
+            warnings: 1,
+            first: vec![checks::ServerMessage {
+                case: 3,
+                kind: "error",
+                method: "window/showMessage".into(),
+                message: "crashed | \"here\"\nstack".into(),
+            }],
+        };
+        run.mutation = Some(summary.clone());
+        let (terminal, markdown) = line(std::slice::from_ref(&run));
+        let mut lines = terminal.lines();
+        assert!(lines.next().unwrap().ends_with("— mutation seed 7, 4 cases"), "{terminal}");
+        assert_eq!(
+            lines.next().unwrap(),
+            r#"  server messages: 2 errors, 1 warning during mutation (first, case 3, window/showMessage: "crashed | \"here\"\nstack")"#
+        );
+        assert!(
+            markdown.contains(
+                r#"Server messages: 2 errors, 1 warning during mutation (first, case 3, window/showMessage: "crashed \| \\"here\\"\\nstack")"#
+            ),
+            "{markdown}"
+        );
+        summary.messages.errors = 0;
+        run.mutation = Some(summary.clone());
+        assert!(
+            line(std::slice::from_ref(&run))
+                .0
+                .contains("  server messages: 1 warning during mutation (first, case 3, window/showMessage: ")
+        );
+        // Every kept message is quoted.
+        summary.messages.first.push(checks::ServerMessage {
+            case: 4,
+            kind: "warning",
+            method: "window/logMessage".into(),
+            message: "again".into(),
+        });
+        run.mutation = Some(summary);
+        assert!(
+            line(&[run]).0.contains(r#"(first ones, case 3, window/showMessage: "crashed | \"here\"\nstack"; case 4, window/logMessage: "again")"#),
+            "every kept message is quoted"
+        );
     }
 
     #[test]

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- Under `--mutate`, lspcheck warns on stderr when `mutation.run_timeout` leaves less than a minute beyond one case's
+  budget in which cases can start, since a slow machine may then run fewer cases than asked with every verdict
+  passing. The run, its report and its exit status are unchanged.
+- Under `--mutate`, the report counts the Error and Warning messages the server sent with `window/showMessage`,
+  `window/logMessage` or `window/showMessageRequest` during the cases, so a contained crash the server reports only
+  as a message is visible. The JSON report's `mutation.messages` has the counts and the first three, with the case
+  each arrived in, cut to 200 characters; the terminal and Markdown reports add a line quoting them when there is at
+  least one. They change no verdict.
+
 ### Fixed
 
 - Under `--mutate`, when some of M2's unanswered requests may have been answered in output lspcheck didn't see, its

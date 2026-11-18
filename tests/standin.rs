@@ -72,6 +72,8 @@ struct Run {
     report: Value,
     /// What the server wrote to stderr, from every transcript.
     server_stderr: String,
+    /// What lspcheck wrote to stderr.
+    stderr: String,
     took: Duration,
 }
 
@@ -132,7 +134,8 @@ fn run_command_in(
             }
         }
     }
-    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, report: json, server_stderr, took }
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, report: json, server_stderr, stderr, took }
 }
 
 fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
@@ -2698,6 +2701,28 @@ fn a_bad_mutation_setting_is_a_usage_error_before_any_server_starts() {
     }
 }
 
+#[test]
+fn a_run_timeout_leaving_little_room_to_start_cases_is_warned_of_but_runs() {
+    // At a 2 s timeout the fixture's case budget is 53 s: 100 s leaves 47 s
+    // in which a case can start.
+    let (path, _keep) = mutation_variant(&[("[mutation]\n", "[mutation]\nrun_timeout = \"100s\"\n")]);
+    let args = ["--timeout", "2", "--only", "M1,M2,M3"];
+    let (r, _, _keep) = mutated_with(&path, &[], &args);
+    assert_eq!(
+        r.stderr,
+        "lspcheck: warning: mutation.run_timeout of 100 s leaves 47 s in which a case can start (a case may take up \
+         to 53 s with a request timeout of 2 s), so a slow machine may run fewer than the 4 cases asked; raise \
+         run_timeout (at most 4h), or lower mutation.steps, mutation.requests_per_step or the request timeout\n"
+    );
+    for id in MUTATION_CHECKS {
+        expect(&r, id, "pass");
+    }
+    assert_eq!((r.status, &r.report["mutation"]["cases_run"]), (0, &4.into()), "{}", r.stdout);
+    // The fixture's default hour leaves plenty, and nothing is printed.
+    let (r, _, _keep) = mutated(&[], &args);
+    assert_eq!((r.status, r.stderr.as_str()), (0, ""), "{}", r.stdout);
+}
+
 /// The stand-in's mutation profile: one seed document, mutated only by
 /// `unbalance-bracket`, four cases of up to two steps.
 fn mutation_profile() -> String {
@@ -2732,7 +2757,8 @@ fn the_clean_standin_survives_mutation() {
     assert_eq!(
         r.report["mutation"],
         serde_json::json!({
-            "seed": 20261111, "format": 1, "cases": 4, "cases_run": 4, "stopped": null, "isolated": []
+            "seed": 20261111, "format": 1, "cases": 4, "cases_run": 4, "stopped": null, "isolated": [],
+            "messages": {"errors": 0, "warnings": 0, "first": []}
         })
     );
     assert!(r.stdout.lines().next().unwrap().ends_with("— mutation seed 20261111, 4 cases"), "{}", r.stdout);
@@ -2793,7 +2819,8 @@ fn the_seed_and_case_flags_override_the_profile() {
     let (r, t, _keep) = mutated(&[], &["--mutation-seed", "7", "--mutation-cases", "1", "--only", "M1,M2,M3"]);
     assert_eq!(
         r.report["mutation"],
-        serde_json::json!({"seed": 7, "format": 1, "cases": 1, "cases_run": 1, "stopped": null, "isolated": []})
+        serde_json::json!({"seed": 7, "format": 1, "cases": 1, "cases_run": 1, "stopped": null, "isolated": [],
+            "messages": {"errors": 0, "warnings": 0, "first": []}})
     );
     expect(&r, "M1", "pass");
     let plans = recorded_plans(&t);
@@ -2993,6 +3020,36 @@ fn a_case_that_fails_only_in_the_whole_run_is_not_reproduced_alone() {
             "detail": "not reproduced: M2 FAIL in textDocument/foldingRange and workspace/symbol not seen again"
         }])
     );
+}
+
+#[test]
+fn mutation_messages_are_reported_but_change_no_verdict() {
+    // The stand-in shows an Error and logs a Warning on the session's fourth
+    // didChange, case 1's first step. It also logs a Warning before answering
+    // initialize and another on shutdown, neither during mutation.
+    let dir = tempfile::tempdir().unwrap();
+    let markdown = dir.path().join("report.md");
+    let (clean, _, _keep) = mutated(&[], &[]);
+    let (r, _, _keep) = mutated(&["mutation-error-message"], &["--markdown", markdown.to_str().unwrap()]);
+    assert_eq!(r.verdicts, clean.verdicts, "{}", r.stdout);
+    assert_eq!(r.status, clean.status, "{}", r.stdout);
+    assert_eq!(
+        r.report["mutation"]["messages"],
+        serde_json::json!({"errors": 1, "warnings": 1, "first": [
+            {"case": 1, "type": "error", "method": "window/showMessage", "message": "contained crash"},
+            {"case": 1, "type": "warning", "method": "window/logMessage", "message": "recovered"},
+        ]})
+    );
+    let line = r#"  server messages: 1 error, 1 warning during mutation (first ones, case 1, window/showMessage: "contained crash"; case 1, window/logMessage: "recovered")"#;
+    assert_eq!(r.stdout.lines().nth(1), Some(line), "{}", r.stdout);
+    let markdown = std::fs::read_to_string(markdown).unwrap();
+    assert!(
+        markdown.lines().any(|line| line
+            == r#"Server messages: 1 error, 1 warning during mutation (first ones, case 1, window/showMessage: "contained crash"; case 1, window/logMessage: "recovered")"#),
+        "{markdown}"
+    );
+    assert_eq!(clean.report["mutation"]["messages"], serde_json::json!({"errors": 0, "warnings": 0, "first": []}));
+    assert!(!clean.stdout.contains("server messages"), "{}", clean.stdout);
 }
 
 #[test]
