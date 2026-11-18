@@ -115,6 +115,7 @@ pub struct Request {
     /// The method and, for one asked at a position, where (`LINE:COLUMN`).
     pub label: String,
     pub params: Value,
+    followup: Option<Followup>,
 }
 
 /// What a request is asked with, beyond its `textDocument`.
@@ -131,53 +132,100 @@ enum Shape {
     Workspace(Value),
 }
 
-/// The capability, the part of it that must be advertised (for a capability
-/// that advertises several requests), the method and its params.
-fn table() -> Vec<(&'static str, Option<&'static str>, &'static str, Shape)> {
+type Row = (&'static str, Option<&'static str>, &'static str, Shape, Option<Followup>);
+
+/// The capability, its required part, the method, its params and its follow-ups.
+fn table() -> Vec<Row> {
     use Shape::*;
     let none = || json!({});
     let options = || json!({"options": {"tabSize": 4, "insertSpaces": true}});
     vec![
-        ("hoverProvider", None, "textDocument/hover", Position(none())),
-        ("definitionProvider", None, "textDocument/definition", Position(none())),
-        ("declarationProvider", None, "textDocument/declaration", Position(none())),
-        ("typeDefinitionProvider", None, "textDocument/typeDefinition", Position(none())),
-        ("implementationProvider", None, "textDocument/implementation", Position(none())),
+        ("hoverProvider", None, "textDocument/hover", Position(none()), None),
+        ("definitionProvider", None, "textDocument/definition", Position(none()), None),
+        ("declarationProvider", None, "textDocument/declaration", Position(none()), None),
+        ("typeDefinitionProvider", None, "textDocument/typeDefinition", Position(none()), None),
+        ("implementationProvider", None, "textDocument/implementation", Position(none()), None),
         (
             "referencesProvider",
             None,
             "textDocument/references",
             Position(json!({"context": {"includeDeclaration": true}})),
+            None,
         ),
-        ("documentHighlightProvider", None, "textDocument/documentHighlight", Position(none())),
-        ("signatureHelpProvider", None, "textDocument/signatureHelp", Position(none())),
-        ("completionProvider", None, "textDocument/completion", Position(none())),
-        ("renameProvider", Some("prepareProvider"), "textDocument/prepareRename", Position(none())),
-        ("renameProvider", None, "textDocument/rename", Position(json!({"newName": NEW_NAME}))),
-        ("linkedEditingRangeProvider", None, "textDocument/linkedEditingRange", Position(none())),
-        ("callHierarchyProvider", None, "textDocument/prepareCallHierarchy", Position(none())),
-        ("typeHierarchyProvider", None, "textDocument/prepareTypeHierarchy", Position(none())),
-        ("monikerProvider", None, "textDocument/moniker", Position(none())),
-        ("selectionRangeProvider", None, "textDocument/selectionRange", Positions),
-        ("documentSymbolProvider", None, "textDocument/documentSymbol", Document(none())),
-        ("foldingRangeProvider", None, "textDocument/foldingRange", Document(none())),
-        ("codeLensProvider", None, "textDocument/codeLens", Document(none())),
-        ("documentLinkProvider", None, "textDocument/documentLink", Document(none())),
-        ("colorProvider", None, "textDocument/documentColor", Document(none())),
-        ("diagnosticProvider", None, "textDocument/diagnostic", Document(none())),
-        ("documentFormattingProvider", None, "textDocument/formatting", Document(options())),
-        ("documentRangeFormattingProvider", None, "textDocument/rangeFormatting", Range(options())),
-        ("codeActionProvider", None, "textDocument/codeAction", Range(json!({"context": {"diagnostics": []}}))),
-        ("inlayHintProvider", None, "textDocument/inlayHint", Range(none())),
-        ("semanticTokensProvider", Some("full"), "textDocument/semanticTokens/full", Document(none())),
-        ("semanticTokensProvider", Some("range"), "textDocument/semanticTokens/range", Range(none())),
-        ("workspaceSymbolProvider", None, "workspace/symbol", Workspace(json!({"query": ""}))),
+        ("documentHighlightProvider", None, "textDocument/documentHighlight", Position(none()), None),
+        ("signatureHelpProvider", None, "textDocument/signatureHelp", Position(none()), None),
+        (
+            "completionProvider",
+            None,
+            "textDocument/completion",
+            Position(none()),
+            Some(Followup::resolve(&["completionItem/resolve"], "CompletionItem")),
+        ),
+        ("renameProvider", Some("prepareProvider"), "textDocument/prepareRename", Position(none()), None),
+        ("renameProvider", None, "textDocument/rename", Position(json!({"newName": NEW_NAME})), None),
+        ("linkedEditingRangeProvider", None, "textDocument/linkedEditingRange", Position(none()), None),
+        (
+            "callHierarchyProvider",
+            None,
+            "textDocument/prepareCallHierarchy",
+            Position(none()),
+            Some(Followup::hierarchy(
+                &["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"],
+                "CallHierarchyItem",
+            )),
+        ),
+        (
+            "typeHierarchyProvider",
+            None,
+            "textDocument/prepareTypeHierarchy",
+            Position(none()),
+            Some(Followup::hierarchy(&["typeHierarchy/supertypes", "typeHierarchy/subtypes"], "TypeHierarchyItem")),
+        ),
+        ("monikerProvider", None, "textDocument/moniker", Position(none()), None),
+        ("selectionRangeProvider", None, "textDocument/selectionRange", Positions, None),
+        ("documentSymbolProvider", None, "textDocument/documentSymbol", Document(none()), None),
+        ("foldingRangeProvider", None, "textDocument/foldingRange", Document(none()), None),
+        (
+            "codeLensProvider",
+            None,
+            "textDocument/codeLens",
+            Document(none()),
+            Some(Followup::resolve(&["codeLens/resolve"], "CodeLens")),
+        ),
+        (
+            "documentLinkProvider",
+            None,
+            "textDocument/documentLink",
+            Document(none()),
+            Some(Followup::resolve(&["documentLink/resolve"], "DocumentLink")),
+        ),
+        ("colorProvider", None, "textDocument/documentColor", Document(none()), None),
+        ("diagnosticProvider", None, "textDocument/diagnostic", Document(none()), None),
+        ("documentFormattingProvider", None, "textDocument/formatting", Document(options()), None),
+        ("documentRangeFormattingProvider", None, "textDocument/rangeFormatting", Range(options()), None),
+        ("codeActionProvider", None, "textDocument/codeAction", Range(json!({"context": {"diagnostics": []}})), None),
+        (
+            "inlayHintProvider",
+            None,
+            "textDocument/inlayHint",
+            Range(none()),
+            Some(Followup::resolve(&["inlayHint/resolve"], "InlayHint")),
+        ),
+        ("semanticTokensProvider", Some("full"), "textDocument/semanticTokens/full", Document(none()), None),
+        ("semanticTokensProvider", Some("range"), "textDocument/semanticTokens/range", Range(none()), None),
+        (
+            "workspaceSymbolProvider",
+            None,
+            "workspace/symbol",
+            Workspace(json!({"query": ""})),
+            Some(Followup::resolve(&["workspaceSymbol/resolve"], "WorkspaceSymbol")),
+        ),
     ]
 }
 
 /// The methods K1 can ask, in the order of its table.
 pub fn methods() -> Vec<&'static str> {
-    table().into_iter().map(|(_, _, method, _)| method).collect()
+    table().into_iter().map(|(_, _, method, ..)| method).collect()
 }
 
 /// Whether a capability's value advertises support: `true`, or an options
@@ -237,7 +285,7 @@ pub fn requests(caps: &Value, doc: &Document, spots: &[Spot], encoding: Encoding
     let mut requests = Vec::new();
     let mut unopened = Vec::new();
     let mut unselected = Vec::new();
-    for (capability, part, method, shape) in table() {
+    for (capability, part, method, shape, followup) in table() {
         if !advertised(caps, capability, part) {
             continue;
         }
@@ -252,6 +300,8 @@ pub fn requests(caps: &Value, doc: &Document, spots: &[Spot], encoding: Encoding
             unselected.push(method);
             continue;
         }
+        let followup =
+            followup.filter(|f| f.wrapped || caps[capability].get("resolveProvider") == Some(&Value::Bool(true)));
         let with = |mut params: Value, extra: (&str, Value)| {
             params[extra.0] = extra.1;
             params
@@ -265,21 +315,28 @@ pub fn requests(caps: &Value, doc: &Document, spots: &[Spot], encoding: Encoding
             Shape::Position(members) => {
                 for (at, position) in &positions {
                     let params = with(base(members.clone()), ("position", position.clone()));
-                    requests.push(Request { method, label: format!("{method} at {at}"), params });
+                    requests.push(Request { method, label: format!("{method} at {at}"), params, followup });
                 }
             }
             Shape::Positions => {
                 let labels: Vec<&str> = positions.iter().map(|(at, _)| at.as_str()).collect();
                 let all: Vec<Value> = positions.iter().map(|(_, p)| p.clone()).collect();
                 let params = with(base(json!({})), ("positions", Value::Array(all)));
-                requests.push(Request { method, label: format!("{method} at {}", labels.join(", ")), params });
+                requests.push(Request {
+                    method,
+                    label: format!("{method} at {}", labels.join(", ")),
+                    params,
+                    followup,
+                });
             }
-            Shape::Document(members) => requests.push(Request { method, label: method.into(), params: base(members) }),
+            Shape::Document(members) => {
+                requests.push(Request { method, label: method.into(), params: base(members), followup })
+            }
             Shape::Range(members) => {
                 let params = with(base(members), ("range", whole.clone()));
-                requests.push(Request { method, label: method.into(), params });
+                requests.push(Request { method, label: method.into(), params, followup });
             }
-            Shape::Workspace(params) => requests.push(Request { method, label: method.into(), params }),
+            Shape::Workspace(params) => requests.push(Request { method, label: method.into(), params, followup }),
         }
     }
     let mut notes = Vec::new();
@@ -298,168 +355,73 @@ pub fn requests(caps: &Value, doc: &Document, spots: &[Spot], encoding: Encoding
     (requests, notes)
 }
 
-/// A request that needs an item from an earlier answer: the source method,
-/// the capability and the part of it that must be `true` (none when the
-/// capability itself covers the follow-ups), the follow-up methods, the
-/// item's type, and whether the item is sent as `{item}` rather than as the
-/// params themselves.
+/// The methods a source answer leads to and the first item's wire type.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Followup {
-    source: &'static str,
-    capability: &'static str,
-    part: Option<&'static str>,
     methods: &'static [&'static str],
     item: &'static str,
     wrapped: bool,
 }
 
-/// K1's follow-ups, by source method. `codeAction/resolve` isn't one: it also
-/// needs client capabilities lspcheck doesn't offer.
-const FOLLOWUPS: [Followup; 7] = [
-    Followup {
-        source: "textDocument/prepareCallHierarchy",
-        capability: "callHierarchyProvider",
-        part: None,
-        methods: &["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"],
-        item: "CallHierarchyItem",
-        wrapped: true,
-    },
-    Followup {
-        source: "textDocument/prepareTypeHierarchy",
-        capability: "typeHierarchyProvider",
-        part: None,
-        methods: &["typeHierarchy/supertypes", "typeHierarchy/subtypes"],
-        item: "TypeHierarchyItem",
-        wrapped: true,
-    },
-    Followup {
-        source: "textDocument/completion",
-        capability: "completionProvider",
-        part: Some("resolveProvider"),
-        methods: &["completionItem/resolve"],
-        item: "CompletionItem",
-        wrapped: false,
-    },
-    Followup {
-        source: "textDocument/codeLens",
-        capability: "codeLensProvider",
-        part: Some("resolveProvider"),
-        methods: &["codeLens/resolve"],
-        item: "CodeLens",
-        wrapped: false,
-    },
-    Followup {
-        source: "textDocument/documentLink",
-        capability: "documentLinkProvider",
-        part: Some("resolveProvider"),
-        methods: &["documentLink/resolve"],
-        item: "DocumentLink",
-        wrapped: false,
-    },
-    Followup {
-        source: "textDocument/inlayHint",
-        capability: "inlayHintProvider",
-        part: Some("resolveProvider"),
-        methods: &["inlayHint/resolve"],
-        item: "InlayHint",
-        wrapped: false,
-    },
-    Followup {
-        source: "workspace/symbol",
-        capability: "workspaceSymbolProvider",
-        part: Some("resolveProvider"),
-        methods: &["workspaceSymbol/resolve"],
-        item: "WorkspaceSymbol",
-        wrapped: false,
-    },
-];
-
-/// The follow-up K1 sends after `source` when the server advertises it.
-fn followup(caps: &Value, source: &str) -> Option<&'static Followup> {
-    FOLLOWUPS.iter().find(|f| {
-        f.source == source
-            && match f.part {
-                None => truthy(caps.get(f.capability)),
-                Some(part) => caps.get(f.capability).and_then(|c| c.get(part)) == Some(&Value::Bool(true)),
-            }
-    })
-}
-
-/// The follow-up methods the server advertises for `source`, none when it
-/// advertises none.
-pub fn followup_methods(caps: &Value, source: &str) -> &'static [&'static str] {
-    followup(caps, source).map_or(&[], |f| f.methods)
-}
-
-/// The follow-ups to send for `source`'s answer `result`, each with the
-/// answer's first item exactly as received; or why none can be. The item
-/// must be of its type in the meta-model, so that K1 sends valid params: one
-/// that isn't is K2's to judge.
-pub fn followups(caps: &Value, source: &Request, result: &Value) -> Result<Vec<Request>, String> {
-    let Some(f) = followup(caps, source.method) else { return Ok(Vec::new()) };
-    let items = match result {
-        Value::Null => return Err("the answer was null".into()),
-        Value::Array(items) => items,
-        Value::Object(list) if f.source == "textDocument/completion" => match list.get("items") {
-            Some(Value::Array(items)) => items,
-            _ => return Err("the answer had no items array".into()),
-        },
-        _ => return Err("the answer wasn't an array".into()),
-    };
-    let Some(item) = items.first() else { return Err("the answer was empty".into()) };
-    let ty = metamodel::Type::Reference { name: f.item.into() };
-    match metamodel::on_validation_stack(|| metamodel::validate(&ty, item, "item").map(|v| v.is_empty())) {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => return Err(format!("its first item isn't a valid {} (see K2)", f.item)),
-        Ok(Err(TooLarge)) => return Err(format!("its first item is too large for lspcheck to check as a {}", f.item)),
-        Err(e) => return Err(format!("lspcheck couldn't check its first item ({e})")),
+impl Followup {
+    fn hierarchy(methods: &'static [&'static str], item: &'static str) -> Self {
+        Self { methods, item, wrapped: true }
     }
-    let params = if f.wrapped { json!({"item": item}) } else { item.clone() };
-    Ok(f.methods
-        .iter()
-        .map(|&method| Request {
-            method,
-            label: format!("{method} with the first item of {}", source.label),
-            params: params.clone(),
-        })
-        .collect())
+
+    fn resolve(methods: &'static [&'static str], item: &'static str) -> Self {
+        Self { methods, item, wrapped: false }
+    }
 }
 
-/// The notes on follow-ups K1 didn't send, given why for each source
-/// request: one note per reason, naming the follow-ups for each source
-/// method with its positions, in the order first seen.
-pub fn skipped_notes(caps: &Value, skipped: &[(String, &Request)]) -> Vec<String> {
-    let mut reasons: Vec<&str> = Vec::new();
-    for (why, _) in skipped {
-        if !reasons.contains(&why.as_str()) {
-            reasons.push(why);
+#[derive(Debug, PartialEq)]
+pub enum FollowupError {
+    Unusable(String),
+    Inconclusive(String),
+}
+
+impl Request {
+    pub fn followup_methods(&self) -> &'static [&'static str] {
+        self.followup.map_or(&[], |f| f.methods)
+    }
+
+    pub fn skipped_followups(&self, why: &str) -> String {
+        format!("follow-ups not sent for {} ({}): {why}", self.label, self.followup_methods().join(" and "))
+    }
+
+    /// Passes back the answer's first item exactly as received. The item
+    /// must match its meta-model type so that K1 sends valid params.
+    pub fn followups(&self, result: &Value) -> Result<Vec<Request>, FollowupError> {
+        use FollowupError::{Inconclusive, Unusable};
+        let Some(f) = self.followup else { return Ok(Vec::new()) };
+        let items = match result {
+            Value::Null => return Err(Unusable("the answer was null".into())),
+            Value::Array(items) => items,
+            Value::Object(list) if self.method == "textDocument/completion" => match list.get("items") {
+                Some(Value::Array(items)) => items,
+                _ => return Err(Unusable("the answer had no items array".into())),
+            },
+            _ => return Err(Unusable("the answer wasn't an array".into())),
+        };
+        let Some(item) = items.first() else { return Err(Unusable("the answer was empty".into())) };
+        match metamodel::on_validation_stack(|| metamodel::validate_followup_item(f.item, item)) {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return Err(Unusable(format!("its first item isn't a valid {} (see K2)", f.item))),
+            Ok(Err(TooLarge)) => {
+                return Err(Inconclusive(format!("its first item is too large for lspcheck to check as a {}", f.item)));
+            }
+            Err(e) => return Err(Inconclusive(format!("lspcheck couldn't check its first item ({e})"))),
         }
+        let params = if f.wrapped { json!({"item": item}) } else { item.clone() };
+        Ok(f.methods
+            .iter()
+            .map(|&method| Request {
+                method,
+                label: format!("{method} with the first item of {}", self.label),
+                params: params.clone(),
+                followup: None,
+            })
+            .collect())
     }
-    reasons
-        .into_iter()
-        .map(|why| {
-            let sources: Vec<&Request> = skipped.iter().filter(|(w, _)| w == why).map(|(_, r)| *r).collect();
-            let mut methods: Vec<&str> = Vec::new();
-            for r in &sources {
-                if !methods.contains(&r.method) {
-                    methods.push(r.method);
-                }
-            }
-            let each: Vec<String> = methods
-                .into_iter()
-                .map(|method| {
-                    let at: Vec<&str> = sources
-                        .iter()
-                        .filter(|r| r.method == method)
-                        .filter_map(|r| r.label.strip_prefix(method)?.strip_prefix(" at "))
-                        .collect();
-                    let which = followup_methods(caps, method).join(" and ");
-                    let at = if at.is_empty() { String::new() } else { format!(" at {}", at.join(", ")) };
-                    format!("{which} for {method}{at}")
-                })
-                .collect();
-            format!("follow-ups not sent, because {why}: {}", each.join("; "))
-        })
-        .collect()
 }
 
 /// How one of K1's requests went.
@@ -535,7 +497,7 @@ fn other_errors(asked: &[(String, Outcome)]) -> Option<String> {
 /// happened to the rest. LSP sets no deadline for a response, so a delivered
 /// request with no response by the end of the session is inconclusive rather
 /// than a failure; one lspcheck couldn't deliver is an error too.
-pub fn judge(asked: &[(String, Outcome)], notes: &[String]) -> Judgement {
+pub fn judge(asked: &[(String, Outcome)], notes: &[String], inspection_errors: &[String]) -> Judgement {
     let with_notes = |detail: String| {
         let mut parts = vec![detail];
         parts.extend(other_errors(asked));
@@ -560,8 +522,9 @@ pub fn judge(asked: &[(String, Outcome)], notes: &[String]) -> Judgement {
         let each = if unanswered.len() == 1 { "it" } else { "them" };
         format!("no response to {} by the end of the session, so K1 couldn't judge {each}", unanswered.join(", "))
     });
-    // Everything K1 couldn't judge: unanswered requests, then undelivered ones.
-    let unjudged: Vec<String> = unanswered_detail.into_iter().chain(undelivered).collect();
+    // Everything K1 couldn't judge.
+    let unjudged: Vec<String> =
+        unanswered_detail.into_iter().chain(undelivered).chain(inspection_errors.iter().cloned()).collect();
     if !not_found.is_empty() {
         let mut parts = vec![format!(
             "MethodNotFound (-32601) for {} advertised request(s): {}",
@@ -730,8 +693,9 @@ mod tests {
         }
     }
 
-    fn source(method: &'static str, label: &str) -> Request {
-        Request { method, label: label.into(), params: json!({}) }
+    fn source_requests(caps: &Value) -> Vec<Request> {
+        let doc = Document { uri: "file:///w/a.txt", language_id: "plaintext", text: "fn", opened: true };
+        requests(caps, &doc, &[Spot { line: 0, column: 1 }], Encoding::Utf16).0
     }
 
     #[test]
@@ -745,25 +709,14 @@ mod tests {
             "inlayHintProvider": {"resolveProvider": true, "documentSelector": null, "id": "x"},
             "workspaceSymbolProvider": true,
         });
-        let advertised: Vec<&str> = [
-            "textDocument/prepareCallHierarchy",
-            "textDocument/prepareTypeHierarchy",
-            "textDocument/completion",
-            "textDocument/codeLens",
-            "textDocument/documentLink",
-            "textDocument/inlayHint",
-            "workspace/symbol",
-            "textDocument/codeAction",
-        ]
-        .into_iter()
-        .flat_map(|source| followup_methods(&caps, source).iter().copied())
-        .collect();
+        let advertised: Vec<&str> =
+            source_requests(&caps).iter().flat_map(|r| r.followup_methods().iter().copied()).collect();
         assert_eq!(
             advertised,
             [
+                "completionItem/resolve",
                 "callHierarchy/incomingCalls",
                 "callHierarchy/outgoingCalls",
-                "completionItem/resolve",
                 "inlayHint/resolve"
             ]
         );
@@ -776,8 +729,9 @@ mod tests {
         let item = json!({"name": "f", "kind": 12, "uri": "file:///w/a.txt", "range": at, "selectionRange": at,
                           "data": {"deep": [1, {"x": null}]}, "lspcheckExtra": true});
         let other = json!({"name": "g", "kind": 12, "uri": "file:///w/a.txt", "range": at, "selectionRange": at});
-        let prepare = source("textDocument/prepareCallHierarchy", "textDocument/prepareCallHierarchy at 1:2");
-        let sent = followups(&caps, &prepare, &json!([item, other])).unwrap();
+        let requests = source_requests(&caps);
+        let prepare = requests.iter().find(|r| r.method == "textDocument/prepareCallHierarchy").unwrap();
+        let sent = prepare.followups(&json!([item, other])).unwrap();
         let labels: Vec<&str> = sent.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -788,63 +742,34 @@ mod tests {
         );
         assert!(sent.iter().all(|r| r.params == json!({"item": item})));
 
-        let completion = source("textDocument/completion", "textDocument/completion at 1:2");
+        let completion = requests.iter().find(|r| r.method == "textDocument/completion").unwrap();
         let first = json!({"label": "a", "data": 7});
         for answer in [json!([first, {"label": "b"}]), json!({"isIncomplete": true, "items": [first]})] {
-            let sent = followups(&caps, &completion, &answer).unwrap();
+            let sent = completion.followups(&answer).unwrap();
             assert_eq!(sent.len(), 1);
             assert_eq!(sent[0].method, "completionItem/resolve");
             assert_eq!(sent[0].params, first, "the item itself is the params");
         }
-        // A source whose follow-up isn't advertised has none.
-        assert_eq!(
-            followups(&caps, &source("textDocument/codeLens", "textDocument/codeLens"), &json!([{}])),
-            Ok(vec![])
-        );
     }
 
     #[test]
     fn an_answer_without_a_valid_first_item_gets_no_follow_up() {
         let caps = json!({"callHierarchyProvider": true, "completionProvider": {"resolveProvider": true}});
-        let prepare = source("textDocument/prepareCallHierarchy", "textDocument/prepareCallHierarchy at 1:2");
-        let completion = source("textDocument/completion", "textDocument/completion at 1:2");
+        let requests = source_requests(&caps);
+        let prepare = requests.iter().find(|r| r.method == "textDocument/prepareCallHierarchy").unwrap();
+        let completion = requests.iter().find(|r| r.method == "textDocument/completion").unwrap();
         for (r, answer, why) in [
-            (&prepare, json!(null), "the answer was null"),
-            (&prepare, json!([]), "the answer was empty"),
-            (&prepare, json!({"name": "f"}), "the answer wasn't an array"),
-            (&prepare, json!([{"name": "f", "kind": 12}]), "its first item isn't a valid CallHierarchyItem (see K2)"),
-            (&prepare, json!([3]), "its first item isn't a valid CallHierarchyItem (see K2)"),
-            (&completion, json!({"isIncomplete": false, "items": []}), "the answer was empty"),
-            (&completion, json!({"isIncomplete": false}), "the answer had no items array"),
-            (&completion, json!([{"detail": "no label"}]), "its first item isn't a valid CompletionItem (see K2)"),
+            (prepare, json!(null), "the answer was null"),
+            (prepare, json!([]), "the answer was empty"),
+            (prepare, json!({"name": "f"}), "the answer wasn't an array"),
+            (prepare, json!([{"name": "f", "kind": 12}]), "its first item isn't a valid CallHierarchyItem (see K2)"),
+            (prepare, json!([3]), "its first item isn't a valid CallHierarchyItem (see K2)"),
+            (completion, json!({"isIncomplete": false, "items": []}), "the answer was empty"),
+            (completion, json!({"isIncomplete": false}), "the answer had no items array"),
+            (completion, json!([{"detail": "no label"}]), "its first item isn't a valid CompletionItem (see K2)"),
         ] {
-            assert_eq!(followups(&caps, r, &answer), Err(why.into()), "{answer}");
+            assert_eq!(r.followups(&answer), Err(FollowupError::Unusable(why.into())), "{answer}");
         }
-    }
-
-    #[test]
-    fn skipped_follow_ups_are_noted_by_reason_with_their_positions() {
-        let caps = json!({"callHierarchyProvider": true, "codeLensProvider": {"resolveProvider": true}});
-        let at =
-            |p: &str| source("textDocument/prepareCallHierarchy", &format!("textDocument/prepareCallHierarchy at {p}"));
-        let (a, b, c) = (at("1:2"), at("2:6"), at("3:2"));
-        let lens = source("textDocument/codeLens", "textDocument/codeLens");
-        let skipped = [
-            ("the answer was null".to_string(), &a),
-            ("the answer was empty".to_string(), &b),
-            ("the answer was null".to_string(), &c),
-            ("the answer was null".to_string(), &lens),
-        ];
-        assert_eq!(
-            skipped_notes(&caps, &skipped),
-            [
-                "follow-ups not sent, because the answer was null: callHierarchy/incomingCalls and \
-                 callHierarchy/outgoingCalls for textDocument/prepareCallHierarchy at 1:2, 3:2; codeLens/resolve for \
-                 textDocument/codeLens",
-                "follow-ups not sent, because the answer was empty: callHierarchy/incomingCalls and \
-                 callHierarchy/outgoingCalls for textDocument/prepareCallHierarchy at 2:6",
-            ]
-        );
     }
 
     #[test]
@@ -855,7 +780,7 @@ mod tests {
             answered("textDocument/completion at 2:6", Outcome::Answered),
             answered("completionItem/resolve with the first item of textDocument/completion at 2:6", Outcome::Answered),
         ];
-        let Judgement::Pass(detail) = judge(&asked, &[]) else { panic!() };
+        let Judgement::Pass(detail) = judge(&asked, &[], &[]) else { panic!() };
         assert!(detail.starts_with("4 request(s) for 2 advertised method(s) were answered"), "{detail}");
     }
 
@@ -871,10 +796,21 @@ mod tests {
             answered("textDocument/codeLens", Outcome::Error(-32803)),
             answered("textDocument/documentColor", Outcome::Unanswered),
         ];
-        let Judgement::Fail(detail) = judge(&asked, &[]) else { panic!() };
+        let Judgement::Fail(detail) = judge(&asked, &[], &[]) else { panic!() };
         assert!(detail.starts_with("MethodNotFound (-32601) for 1 advertised request(s): textDocument/foldingRange"));
         assert!(detail.contains("no response to textDocument/documentColor by the end of the session"), "{detail}");
         assert!(detail.contains("-32803 (RequestFailed) for textDocument/codeLens"), "{detail}");
+    }
+
+    #[test]
+    fn a_local_follow_up_validation_limit_leaves_k1_inconclusive() {
+        let error = "follow-ups not sent for textDocument/inlayHint (inlayHint/resolve): its first item is too large";
+        let errors = [error.to_string()];
+        let mut asked = [answered("textDocument/inlayHint", Outcome::Answered)];
+        assert_eq!(judge(&asked, &[], &errors), Judgement::Error(error.into()));
+        asked[0].1 = Outcome::Error(codes::METHOD_NOT_FOUND);
+        let Judgement::Fail(detail) = judge(&asked, &[], &errors) else { panic!() };
+        assert!(detail.contains(error), "{detail}");
     }
 
     #[test]
@@ -884,7 +820,7 @@ mod tests {
             answered("textDocument/hover at 1:1", Outcome::Unanswered),
         ];
         assert_eq!(
-            judge(&asked, &[]),
+            judge(&asked, &[], &[]),
             Judgement::Error(
                 "no response to textDocument/hover at 1:1 by the end of the session, so K1 couldn't judge it; \
                  other errors, which are lawful: -32801 (ContentModified) for workspace/symbol"
@@ -895,7 +831,7 @@ mod tests {
             answered("textDocument/hover at 1:1", Outcome::Answered),
             answered("workspace/symbol", Outcome::Undelivered("the server's stdin is closed".into())),
         ];
-        let Judgement::Error(detail) = judge(&asked, &[]) else { panic!() };
+        let Judgement::Error(detail) = judge(&asked, &[], &[]) else { panic!() };
         assert_eq!(detail, "lspcheck couldn't send workspace/symbol (the server's stdin is closed)");
     }
 
@@ -905,7 +841,7 @@ mod tests {
             answered("textDocument/hover at 1:1", Outcome::Unanswered),
             answered("textDocument/hover at 2:1", Outcome::Undelivered("the server exited with status 17".into())),
         ];
-        let Judgement::Error(detail) = judge(&asked, &[]) else { panic!() };
+        let Judgement::Error(detail) = judge(&asked, &[], &[]) else { panic!() };
         assert_eq!(
             detail,
             "no response to textDocument/hover at 1:1 by the end of the session, so K1 couldn't judge it; \
@@ -916,7 +852,7 @@ mod tests {
             answered("textDocument/hover at 1:1", Outcome::Unanswered),
             answered("textDocument/hover at 2:1", Outcome::Undelivered("the server exited with status 17".into())),
         ];
-        let Judgement::Fail(detail) = judge(&asked, &[]) else { panic!() };
+        let Judgement::Fail(detail) = judge(&asked, &[], &[]) else { panic!() };
         assert!(detail.contains("no response to textDocument/hover at 1:1"), "{detail}");
         assert!(
             detail.contains("couldn't send textDocument/hover at 2:1 (the server exited with status 17)"),
@@ -926,15 +862,15 @@ mod tests {
 
     #[test]
     fn nothing_advertised_is_not_exercised_and_answers_pass() {
-        assert!(matches!(judge(&[], &[]), Judgement::NotExercised(_)));
-        let Judgement::NotExercised(d) = judge(&[], &["not sent: x".into()]) else { panic!() };
+        assert!(matches!(judge(&[], &[], &[]), Judgement::NotExercised(_)));
+        let Judgement::NotExercised(d) = judge(&[], &["not sent: x".into()], &[]) else { panic!() };
         assert!(d.contains("not sent: x"), "{d}");
         let asked = [
             answered("textDocument/hover at 1:1", Outcome::Answered),
             answered("textDocument/hover at 2:1", Outcome::Error(-32602)),
             answered("workspace/symbol", Outcome::Answered),
         ];
-        let Judgement::Pass(detail) = judge(&asked, &[]) else { panic!() };
+        let Judgement::Pass(detail) = judge(&asked, &[], &[]) else { panic!() };
         assert_eq!(
             detail,
             "3 request(s) for 2 advertised method(s) were answered, none with MethodNotFound; other errors, which \

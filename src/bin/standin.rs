@@ -390,6 +390,8 @@ const FAULTS: &[(&str, &str)] = &[
     ),
     ("followup-request-failed", "lawful: answer every follow-up K1 sends with RequestFailed (-32803)"),
     ("followup-unanswered", "never answer codeLens/resolve"),
+    ("followup-source-deferred", "lawful: hold the first completion reply until the next request"),
+    ("followup-large-data", "lawful: attach a large opaque data array to a code lens"),
     ("defer-hover-until-shutdown", "lawful: answer hover requests only when shutdown arrives"),
     (
         "advertised-error-after-shutdown",
@@ -494,6 +496,8 @@ fn main() {
     // A workspace/symbol request whose reply waits for the next message.
     let mut deferred: Option<Value> = None;
     let mut held_hovers: Vec<Value> = Vec::new();
+    let mut defer_followup_source = fault("followup-source-deferred");
+    let mut held_followup_source = None;
     // Set by stop-after-unknown-cancel: requests are no longer answered.
     let mut no_more_answers = false;
     // For drop-first-request: whether the first document request was dropped.
@@ -1565,6 +1569,9 @@ fn main() {
             held_hovers.push(id);
             continue;
         }
+        if let Some(held) = held_followup_source.take() {
+            out.frame(&held);
+        }
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
@@ -1712,7 +1719,20 @@ fn main() {
             | "textDocument/documentLink"
             | "textDocument/inlayHint" => {
                 let uri = msg.pointer("/params/textDocument/uri").cloned().unwrap_or(Value::Null);
-                out.frame(&ok(&id, followup_source(&method, uri, fault("followup-sources-empty"))));
+                let mut result =
+                    followup_source(&method, uri, &msg["params"]["position"], fault("followup-sources-empty"));
+                if method == "textDocument/codeLens"
+                    && fault("followup-large-data")
+                    && let Some(lens) = result.get_mut(0)
+                {
+                    lens["data"] = Value::Array(vec![Value::Null; 500_000]);
+                }
+                let answer = ok(&id, result);
+                if method == "textDocument/completion" && std::mem::take(&mut defer_followup_source) {
+                    held_followup_source = Some(answer);
+                    continue;
+                }
+                out.frame(&answer);
             }
             "callHierarchy/incomingCalls"
             | "callHierarchy/outgoingCalls"
@@ -1734,7 +1754,7 @@ fn main() {
                     out.frame(&err(&id, -32803, "not today"));
                 } else {
                     let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                    out.frame(&match followup_answer(&method, params) {
+                    out.frame(&match followup_answer(&method, params, fault("followup-large-data")) {
                         Some(result) => ok(&id, result),
                         None => err(&id, -32602, "the item didn't come back with the data the stand-in gave it"),
                     });
@@ -2660,24 +2680,25 @@ fn followup_data(kind: &str) -> Value {
 
 /// The answer to a request whose item K1 follows up: one item at the
 /// document's start, or none for followup-sources-empty.
-fn followup_source(method: &str, uri: Value, empty: bool) -> Value {
+fn followup_source(method: &str, uri: Value, position: &Value, empty: bool) -> Value {
     let at = range(0, 0, 0, 0);
+    let name = format!("standin {}:{}", position["line"], position["character"]);
     match method {
         "textDocument/prepareCallHierarchy" if empty => Value::Null,
         "textDocument/documentLink" if empty => Value::Null,
         "textDocument/completion" if empty => json!({"isIncomplete": false, "items": []}),
         _ if empty => json!([]),
         "textDocument/prepareCallHierarchy" => json!([{
-            "name": "standin", "kind": 12, "uri": uri, "range": at, "selectionRange": at,
+            "name": name, "kind": 12, "uri": uri, "range": at, "selectionRange": at,
             "data": followup_data("callHierarchy"),
         }]),
         "textDocument/prepareTypeHierarchy" => json!([{
-            "name": "standin", "kind": 5, "uri": uri, "range": at, "selectionRange": at,
+            "name": name, "kind": 5, "uri": uri, "range": at, "selectionRange": at,
             "data": followup_data("typeHierarchy"),
         }]),
         "textDocument/completion" => json!({
             "isIncomplete": false,
-            "items": [{"label": "standin", "data": followup_data("completion")}],
+            "items": [{"label": name, "data": followup_data("completion")}, {"label": "second item"}],
         }),
         "textDocument/codeLens" => json!([{"range": at, "data": followup_data("codeLens")}]),
         "textDocument/documentLink" => json!([{"range": at, "data": followup_data("documentLink")}]),
@@ -2690,7 +2711,7 @@ fn followup_source(method: &str, uri: Value, empty: bool) -> Value {
 
 /// The answer to a follow-up, echoing its item to show it came back; `None`
 /// when the item doesn't carry the `data` the stand-in gave it.
-fn followup_answer(method: &str, params: Value) -> Option<Value> {
+fn followup_answer(method: &str, params: Value, large_data: bool) -> Option<Value> {
     let (kind, item) = match method {
         "callHierarchy/incomingCalls" | "callHierarchy/outgoingCalls" => ("callHierarchy", &params["item"]),
         "typeHierarchy/supertypes" | "typeHierarchy/subtypes" => ("typeHierarchy", &params["item"]),
@@ -2700,7 +2721,13 @@ fn followup_answer(method: &str, params: Value) -> Option<Value> {
         "inlayHint/resolve" => ("inlayHint", &params),
         _ => ("workspaceSymbol", &params),
     };
-    if item.get("data") != Some(&followup_data(kind)) {
+    let data = item.get("data")?;
+    let correct = if large_data && kind == "codeLens" {
+        data.as_array().is_some_and(|a| a.len() == 500_000 && a.iter().all(Value::is_null))
+    } else {
+        *data == followup_data(kind)
+    };
+    if !correct {
         return None;
     }
     let mut item = item.clone();

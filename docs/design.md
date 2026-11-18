@@ -399,8 +399,8 @@ command, a save, a trigger character or a stopped debugger, which K1 can't set u
 `codeAction/resolve`, which also needs the client capabilities `codeAction.resolveSupport` and
 `codeActionLiteralSupport`, which lspcheck doesn't offer.
 
-Some advertised capabilities also cover a **follow-up** request that needs an item from an earlier answer. Right after
-the answer to its source request, before the next row of the table above, K1 sends:
+Some advertised capabilities also cover a **follow-up** request that needs an item from an earlier answer. When
+K1 matches the source answer before shutdown, it sends:
 
 | Advertised | Source answer | Follow-ups, with params |
 |---|---|---|
@@ -414,11 +414,9 @@ the answer to its source request, before the next row of the table above, K1 sen
 
 - The item is the source answer's first, passed back exactly as received (including its `data`), never rebuilt. One
   set of follow-ups is sent per source answer, so per position for a position request.
-- A follow-up is sent only for a source answer read while K1 was waiting for it. A source answer that is null, empty,
-  an error, not of the shape above, or whose first item isn't of its type in the meta-model (K2 judges that answer)
-  gets no follow-up. Once a K1 request goes unanswered, later source answers aren't waited for, so their follow-ups
-  aren't sent either. The detail notes each follow-up not sent and why, grouped by reason, with the source request
-  and its positions.
+- A source answer that is null, empty, an error, or has no usable item gets no follow-up. K1 checks the first
+  item's type in the meta-model and passes through opaque JSON as received. The detail names the source request,
+  the follow-ups left unsent, and the reason.
 - A follow-up is judged like any other K1 request: one at a time with `--timeout`, and by the rules below, named by
   its method and its source request with its position (`completionItem/resolve with the first item of
   textDocument/completion at 1:2`). It is about the document only if its source request is, and a `documentSelector`
@@ -435,11 +433,13 @@ for `didOpen` has no open document to be asked about (only `workspace/symbol` is
 document's language id and its `scheme` (if any) is `file`; a filter with a glob `pattern`, or for notebooks, isn't
 evaluated and doesn't select it.
 
-The requests are sent one at a time, each waiting up to `--timeout` for its reply. After one goes unanswered, the
-remaining requests are sent without waiting for each reply. Only a delivery failure stops sending (the detail
-lists the requests left unsent). LSP sets no deadline for a response, so a wait that ends is not evidence against
-the server: after sending the requests, the scenario shuts the server down gracefully (`shutdown`, then `exit`),
-answering the server's requests on the way. Once session cleanup has drained the final stdout, K1 judges every
+The requests are sent one at a time, each waiting up to `--timeout` for its reply. After a wait expires, K1
+continues waiting for each source and follow-up, and sends the other requests without waiting for individual replies.
+Matched source replies can still trigger their follow-ups after their own wait expires. After the last request in the
+table, K1 waits up to one more `--timeout` for outstanding source replies. Only a delivery failure stops sending.
+LSP sets no deadline for a response, so a wait that ends is not evidence against the server. The scenario then shuts
+the server down gracefully (`shutdown`, then `exit`), answering the server's requests on the way. Once session
+cleanup has drained the final stdout, K1 judges every
 request by its matched response, including replies read during shutdown or the final drain. A MethodNotFound reply
 counts when its id equals the request's exactly and it was read at or after the request was sent, even after another
 response with that id (the duplicate is J2's).
@@ -451,8 +451,9 @@ remaining requests in a single `not sent after that` note.
 - **fail:** a request, or a follow-up, was answered with an error whose code is -32601. The detail names each such
   request (method and position). This is seen evidence and stands whatever happened to the other requests.
 - **error:** initialize didn't succeed, the server chose an encoding lspcheck didn't offer (see L2), the document
-  couldn't be written, read or opened (`didOpen` not delivered), or a request couldn't be delivered. A delivered
-  request with no response by the end of the session is also `ERROR` (`no response to <method> at <position> by the
+  couldn't be written, read or opened (`didOpen` not delivered), a request couldn't be delivered, or lspcheck
+  couldn't complete validation of a source item. A delivered request with no response by the end of the session
+  is also `ERROR` (`no response to <method> at <position> by the
   end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1.
 - **not-exercised:** the initialize result has no capabilities object, or the server advertises none of the requests
   above, or all advertised requests were excluded by the `didOpen` or selector rules (the detail says why).
