@@ -3025,7 +3025,8 @@ fn a_case_that_fails_only_in_the_whole_run_is_not_reproduced_alone() {
 #[test]
 fn mutation_messages_are_reported_but_change_no_verdict() {
     // The stand-in shows an Error and logs a Warning on the session's fourth
-    // didChange, case 1's first step. It logs another Warning on shutdown.
+    // didChange, case 1's first step. It also logs a Warning before answering
+    // initialize and another on shutdown, neither during mutation.
     let dir = tempfile::tempdir().unwrap();
     let markdown = dir.path().join("report.md");
     let (clean, _, _keep) = mutated(&[], &[]);
@@ -3039,12 +3040,12 @@ fn mutation_messages_are_reported_but_change_no_verdict() {
             {"case": 1, "type": "warning", "method": "window/logMessage", "message": "recovered"},
         ]})
     );
-    let line = r#"  server messages: 1 error, 1 warning during mutation (first ones, case 1: "contained crash"; case 1: "recovered")"#;
+    let line = r#"  server messages: 1 error, 1 warning during mutation (first ones, case 1, window/showMessage: "contained crash"; case 1, window/logMessage: "recovered")"#;
     assert_eq!(r.stdout.lines().nth(1), Some(line), "{}", r.stdout);
     let markdown = std::fs::read_to_string(markdown).unwrap();
     assert!(
         markdown.lines().any(|line| line
-            == r#"Server messages: 1 error, 1 warning during mutation (first ones, case 1: "contained crash"; case 1: "recovered")"#),
+            == r#"Server messages: 1 error, 1 warning during mutation (first ones, case 1, window/showMessage: "contained crash"; case 1, window/logMessage: "recovered")"#),
         "{markdown}"
     );
     assert_eq!(clean.report["mutation"]["messages"], serde_json::json!({"errors": 0, "warnings": 0, "first": []}));

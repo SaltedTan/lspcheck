@@ -463,16 +463,18 @@ cases planned and run, and why the run stopped early, if it did. The terminal he
 `— mutation seed 20261109, 20 cases`. The schema id is unchanged, as when `"profile"` was added.
 
 A server may report a contained crash only as a message, which is lawful and judged by nothing, so the summary
-also counts the server's Error (type 1) and Warning (type 2) messages: `"messages": {"errors": 1, "warnings": 1,
+also counts the server's Error (type 1) and Warning (type 2) messages: `"messages": {"errors": 1, "warnings": 0,
 "first": [{"case": 3, "type": "error", "method": "window/showMessage", "message": "…"}]}`, always present. It counts
 every `window/showMessage`, `window/logMessage` and `window/showMessageRequest` of either type read in the main run
-from the first mutation's `didChange` until lspcheck begins shutting the server down, and keeps the first three,
+from the first mutation's `didChange` until lspcheck begins shutting the server down (or, for a run that stops
+without doing so, until its cleanup), and keeps the first three,
 each message cut to 200 characters (a crash dump can be megabytes, and the Markdown report often goes into a
 size-limited CI summary). Only `type` and `message` are read: a message without an integer `type` or a string
 `message` isn't counted, and K2 judges the rest of its params. A message in a frame lspcheck skipped (larger than
 `--max-frame-mib`) isn't seen, so isn't counted. `case` is the case under way when the message was read, so one read
 during a case's restoration or recovery is that case's; the isolated runs aren't counted. When there is at least one,
-the terminal report adds `server messages: 1 error, 1 warning during mutation (first, case 3: "…")` below its header,
+the terminal report adds `server messages: 1 error during mutation (first, case 3, window/showMessage: "…")` below
+its header,
 quoting each kept message, and the Markdown summary adds the same line above its counts. No verdict depends on
 them.
 
@@ -517,7 +519,7 @@ runner stalled for 3 s) tests something else, and is repeated.
 | `recover-before-deadline` | lawful: after restoration, answer the first `documentSymbol` request with `[]` 4 s late, then with the baseline | nothing fails with `expect = "baseline"` and a 3 s `recovery_timeout`: the terminal probe, written after the deadline, sees the baseline |
 | `ignore-while-unbalanced` | don't answer requests about a document while it is unbalanced | M2 fails; only the first three of its four failing cases are [isolated](#step-6) |
 | `ignore-while-extra-square-bracket` | don't answer requests about a document with more `[` than `]` (in the fixture, case 3 alone) | M2 fails; case 3 is isolated and reproduced; with too little of `run_timeout` left it isn't run, and the verdicts are the same |
-| `mutation-error-message` | lawful: on the session's fourth `didChange` (case 1's first step), show an Error message and log a Warning, then log another Warning on shutdown | every verdict is the clean run's; `"mutation"."messages"` counts 1 error and 1 warning, both in case 1 (the shutdown Warning isn't counted) |
+| `mutation-error-message` | lawful: on the session's fourth `didChange` (case 1's first step), show an Error message and log a Warning, and log a Warning before answering initialize and on shutdown | every verdict is the clean run's; `"mutation"."messages"` counts 1 error and 1 warning, both in case 1 (the other two Warnings aren't counted) |
 | `ignore-after-fourth-change` | don't answer requests read after the session's fourth `didChange` and before its fifth (case 1's first step) | M2 fails; case 1 is isolated and not reproduced, and M2 still fails |
 | `oversized-after-first-change` | answer the first request answered after the first `didChange` with an error padded past 2 MiB | with `--max-frame-mib 1` and `ignore-while-extra-square-bracket`, case 0's trouble is `M2 ERROR`; case 3, with `M2 FAIL`, is isolated first |
 | `stuck-after-unbalanced` | once a document was unbalanced, answer its `documentSymbol` with `[]` forever | M3 `ERROR` without `expect`; fails with `expect = "baseline"` |

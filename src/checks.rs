@@ -1249,12 +1249,15 @@ async fn run_session(
         _ => unreachable!("unknown scenario {name}"),
     }
     let Ctx { s, mut results, j3_exercise, k1_pending, mut mutation, isolate, .. } = ctx;
+    // A scenario that stopped without beginning a shutdown counts the
+    // server's messages up to its cleanup, not during it.
+    let stopping = s.elapsed();
     let finish = s.finish(cfg.leftover_grace).await;
     if isolate.is_none()
         && let Some(m) = &mut mutation
         && let Some(from) = m.first_change
     {
-        m.messages = server_messages(&finish.messages, from..m.shutdown_at.unwrap_or(Duration::MAX), &m.case_times);
+        m.messages = server_messages(&finish.messages, from..m.shutdown_at.unwrap_or(stopping), &m.case_times);
     }
     if let (Some(K1Pending::Mutation { asked }), Some(m)) = (&k1_pending, &mut mutation) {
         // The label is the method, then " in " and the case.
@@ -3003,20 +3006,6 @@ async fn leave(ctx: &mut Ctx<'_>) -> Duration {
     }
     ctx.s.take_in();
     end
-}
-
-/// Writes the mutation scenario's `shutdown`, noting when it began: the
-/// server's messages are counted up to then.
-async fn write_shutdown(ctx: &mut Ctx<'_>, id: &Id, deadline: Instant) -> Result<(), WriteError> {
-    let bytes = frame(&message::request(id, "shutdown", None));
-    if let Some(summary) = &mut ctx.mutation {
-        summary.shutdown_at = Some(ctx.s.elapsed());
-    }
-    let result = ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await;
-    if result.is_err() {
-        ctx.s.abort_request(id);
-    }
-    result
 }
 
 /// The method whose notifications carry diagnostics.
@@ -6123,6 +6112,9 @@ async fn leave_mutation(
     // Everything already read is taken in before M1 is judged: an end of
     // output queued behind it would otherwise go unseen.
     let drained = ctx.s.absorb_all().await;
+    // lspcheck begins shutting down here: the server's messages are counted
+    // up to now.
+    summary.shutdown_at = Some(ctx.s.elapsed());
     let id = ctx.s.fresh_id();
     let deadline = Instant::now() + ctx.cfg.request_timeout;
     let registered = ctx.s.begin_request(&id, "shutdown", deadline).await;
@@ -6193,8 +6185,10 @@ async fn leave_mutation(
     // stopped waiting for shutdown's reply.
     let mut end = ctx.s.elapsed();
     if registered.is_ok() {
-        if write_shutdown(ctx, &id, deadline).await.is_err() {
+        let bytes = frame(&message::request(&id, "shutdown", None));
+        if ctx.s.write_split(&bytes, &[], Duration::ZERO, deadline).await.is_err() {
             end = ctx.s.elapsed();
+            ctx.s.abort_request(&id);
         } else {
             let answered = ctx.s.wait_response(&id, deadline).await.is_ok();
             end = ctx.s.elapsed();

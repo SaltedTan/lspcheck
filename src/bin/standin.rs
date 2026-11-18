@@ -224,7 +224,8 @@ const FAULTS: &[(&str, &str)] = &[
     (
         "mutation-error-message",
         "lawful: on reading the session's fourth didChange (in the mutation fixture, case 1's first step), send a \
-         window/showMessage of type Error and a window/logMessage of type Warning; log another Warning on shutdown",
+         window/showMessage of type Error and a window/logMessage of type Warning; log another Warning before answering \
+         initialize and on shutdown",
     ),
     (
         "oversized-after-first-change",
@@ -1236,6 +1237,12 @@ fn main() {
             continue;
         }
         if method == "initialize" {
+            if fault("mutation-error-message") {
+                out.frame(&json!({
+                    "jsonrpc": "2.0", "method": "window/logMessage",
+                    "params": {"type": 2, "message": "starting"}
+                }));
+            }
             if fault("orphan-child") {
                 children.push(spawn_child("--child"));
             }

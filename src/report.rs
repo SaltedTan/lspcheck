@@ -51,7 +51,8 @@ fn server_messages(runs: &[ScenarioRun]) -> Option<String> {
     };
     let counts: Vec<String> = [count(m.errors, "error"), count(m.warnings, "warning")].into_iter().flatten().collect();
     // Debug quoting escapes the server's line breaks and control characters.
-    let quotes: Vec<String> = m.first.iter().map(|q| format!("case {}: {:?}", q.case, q.message)).collect();
+    let quotes: Vec<String> =
+        m.first.iter().map(|q| format!("case {}, {}: {:?}", q.case, q.method, q.message)).collect();
     let first = if quotes.len() == 1 { "first" } else { "first ones" };
     Some(format!("{} during mutation ({first}, {})", counts.join(", "), quotes.join("; ")))
 }
@@ -689,11 +690,11 @@ mod tests {
         assert!(lines.next().unwrap().ends_with("— mutation seed 7, 4 cases"), "{terminal}");
         assert_eq!(
             lines.next().unwrap(),
-            r#"  server messages: 2 errors, 1 warning during mutation (first, case 3: "crashed | \"here\"\nstack")"#
+            r#"  server messages: 2 errors, 1 warning during mutation (first, case 3, window/showMessage: "crashed | \"here\"\nstack")"#
         );
         assert!(
             markdown.contains(
-                r#"Server messages: 2 errors, 1 warning during mutation (first, case 3: "crashed \| \\"here\\"\\nstack")"#
+                r#"Server messages: 2 errors, 1 warning during mutation (first, case 3, window/showMessage: "crashed \| \\"here\\"\\nstack")"#
             ),
             "{markdown}"
         );
@@ -702,7 +703,7 @@ mod tests {
         assert!(
             line(std::slice::from_ref(&run))
                 .0
-                .contains("  server messages: 1 warning during mutation (first, case 3: ")
+                .contains("  server messages: 1 warning during mutation (first, case 3, window/showMessage: ")
         );
         // Every kept message is quoted.
         summary.messages.first.push(checks::ServerMessage {
@@ -713,7 +714,7 @@ mod tests {
         });
         run.mutation = Some(summary);
         assert!(
-            line(&[run]).0.contains(r#"(first ones, case 3: "crashed | \"here\"\nstack"; case 4: "again")"#),
+            line(&[run]).0.contains(r#"(first ones, case 3, window/showMessage: "crashed | \"here\"\nstack"; case 4, window/logMessage: "again")"#),
             "every kept message is quoted"
         );
     }
