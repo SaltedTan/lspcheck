@@ -256,6 +256,13 @@ struct Evidence {
     stopped: Option<(Duration, String)>,
     /// When the first readable frame with non-ASCII text in its body arrived.
     non_ascii: Option<Duration>,
+    /// When lspcheck began signalling processes that may hold stdout: an
+    /// end of the stream seen from then on may be lspcheck's doing.
+    signalled: Option<Duration>,
+    /// A frame the stream was seen to end inside after lspcheck began
+    /// signalling: when, and how much of it came. Too long a Content-Length
+    /// looks the same, so it is an inspection limit, not a problem.
+    cut_short: Option<(Duration, String)>,
     /// Frames whose body isn't JSON: when, the Content-Length, and where the body starts.
     unparsed: Vec<(Duration, usize, usize)>,
     /// lspcheck stopped reading stdout into the transcript before it ended.
@@ -340,6 +347,11 @@ pub struct Finish {
     pub abandoned_at: Option<Duration>,
     /// Every stream problem in the whole of stdout.
     pub problems: Vec<(Duration, Problem)>,
+    /// A frame still unfinished when the stream was seen to end after
+    /// lspcheck began stopping the server's processes, with when and how much
+    /// of it came. It isn't among `problems`: lspcheck may have cut it short
+    /// itself.
+    pub cut_short: Option<(Duration, String)>,
     /// Responses that matched no outstanding request, with what explains them.
     pub unmatched: Vec<Unmatched>,
     /// Requests that were answered, with when their response was read.
@@ -1194,6 +1206,20 @@ impl Session {
         }
     }
 
+    /// Records that lspcheck is about to signal processes that may hold
+    /// stdout, unless it already has.
+    fn signalling(&self) {
+        let at = self.start.elapsed();
+        self.evidence.lock().expect("evidence lock").signalled.get_or_insert(at);
+    }
+
+    /// Waits until the stdout task has seen the end of the stream, or `deadline`.
+    async fn wait_for_stdout_end(&self, deadline: Instant) {
+        while !self.evidence.lock().expect("evidence lock").done && Instant::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Ends the session: stops the server if it is still running, waits up to
     /// `grace` for its descendants to exit, records any still alive, and stops them.
     pub async fn finish(mut self, grace: Duration) -> Finish {
@@ -1202,6 +1228,7 @@ impl Session {
         if self.is_alive() {
             killed = true;
             self.note(STOPPING_NOTE);
+            self.signalling();
             #[cfg(unix)]
             {
                 self.group.signal(nix::sys::signal::Signal::SIGTERM);
@@ -1247,6 +1274,20 @@ impl Session {
         // and so can't have been replaced by another process. Stopping one can
         // orphan its own children, which are then adopted too, so repeat for
         // up to two seconds.
+        //
+        // With none found and the server gone by itself, nothing should hold
+        // stdout, so let the stdout task see its end first: a stream the
+        // server ended itself is then judged as such. Whatever holds it still,
+        // which the scans missed, the signals below may stop, and from then
+        // on an end of the stream may be lspcheck's doing. Elsewhere the sweep
+        // sends no signal, so the end of the stream stays the server's.
+        #[cfg(unix)]
+        {
+            if !killed && leftovers.is_empty() && scan_error.is_none() {
+                self.wait_for_stdout_end(Instant::now() + Duration::from_secs(5)).await;
+            }
+            self.signalling();
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         let me = std::process::id() as i32;
         let mut not_stopped = Vec::new();
@@ -1276,10 +1317,7 @@ impl Session {
         // complete. Every process has been stopped, so only parsing what is
         // already buffered remains; the bound covers a process lspcheck
         // couldn't stop that still holds the pipe.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !self.evidence.lock().expect("evidence lock").done && Instant::now() < deadline {
-            sleep(Duration::from_millis(10)).await;
-        }
+        self.wait_for_stdout_end(Instant::now() + Duration::from_secs(10)).await;
         // The stdout task has stopped (or the bound above expired), so
         // everything it read is already queued. Record it all without waiting:
         // every process has been stopped, so no server request can be answered,
@@ -1350,6 +1388,7 @@ impl Session {
             j3_incomplete,
             abandoned_at: self.abandoned,
             problems: evidence.problems,
+            cut_short: evidence.cut_short,
             unmatched,
             answered: std::mem::take(&mut self.answered),
             answers: std::mem::take(&mut self.answers),
@@ -1395,6 +1434,22 @@ async fn read_stdout(
         ev.limit.get_or_insert((at, why));
         drop(ev);
         let _ = tx.send((at, Inbound::Stopped));
+    };
+    // Records a frame the stream ended inside as cut short, if the end was
+    // seen after lspcheck began signalling, whose signal may have stopped a
+    // process in the middle of writing it. Other checks see it as unread, as
+    // they would a problem. A server that ended its stream itself but whose
+    // end is seen only after that gets the same benefit of the doubt.
+    let cut_short = |ev: &mut Evidence, began: Duration, at: Duration, came: String| {
+        if ev.signalled.is_none() {
+            return false;
+        }
+        ev.lost.push((began, at, UNREAD.into()));
+        let why = format!(
+            "lspcheck saw stdout end inside a frame after it began stopping the server's processes, so it may have cut the frame short: {came} came"
+        );
+        ev.cut_short = Some((at, why));
+        true
     };
     // `began`: when the first byte the chunk may contain arrived.
     let deliver = |began: Duration, at: Duration, chunk: Chunk, stopped: &mut bool| {
@@ -1446,7 +1501,16 @@ async fn read_stdout(
             Chunk::BadHeader { block, reason } => Problem::BadHeader { block, reason },
             Chunk::Truncated { headers, content_length, received } => {
                 content_types(&mut ev, &headers);
+                if cut_short(&mut ev, began, at, format!("{received} of {content_length} body bytes")) {
+                    return;
+                }
                 Problem::Truncated { content_length, received }
+            }
+            Chunk::UnfinishedHeader { block } => {
+                if cut_short(&mut ev, began, at, format!("{} bytes of its header section", block.len())) {
+                    return;
+                }
+                Problem::BadHeader { block, reason: "the stream ended inside a header section".into() }
             }
         };
         if !matches!(problem, Problem::Garbage(_)) {
@@ -1571,6 +1635,7 @@ fn parsed_event(chunk: &Chunk) -> EventKind {
         Chunk::Truncated { content_length, received, .. } => {
             ("truncated", format!("{received} of {content_length} body bytes"))
         }
+        Chunk::UnfinishedHeader { block } => ("truncated", format!("{} bytes into a header section", block.len())),
         Chunk::HeaderLimit { limit } => ("header-limit", format!("header section longer than {limit} bytes")),
     };
     EventKind::Parsed { kind, detail }

@@ -832,12 +832,79 @@ fn a_frame_unfinished_when_inspection_stops_makes_its_absence_inconclusive() {
 #[test]
 fn a_cancelled_answer_swallowed_by_an_unfinished_frame_is_inconclusive() {
     // The answer to the cancelled request goes inside a frame found cut short
-    // only when the stream ends, after C1 was judged.
+    // only when the stream ends, after C1 was judged. The stream ends because
+    // lspcheck stops the server, so the rest of the frame might have come.
     let r = fault("inflated-on-cancel");
     expect(&r, "C1", "error");
+    expect(&r, "F1", "error");
+    assert!(!r.verdicts.values().any(|v| v == "fail"), "{}", r.stdout);
+}
+
+#[test]
+fn a_frame_cut_short_by_lspchecks_own_cleanup_doesnt_fail_f1() {
+    // The shutdown reply is half written when lspcheck's wait for it runs
+    // out; the stand-in stays running, so cleanup signals it and the stream
+    // ends inside the reply. lspcheck cut the frame itself, and a too-large
+    // Content-Length would look the same, so F1 is inconclusive.
+    let (r, t, _keep) = run_with_transcripts(&["--fault", "half-written-shutdown-reply"], &["--timeout", "1"]);
+    expect(&r, "F1", "error");
+    assert!(
+        r.stdout.contains("lspcheck saw stdout end inside a frame after it began stopping the server's processes"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.verdicts.values().any(|v| v == "fail"), "{}", r.stdout);
+    // The transcript still shows the frame cut short, after the stop began.
+    let events: Vec<Value> = std::fs::read_to_string(t.join("lifecycle.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let stopping = events.iter().position(|e| e["note"] == "lspcheck is stopping the server").expect("stopping note");
+    let truncated = events.iter().position(|e| e["kind"] == "truncated").expect("truncated entry");
+    assert!(stopping < truncated, "{events:?}");
+}
+
+#[test]
+fn a_header_section_cut_short_by_lspchecks_own_cleanup_doesnt_fail_f1() {
+    // As above, but the stand-in stops after the header section's first
+    // line, before the blank line that ends it.
+    let r = run(&["--fault", "half-written-shutdown-header"], &["--timeout", "1"]);
+    expect(&r, "F1", "error");
+    assert!(
+        r.stdout.contains("lspcheck saw stdout end inside a frame after it began stopping the server's processes"),
+        "{}",
+        r.stdout
+    );
+    assert!(r.stdout.contains(" bytes of its header section came"), "{}", r.stdout);
+    assert!(!r.verdicts.values().any(|v| v == "fail"), "{}", r.stdout);
+}
+
+#[test]
+fn a_header_section_the_server_cuts_short_itself_fails_f1() {
+    // The server writes a header section's first line and exits on its own,
+    // before lspcheck signals it.
+    let r = fault("half-header-on-exit");
     expect(&r, "F1", "fail");
+    assert!(r.stdout.contains("the stream ended inside a header section"), "{}", r.stdout);
     for (id, v) in &r.verdicts {
         if id != "F1" {
+            assert_ne!(v, "fail", "{id}\n{}", r.stdout);
+        }
+    }
+}
+
+/// The server exits by itself, but a child it left behind is still writing
+/// a frame to the same stdout when lspcheck stops it.
+#[cfg(unix)]
+#[test]
+fn a_frame_cut_short_by_stopping_a_leftover_doesnt_fail_f1() {
+    let r = fault("half-frame-in-leftover");
+    expect(&r, "F1", "error");
+    assert!(r.stdout.contains("so it may have cut the frame short: 17 of 52 body bytes came"), "{}", r.stdout);
+    expect(&r, "L9", "fail");
+    for (id, v) in &r.verdicts {
+        if id != "L9" {
             assert_ne!(v, "fail", "{id}\n{}", r.stdout);
         }
     }
@@ -849,15 +916,17 @@ fn verdicts_reached_before_a_frame_was_found_cut_short_are_inconclusive() {
     // checks judge, while they are still judged as passing or not exercised.
     // The frame is found cut short only when the stream ends; it may have
     // held what they look for.
-    for (f, ids) in [
+    // F1 fails where the server itself ends a stream inside the frame, and
+    // is inconclusive where every such stream ends because lspcheck stops it.
+    for (f, ids, f1) in [
         // The frame starts at shutdown, before the cancellation scenario's
         // window ends; C1's ends at the cancel, earlier.
-        ("inflated-before-shutdown", &["C2", "C3"][..]),
+        ("inflated-before-shutdown", &["C2", "C3"][..], "fail"),
         // The frame starts at the change, while document A is open.
-        ("inflated-on-change", &["D1", "D2", "D3", "D5", "D6"][..]),
+        ("inflated-on-change", &["D1", "D2", "D3", "D5", "D6"][..], "error"),
         // The frame swallows the framing scenario's plain request, which
         // would have left the variants not exercised.
-        ("inflated-on-first-probe", &["F3", "F4", "F5", "F6", "F7"][..]),
+        ("inflated-on-first-probe", &["F3", "F4", "F5", "F6", "F7"][..], "error"),
     ] {
         let r = run(&["--fault", f], &["--timeout", "2"]);
         for id in ids {
@@ -872,7 +941,7 @@ fn verdicts_reached_before_a_frame_was_found_cut_short_are_inconclusive() {
             // C1's window ended at the cancel, before the frame began.
             expect(&r, "C1", "pass");
         }
-        expect(&r, "F1", "fail");
+        expect(&r, "F1", f1);
         for (id, v) in &r.verdicts {
             if id != "F1" {
                 assert_ne!(v, "fail", "{f}: {id}\n{}", r.stdout);

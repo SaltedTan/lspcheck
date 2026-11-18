@@ -20,7 +20,8 @@ compared separately, so one run cannot excuse a change in the other.
 
 A line may list alternatives, as in `F1 pass|fail`, only for a check that a race in the server itself can flip, with a
 comment above it that says what the race is and where it was seen. Four are known:
-[gopls](gopls.verdicts) sometimes exits mid-frame, [lua-language-server](lua-language-server.verdicts) sometimes
+[gopls](gopls.verdicts) sometimes exits mid-frame (which in its [mutation run](gopls.mutation.verdicts) also leaves M3
+inconclusive), [lua-language-server](lua-language-server.verdicts) sometimes
 publishes stale diagnostics within lspcheck's wait, [rust-analyzer](rust-analyzer.verdicts) exits without stopping its
 sysroot `rustc`, which can outlive lspcheck's grace for descendants, and [gopls](gopls.mutation.verdicts) sometimes
 publishes diagnostics for only some of the mutation scenario's versions.

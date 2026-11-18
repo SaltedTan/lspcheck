@@ -40,6 +40,9 @@ pub enum Chunk {
     Oversized { headers: Vec<Header>, content_length: usize, limit: usize },
     /// The stream ended inside a frame: the header promised more body bytes.
     Truncated { headers: Vec<Header>, content_length: usize, received: usize },
+    /// The stream ended inside a header section that more bytes could still
+    /// have made valid.
+    UnfinishedHeader { block: Vec<u8> },
     /// A header section that looks valid so far but is longer than the
     /// inspection limit. Its body can't be found, so the reader stops
     /// inspecting the stream from here on.
@@ -231,7 +234,13 @@ impl FrameReader {
         } else if !rest.is_empty() {
             let header_like = (self.synced && invalid_line_end(&rest).is_none()) || find_anchor(&rest) == Some(0);
             if header_like {
-                out.push(Chunk::BadHeader { block: rest, reason: "the stream ended inside a header section".into() });
+                out.push(match unfinishable(&rest) {
+                    Some(reason) => Chunk::BadHeader {
+                        block: rest,
+                        reason: format!("the stream ended inside a header section that couldn't be valid: {reason}"),
+                    },
+                    None => Chunk::UnfinishedHeader { block: rest },
+                });
             } else {
                 out.push(Chunk::Garbage(rest));
             }
@@ -480,6 +489,107 @@ fn invalid_line_end(buf: &[u8]) -> Option<(usize, String)> {
     Some((start + bad + 1, format!("header name {:?} is not a token", String::from_utf8_lossy(&rest[..name_end]))))
 }
 
+/// Why the start of a header section, which [`invalid_line_end`] accepts,
+/// couldn't become a valid one however it went on, if it couldn't.
+fn unfinishable(start: &[u8]) -> Option<String> {
+    let mut length = false;
+    let mut first = true;
+    for raw in start.split_inclusive(|&b| b == b'\n') {
+        // A lone CR can only be followed by LF, so a line ending in one is
+        // as final as one ending in CRLF.
+        let line = match raw.strip_suffix(b"\n") {
+            Some(line) => match line.strip_suffix(b"\r") {
+                Some(line) => line,
+                None => {
+                    return Some(format!("header line {:?} ends with a bare LF", String::from_utf8_lossy(line)));
+                }
+            },
+            None => match raw.strip_suffix(b"\r") {
+                Some(line) => line,
+                None => return unfinishable_line(raw, &mut length),
+            },
+        };
+        // An empty line after a field has begun the end of the section; one
+        // that comes first fails below, ending the section before any field.
+        if line.is_empty() && !first {
+            return (!length).then(|| "the header section has no Content-Length".into());
+        }
+        first = false;
+        let header = match parse_field(line) {
+            Ok(header) => header,
+            Err(reason) => return Some(reason),
+        };
+        if header.name.eq_ignore_ascii_case("content-length")
+            && let Some(reason) = content_length(&mut length, &header.value, true)
+        {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// Why a header line that may still lack part of its value couldn't become
+/// valid, if it couldn't. A control byte in its value stays there, but of
+/// the values only a Content-Length's and a media type's type and subtype
+/// are judged: a parameter's prefix may not be one.
+fn unfinishable_line(line: &[u8], length: &mut bool) -> Option<String> {
+    let colon = line.iter().position(|&b| b == b':')?;
+    let (name, value) = (&line[..colon], &line[colon + 1..]);
+    if name.is_empty() {
+        return Some("header name \"\" is not a token".into());
+    }
+    if let Err(reason) = value_bytes(name, value) {
+        return Some(reason);
+    }
+    let value = String::from_utf8_lossy(value);
+    if name.eq_ignore_ascii_case(b"content-length") {
+        return content_length(length, value.trim_matches([' ', '\t']), false);
+    }
+    let value = value.trim_start_matches([' ', '\t']).as_bytes();
+    (name.eq_ignore_ascii_case(b"content-type") && bad_media_type_start(value))
+        .then(|| parse_media_type(value).err())
+        .flatten()
+}
+/// Why a Content-Length value, `whole` or perhaps only the start of one,
+/// can't be valid, if it can't. `seen` records that one has appeared.
+fn content_length(seen: &mut bool, value: &str, whole: bool) -> Option<String> {
+    if std::mem::replace(seen, true) {
+        return Some("Content-Length appears twice".to_string());
+    }
+    if (whole && value.is_empty()) || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(format!("Content-Length {value:?} is not a decimal number"));
+    }
+    (!value.is_empty() && value.parse::<usize>().is_err()).then(|| format!("Content-Length {value} is too large"))
+}
+
+/// Whether the start of a Content-Type value already can't begin a media
+/// type: its type is empty or ends in a byte other than '/', or its subtype
+/// is empty or ends in one other than a space, a tab or ';'.
+fn bad_media_type_start(v: &[u8]) -> bool {
+    let token = |s: &[u8]| s.iter().position(|&b| !is_token_byte(b)).unwrap_or(s.len());
+    let ty = token(v);
+    match v.get(ty) {
+        None => false,
+        Some(b'/') if ty > 0 => {
+            let rest = &v[ty + 1..];
+            let sub = token(rest);
+            rest.get(sub).is_some_and(|&b| sub == 0 || !matches!(b, b' ' | b'\t' | b';'))
+        }
+        Some(_) => true,
+    }
+}
+
+/// Whether a field value has only the bytes RFC 9110 section 5.5 allows:
+/// visible characters, spaces and tabs.
+fn value_bytes(name: &[u8], value: &[u8]) -> Result<(), String> {
+    match value.iter().find(|&&b| !(b == b' ' || b == b'\t' || (0x21..=0x7e).contains(&b) || b >= 0x80)) {
+        Some(&bad) => {
+            Err(format!("header {:?} has the control byte 0x{bad:02x} in its value", String::from_utf8_lossy(name)))
+        }
+        None => Ok(()),
+    }
+}
+
 fn parse_field(line: &[u8]) -> Result<Header, String> {
     let shown = String::from_utf8_lossy(line);
     let Some(colon) = line.iter().position(|&b| b == b':') else {
@@ -489,13 +599,7 @@ fn parse_field(line: &[u8]) -> Result<Header, String> {
     if name.is_empty() || !name.iter().all(|&b| is_token_byte(b)) {
         return Err(format!("header name {:?} is not a token", String::from_utf8_lossy(name)));
     }
-    // RFC 9110 section 5.5: field values are visible characters, spaces and tabs.
-    if let Some(&bad) = value.iter().find(|&&b| !(b == b' ' || b == b'\t' || (0x21..=0x7e).contains(&b) || b >= 0x80)) {
-        return Err(format!(
-            "header {:?} has the control byte 0x{bad:02x} in its value",
-            String::from_utf8_lossy(name)
-        ));
-    }
+    value_bytes(name, value)?;
     let value = String::from_utf8_lossy(value).trim_matches([' ', '\t']).to_string();
     if name.eq_ignore_ascii_case(b"content-type") {
         parse_media_type(value.as_bytes())?;
@@ -708,9 +812,60 @@ mod tests {
         let mut r = FrameReader::default();
         assert!(r.feed(b"Content-Length: 10\r\n\r\n{\"a\"").is_empty());
         assert!(matches!(r.finish().as_slice(), [Chunk::Truncated { content_length: 10, received: 4, .. }]));
-        let mut r = FrameReader::default();
-        assert!(r.feed(b"Content-Length: 10\r\n").is_empty());
-        assert!(matches!(r.finish().as_slice(), [Chunk::BadHeader { .. }]));
+    }
+
+    #[test]
+    fn a_header_section_cut_off_by_the_end_of_the_stream_is_unfinished_only_if_it_could_still_be_valid() {
+        // More bytes could still make each of these a valid header section.
+        for start in [
+            &b"Content-Length: 10\r\n"[..],
+            b"Content-Length: 10\r\n\r",
+            b"Content-Length: 1",
+            b"Content-Length:",
+            b"Content-Len",
+            b"Content-Length: 12 \r",
+            b"Content-Type: application/vscode-jsonrpc; charset=",
+            b"Content-Type: text/plain\r\nContent-Length: 4\r\nX-Trace: a",
+            b"Content-Length: 4\r\nContent-Type: text/pl",
+            b"Content-Length: 4\r\nContent-Type: text/plain ;",
+            b"Content-Length: 4\r\nContent-Type: te",
+        ] {
+            let mut r = FrameReader::default();
+            assert!(r.feed(start).is_empty(), "{start:?}");
+            assert_eq!(r.finish(), vec![Chunk::UnfinishedHeader { block: start.to_vec() }], "{start:?}");
+        }
+        // None could: each is already malformed.
+        for (start, reason) in [
+            (&b"Content-Length: x\r\n"[..], "Content-Length \"x\" is not a decimal number"),
+            (b"Content-Length:\r\n", "Content-Length \"\" is not a decimal number"),
+            (b"Content-Length: 1 2", "Content-Length \"1 2\" is not a decimal number"),
+            (b"Content-Length: 12a", "Content-Length \"12a\" is not a decimal number"),
+            (b"Content-Length: 99999999999999999999999", "Content-Length 99999999999999999999999 is too large"),
+            (b"Content-Length: 1\r\nContent-Length: 2", "Content-Length appears twice"),
+            (b"X-Trace: a\x01", "header \"X-Trace\" has the control byte 0x01 in its value"),
+            (b"\r\nContent-Length: 2", "header line \"\" has no colon"),
+            (b"Content-Length:\r", "Content-Length \"\" is not a decimal number"),
+            (b"Content-Type: text/plain\r\n\r", "the header section has no Content-Length"),
+            (b": a", "header name \"\" is not a token"),
+            (
+                b"Content-Length: 2\r\nContent-Type: text /plain",
+                "Content-Type \"text /plain\" has no '/' in its media type",
+            ),
+            (b"Content-Length: 2\r\nContent-Type: text/@", "Content-Type \"text/@\" has no media subtype"),
+        ] {
+            let mut r = FrameReader::default();
+            assert!(r.feed(start).is_empty(), "{start:?}");
+            match r.finish().as_slice() {
+                [Chunk::BadHeader { block, reason: r }] => {
+                    assert_eq!(block, start);
+                    assert_eq!(
+                        r,
+                        &format!("the stream ended inside a header section that couldn't be valid: {reason}")
+                    );
+                }
+                out => panic!("{start:?}: {out:?}"),
+            }
+        }
     }
 
     #[test]

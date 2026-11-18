@@ -557,6 +557,9 @@ const K1_FILE: &str = "lspcheck-k1.txt";
 #[derive(Debug)]
 pub struct Observations {
     pub problems: Vec<(Duration, Problem)>,
+    /// A frame the stream was seen to end inside after lspcheck began
+    /// stopping the server's processes (see [`crate::session::Finish::cut_short`]).
+    pub cut_short: Option<(Duration, String)>,
     pub content_types: Vec<(Duration, String)>,
     pub non_ascii: Option<Duration>,
     pub miscounted: Vec<(Duration, String)>,
@@ -1308,6 +1311,7 @@ async fn run_session(
 fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observations {
     Observations {
         problems: f.problems,
+        cut_short: f.cut_short,
         content_types: f.content_types,
         non_ascii: f.non_ascii,
         miscounted: f.miscounted,
@@ -6596,7 +6600,15 @@ fn judge_f1(runs: &[ScenarioRun]) -> CheckResult {
             Some(format!("in {name} at {} ms: {p}{tail}", at.as_millis()))
         })
         .collect();
-    cross("F1", runs, failures, "", true)
+    let r = cross("F1", runs, failures, "", true);
+    // lspcheck may have cut the frame short itself, and a Content-Length
+    // larger than the body that was coming looks the same.
+    if r.verdict == Verdict::Pass
+        && let Some((name, (at, why))) = observed(runs).find_map(|(n, o)| o.cut_short.as_ref().map(|c| (n, c)))
+    {
+        return result("all", "F1", Verdict::Error, format!("inconclusive: in {name} at {} ms, {why}", at.as_millis()));
+    }
+    r
 }
 
 fn judge_f2(runs: &[ScenarioRun]) -> CheckResult {
@@ -6653,7 +6665,8 @@ fn unless_unreadable(runs: &[ScenarioRun], r: CheckResult) -> CheckResult {
         return r;
     }
     let unread = observed(runs).find_map(|(name, o)| {
-        o.problems.iter().find(|(_, p)| !matches!(p, Problem::Garbage(_))).map(|(at, _)| (name, *at))
+        let problem = o.problems.iter().find(|(_, p)| !matches!(p, Problem::Garbage(_))).map(|(at, _)| *at);
+        problem.or(o.cut_short.as_ref().map(|(at, _)| *at)).map(|at| (name, at))
     });
     match unread {
         Some((name, at)) => CheckResult {
@@ -8941,6 +8954,7 @@ while header := sys.stdin.buffer.readline():
             results: Vec::new(),
             observed: Some(Observations {
                 problems: Vec::new(),
+                cut_short: None,
                 content_types: Vec::new(),
                 non_ascii: None,
                 miscounted: Vec::new(),
