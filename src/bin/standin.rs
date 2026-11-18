@@ -224,7 +224,7 @@ const FAULTS: &[(&str, &str)] = &[
     (
         "mutation-error-message",
         "lawful: on reading the session's fourth didChange (in the mutation fixture, case 1's first step), send a \
-         window/showMessage of type Error and a window/logMessage of type Warning",
+         window/showMessage of type Error and a window/logMessage of type Warning; log another Warning on shutdown",
     ),
     (
         "oversized-after-first-change",
@@ -1532,6 +1532,12 @@ fn main() {
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
+                if fault("mutation-error-message") {
+                    out.frame(&json!({
+                        "jsonrpc": "2.0", "method": "window/logMessage",
+                        "params": {"type": 2, "message": "flushing cache"}
+                    }));
+                }
                 if fault("configure-on-shutdown") {
                     let items = vec![json!({"section": "big"}); 256];
                     out.frame(&json!({"jsonrpc": "2.0", "id": "configure-shutdown", "method": "workspace/configuration", "params": {"items": items}}));

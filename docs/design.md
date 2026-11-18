@@ -7,6 +7,8 @@ Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 [implementation plan](source-mutations.md#implementation-plan) for the remaining step,
 minimisation, which waits until isolation shows it is wanted.
 D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios.
+Mutation runs warn on stderr about a short case start window and summarize the server's Error and Warning messages
+in the [reports](#report).
 See the [changelog](../CHANGELOG.md) for changes by release.
 
 ## Purpose
@@ -653,6 +655,9 @@ capabilities = "default"       # planned: or a path to a capabilities JSON
   paths of failed or errored checks. Code spans display CR/LF as `\r`/`\n` so commands and paths stay within one paragraph.
 - Terminal, JUnit and Markdown evidence references use `transcript: PATH` for per-scenario failures and errors, and
   `transcripts: DIR` for cross-cutting failures and errors, using the shared parent of the recorded scenario paths.
+- With `--mutate`, stderr warns if [less than a minute remains](source-mutations.md#bounds) beyond one case's budget
+  in which a case can start. The JSON, terminal and Markdown reports include the main mutation run's Error and
+  Warning [message counts and first three quotes](source-mutations.md#reports-transcripts-and-reproduction).
 - `--transcripts DIR`: one JSONL per session with direction, monotonic timestamp, raw bytes (base64 when not UTF-8),
   how the reader split them into frames, and stderr. Each file includes a meta line naming the workspace and the
   files it held, so a replay can recreate it. Each event takes a sequence number from a process-wide atomic counter:

@@ -9,9 +9,8 @@
   passing. The run, its report and its exit status are unchanged.
 - Under `--mutate`, the report counts the Error and Warning messages the server sent with `window/showMessage`,
   `window/logMessage` or `window/showMessageRequest` during the cases, so a contained crash the server reports only
-  as a message is visible. The JSON report's `mutation.messages` has the counts and the first three, with the case
-  each arrived in; the terminal and Markdown reports add a line quoting them when there is at least one. They change
-  no verdict.
+  as a message is visible. The JSON report's `mutation.messages` has the counts and the first three messages.
+  The terminal and Markdown reports quote those messages when there is at least one. Verdicts stay the same.
 
 ### Fixed
 
