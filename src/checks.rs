@@ -26,7 +26,7 @@ use crate::transcript;
 use crate::transport;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -588,6 +588,8 @@ pub struct Observations {
     pub sent: Vec<(Duration, Id)>,
     /// The server's requests, in the order they were read.
     pub server_requests: Vec<ServerRequest>,
+    /// K1's follow-ups, whose results K2 doesn't judge.
+    pub k1_followups: HashSet<Id>,
 }
 
 /// One scenario's verdicts and observations.
@@ -1267,6 +1269,7 @@ async fn run_session(
         });
         m.troubles.extend(troubles);
     }
+    let k1_followups = k1_pending.as_ref().map(K1Pending::followup_ids).unwrap_or_default();
     if let Some(pending) = k1_pending
         && let Some(judgement) = judge_k1(pending, &finish)
     {
@@ -1302,10 +1305,19 @@ async fn run_session(
         None => (None, None),
     };
     drop(workspace);
-    (ScenarioRun { name, results, observed: Some(observations(finish, j3_exercise)), transcript, mutation }, unwritten)
+    (
+        ScenarioRun {
+            name,
+            results,
+            observed: Some(observations(finish, j3_exercise, k1_followups)),
+            transcript,
+            mutation,
+        },
+        unwritten,
+    )
 }
 
-fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observations {
+fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>, k1_followups: HashSet<Id>) -> Observations {
     Observations {
         problems: f.problems,
         content_types: f.content_types,
@@ -1328,6 +1340,7 @@ fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observatio
         answered_methods: f.answered_methods,
         sent: f.sent,
         server_requests: f.server_requests,
+        k1_followups,
     }
 }
 
@@ -2533,8 +2546,12 @@ struct K1Asked {
     /// The request's id, unless lspcheck couldn't send it.
     id: Option<Id>,
     outcome: capabilities::Outcome,
-    /// For a follow-up, an excerpt of the item it echoed.
-    item: Option<String>,
+}
+
+/// A follow-up K1 sent or tried to, with an excerpt of the item it echoed.
+struct K1Followup {
+    asked: K1Asked,
+    item: String,
 }
 
 /// Evidence held until session cleanup drains the final stdout, so replies
@@ -2543,12 +2560,23 @@ enum K1Pending {
     Judged(Judgement),
     Sent {
         asked: Vec<K1Asked>,
+        followups: Vec<K1Followup>,
         notes: Vec<String>,
     },
     /// Each request's id, when it was sent, its label and its case.
     Mutation {
         asked: Vec<(Id, Duration, String, Option<u64>)>,
     },
+}
+
+impl K1Pending {
+    /// The ids of the follow-ups sent, whose results K2 doesn't judge.
+    fn followup_ids(&self) -> HashSet<Id> {
+        match self {
+            K1Pending::Sent { followups, .. } => followups.iter().filter_map(|f| f.asked.id.clone()).collect(),
+            _ => HashSet::new(),
+        }
+    }
 }
 
 /// K1: opens the profile's document (or lspcheck's own) and sends advertised
@@ -2566,39 +2594,46 @@ async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
     leave(ctx).await;
 }
 
+/// `a`'s outcome by the end of the session: a response read during shutdown
+/// or the final drain answers it, and MethodNotFound for it is seen evidence
+/// even when it isn't the first response with its id (J2 judges the
+/// duplicate); only responses read after the request was sent count.
+fn k1_settle(a: &mut K1Asked, finish: &Finish) {
+    let Some(id) = &a.id else { return };
+    if a.outcome == capabilities::Outcome::Unanswered
+        && let Some(m) = finish.answer_to(id)
+    {
+        a.outcome = k1_outcome(m);
+    }
+    if let Some(&(sent, _)) = finish.sent.iter().find(|(_, s)| s == id)
+        && finish.messages.iter().any(|(at, m)| {
+            *at >= sent
+                && m.response_id() == Some(id)
+                && k1_outcome(m) == capabilities::Outcome::Error(codes::METHOD_NOT_FOUND)
+        })
+    {
+        a.outcome = capabilities::Outcome::Error(codes::METHOD_NOT_FOUND);
+    }
+}
+
 fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
     match pending {
         K1Pending::Judged(judgement) => Some(judgement),
-        K1Pending::Sent { mut asked, notes } => {
+        K1Pending::Sent { mut asked, followups, notes } => {
             for a in &mut asked {
-                let Some(id) = &a.id else { continue };
-                if a.outcome == capabilities::Outcome::Unanswered
-                    && let Some(m) = finish.answer_to(id)
-                {
-                    a.outcome = k1_outcome(m);
-                }
-                // MethodNotFound for the request is seen evidence even when
-                // it isn't the first response with its id (J2 judges the
-                // duplicate); only responses read after the request was sent
-                // count.
-                if let Some(&(sent, _)) = finish.sent.iter().find(|(_, s)| s == id)
-                    && finish.messages.iter().any(|(at, m)| {
-                        *at >= sent
-                            && m.response_id() == Some(id)
-                            && k1_outcome(m) == capabilities::Outcome::Error(codes::METHOD_NOT_FOUND)
-                    })
-                {
-                    a.outcome = capabilities::Outcome::Error(codes::METHOD_NOT_FOUND);
-                }
+                k1_settle(a, finish);
             }
-            let (followups, asked): (Vec<_>, Vec<_>) = asked.into_iter().partition(|a| a.item.is_some());
             let asked: Vec<(String, capabilities::Outcome)> = asked.into_iter().map(|a| (a.label, a.outcome)).collect();
             let followups: Vec<capabilities::FollowupAsked> = followups
                 .into_iter()
-                .map(|a| capabilities::FollowupAsked {
-                    label: a.label,
-                    outcome: a.outcome,
-                    item: a.item.unwrap_or_default(),
+                .map(|K1Followup { mut asked, item }| {
+                    k1_settle(&mut asked, finish);
+                    let result = asked
+                        .id
+                        .as_ref()
+                        .and_then(|id| finish.answer_to(id))
+                        .is_some_and(|m| matches!(m.kind, Kind::Response { outcome: Outcome::Result(_), .. }));
+                    capabilities::FollowupAsked { label: asked.label, outcome: asked.outcome, result, item }
                 })
                 .collect();
             Some(capabilities::judge(&asked, &followups, &notes))
@@ -2694,100 +2729,108 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
     }
 
     let mut asked: Vec<K1Asked> = Vec::new();
-    let mut requests = requests.iter();
-    let mut sources: Vec<(&capabilities::Request, Id)> = Vec::new();
     let mut wait = true;
-    let mut source_deadline = None;
-    'requests: loop {
-        if let Some(i) = sources.iter().position(|(_, id)| ctx.s.answer_to(id).is_some()) {
-            let (r, id) = sources.remove(i);
-            let item = match &ctx.s.answer_to(&id).expect("matched source").kind {
-                Kind::Response { outcome: Outcome::Result(result), .. } => r.followup_item(result).cloned(),
-                Kind::Response { outcome: Outcome::Error { .. }, .. } => Err("the answer was an error".into()),
-                _ => Err("the answer wasn't a result".into()),
-            };
-            let item = match item {
-                Ok(item) => item,
-                Err(why) => {
-                    notes.push(r.skipped_followups(&why));
-                    continue;
-                }
-            };
-            let followups = r.followups(&item);
-            let excerpt = capabilities::excerpt(&item);
-            for (j, f) in followups.iter().enumerate() {
-                let mut sent = k1_send(ctx, f, true).await;
-                let failed = sent.id.is_none();
-                wait &= sent.outcome != capabilities::Outcome::Unanswered;
-                // A follow-up whose failure leaves requests from K1's table
-                // unsent is judged as one of them: K1 couldn't judge those.
-                if !(failed && requests.len() > 0) {
-                    sent.item = Some(excerpt.clone());
-                }
-                asked.push(sent);
-                if failed {
-                    k1_not_sent_after(&mut notes, followups[j + 1..].iter().chain(requests));
-                    break 'requests;
-                }
-            }
-        } else if let Some(r) = requests.next() {
-            let is_source = !r.followup_methods().is_empty();
-            let sent = k1_send(ctx, r, wait || is_source).await;
-            let id = sent.id.clone();
-            wait &= sent.outcome != capabilities::Outcome::Unanswered;
-            asked.push(sent);
-            let Some(id) = id else {
-                k1_not_sent_after(&mut notes, requests);
-                break;
-            };
-            if is_source {
-                sources.push((r, id));
-            }
+    for (i, r) in requests.iter().enumerate() {
+        let sent = match if wait {
+            ask(ctx, r.method, r.params.clone()).await.map(|(a, reply)| (a.id, reply.ok()))
         } else {
-            if sources.is_empty() {
-                break;
+            ctx.s.request(r.method, Some(r.params.clone())).await.map(|id| (id, None))
+        } {
+            Ok((id, Some(m))) => K1Asked { label: r.label.clone(), id: Some(id), outcome: k1_outcome(&m) },
+            Ok((id, None)) => {
+                wait = false;
+                K1Asked { label: r.label.clone(), id: Some(id), outcome: capabilities::Outcome::Unanswered }
             }
-            let deadline = *source_deadline.get_or_insert_with(|| Instant::now() + ctx.cfg.request_timeout);
-            if matches!(ctx.s.recv(deadline).await, Recv::Timeout | Recv::Closed) {
-                break;
+            Err(e) => {
+                let why = if e == WriteError::Closed { with_exit(ctx, e.to_string()).await } else { e.to_string() };
+                K1Asked { label: r.label.clone(), id: None, outcome: capabilities::Outcome::Undelivered(why) }
             }
+        };
+        let stop = matches!(sent.outcome, capabilities::Outcome::Undelivered(_));
+        asked.push(sent);
+        if stop {
+            // The cause is in the failed request's entry; name the rest once.
+            let rest: Vec<&str> = requests[i + 1..].iter().map(|remaining| remaining.label.as_str()).collect();
+            if !rest.is_empty() {
+                notes.insert(0, format!("not sent after that: {}", rest.join(", ")));
+            }
+            break;
         }
     }
-    let why = if asked.last().is_some_and(|a| a.id.is_none()) {
-        "sending stopped after a delivery failure"
-    } else {
-        "no answer was read before shutdown"
-    };
-    notes.extend(sources.iter().map(|(r, _)| r.skipped_followups(why)));
-    K1Pending::Sent { asked, notes }
+    let followups = k1_followups(ctx, &requests, &asked, &mut notes).await;
+    K1Pending::Sent { asked, followups, notes }
 }
 
-/// Sends one of K1's requests, waiting up to `--timeout` if requested.
-async fn k1_send(ctx: &mut Ctx<'_>, r: &capabilities::Request, wait: bool) -> K1Asked {
-    let label = r.label.clone();
-    match if wait {
-        ask(ctx, r.method, r.params.clone()).await.map(|(a, reply)| (a.id, reply.ok()))
-    } else {
-        ctx.s.request(r.method, Some(r.params.clone())).await.map(|id| (id, None))
-    } {
-        Ok((id, reply)) => {
-            let outcome = reply.as_ref().map_or(capabilities::Outcome::Unanswered, k1_outcome);
-            K1Asked { label, id: Some(id), outcome, item: None }
-        }
-        Err(e) => {
-            let why = if e == WriteError::Closed { with_exit(ctx, e.to_string()).await } else { e.to_string() };
-            K1Asked { label, id: None, outcome: capabilities::Outcome::Undelivered(why), item: None }
+/// K1's follow-ups, sent after its table requests so they can't change how
+/// those are sent or waited for. They are sent only when every table request
+/// has been answered: a server that crashed on one would lose a table reply
+/// that shutdown might still have collected. Each waits up to `--timeout`
+/// until one goes unanswered; a delivery failure stops them.
+async fn k1_followups(
+    ctx: &mut Ctx<'_>,
+    requests: &[capabilities::Request],
+    asked: &[K1Asked],
+    notes: &mut Vec<String>,
+) -> Vec<K1Followup> {
+    // The table requests sent, paired with their entries in order.
+    let sources: Vec<(&capabilities::Request, &K1Asked)> =
+        requests.iter().zip(asked).filter(|(r, _)| !r.followup_methods().is_empty()).collect();
+    if sources.is_empty() {
+        return Vec::new();
+    }
+    if asked.iter().any(|a| a.id.is_none()) {
+        notes.push("follow-ups not sent: a table request couldn't be sent".into());
+        return Vec::new();
+    }
+    if asked.iter().any(|a| a.id.as_ref().is_some_and(|id| ctx.s.answer_to(id).is_none())) {
+        notes.push("follow-ups not sent: a table request was still unanswered".into());
+        return Vec::new();
+    }
+    let mut planned: Vec<(capabilities::Request, String)> = Vec::new();
+    for (r, a) in sources {
+        let answer = a.id.as_ref().and_then(|id| ctx.s.answer_to(id)).expect("every table request was answered");
+        let item = match &answer.kind {
+            Kind::Response { outcome: Outcome::Result(result), .. } => r.followup_item(result),
+            Kind::Response { outcome: Outcome::Error { .. }, .. } => Err("the answer was an error".into()),
+            _ => Err("the answer wasn't a result".into()),
+        };
+        match item {
+            Ok(item) => {
+                let excerpt = capabilities::excerpt(item);
+                planned.extend(r.followups(item).into_iter().map(|f| (f, excerpt.clone())));
+            }
+            Err(why) => notes.push(r.skipped_followups(&why)),
         }
     }
-}
-
-/// After a request lspcheck couldn't deliver, whose entry gives the cause,
-/// names the requests left unsent once.
-fn k1_not_sent_after<'a>(notes: &mut Vec<String>, rest: impl Iterator<Item = &'a capabilities::Request>) {
-    let rest: Vec<&str> = rest.map(|remaining| remaining.label.as_str()).collect();
-    if !rest.is_empty() {
-        notes.insert(0, format!("not sent after that: {}", rest.join(", ")));
+    let mut followups = Vec::new();
+    let mut wait = true;
+    for (i, (f, item)) in planned.iter().enumerate() {
+        let sent = match if wait {
+            ask(ctx, f.method, f.params.clone()).await.map(|(a, reply)| (a.id, reply.ok()))
+        } else {
+            ctx.s.request(f.method, Some(f.params.clone())).await.map(|id| (id, None))
+        } {
+            Ok((id, reply)) => {
+                let outcome = reply.as_ref().map_or(capabilities::Outcome::Unanswered, k1_outcome);
+                wait &= outcome != capabilities::Outcome::Unanswered;
+                K1Asked { label: f.label.clone(), id: Some(id), outcome }
+            }
+            Err(e) => {
+                let why = if e == WriteError::Closed { with_exit(ctx, e.to_string()).await } else { e.to_string() };
+                K1Asked { label: f.label.clone(), id: None, outcome: capabilities::Outcome::Undelivered(why) }
+            }
+        };
+        let stop = sent.id.is_none();
+        followups.push(K1Followup { asked: sent, item: item.clone() });
+        if stop {
+            let rest: Vec<&str> = planned[i + 1..].iter().map(|(f, _)| f.label.as_str()).collect();
+            if !rest.is_empty() {
+                notes.push(format!("follow-ups not sent after that: {}", rest.join(", ")));
+            }
+            break;
+        }
     }
+    followups
 }
 
 /// The index in `messages` of the first response to `id` at or after `from`.
@@ -7140,7 +7183,9 @@ fn k2_subject<'m>(o: &'m Observations, index: usize, m: &'m Message) -> Option<K
     let model = metamodel::model();
     match &m.kind {
         // L4 judges shutdown's result; one bug shouldn't fail two checks.
-        Kind::Response { outcome: Outcome::Result(result), .. } => {
+        // K1's follow-ups echo an item K1 can't validate, and they would
+        // share the run's budget with the table requests' results.
+        Kind::Response { id, outcome: Outcome::Result(result), .. } if !o.k1_followups.contains(id) => {
             let method = o.answered_methods.get(&index).filter(|m| m.as_str() != "shutdown")?;
             let ty = model.result(method)?;
             Some(K2Subject { role: K2Role::Result, method, ty, value: Some(result) })
@@ -9084,6 +9129,7 @@ while header := sys.stdin.buffer.readline():
                 answered_methods: HashMap::new(),
                 sent: Vec::new(),
                 server_requests: Vec::new(),
+                k1_followups: HashSet::new(),
             }),
             transcript: None,
             mutation: None,
@@ -9365,6 +9411,19 @@ while header := sys.stdin.buffer.readline():
             "1 violation(s): in documents at 0 ms, a window/showMessage notification: params is missing; required: \
              ShowMessageParams"
         );
+    }
+
+    #[test]
+    fn k2_doesnt_judge_the_results_of_k1s_follow_ups() {
+        let bad = |id: &str| json!({"jsonrpc": "2.0", "id": id, "result": {"label": 3}});
+        let mut runs =
+            k2_run(vec![bad("f"), bad("t")], &[(0, "completionItem/resolve"), (1, "completionItem/resolve")]);
+        runs[0].observed.as_mut().unwrap().k1_followups = HashSet::from([Id::Str("f".into())]);
+        let r = judge_k2(&runs);
+        assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
+        assert!(r.detail.starts_with("1 violation(s): in documents at 1 ms, the result of"), "{}", r.detail);
+        runs[0].observed.as_mut().unwrap().k1_followups.insert(Id::Str("t".into()));
+        assert_eq!(judge_k2(&runs).verdict, Verdict::NotExercised);
     }
 
     #[test]

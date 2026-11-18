@@ -650,14 +650,6 @@ const CLEAN_K1: &str = "22 request(s) for 12 advertised method(s) were answered,
                         follow-ups, which don't change K1's verdict: 19 sent for 9 method(s), 19 answered with a result";
 
 #[test]
-fn k1_follows_up_a_source_that_answers_after_its_wait() {
-    let r = run(&["--fault", "followup-source-deferred"], &["--only", "K1"]);
-    expect(&r, "K1", "pass");
-    assert_eq!(r.status, 0, "{}", r.stdout);
-    assert_eq!(detail(&r, "K1"), CLEAN_K1);
-}
-
-#[test]
 fn k1_names_every_unsent_request_after_an_unanswered_request_and_exit() {
     let r = run(&["--fault", "exit-on-first-hover", "--fault", "advertises-unimplemented"], &["--only", "K1"]);
     expect(&r, "K1", "error");
@@ -713,60 +705,55 @@ fn k1_passes_each_follow_up_the_first_item_exactly_as_received() {
     // The stand-in answers a follow-up whose item lost its `data` with
     // InvalidParams, which K1 would note.
     assert!(!detail(&r, "K1").contains("-32602"), "{}", r.stdout);
-    let mut sources: BTreeMap<&str, (&[&str], usize)> = BTreeMap::from([
-        ("textDocument/prepareCallHierarchy", (&["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"][..], 3)),
-        ("textDocument/prepareTypeHierarchy", (&["typeHierarchy/subtypes", "typeHierarchy/supertypes"][..], 3)),
-        ("textDocument/completion", (&["completionItem/resolve"][..], 3)),
-        ("textDocument/codeLens", (&["codeLens/resolve"][..], 1)),
-        ("textDocument/documentLink", (&["documentLink/resolve"][..], 1)),
-        ("textDocument/inlayHint", (&["inlayHint/resolve"][..], 1)),
-        ("workspace/symbol", (&["workspaceSymbol/resolve"][..], 1)),
+    let sources: BTreeMap<&str, &[&str]> = BTreeMap::from([
+        ("textDocument/prepareCallHierarchy", &["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"][..]),
+        ("textDocument/prepareTypeHierarchy", &["typeHierarchy/supertypes", "typeHierarchy/subtypes"][..]),
+        ("textDocument/completion", &["completionItem/resolve"][..]),
+        ("textDocument/codeLens", &["codeLens/resolve"][..]),
+        ("textDocument/documentLink", &["documentLink/resolve"][..]),
+        ("textDocument/inlayHint", &["inlayHint/resolve"][..]),
+        ("workspace/symbol", &["workspaceSymbol/resolve"][..]),
     ]);
-    let mut methods: BTreeMap<String, String> = BTreeMap::new();
-    let mut followups: BTreeMap<String, String> = BTreeMap::new();
-    let mut source_answer: Option<(&[&str], Value)> = None;
-    let mut sent = Vec::new();
-    for (dir, m) in transcript_messages(&transcripts.join("capabilities.jsonl")) {
-        let id = m["id"].to_string();
-        match (dir.as_str(), m["method"].as_str()) {
-            ("out", Some(method)) if m.get("id").is_some() => {
-                let followup = ["callHierarchy/", "typeHierarchy/", "/resolve"].iter().any(|p| method.contains(p));
-                if followup {
-                    let (_, item) = source_answer.as_ref().expect("follow-up before source answer");
-                    let params = if method.contains("Hierarchy/") { &m["params"]["item"] } else { &m["params"] };
-                    assert_eq!(params, item, "{method}");
-                    assert!(params["data"]["nonce"].is_array(), "{params}");
-                    followups.insert(id.clone(), method.to_string());
-                    sent.push(method.to_string());
-                }
-                methods.insert(id, method.to_string());
-            }
-            ("in", None) => {
-                let Some(method) = methods.get(&id) else { continue };
-                if let Some((expected, remaining)) = sources.get_mut(method.as_str()) {
-                    if let Some((previous, item)) = &source_answer {
-                        sent.sort_unstable();
-                        assert_eq!(sent.as_slice(), *previous, "follow-ups for {item}");
-                        sent.clear();
-                    }
-                    assert!(*remaining > 0, "unexpected source answer for {method}");
-                    *remaining -= 1;
-                    let result = &m["result"];
-                    let items = result.get("items").unwrap_or(result);
-                    source_answer = Some((*expected, items.get(0).expect("first source item").clone()));
-                }
-                if followups.remove(&id).is_some() {
-                    assert!(m.get("result").is_some_and(|r| !r.is_null()), "{method}: {m}");
-                }
-            }
-            _ => {}
-        }
+    let messages = transcript_messages(&transcripts.join("capabilities.jsonl"));
+    let requests: Vec<(usize, &Value)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, (dir, m))| dir == "out" && m.get("id").is_some() && m["method"].is_string())
+        .map(|(i, (_, m))| (i, m))
+        .collect();
+    let answer = |id: &Value| {
+        let found = messages.iter().find(|(dir, m)| dir == "in" && m["id"] == *id && m.get("method").is_none());
+        found.map(|(_, m)| &m["result"]).expect("answered")
+    };
+    let is_followup = |m: &&Value| ["Hierarchy/", "/resolve"].iter().any(|p| m["method"].as_str().unwrap().contains(p));
+    // Each source answer's first item, in the order the sources were sent,
+    // once for each of its follow-ups.
+    let mut expected = Vec::new();
+    for (_, m) in requests.iter().filter(|(_, m)| !is_followup(m)) {
+        let Some(methods) = sources.get(m["method"].as_str().unwrap()) else { continue };
+        let result = answer(&m["id"]);
+        let item = result.get("items").unwrap_or(result)[0].clone();
+        assert!(item["data"]["nonce"].is_array(), "{item}");
+        expected.extend(methods.iter().map(|method| (method.to_string(), item.clone())));
     }
-    let (expected, item) = source_answer.expect("source answers");
-    sent.sort_unstable();
-    assert_eq!(sent.as_slice(), expected, "follow-ups for {item}");
-    assert!(sources.values().all(|&(_, remaining)| remaining == 0), "{sources:?}");
-    assert!(followups.is_empty(), "{followups:?}");
+    let followups: Vec<&(usize, &Value)> = requests.iter().filter(|(_, m)| is_followup(m)).collect();
+    let sent: Vec<(String, Value)> = followups
+        .iter()
+        .map(|(_, m)| {
+            let method = m["method"].as_str().unwrap();
+            let item = if method.contains("Hierarchy/") { &m["params"]["item"] } else { &m["params"] };
+            (method.to_string(), item.clone())
+        })
+        .collect();
+    assert_eq!(sent, expected);
+    // They come after the last table request (before shutdown), and each got
+    // a result.
+    let table = requests.iter().filter(|(_, m)| !is_followup(m) && m["method"] != "shutdown");
+    let last_table = table.map(|(i, _)| *i).max().unwrap();
+    assert!(followups.iter().all(|(i, _)| *i > last_table), "{followups:?}");
+    for (_, m) in &followups {
+        assert!(!answer(&m["id"]).is_null(), "{m}");
+    }
 }
 
 #[test]
@@ -858,47 +845,86 @@ fn a_follow_up_answered_with_another_error_is_lawful() {
 }
 
 #[test]
-fn a_follow_up_left_unanswered_is_noted_and_k1_passes() {
-    let (r, transcripts, _dir) = run_with_transcripts(&["--fault", "followup-unanswered"], &["--only", "K1"]);
+fn an_unanswered_follow_up_changes_no_wait_for_k1s_table() {
+    // Every incomingCalls goes unanswered, and documentSymbol, after the
+    // call hierarchy in K1's table, is answered a second late.
+    let (r, transcripts, _dir) =
+        run_with_transcripts(&["--fault", "followup-unanswered", "--fault", "slow-document-symbol"], &["--only", "K1"]);
     expect(&r, "K1", "pass");
     assert_eq!(r.status, 0, "{}", r.stdout);
     let k1 = detail(&r, "K1");
     assert!(
         k1.starts_with(
             "22 request(s) for 12 advertised method(s) were answered, none with MethodNotFound; follow-ups, which \
-             don't change K1's verdict: 19 sent for 9 method(s), 18 answered with a result; no response to \
-             codeLens/resolve with the first item of textDocument/codeLens by the end of the session (not judged)"
+             don't change K1's verdict: 19 sent for 9 method(s), 16 answered with a result; no response to \
+             callHierarchy/incomingCalls with the first item of textDocument/prepareCallHierarchy at 1:2 by the end \
+             of the session (not judged)"
         ),
         "{k1}"
     );
-    assert!(!k1.contains("follow-ups not sent"), "{k1}");
-    // The follow-ups after it are still sent.
-    let mut sent: Vec<_> = transcript_messages(&transcripts.join("capabilities.jsonl"))
-        .into_iter()
-        .filter(|(dir, _)| dir == "out")
-        .filter_map(|(_, m)| m["method"].as_str().filter(|m| m.ends_with("/resolve")).map(str::to_string))
-        .collect();
-    let later = sent.split_off(sent.iter().position(|m| m == "codeLens/resolve").unwrap() + 1);
-    assert_eq!(later, ["documentLink/resolve", "inlayHint/resolve", "workspaceSymbol/resolve"]);
+    assert_eq!(k1.matches("no response to callHierarchy/incomingCalls").count(), 3, "{k1}");
+    // K1 waited for documentSymbol's reply before sending anything more.
+    let messages = transcript_messages(&transcripts.join("capabilities.jsonl"));
+    let asked = messages.iter().position(|(dir, m)| dir == "out" && m["method"] == "textDocument/documentSymbol");
+    let asked = asked.expect("documentSymbol sent");
+    let id = &messages[asked].1["id"];
+    let answered = messages.iter().position(|(dir, m)| dir == "in" && m["id"] == *id && m.get("method").is_none());
+    let next = messages[asked + 1..].iter().position(|(dir, _)| dir == "out").map(|i| asked + 1 + i);
+    assert!(answered.expect("documentSymbol answered") < next.expect("a later request"), "{messages:?}");
 }
 
 #[test]
-fn a_follow_up_that_couldnt_be_sent_before_table_requests_leaves_k1_inconclusive() {
-    // The stand-in exits on the first incomingCalls, so outgoingCalls, the
-    // next write, can't be delivered, nor can the table requests after it.
+fn a_server_that_crashes_on_a_follow_up_costs_k1_no_table_reply() {
+    // The stand-in exits on the first incomingCalls, after the completion
+    // resolves, so outgoingCalls, the next write, can't be delivered; K1
+    // notes it and the follow-ups left.
     let r = run(&["--fault", "exit-on-first-incoming-calls"], &["--only", "K1"]);
-    expect(&r, "K1", "error");
-    assert_eq!(r.status, 2, "{}", r.stdout);
+    expect(&r, "K1", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
     let k1 = detail(&r, "K1");
-    let cause = "lspcheck couldn't send callHierarchy/outgoingCalls with the first item of \
-                 textDocument/prepareCallHierarchy at 1:2 (";
-    assert!(k1.starts_with(cause), "{k1}");
-    assert!(k1.contains("the server exited with status 17"), "{k1}");
-    assert!(k1.contains("not sent after that: textDocument/prepareCallHierarchy at 2:6, "), "{k1}");
     assert!(
-        k1.contains(
-            "no response to callHierarchy/incomingCalls with the first item of textDocument/prepareCallHierarchy at \
-             1:2 by the end of the session (not judged)"
+        k1.starts_with(
+            "22 request(s) for 12 advertised method(s) were answered, none with MethodNotFound; follow-ups, which \
+             don't change K1's verdict: 4 sent for 2 method(s), 3 answered with a result; no response to \
+             callHierarchy/incomingCalls with the first item of textDocument/prepareCallHierarchy at 1:2 by the end \
+             of the session (not judged); lspcheck couldn't send callHierarchy/outgoingCalls with the first item of \
+             textDocument/prepareCallHierarchy at 1:2 ("
+        ),
+        "{k1}"
+    );
+    assert!(k1.contains("the server exited with status 17"), "{k1}");
+    let rest = "; follow-ups not sent after that: callHierarchy/incomingCalls with the first item of \
+                textDocument/prepareCallHierarchy at 2:6, ";
+    assert!(k1.contains(rest), "{k1}");
+    assert!(k1.ends_with(", workspaceSymbol/resolve with the first item of workspace/symbol"), "{k1}");
+    // With a table reply held until shutdown, no follow-up is sent, so the
+    // crash can't lose that reply.
+    let r =
+        run(&["--fault", "exit-on-first-incoming-calls", "--fault", "defer-hover-until-shutdown"], &["--only", "K1"]);
+    expect(&r, "K1", "pass");
+    assert_eq!(
+        detail(&r, "K1"),
+        "22 request(s) for 12 advertised method(s) were answered, none with MethodNotFound; follow-ups not sent: a \
+         table request was still unanswered"
+    );
+}
+
+#[test]
+fn a_first_item_that_isnt_an_object_gets_no_follow_up() {
+    // Echoing a null item would send `params: null`.
+    let r = fault("followup-null-item");
+    passes_except(&r, &[("K2", "fail")]);
+    let k1 = detail(&r, "K1");
+    assert!(
+        k1.starts_with(
+            "22 request(s) for 12 advertised method(s) were answered, none with MethodNotFound; follow-ups, which \
+             don't change K1's verdict: 18 sent for 8 method(s), 18 answered with a result"
+        ),
+        "{k1}"
+    );
+    assert!(
+        k1.ends_with(
+            "follow-ups not sent for textDocument/codeLens (codeLens/resolve): its first item was null, not an object"
         ),
         "{k1}"
     );

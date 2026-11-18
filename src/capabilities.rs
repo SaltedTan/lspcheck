@@ -378,7 +378,9 @@ impl Request {
     }
 
     /// The source answer's first item, or why there is none: an array's
-    /// first element, or a `CompletionList`'s first item.
+    /// first element, or a `CompletionList`'s first item. It must be an
+    /// object: echoing `null` would send `params: null`, which a server
+    /// can't tell from a request without params.
     pub fn followup_item<'a>(&self, result: &'a Value) -> Result<&'a Value, String> {
         if self.followup.is_none() {
             return Err("it has no follow-ups".into());
@@ -392,7 +394,16 @@ impl Request {
             },
             _ => return Err("the answer wasn't an array".into()),
         };
-        items.first().ok_or_else(|| "the answer was empty".into())
+        let item = items.first().ok_or_else(|| "the answer was empty".to_string())?;
+        let shape = match item {
+            Value::Object(_) => return Ok(item),
+            Value::Null => "null",
+            Value::Bool(_) => "a boolean",
+            Value::Number(_) => "a number",
+            Value::String(_) => "a string",
+            Value::Array(_) => "an array",
+        };
+        Err(format!("its first item was {shape}, not an object"))
     }
 
     /// The follow-ups for `item`, each with the item exactly as received.
@@ -492,11 +503,14 @@ fn other_errors<'a>(asked: impl Iterator<Item = (&'a str, &'a Outcome)>) -> Opti
     Some(format!("other errors, which are lawful: {}", each.join("; ")))
 }
 
-/// A follow-up K1 sent, with an [`excerpt`] of the item it echoed.
+/// A follow-up K1 sent, or tried to, with an [`excerpt`] of the item it
+/// echoed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FollowupAsked {
     pub label: String,
     pub outcome: Outcome,
+    /// Whether its first response was a result (not an error or malformed).
+    pub result: bool,
     pub item: String,
 }
 
@@ -508,13 +522,15 @@ fn followup_notes(followups: &[FollowupAsked]) -> Vec<String> {
     if followups.is_empty() {
         return Vec::new();
     }
-    let mut methods: Vec<&str> = followups.iter().map(|f| f.label.split(' ').next().unwrap_or(&f.label)).collect();
+    let sent: Vec<&FollowupAsked> =
+        followups.iter().filter(|f| !matches!(f.outcome, Outcome::Undelivered(_))).collect();
+    let mut methods: Vec<&str> = sent.iter().map(|f| f.label.split(' ').next().unwrap_or(&f.label)).collect();
     methods.sort_unstable();
     methods.dedup();
-    let results = followups.iter().filter(|f| f.outcome == Outcome::Answered).count();
+    let results = followups.iter().filter(|f| f.result).count();
     let mut notes = vec![format!(
         "follow-ups, which don't change K1's verdict: {} sent for {} method(s), {results} answered with a result",
-        followups.len(),
+        sent.len(),
         methods.len()
     )];
     for f in followups {
@@ -807,6 +823,8 @@ mod tests {
             (prepare, json!({"name": "f"}), "the answer wasn't an array"),
             (completion, json!({"isIncomplete": false, "items": []}), "the answer was empty"),
             (completion, json!({"isIncomplete": false}), "the answer had no items array"),
+            (prepare, json!([null, {"name": "f"}]), "its first item was null, not an object"),
+            (completion, json!({"isIncomplete": false, "items": [3]}), "its first item was a number, not an object"),
         ] {
             assert_eq!(r.followup_item(&answer), Err(why.into()), "{answer}");
         }
@@ -823,7 +841,8 @@ mod tests {
     }
 
     fn followup(label: &str, outcome: Outcome) -> FollowupAsked {
-        FollowupAsked { label: label.into(), outcome, item: r#"{"label":"a"}"#.into() }
+        let result = outcome == Outcome::Answered;
+        FollowupAsked { label: label.into(), outcome, result, item: r#"{"label":"a"}"#.into() }
     }
 
     #[test]
@@ -840,6 +859,11 @@ mod tests {
             followup("codeLens/resolve with the first item of textDocument/codeLens", Outcome::Unanswered),
             followup("codeLens/resolve with the first item of textDocument/codeLens", Outcome::Error(-32803)),
             followup("inlayHint/resolve with the first item of textDocument/inlayHint", Outcome::Answered),
+            // A malformed response is answered, but not with a result.
+            FollowupAsked {
+                result: false,
+                ..followup("documentLink/resolve with the first item of textDocument/documentLink", Outcome::Answered)
+            },
             followup(
                 "inlayHint/resolve with the first item of textDocument/inlayHint",
                 Outcome::Undelivered("the server's stdin is closed".into()),
@@ -850,7 +874,7 @@ mod tests {
             detail,
             "2 request(s) for 2 advertised method(s) were answered, none with MethodNotFound; other errors, which are \
              lawful: -32803 (RequestFailed) for codeLens/resolve with the first item of textDocument/codeLens; \
-             follow-ups, which don't change K1's verdict: 5 sent for 3 method(s), 1 answered with a result; \
+             follow-ups, which don't change K1's verdict: 5 sent for 4 method(s), 1 answered with a result; \
              completionItem/resolve with the first item of textDocument/completion at 1:2 was answered MethodNotFound \
              (not judged: K1 can't tell whether the item it echoed was valid); item: {\"label\":\"a\"}; no response to \
              codeLens/resolve with the first item of textDocument/codeLens by the end of the session (not judged); \

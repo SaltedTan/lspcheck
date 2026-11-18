@@ -239,8 +239,9 @@ cut off because the server's output closed, makes D6 `ERROR` unless it already f
 
 K1 checks that the server handles what it advertises: it opens a document (a profile's
 [`[document]`](#profiles), or a plain-text one of lspcheck's own) and probes advertised methods without judging the
-content of their results. It also sends the hierarchy and resolve requests that take the first item of an answer,
-and notes how they were answered without judging them. See the
+content of their results. Once every one has been answered, it also sends the hierarchy and resolve requests that
+take the first item of an answer, and notes how they were answered without judging them (K2 doesn't judge their
+results either). See the
 [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage, MethodNotFound failures, late and
 duplicate replies, and details naming unanswered and undeliverable requests.
 

@@ -389,8 +389,9 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: answer the requests whose items K1 follows up with null, an empty array or an empty CompletionList",
     ),
     ("followup-request-failed", "lawful: answer every follow-up K1 sends with RequestFailed (-32803)"),
-    ("followup-unanswered", "lawful for K1: never answer codeLens/resolve"),
-    ("followup-source-deferred", "lawful: hold the first completion reply until the next request"),
+    ("followup-unanswered", "lawful for K1: never answer callHierarchy/incomingCalls"),
+    ("followup-null-item", "answer textDocument/codeLens with [null], which K2 fails"),
+    ("slow-document-symbol", "lawful: answer textDocument/documentSymbol a second late in K1's scenario"),
     (
         "followup-invalid-items",
         "lawful for K1: give each item K1 follows up, but call hierarchy items, a flaw the meta-model's types don't \
@@ -502,8 +503,6 @@ fn main() {
     // A workspace/symbol request whose reply waits for the next message.
     let mut deferred: Option<Value> = None;
     let mut held_hovers: Vec<Value> = Vec::new();
-    let mut defer_followup_source = fault("followup-source-deferred");
-    let mut held_followup_source = None;
     // Set by stop-after-unknown-cancel: requests are no longer answered.
     let mut no_more_answers = false;
     // For drop-first-request: whether the first document request was dropped.
@@ -1578,9 +1577,6 @@ fn main() {
             held_hovers.push(id);
             continue;
         }
-        if let Some(held) = held_followup_source.take() {
-            out.frame(&held);
-        }
         match method.as_str() {
             "shutdown" => {
                 shut_down = true;
@@ -1735,12 +1731,10 @@ fn main() {
                 if fault("followup-invalid-items") {
                     flaw_followup_source(&method, &mut result, &msg["params"]["position"]);
                 }
-                let answer = ok(&id, result);
-                if method == "textDocument/completion" && std::mem::take(&mut defer_followup_source) {
-                    held_followup_source = Some(answer);
-                    continue;
+                if method == "textDocument/codeLens" && fault("followup-null-item") {
+                    result = json!([null]);
                 }
-                out.frame(&answer);
+                out.frame(&ok(&id, result));
             }
             "callHierarchy/incomingCalls"
             | "callHierarchy/outgoingCalls"
@@ -1751,7 +1745,7 @@ fn main() {
             | "documentLink/resolve"
             | "inlayHint/resolve"
             | "workspaceSymbol/resolve" => {
-                if method == "codeLens/resolve" && fault("followup-unanswered") {
+                if method == "callHierarchy/incomingCalls" && fault("followup-unanswered") {
                     // Never answered.
                 } else if fault("followup-method-not-found")
                     || fault("followup-invalid-items") && !method.starts_with("callHierarchy/")
@@ -1789,6 +1783,11 @@ fn main() {
                     (None, Some(t)) => document_answer(&method, &params, &t, units, split, &faults),
                     _ => Value::Null,
                 };
+                // Well within the --timeout lspcheck waits for each of K1's
+                // requests, which the tests set to 5 s.
+                if method == "textDocument/documentSymbol" && followups_advertised && fault("slow-document-symbol") {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
                 let uri = msg.pointer("/params/textDocument/uri").and_then(Value::as_str);
                 let mut nth = None;
                 if method == "textDocument/documentSymbol"

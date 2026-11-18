@@ -15,9 +15,14 @@
 - K1 now also sends follow-up requests that need an item from an earlier answer, passing the answer's first item
   back unchanged: `callHierarchy/incomingCalls` and `outgoingCalls`, `typeHierarchy/supertypes` and `subtypes`, and,
   when their `resolveProvider` is `true`, `completionItem/resolve`, `codeLens/resolve`, `documentLink/resolve`,
-  `inlayHint/resolve` and `workspaceSymbol/resolve`. Their answers are reported in K1's detail, and a MethodNotFound
-  answer is noted with the item, but follow-ups don't change K1's verdict. A source answer with no usable item gets
-  no follow-up, and the detail says so.
+  `inlayHint/resolve` and `workspaceSymbol/resolve`. They are sent after K1's other requests, and only when all of
+  those have been answered, so they don't change how those are sent or waited for. Their answers are reported in
+  K1's detail, and a MethodNotFound answer is noted with the item, but follow-ups don't change K1's verdict, and K2
+  doesn't judge their results. A source answer whose first item isn't a JSON object gets no follow-up, and the
+  detail says so.
+- K1's scenario now offers clients' `resolveSupport` for completion items, inlay hints and workspace symbols, so a
+  server that advertises a provider only to clients that can resolve its items is now asked that provider's
+  requests too: K1 may exercise more methods than before.
 
 ### Fixed
 

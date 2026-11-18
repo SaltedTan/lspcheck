@@ -6,8 +6,9 @@ Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 [mutation implementation status](source-mutations.md) for current behavior and the
 [implementation plan](source-mutations.md#implementation-plan) for the remaining step,
 minimisation, which waits until isolation shows it is wanted.
-D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios, and K1 sends
-[follow-up requests](#capabilities-and-robustness) with the first item of an earlier answer and notes their answers.
+D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios, and K1 sends,
+after its other requests, [follow-up requests](#capabilities-and-robustness) with the first item of an earlier answer
+and notes their answers.
 Mutation runs warn on stderr about a short case start window and summarize the server's Error and Warning messages
 in the [reports](#report).
 See the [changelog](../CHANGELOG.md) for changes by release.
@@ -411,13 +412,24 @@ Some advertised capabilities also cover a **follow-up** request that needs an it
 | inlayHintProvider.resolveProvider: true | textDocument/inlayHint: `InlayHint[]` | inlayHint/resolve, the item |
 | workspaceSymbolProvider.resolveProvider: true | workspace/symbol: `WorkspaceSymbol[]` | workspaceSymbol/resolve, the item |
 
-- K1 passes the first item back exactly as received, including its `data`, once per listed follow-up for each
-  source request: an array's first element, or a `CompletionList`'s first item. A null, empty or error reply, or
-  one of another shape, gets no follow-up; the detail names the source request, the follow-ups left unsent, and why.
+Follow-ups are sent in a phase of their own, after the table's requests have been sent and the last one's wait has
+ended, so they can't change how the table's requests are sent or waited for:
+
+- They are sent only if every request from the table has been answered by then. Otherwise none is sent, and the
+  detail says `follow-ups not sent: a table request was still unanswered` (or `couldn't be sent`): a server that
+  crashed on a follow-up would lose a reply that shutdown might still have collected, and K1 would lose evidence.
+- For each source request, in table order, K1 passes the first item back exactly as received, including its `data`,
+  once per listed follow-up: an array's first element, or a `CompletionList`'s first item. The item must be a JSON
+  object (a `null` item would be sent as `params: null`, which a server can't tell from a request without params). A
+  null, empty or error reply, one of another shape, or one whose first item isn't an object gets no follow-up; the
+  detail names the source request, the follow-ups left unsent, and why.
 - A follow-up's label includes its method and the source request's label, for example `completionItem/resolve with
   the first item of textDocument/completion at 1:2`. A `documentSelector` that excludes the source excludes its
   follow-ups too.
-- **Follow-ups don't change K1's verdict.** The detail counts them and the ones answered with a result, and notes
+- They are sent one at a time, each waiting up to `--timeout` for its reply; after one goes unanswered, the rest are
+  sent without waiting. A follow-up lspcheck couldn't deliver stops the phase, and the detail lists the rest as
+  `follow-ups not sent after that`. That is never `ERROR`: every table request has been sent and answered by then.
+- **Follow-ups don't change K1's verdict.** The detail counts those sent and those answered with a result, and notes
   each one answered with MethodNotFound, with an excerpt of the item it echoed (200 characters at most), each other
   error with the lawful ones, and each one left unanswered or that lspcheck couldn't deliver. The reason: JSON-RPC
   answers an unknown method with MethodNotFound (-32601) and invalid params with InvalidParams (-32602), so K1's
@@ -425,23 +437,21 @@ Some advertised capabilities also cover a **follow-up** request that needs an it
   its validity may depend on URIs, on the document's text and the negotiated encoding, on `itemDefaults` the client
   didn't negotiate, or on registrations withdrawn since. A follow-up's MethodNotFound is reported, not judged; a later
   version may judge it once K1 can validate items, for example against the open document's text and the negotiated
-  capabilities. K2 validates the follow-ups' results like any other.
-- A follow-up lspcheck couldn't deliver stops sending, like any request. When requests from the table above are left
-  unsent by it, it is judged as one of them: K1 is `ERROR`, and the detail lists the rest as `not sent after that`.
+  capabilities. For the same reason, K2 doesn't judge the follow-ups' results.
 
-Only the capabilities scenario sends follow-ups and adds client `resolveSupport` for completion items, inlay hints
-and workspace symbols. See [`k1_initialize_params`](../src/checks.rs) for the exact properties offered.
+Only the capabilities scenario sends follow-ups. It offers client `resolveSupport` for completion items, inlay hints
+and workspace symbols (see [`k1_initialize_params`](../src/checks.rs) for the exact properties), so a server that
+advertises a provider only to clients that support resolving its items is now asked that provider's table requests
+too: K1 may exercise more of the table than before.
 
 Document probes require the server to ask for `didOpen`. If a capability supplies a non-null `documentSelector`,
 the selector must match the document. The detail names exclusions. A filter selects the document when its
 `language` (if any) matches the document's language id and its `scheme` (if any) is `file`. K1 excludes filters
 with glob `pattern`s and notebook filters. The workspace symbol probe and its resolve follow-up need no open document.
 
-The requests are sent one at a time, each waiting up to `--timeout` for its reply. After a wait expires, K1
-still waits for each source and follow-up, and sends the other requests without waiting for individual replies.
-Matched source replies can still trigger follow-ups after their individual wait expires. After the initial probes,
-K1 uses a shared `--timeout` window to wait for outstanding source replies. A delivery failure stops sending early.
-When sending ends, K1 notes any outstanding sources' follow-ups as unsent, even if those sources reply during shutdown.
+The table's requests are sent one at a time, each waiting up to `--timeout` for its reply. After one goes unanswered,
+the remaining requests are sent without waiting for each reply. Only a delivery failure stops sending (the detail
+lists the requests left unsent).
 
 LSP sets no deadline for a response, so a wait that ends is not evidence against the server. The scenario shuts the
 server down gracefully (`shutdown`, then `exit`), answering the server's requests on the way. Replies read during
@@ -484,7 +494,9 @@ for LSP 3.17, vendored unmodified from microsoft/language-server-protocol under 
 
 Not judged: methods the meta-model doesn't have (including custom methods), definitions marked `proposed`
 (requests, notifications, structures, enumerations, type aliases and properties), the replies to lspcheck's
-unknown-method probes, and frames lspcheck couldn't read (F1's).
+unknown-method probes, the results of [K1's follow-ups](#capabilities-and-robustness) (they echo items K1 can't
+validate, and would share the run's validation budget with the table's results), and frames lspcheck couldn't read
+(F1's).
 
 A value is of a type when:
 
