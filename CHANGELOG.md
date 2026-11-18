@@ -15,8 +15,9 @@
 - K1 now also sends follow-up requests that need an item from an earlier answer, passing the answer's first item
   back unchanged: `callHierarchy/incomingCalls` and `outgoingCalls`, `typeHierarchy/supertypes` and `subtypes`, and,
   when their `resolveProvider` is `true`, `completionItem/resolve`, `codeLens/resolve`, `documentLink/resolve`,
-  `inlayHint/resolve` and `workspaceSymbol/resolve`. A server that answers one it advertises with MethodNotFound now
-  fails K1. A source answer with no usable item gets no follow-up, and the detail says so.
+  `inlayHint/resolve` and `workspaceSymbol/resolve`. Their answers are reported in K1's detail, and a MethodNotFound
+  answer is noted with the item, but follow-ups don't change K1's verdict. A source answer with no usable item gets
+  no follow-up, and the detail says so.
 
 ### Fixed
 

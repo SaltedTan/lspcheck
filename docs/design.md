@@ -7,7 +7,7 @@ Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 [implementation plan](source-mutations.md#implementation-plan) for the remaining step,
 minimisation, which waits until isolation shows it is wanted.
 D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios, and K1 sends
-[follow-up requests](#capabilities-and-robustness) with the first item of an earlier answer.
+[follow-up requests](#capabilities-and-robustness) with the first item of an earlier answer and notes their answers.
 Mutation runs warn on stderr about a short case start window and summarize the server's Error and Warning messages
 in the [reports](#report).
 See the [changelog](../CHANGELOG.md) for changes by release.
@@ -339,7 +339,7 @@ it, and the detail names the scenario and case.
 ### Capabilities and robustness
 | ID | Basis | Check |
 |---|---|---|
-| K1 | MUST | MethodNotFound (-32601) violates an advertised capability when the request has valid parameters. |
+| K1 | MUST | A request the server advertises, sent with valid parameters about an open document, isn't answered with MethodNotFound (-32601). |
 | K2 | MUST | What the server sends validates against the LSP 3.17 [meta-model](../vendor/lsp-3.17/README.md): results of requests, and the params of its own requests and notifications. |
 | R1 | POLICY | A well-framed body that isn't JSON gets ParseError `-32700` with id `null` or is ignored, and the server keeps serving. |
 | R2 | POLICY | A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving. |
@@ -412,33 +412,22 @@ Some advertised capabilities also cover a **follow-up** request that needs an it
 | workspaceSymbolProvider.resolveProvider: true | workspace/symbol: `WorkspaceSymbol[]` | workspaceSymbol/resolve, the item |
 
 - K1 passes the first item back exactly as received, including its `data`, once per listed follow-up for each
-  source request, but only if the item is a valid parameter. It checks the item's type against the meta-model,
-  without descending into opaque `LSPAny` values, and then the rules of the specification that types can't express:
-  - every range in the item starts no later than it ends. A range is any object whose `start` and `end` each have
-    an integer `line` and `character`, spelled `2` or `2.0` as the meta-model reads them, except within `data` and
-    a command's `arguments`, which are `LSPAny`;
-  - a hierarchy item's `selectionRange` lies within its `range`;
-  - a completion item's `textEdit` is a `TextEdit` (an `InsertReplaceEdit` needs `insertReplaceSupport`, which
-    lspcheck doesn't offer), on one line and containing the completion's position, and its `additionalTextEdits`
-    neither overlap nor share a start with each other or the `textEdit`;
-  - an inlay hint's `label` is a non-empty string or a non-empty array of parts with non-empty values, and its
-    `textEdits` don't overlap (as in any `TextEdit[]`, several may start at one place if all but the last there are
-    inserts);
-  - a workspace symbol's `location.range`, when present, is a range (the meta-model's `Location | {uri}` takes
-    `{uri, range: null}` as the latter), and the symbol has `data` or a `location` without a `range`: anything else
-    may be a `SymbolInformation`, which `workspace/symbol` may answer with even when resolving, and which
-    workspaceSymbol/resolve doesn't take.
-- Members for client capabilities lspcheck didn't offer (such as a completion item's `labelDetails` or
-  `insertTextMode`) and rules the specification only recommends (a code lens on one line) don't stop a follow-up:
-  such items are sent as received.
-- The check runs on a thread of its own that K1 waits on for at most 10 seconds, whatever `--timeout` is: far longer
-  than its step budget takes. One that doesn't finish in time leaves K1 inconclusive, like an item too large to
-  check, and while its thread still runs, later items aren't checked and leave K1 inconclusive too.
-- K1 skips follow-ups from null, empty or error replies and replies with an unusable first item. The detail names
-  the source request, the follow-ups left unsent, and the reason.
+  source request: an array's first element, or a `CompletionList`'s first item. A null, empty or error reply, or
+  one of another shape, gets no follow-up; the detail names the source request, the follow-ups left unsent, and why.
 - A follow-up's label includes its method and the source request's label, for example `completionItem/resolve with
   the first item of textDocument/completion at 1:2`. A `documentSelector` that excludes the source excludes its
   follow-ups too.
+- **Follow-ups don't change K1's verdict.** The detail counts them and the ones answered with a result, and notes
+  each one answered with MethodNotFound, with an excerpt of the item it echoed (200 characters at most), each other
+  error with the lawful ones, and each one left unanswered or that lspcheck couldn't deliver. The reason: JSON-RPC
+  answers an unknown method with MethodNotFound (-32601) and invalid params with InvalidParams (-32602), so K1's
+  MethodNotFound rule holds only for valid params, and K1 can't establish that an item the server produced is one:
+  its validity may depend on URIs, on the document's text and the negotiated encoding, on `itemDefaults` the client
+  didn't negotiate, or on registrations withdrawn since. A follow-up's MethodNotFound is reported, not judged; a later
+  version may judge it once K1 can validate items, for example against the open document's text and the negotiated
+  capabilities. K2 validates the follow-ups' results like any other.
+- A follow-up lspcheck couldn't deliver stops sending, like any request. When requests from the table above are left
+  unsent by it, it is judged as one of them: K1 is `ERROR`, and the detail lists the rest as `not sent after that`.
 
 Only the capabilities scenario sends follow-ups and adds client `resolveSupport` for completion items, inlay hints
 and workspace symbols. See [`k1_initialize_params`](../src/checks.rs) for the exact properties offered.
@@ -449,7 +438,7 @@ the selector must match the document. The detail names exclusions. A filter sele
 with glob `pattern`s and notebook filters. The workspace symbol probe and its resolve follow-up need no open document.
 
 The requests are sent one at a time, each waiting up to `--timeout` for its reply. After a wait expires, K1
-continues waiting for each source and follow-up, and sends the other requests without waiting for individual replies.
+still waits for each source and follow-up, and sends the other requests without waiting for individual replies.
 Matched source replies can still trigger follow-ups after their individual wait expires. After the initial probes,
 K1 uses a shared `--timeout` window to wait for outstanding source replies. A delivery failure stops sending early.
 When sending ends, K1 notes any outstanding sources' follow-ups as unsent, even if those sources reply during shutdown.
@@ -464,20 +453,20 @@ For either a failure or an error, the detail names every unanswered request. It 
 (including the server's exit status when observed) once, on the request lspcheck couldn't send, then lists the
 remaining requests in a single `not sent after that` note.
 
-- **fail:** a probe or follow-up was answered with an error whose code is -32601. The detail names each such request.
-  This is seen evidence and stands whatever happened to the other requests.
+- **fail:** a request from the table above was answered with an error whose code is -32601. The detail names each
+  such request (method and position). This is seen evidence and stands whatever happened to the other requests.
 - **error:** initialize didn't succeed, the server chose an encoding lspcheck didn't offer (see L2), the document
-  couldn't be written, read or opened (`didOpen` not delivered), a request couldn't be delivered, or lspcheck
-  couldn't complete validation of a source item. A delivered request with no response by the end of the session
-  is also `ERROR`, unless another request got -32601, which fails K1.
+  couldn't be written, read or opened (`didOpen` not delivered), or a request from the table above couldn't be
+  delivered. A delivered one with no response by the end of the session is also `ERROR` (`no response to <method>
+  at <position> by the end of the session, so K1 couldn't judge it`), unless another got -32601, which fails K1.
 - **not-exercised:** the initialize result has no capabilities object, or the server advertises none of the requests
   above, or all advertised requests were excluded by the `didOpen` or selector rules (the detail says why).
-- **pass:** with the error conditions above ruled out, every request sent was answered by the end of the session
-  with a result or an error other than -32601. The detail counts the requests and methods, lists the other errors
-  by code with the requests that got them, and notes the follow-ups left unsent.
+- **pass:** every request from the table above that was sent was answered by the end of the session with a result
+  or another error. The detail counts the requests and methods, lists the other errors by code with the requests
+  that got them, and notes the follow-ups.
 
-J1, J2 and J5 judge responses to K1's requests. J3 covers the scenario's notifications. K1 uses result content to
-plan follow-ups and leaves result conformance to K2. With `--mutate`, a MethodNotFound to a request about a mutated
+J1, J2 and J5 judge responses to K1's requests. J3 covers the scenario's notifications. K1 uses a result's content only
+to find the item a follow-up echoes, and leaves result conformance to K2. With `--mutate`, a MethodNotFound to a request about a mutated
 document also [fails K1](source-mutations.md#verdict-rules).
 
 K2 is judged across every scenario, like J5, over every message lspcheck read. Its validator runs only when K2 is

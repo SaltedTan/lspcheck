@@ -299,13 +299,9 @@ fn the_clean_standin_passes_every_check() {
     assert!(r.stdout.contains("following didOpen of a 4 MiB document"), "{}", r.stdout);
     // K1 passed on evidence: three positions for hover, highlights, completion
     // and both hierarchies, one selectionRange with all three, symbols, folding
-    // ranges, code lenses, document links, inlay hints and workspace symbols,
-    // with each follow-up: 22 requests for 12 methods, and 19 for 9.
-    assert!(
-        r.stdout.contains("41 request(s) for 21 advertised method(s) were answered, none with MethodNotFound"),
-        "{}",
-        r.stdout
-    );
+    // ranges, code lenses, document links, inlay hints and workspace symbols;
+    // and it noted their follow-ups.
+    assert_eq!(detail(&r, "K1"), CLEAN_K1);
     // D4 passed on evidence: the closed, the never-opened and the plain
     // request were all answered.
     assert!(r.stdout.contains("all three answered"), "{}", r.stdout);
@@ -645,15 +641,20 @@ fn k1_covers_all_requests_when_hover_waits_for_shutdown() {
     let r = run(&["--fault", "defer-hover-until-shutdown"], &["--only", "K1"]);
     expect(&r, "K1", "pass");
     assert_eq!(r.status, 0, "{}", r.stdout);
-    assert!(detail(&r, "K1").starts_with("41 request(s) for 21 advertised method(s) were answered"), "{}", r.stdout);
+    assert!(detail(&r, "K1").starts_with("22 request(s) for 12 advertised method(s) were answered"), "{}", r.stdout);
 }
+
+/// K1's detail for the clean stand-in: 22 requests for 12 methods, and their
+/// 19 follow-ups for 9.
+const CLEAN_K1: &str = "22 request(s) for 12 advertised method(s) were answered, none with MethodNotFound; \
+                        follow-ups, which don't change K1's verdict: 19 sent for 9 method(s), 19 answered with a result";
 
 #[test]
 fn k1_follows_up_a_source_that_answers_after_its_wait() {
     let r = run(&["--fault", "followup-source-deferred"], &["--only", "K1"]);
     expect(&r, "K1", "pass");
     assert_eq!(r.status, 0, "{}", r.stdout);
-    assert!(detail(&r, "K1").starts_with("41 request(s) for 21 advertised method(s) were answered"), "{}", r.stdout);
+    assert_eq!(detail(&r, "K1"), CLEAN_K1);
 }
 
 #[test]
@@ -769,143 +770,46 @@ fn k1_passes_each_follow_up_the_first_item_exactly_as_received() {
 }
 
 #[test]
-fn k1_resolves_a_code_lens_with_large_opaque_data() {
-    let r = run(&["--fault", "followup-large-data"], &["--only", "K1"]);
-    expect(&r, "K1", "pass");
-    let k1 = detail(&r, "K1");
-    assert_eq!(k1, "41 request(s) for 21 advertised method(s) were answered, none with MethodNotFound");
-}
-
-#[test]
-fn a_follow_up_answered_with_method_not_found_fails_k1() {
-    for (fault_name, named, also) in [
-        (
-            "followup-hierarchy-method-not-found",
-            "MethodNotFound (-32601) for 12 advertised request(s): callHierarchy/incomingCalls with the first item of \
-             textDocument/prepareCallHierarchy at 1:2, callHierarchy/outgoingCalls with the first item of \
-             textDocument/prepareCallHierarchy at 1:2, ",
-            "typeHierarchy/subtypes with the first item of textDocument/prepareTypeHierarchy at 3:2",
-        ),
-        (
-            "followup-resolve-method-not-found",
-            "MethodNotFound (-32601) for 7 advertised request(s): completionItem/resolve with the first item of \
-             textDocument/completion at 1:2, ",
-            "workspaceSymbol/resolve with the first item of workspace/symbol",
-        ),
+fn a_follow_ups_method_not_found_is_noted_with_its_item_and_k1_passes() {
+    // K1 can't tell whether an item it echoed was valid, so MethodNotFound
+    // for a follow-up may answer the item, not the method; the flawed items
+    // here are each invalid in a way the meta-model's types don't show.
+    for (fault_name, not_found, item) in [
+        ("followup-method-not-found", 19, r#"item: {"label":"standin 0:1","data":{"standin":"completion""#),
+        ("followup-invalid-items", 13, r#"item: {"label":"standin 0:1","data":"#),
     ] {
         let r = fault(fault_name);
-        only_fails(&r, &["K1"]);
+        passes_except(&r, &[]);
         let k1 = detail(&r, "K1");
-        assert!(k1.starts_with(named), "{fault_name}: {k1}");
-        assert!(k1.contains(also), "{fault_name}: {k1}");
-    }
-}
-
-#[test]
-fn a_follow_ups_method_not_found_read_at_shutdown_fails_k1() {
-    // The stand-in holds the first completionItem/resolve past K1's wait and
-    // answers it with MethodNotFound only when shutdown arrives.
-    let r = fault("followup-method-not-found-at-shutdown");
-    only_fails(&r, &["K1"]);
-    let k1 = detail(&r, "K1");
-    assert!(
-        k1.starts_with(
-            "MethodNotFound (-32601) for 1 advertised request(s): completionItem/resolve with the first item of \
-             textDocument/completion at 1:2"
-        ),
-        "{k1}"
-    );
-}
-
-#[test]
-fn a_symbol_that_may_be_a_symbol_information_isnt_resolved() {
-    // workspace/symbol may answer SymbolInformation[], which a server that
-    // resolves WorkspaceSymbols needn't resolve: this one answers
-    // MethodNotFound, and K1 mustn't ask.
-    let r = fault("followup-symbol-information");
-    passes_except(&r, &[]);
-    let k1 = detail(&r, "K1");
-    assert!(k1.starts_with("40 request(s) for 20 advertised method(s) were answered"), "{k1}");
-    let note = "follow-ups not sent for workspace/symbol (workspaceSymbol/resolve): its first item may be a \
-                SymbolInformation, which workspaceSymbol/resolve doesn't take";
-    assert!(k1.contains(note), "{k1}");
-}
-
-#[test]
-fn items_that_break_the_specifications_rules_arent_followed_up() {
-    // The meta-model's types don't show these flaws, but the items aren't
-    // valid params, so the MethodNotFound the stand-in would answer their
-    // follow-ups with mustn't be asked for.
-    let r = fault("followup-invalid-items");
-    passes_except(&r, &[]);
-    let k1 = detail(&r, "K1");
-    // The call hierarchy items' ranges are valid, though spelled with a
-    // decimal, so their follow-ups are sent and answered.
-    assert!(k1.starts_with("28 request(s) for 14 advertised method(s) were answered"), "{k1}");
-    assert!(!k1.contains("prepareCallHierarchy"), "{k1}");
-    let completion = "completionItem/resolve";
-    let mut notes = vec![
-        ("textDocument/completion at 1:2", completion, "has a textEdit that isn't on one line", "CompletionItem"),
-        (
-            "textDocument/completion at 2:6",
-            completion,
-            "has a textEdit that doesn't contain the completion's position",
-            "CompletionItem",
-        ),
-        (
-            "textDocument/completion at 3:2",
-            completion,
-            "has an InsertReplaceEdit textEdit, which lspcheck's client capabilities don't allow",
-            "CompletionItem",
-        ),
-        (
-            "textDocument/codeLens",
-            "codeLens/resolve",
-            "has a range that ends before it starts (item.range)",
-            "CodeLens",
-        ),
-        (
-            "textDocument/documentLink",
-            "documentLink/resolve",
-            "has a range that ends before it starts (item.range)",
-            "DocumentLink",
-        ),
-        ("textDocument/inlayHint", "inlayHint/resolve", "has an empty label", "InlayHint"),
-        ("workspace/symbol", "workspaceSymbol/resolve", "has a location.range that isn't a Range", "WorkspaceSymbol"),
-    ];
-    // Every number of their ranges is spelled as a decimal.
-    let hierarchy = "typeHierarchy/supertypes and typeHierarchy/subtypes";
-    let sources = ["1:2", "2:6", "3:2"].map(|at| format!("textDocument/prepareTypeHierarchy at {at}"));
-    for source in &sources {
-        notes.push((source, hierarchy, "has a range that ends before it starts (item.range)", "TypeHierarchyItem"));
-    }
-    for (source, methods, why, ty) in notes {
-        let note =
-            format!("follow-ups not sent for {source} ({methods}): its first item {why}, so it isn't a valid {ty}");
-        assert!(k1.contains(&note), "{note} missing in {k1}");
-    }
-}
-
-#[test]
-fn a_hierarchy_item_whose_selection_range_is_outside_its_range_isnt_followed_up() {
-    // The items aren't valid params, so the MethodNotFound the stand-in
-    // would answer their follow-ups with mustn't be asked for.
-    let r = fault("followup-hierarchy-bad-ranges");
-    passes_except(&r, &[]);
-    let k1 = detail(&r, "K1");
-    assert!(k1.starts_with("29 request(s) for 17 advertised method(s) were answered"), "{k1}");
-    for (source, methods, ty) in [
-        ("textDocument/prepareCallHierarchy", "callHierarchy/incomingCalls and callHierarchy/outgoingCalls", "Call"),
-        ("textDocument/prepareTypeHierarchy", "typeHierarchy/supertypes and typeHierarchy/subtypes", "Type"),
-    ] {
-        for position in ["1:2", "2:6", "3:2"] {
-            let note = format!(
-                "follow-ups not sent for {source} at {position} ({methods}): its first item has a selectionRange \
-                 outside its range, so it isn't a valid {ty}HierarchyItem"
-            );
-            assert!(k1.contains(&note), "{note} missing in {k1}");
+        let summary = format!(
+            "22 request(s) for 12 advertised method(s) were answered, none with MethodNotFound; follow-ups, which \
+             don't change K1's verdict: 19 sent for 9 method(s), {} answered with a result",
+            19 - not_found
+        );
+        assert!(k1.starts_with(&summary), "{fault_name}: {k1}");
+        let noted =
+            "was answered MethodNotFound (not judged: K1 can't tell whether the item it echoed was valid); item: ";
+        assert_eq!(k1.matches(noted).count(), not_found, "{fault_name}: {k1}");
+        let completion = format!(
+            "completionItem/resolve with the first item of textDocument/completion at 1:2 was answered \
+             MethodNotFound (not judged: K1 can't tell whether the item it echoed was valid); {item}"
+        );
+        assert!(k1.contains(&completion), "{fault_name}: {k1}");
+        for label in [
+            "typeHierarchy/subtypes with the first item of textDocument/prepareTypeHierarchy at 3:2",
+            "workspaceSymbol/resolve with the first item of workspace/symbol",
+        ] {
+            assert!(k1.contains(&format!("{label} {noted}")), "{label}: {k1}");
         }
     }
+    // The flawed completion item is quoted as received.
+    let k1 = detail(&fault("followup-invalid-items"), "K1");
+    let quoted = r#""textEdit":{"range":{"start":{"line":0,"character":0},"end":{"line":1,"character":0}}"#;
+    assert!(k1.contains(quoted), "{k1}");
+    assert!(
+        !k1.contains("callHierarchy/incomingCalls with the first item of textDocument/prepareCallHierarchy at 1:2 was"),
+        "{k1}"
+    );
 }
 
 #[test]
@@ -941,7 +845,7 @@ fn a_follow_up_answered_with_another_error_is_lawful() {
     passes_except(&r, &[]);
     let k1 = detail(&r, "K1");
     assert!(
-        k1.starts_with("41 request(s) for 21 advertised method(s) were answered, none with MethodNotFound"),
+        k1.starts_with("22 request(s) for 12 advertised method(s) were answered, none with MethodNotFound"),
         "{k1}"
     );
     assert!(
@@ -954,19 +858,21 @@ fn a_follow_up_answered_with_another_error_is_lawful() {
 }
 
 #[test]
-fn a_follow_up_left_unanswered_leaves_k1_inconclusive() {
+fn a_follow_up_left_unanswered_is_noted_and_k1_passes() {
     let (r, transcripts, _dir) = run_with_transcripts(&["--fault", "followup-unanswered"], &["--only", "K1"]);
-    passes_except(&r, &[("K1", "error")]);
-    assert_eq!(r.status, 2, "{}", r.stdout);
+    expect(&r, "K1", "pass");
+    assert_eq!(r.status, 0, "{}", r.stdout);
     let k1 = detail(&r, "K1");
     assert!(
         k1.starts_with(
-            "no response to codeLens/resolve with the first item of textDocument/codeLens by the end of the session, \
-             so K1 couldn't judge it"
+            "22 request(s) for 12 advertised method(s) were answered, none with MethodNotFound; follow-ups, which \
+             don't change K1's verdict: 19 sent for 9 method(s), 18 answered with a result; no response to \
+             codeLens/resolve with the first item of textDocument/codeLens by the end of the session (not judged)"
         ),
         "{k1}"
     );
     assert!(!k1.contains("follow-ups not sent"), "{k1}");
+    // The follow-ups after it are still sent.
     let mut sent: Vec<_> = transcript_messages(&transcripts.join("capabilities.jsonl"))
         .into_iter()
         .filter(|(dir, _)| dir == "out")
@@ -974,6 +880,28 @@ fn a_follow_up_left_unanswered_leaves_k1_inconclusive() {
         .collect();
     let later = sent.split_off(sent.iter().position(|m| m == "codeLens/resolve").unwrap() + 1);
     assert_eq!(later, ["documentLink/resolve", "inlayHint/resolve", "workspaceSymbol/resolve"]);
+}
+
+#[test]
+fn a_follow_up_that_couldnt_be_sent_before_table_requests_leaves_k1_inconclusive() {
+    // The stand-in exits on the first incomingCalls, so outgoingCalls, the
+    // next write, can't be delivered, nor can the table requests after it.
+    let r = run(&["--fault", "exit-on-first-incoming-calls"], &["--only", "K1"]);
+    expect(&r, "K1", "error");
+    assert_eq!(r.status, 2, "{}", r.stdout);
+    let k1 = detail(&r, "K1");
+    let cause = "lspcheck couldn't send callHierarchy/outgoingCalls with the first item of \
+                 textDocument/prepareCallHierarchy at 1:2 (";
+    assert!(k1.starts_with(cause), "{k1}");
+    assert!(k1.contains("the server exited with status 17"), "{k1}");
+    assert!(k1.contains("not sent after that: textDocument/prepareCallHierarchy at 2:6, "), "{k1}");
+    assert!(
+        k1.contains(
+            "no response to callHierarchy/incomingCalls with the first item of textDocument/prepareCallHierarchy at \
+             1:2 by the end of the session (not judged)"
+        ),
+        "{k1}"
+    );
 }
 
 /// The hover positions the stand-in reported for `file`, in order.

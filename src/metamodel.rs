@@ -502,22 +502,7 @@ pub fn validate_spending<'a>(
     root: &'a str,
     budget: usize,
 ) -> (Result<Violations<'a>, TooLarge>, usize) {
-    validate_with_options(ty, value, root, budget, false)
-}
-
-pub fn validate_followup_item(name: &str, item: &Value) -> Result<bool, TooLarge> {
-    let ty = Type::Reference { name: name.into() };
-    validate_with_options(&ty, item, "item", NODE_BUDGET, true).0.map(|v| v.is_empty())
-}
-
-fn validate_with_options<'a>(
-    ty: &'a Type,
-    value: &'a Value,
-    root: &'a str,
-    budget: usize,
-    opaque_lsp_any: bool,
-) -> (Result<Violations<'a>, TooLarge>, usize) {
-    let mut v = Validator { model: model(), budget, root, path: Vec::new(), opaque_lsp_any };
+    let mut v = Validator { model: model(), budget, root, path: Vec::new() };
     match v.check(ty, value, None) {
         Ok(found) => (Ok(found), budget - v.budget),
         // A violation established before the budget ran out stands: it was
@@ -566,7 +551,6 @@ struct Validator<'a> {
     budget: usize,
     root: &'a str,
     path: Vec<Step<'a>>,
-    opaque_lsp_any: bool,
 }
 
 impl<'a> Validator<'a> {
@@ -598,7 +582,6 @@ impl<'a> Validator<'a> {
                     return Ok(self.one(required, value));
                 }
             }
-            Type::Reference { name } if self.opaque_lsp_any && name == "LSPAny" => {}
             Type::Reference { name } => return self.reference(name, value),
             Type::Array { element } => {
                 let Value::Array(items) = value else { return Ok(self.one(expected(), value)) };

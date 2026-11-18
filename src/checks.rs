@@ -2533,6 +2533,8 @@ struct K1Asked {
     /// The request's id, unless lspcheck couldn't send it.
     id: Option<Id>,
     outcome: capabilities::Outcome,
+    /// For a follow-up, an excerpt of the item it echoed.
+    item: Option<String>,
 }
 
 /// Evidence held until session cleanup drains the final stdout, so replies
@@ -2542,7 +2544,6 @@ enum K1Pending {
     Sent {
         asked: Vec<K1Asked>,
         notes: Vec<String>,
-        inspection_errors: Vec<String>,
     },
     /// Each request's id, when it was sent, its label and its case.
     Mutation {
@@ -2568,7 +2569,7 @@ async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
 fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
     match pending {
         K1Pending::Judged(judgement) => Some(judgement),
-        K1Pending::Sent { mut asked, notes, inspection_errors } => {
+        K1Pending::Sent { mut asked, notes } => {
             for a in &mut asked {
                 let Some(id) = &a.id else { continue };
                 if a.outcome == capabilities::Outcome::Unanswered
@@ -2590,8 +2591,17 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
                     a.outcome = capabilities::Outcome::Error(codes::METHOD_NOT_FOUND);
                 }
             }
+            let (followups, asked): (Vec<_>, Vec<_>) = asked.into_iter().partition(|a| a.item.is_some());
             let asked: Vec<(String, capabilities::Outcome)> = asked.into_iter().map(|a| (a.label, a.outcome)).collect();
-            Some(capabilities::judge(&asked, &notes, &inspection_errors))
+            let followups: Vec<capabilities::FollowupAsked> = followups
+                .into_iter()
+                .map(|a| capabilities::FollowupAsked {
+                    label: a.label,
+                    outcome: a.outcome,
+                    item: a.item.unwrap_or_default(),
+                })
+                .collect();
+            Some(capabilities::judge(&asked, &followups, &notes))
         }
         K1Pending::Mutation { asked } => {
             let not_found = k1_not_found(&asked, finish);
@@ -2684,46 +2694,40 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
     }
 
     let mut asked: Vec<K1Asked> = Vec::new();
-    let mut inspection_errors = Vec::new();
     let mut requests = requests.iter();
     let mut sources: Vec<(&capabilities::Request, Id)> = Vec::new();
     let mut wait = true;
     let mut source_deadline = None;
-    let mut item_checks = ItemChecks::default();
     'requests: loop {
         if let Some(i) = sources.iter().position(|(_, id)| ctx.s.answer_to(id).is_some()) {
-            use capabilities::FollowupError::{Inconclusive, Unusable};
             let (r, id) = sources.remove(i);
             let item = match &ctx.s.answer_to(&id).expect("matched source").kind {
-                Kind::Response { outcome: Outcome::Result(result), .. } => {
-                    r.followup_item(result).map(|(ty, item)| (ty, std::sync::Arc::new(item.clone())))
-                }
-                Kind::Response { outcome: Outcome::Error { .. }, .. } => {
-                    Err(Unusable("the answer was an error".into()))
-                }
-                _ => Err(Unusable("the answer wasn't a result".into())),
+                Kind::Response { outcome: Outcome::Result(result), .. } => r.followup_item(result).cloned(),
+                Kind::Response { outcome: Outcome::Error { .. }, .. } => Err("the answer was an error".into()),
+                _ => Err("the answer wasn't a result".into()),
             };
-            let followups = match item {
-                Ok((ty, item)) => {
-                    let deadline = Instant::now() + K1_ITEM_CHECK;
-                    k1_check_item(&mut item_checks, r, ty, item.clone(), deadline).await.map(|()| r.followups(&item))
+            let item = match item {
+                Ok(item) => item,
+                Err(why) => {
+                    notes.push(r.skipped_followups(&why));
+                    continue;
                 }
-                Err(e) => Err(e),
             };
-            match followups {
-                Err(Unusable(why)) => notes.push(r.skipped_followups(&why)),
-                Err(Inconclusive(why)) => inspection_errors.push(r.skipped_followups(&why)),
-                Ok(followups) => {
-                    for (j, f) in followups.iter().enumerate() {
-                        let sent = k1_send(ctx, f, true).await;
-                        let failed = sent.id.is_none();
-                        wait &= sent.outcome != capabilities::Outcome::Unanswered;
-                        asked.push(sent);
-                        if failed {
-                            k1_not_sent_after(&mut notes, followups[j + 1..].iter().chain(requests));
-                            break 'requests;
-                        }
-                    }
+            let followups = r.followups(&item);
+            let excerpt = capabilities::excerpt(&item);
+            for (j, f) in followups.iter().enumerate() {
+                let mut sent = k1_send(ctx, f, true).await;
+                let failed = sent.id.is_none();
+                wait &= sent.outcome != capabilities::Outcome::Unanswered;
+                // A follow-up whose failure leaves requests from K1's table
+                // unsent is judged as one of them: K1 couldn't judge those.
+                if !(failed && requests.len() > 0) {
+                    sent.item = Some(excerpt.clone());
+                }
+                asked.push(sent);
+                if failed {
+                    k1_not_sent_after(&mut notes, followups[j + 1..].iter().chain(requests));
+                    break 'requests;
                 }
             }
         } else if let Some(r) = requests.next() {
@@ -2755,96 +2759,7 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
         "no answer was read before shutdown"
     };
     notes.extend(sources.iter().map(|(r, _)| r.skipped_followups(why)));
-    K1Pending::Sent { asked, notes, inspection_errors }
-}
-
-/// How long K1 waits for a follow-up item's check. Far longer than
-/// [`metamodel::NODE_BUDGET`] steps take, so only a starved machine runs out;
-/// it doesn't depend on `--timeout`, which bounds the server's replies.
-const K1_ITEM_CHECK: Duration = Duration::from_secs(10);
-
-/// Checks that a follow-up's item is a valid `ty` by the meta-model and by
-/// the rules [`capabilities::Request::item_problem`] adds, so that K1 sends
-/// valid params, giving up at `deadline`: any limit lspcheck hits is
-/// inconclusive.
-async fn k1_check_item(
-    checks: &mut ItemChecks,
-    source: &capabilities::Request,
-    ty: &'static str,
-    item: std::sync::Arc<Value>,
-    deadline: Instant,
-) -> Result<(), capabilities::FollowupError> {
-    use capabilities::FollowupError::{Inconclusive, Unusable};
-    let source = source.clone();
-    let check = move || -> Result<Option<String>, TooLarge> {
-        if !metamodel::validate_followup_item(ty, &item)? {
-            return Ok(Some(format!("its first item isn't a valid {ty} (see K2)")));
-        }
-        Ok(source.item_problem(&item))
-    };
-    match checks.run(deadline, check).await {
-        Ok(Ok(None)) => Ok(()),
-        Ok(Ok(Some(why))) => Err(Unusable(why)),
-        Ok(Err(TooLarge)) => Err(Inconclusive(format!("its first item is too large for lspcheck to check as a {ty}"))),
-        Err(Unfinished::Expired) => Err(Inconclusive(format!(
-            "lspcheck didn't finish checking its first item as a {ty} within {} s",
-            seconds(K1_ITEM_CHECK)
-        ))),
-        Err(Unfinished::Busy) => Err(Inconclusive(format!(
-            "lspcheck didn't check its first item as a {ty}: an earlier item check was still running"
-        ))),
-        Err(Unfinished::Unstarted(e)) => Err(Inconclusive(format!("lspcheck couldn't check its first item ({e})"))),
-    }
-}
-
-/// Why [`ItemChecks::run`] has no result.
-#[derive(Debug)]
-enum Unfinished {
-    Unstarted(std::io::Error),
-    Expired,
-    /// A check that outlived its deadline was still running.
-    Busy,
-}
-
-/// Runs checks on a thread with a [`metamodel::STACK`]-sized stack, one at a
-/// time. Nothing joins a thread: one that outlives its deadline finishes its
-/// budget-bounded work unobserved, and until it does no other check starts,
-/// so a slow machine doesn't pile up threads.
-#[derive(Default)]
-struct ItemChecks {
-    /// The thread of the last check, if it outlived its deadline.
-    late: Option<std::thread::JoinHandle<()>>,
-}
-
-impl ItemChecks {
-    /// Runs `f` and waits for it until `deadline`.
-    async fn run<R: Send + 'static>(
-        &mut self,
-        deadline: Instant,
-        f: impl FnOnce() -> R + Send + 'static,
-    ) -> Result<R, Unfinished> {
-        if self.late.as_ref().is_some_and(|thread| !thread.is_finished()) {
-            return Err(Unfinished::Busy);
-        }
-        self.late = None;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let thread = std::thread::Builder::new()
-            .name("lspcheck-validate".into())
-            .stack_size(metamodel::STACK)
-            .spawn(move || {
-                let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
-            })
-            .map_err(Unfinished::Unstarted)?;
-        match tokio::time::timeout_at(deadline, rx).await {
-            Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(panic))) => std::panic::resume_unwind(panic),
-            Ok(Err(_)) => unreachable!("the check's thread sends before it ends"),
-            Err(_) => {
-                self.late = Some(thread);
-                Err(Unfinished::Expired)
-            }
-        }
-    }
+    K1Pending::Sent { asked, notes }
 }
 
 /// Sends one of K1's requests, waiting up to `--timeout` if requested.
@@ -2857,11 +2772,11 @@ async fn k1_send(ctx: &mut Ctx<'_>, r: &capabilities::Request, wait: bool) -> K1
     } {
         Ok((id, reply)) => {
             let outcome = reply.as_ref().map_or(capabilities::Outcome::Unanswered, k1_outcome);
-            K1Asked { label, id: Some(id), outcome }
+            K1Asked { label, id: Some(id), outcome, item: None }
         }
         Err(e) => {
             let why = if e == WriteError::Closed { with_exit(ctx, e.to_string()).await } else { e.to_string() };
-            K1Asked { label, id: None, outcome: capabilities::Outcome::Undelivered(why) }
+            K1Asked { label, id: None, outcome: capabilities::Outcome::Undelivered(why), item: None }
         }
     }
 }
@@ -7466,61 +7381,6 @@ pub fn file_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn k1_checks_a_follow_ups_item_by_the_meta_model_and_the_specs_rules() {
-        use capabilities::FollowupError::Unusable;
-        let caps = json!({"completionProvider": {"resolveProvider": true}});
-        let doc = capabilities::Document { uri: "file:///w/a.txt", language_id: "go", text: "ab\n", opened: true };
-        let (requests, _) = capabilities::requests(&caps, &doc, &[Spot { line: 0, column: 1 }], Encoding::Utf16);
-        let completion = &requests[0];
-        let mut checks = ItemChecks::default();
-        let mut check = async |item: Value| {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            k1_check_item(&mut checks, completion, "CompletionItem", std::sync::Arc::new(item), deadline).await
-        };
-        assert_eq!(check(json!({"label": "a", "data": {"deep": [1]}})).await, Ok(()));
-        assert_eq!(
-            check(json!({"detail": "no label"})).await,
-            Err(Unusable("its first item isn't a valid CompletionItem (see K2)".into()))
-        );
-        let elsewhere = json!({"range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 2}},
-                               "newText": "a"});
-        assert_eq!(
-            check(json!({"label": "a", "textEdit": elsewhere})).await,
-            Err(Unusable(
-                "its first item has a textEdit that doesn't contain the completion's position, so it isn't a valid \
-                 CompletionItem"
-                    .into()
-            ))
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn item_checks_give_up_at_their_deadline_and_run_one_at_a_time() {
-        let mut checks = ItemChecks::default();
-        let later = || Instant::now() + Duration::from_secs(60);
-        // A check that can't finish before its deadline: the thread waits for
-        // a message sent only after K1 has given up on it.
-        let (go, wait) = std::sync::mpsc::channel::<()>();
-        let blocked = checks.run(Instant::now() + Duration::from_millis(50), move || wait.recv()).await;
-        assert!(matches!(blocked, Err(Unfinished::Expired)), "{blocked:?}");
-        // While its thread runs, no other check starts.
-        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = started.clone();
-        let busy = checks.run(later(), move || flag.store(true, std::sync::atomic::Ordering::SeqCst)).await;
-        assert!(matches!(busy, Err(Unfinished::Busy)), "{busy:?}");
-        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
-        // Once it has finished, checks start again.
-        go.send(()).unwrap();
-        let until = std::time::Instant::now() + Duration::from_secs(60);
-        while !checks.late.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
-            assert!(std::time::Instant::now() < until, "the released check didn't finish");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(matches!(checks.run(later(), || 7).await, Ok(7)));
-        assert!(checks.late.is_none());
-    }
 
     #[test]
     fn k1s_initialize_params_are_valid_and_k2_knows_its_follow_ups_results() {

@@ -359,6 +359,10 @@ const FAULTS: &[(&str, &str)] = &[
     ),
     ("drop-first-request", "never answer the first request about a document, then answer normally"),
     ("exit-on-first-hover", "exit with status 17 without answering the first hover request"),
+    (
+        "exit-on-first-incoming-calls",
+        "exit with status 17 without answering the first callHierarchy/incomingCalls request",
+    ),
     ("stop-at-crlf", "stop answering anything from the first request about crlf.txt"),
     ("exit-at-version-42", "exit, without answering, at the first request about a document at version 42"),
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
@@ -379,38 +383,20 @@ const FAULTS: &[(&str, &str)] = &[
         "advertise colorProvider, answer textDocument/documentColor with a result, then again with MethodNotFound when \
          shutdown arrives",
     ),
-    (
-        "followup-hierarchy-method-not-found",
-        "answer callHierarchy/incomingCalls, outgoingCalls and typeHierarchy/supertypes, subtypes with MethodNotFound",
-    ),
-    ("followup-resolve-method-not-found", "answer every resolve request K1 sends with MethodNotFound"),
+    ("followup-method-not-found", "lawful for K1: answer every follow-up K1 sends with MethodNotFound"),
     (
         "followup-sources-empty",
         "lawful: answer the requests whose items K1 follows up with null, an empty array or an empty CompletionList",
     ),
     ("followup-request-failed", "lawful: answer every follow-up K1 sends with RequestFailed (-32803)"),
-    ("followup-unanswered", "never answer codeLens/resolve"),
+    ("followup-unanswered", "lawful for K1: never answer codeLens/resolve"),
     ("followup-source-deferred", "lawful: hold the first completion reply until the next request"),
-    ("followup-large-data", "lawful: attach a large opaque data array to a code lens"),
-    (
-        "followup-symbol-information",
-        "lawful: answer workspace/symbol with a SymbolInformation, and workspaceSymbol/resolve with MethodNotFound",
-    ),
-    (
-        "followup-hierarchy-bad-ranges",
-        "lawful: give hierarchy items a selectionRange outside their range, and answer their follow-ups with \
-         MethodNotFound",
-    ),
     (
         "followup-invalid-items",
-        "lawful: give each item K1 follows up, but call hierarchy items, a flaw the meta-model's types don't show (a \
-         completion textEdit over two lines, away from the position or an InsertReplaceEdit, a range spelled with \
-         decimals or not that ends before it starts, an empty inlay hint label, a workspace symbol range of null), and \
-         answer their follow-ups with MethodNotFound; call hierarchy items have valid ranges spelled with a decimal",
-    ),
-    (
-        "followup-method-not-found-at-shutdown",
-        "hold the first completionItem/resolve and answer it with MethodNotFound when shutdown arrives",
+        "lawful for K1: give each item K1 follows up, but call hierarchy items, a flaw the meta-model's types don't \
+         show (a completion textEdit over two lines, away from the position or an InsertReplaceEdit, a range that ends \
+         before it starts, an empty inlay hint label, a workspace symbol range of null), and answer their follow-ups \
+         with MethodNotFound",
     ),
     ("defer-hover-until-shutdown", "lawful: answer hover requests only when shutdown arrives"),
     (
@@ -518,8 +504,6 @@ fn main() {
     let mut held_hovers: Vec<Value> = Vec::new();
     let mut defer_followup_source = fault("followup-source-deferred");
     let mut held_followup_source = None;
-    let mut hold_resolve = fault("followup-method-not-found-at-shutdown");
-    let mut held_resolve: Option<Value> = None;
     // Set by stop-after-unknown-cancel: requests are no longer answered.
     let mut no_more_answers = false;
     // For drop-first-request: whether the first document request was dropped.
@@ -1221,6 +1205,9 @@ fn main() {
         if method == "textDocument/hover" && fault("exit-on-first-hover") {
             std::process::exit(17);
         }
+        if method == "callHierarchy/incomingCalls" && fault("exit-on-first-incoming-calls") {
+            std::process::exit(17);
+        }
         if fault("drop-first-request")
             && !dropped_first
             && method.starts_with("textDocument/")
@@ -1573,11 +1560,6 @@ fn main() {
         {
             out.frame(&err(&color, -32601, "method not found"));
         }
-        if method == "shutdown"
-            && let Some(resolve) = held_resolve.take()
-        {
-            out.frame(&err(&resolve, -32601, "method not found"));
-        }
         if method == "textDocument/hover" && fault("echo-positions") {
             let uri = msg.pointer("/params/textDocument/uri").and_then(Value::as_str).unwrap_or("");
             let position = &msg["params"]["position"];
@@ -1733,8 +1715,6 @@ fn main() {
             "workspace/symbol" if followups_advertised => {
                 let symbols = if fault("followup-sources-empty") {
                     json!([])
-                } else if fault("followup-symbol-information") {
-                    json!([{"name": "standin", "kind": 13, "location": {"uri": ELSEWHERE, "range": range(0, 0, 0, 1)}}])
                 } else if fault("followup-invalid-items") {
                     json!([{"name": "standin", "kind": 13, "location": {"uri": ELSEWHERE, "range": null}, "data": followup_data("workspaceSymbol")}])
                 } else {
@@ -1752,18 +1732,6 @@ fn main() {
                 let uri = msg.pointer("/params/textDocument/uri").cloned().unwrap_or(Value::Null);
                 let mut result =
                     followup_source(&method, uri, &msg["params"]["position"], fault("followup-sources-empty"));
-                if method == "textDocument/codeLens"
-                    && fault("followup-large-data")
-                    && let Some(lens) = result.get_mut(0)
-                {
-                    lens["data"] = Value::Array(vec![Value::Null; 500_000]);
-                }
-                if method.ends_with("Hierarchy")
-                    && fault("followup-hierarchy-bad-ranges")
-                    && let Some(item) = result.get_mut(0)
-                {
-                    item["selectionRange"] = range(0, 0, 1, 0);
-                }
                 if fault("followup-invalid-items") {
                     flaw_followup_source(&method, &mut result, &msg["params"]["position"]);
                 }
@@ -1783,15 +1751,9 @@ fn main() {
             | "documentLink/resolve"
             | "inlayHint/resolve"
             | "workspaceSymbol/resolve" => {
-                let hierarchy = !method.ends_with("/resolve");
                 if method == "codeLens/resolve" && fault("followup-unanswered") {
                     // Never answered.
-                } else if method == "completionItem/resolve" && std::mem::take(&mut hold_resolve) {
-                    held_resolve = Some(id);
-                } else if hierarchy
-                    && (fault("followup-hierarchy-method-not-found") || fault("followup-hierarchy-bad-ranges"))
-                    || !hierarchy && fault("followup-resolve-method-not-found")
-                    || method == "workspaceSymbol/resolve" && fault("followup-symbol-information")
+                } else if fault("followup-method-not-found")
                     || fault("followup-invalid-items") && !method.starts_with("callHierarchy/")
                 {
                     out.frame(&err(&id, -32601, "method not found"));
@@ -1799,7 +1761,7 @@ fn main() {
                     out.frame(&err(&id, -32803, "not today"));
                 } else {
                     let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                    out.frame(&match followup_answer(&method, params, fault("followup-large-data")) {
+                    out.frame(&match followup_answer(&method, params) {
                         Some(result) => ok(&id, result),
                         None => err(&id, -32602, "the item didn't come back with the data the stand-in gave it"),
                     });
@@ -2755,22 +2717,13 @@ fn followup_source(method: &str, uri: Value, position: &Value, empty: bool) -> V
 }
 
 /// For followup-invalid-items: gives the first item of a source answer at
-/// `position` a flaw the meta-model's types don't show, but a call hierarchy
-/// item valid ranges spelled with a decimal.
+/// `position`, but a call hierarchy item, a flaw the meta-model's types
+/// don't show.
 fn flaw_followup_source(method: &str, result: &mut Value, position: &Value) {
-    let n = |text: &str| -> Value { serde_json::from_str(text).expect("a JSON number") };
     let item = if result.get("items").is_some() { &mut result["items"][0] } else { &mut result[0] };
     match method {
-        "textDocument/prepareCallHierarchy" => {
-            item["range"] = json!({"start": {"line": 0, "character": 0}, "end": {"line": n("2.0"), "character": 0}});
-        }
-        "textDocument/prepareTypeHierarchy" => {
-            // Every number a decimal, so that reading them only as plain
-            // integers would see no order at all.
-            let at = |line: &str| json!({"line": n(line), "character": n("0.0")});
-            item["range"] = json!({"start": at("3.0"), "end": at("1.0")});
-            item["selectionRange"] = json!({"start": at("3.0"), "end": at("3.0")});
-        }
+        "textDocument/prepareCallHierarchy" => {}
+        "textDocument/prepareTypeHierarchy" => item["range"] = range(3, 0, 1, 0),
         "textDocument/completion" => {
             // K1 asks at lines 0, 1 and 2, at characters 1, 5 and 1.
             let line = position["line"].as_u64().unwrap_or(0) as usize;
@@ -2791,7 +2744,7 @@ fn flaw_followup_source(method: &str, result: &mut Value, position: &Value) {
 
 /// The answer to a follow-up, echoing its item to show it came back; `None`
 /// when the item doesn't carry the `data` the stand-in gave it.
-fn followup_answer(method: &str, params: Value, large_data: bool) -> Option<Value> {
+fn followup_answer(method: &str, params: Value) -> Option<Value> {
     let (kind, item) = match method {
         "callHierarchy/incomingCalls" | "callHierarchy/outgoingCalls" => ("callHierarchy", &params["item"]),
         "typeHierarchy/supertypes" | "typeHierarchy/subtypes" => ("typeHierarchy", &params["item"]),
@@ -2801,13 +2754,7 @@ fn followup_answer(method: &str, params: Value, large_data: bool) -> Option<Valu
         "inlayHint/resolve" => ("inlayHint", &params),
         _ => ("workspaceSymbol", &params),
     };
-    let data = item.get("data")?;
-    let correct = if large_data && kind == "codeLens" {
-        data.as_array().is_some_and(|a| a.len() == 500_000 && a.iter().all(Value::is_null))
-    } else {
-        *data == followup_data(kind)
-    };
-    if !correct {
+    if item.get("data")? != &followup_data(kind) {
         return None;
     }
     let mut item = item.clone();

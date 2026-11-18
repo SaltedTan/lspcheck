@@ -5,10 +5,10 @@
 //! document they are asked about, the follow-ups their answers lead to, and
 //! the verdict on how they were answered.
 //!
-//! Pure functions only; the scenario that sends the requests, and checks a
-//! follow-up's item against the meta-model, is in [`crate::checks`].
+//! Pure functions only; the scenario that sends the requests is in
+//! [`crate::checks`].
 
-use crate::message::{self, codes};
+use crate::message::codes;
 use crate::text::{self, Encoding, Position};
 use serde_json::{Value, json};
 
@@ -157,7 +157,7 @@ fn table() -> Vec<Row> {
             None,
             "textDocument/completion",
             Position(none()),
-            Some(Followup::resolve(&["completionItem/resolve"], "CompletionItem")),
+            Some(Followup::resolve(&["completionItem/resolve"])),
         ),
         ("renameProvider", Some("prepareProvider"), "textDocument/prepareRename", Position(none()), None),
         ("renameProvider", None, "textDocument/rename", Position(json!({"newName": NEW_NAME})), None),
@@ -167,17 +167,14 @@ fn table() -> Vec<Row> {
             None,
             "textDocument/prepareCallHierarchy",
             Position(none()),
-            Some(Followup::hierarchy(
-                &["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"],
-                "CallHierarchyItem",
-            )),
+            Some(Followup::hierarchy(&["callHierarchy/incomingCalls", "callHierarchy/outgoingCalls"])),
         ),
         (
             "typeHierarchyProvider",
             None,
             "textDocument/prepareTypeHierarchy",
             Position(none()),
-            Some(Followup::hierarchy(&["typeHierarchy/supertypes", "typeHierarchy/subtypes"], "TypeHierarchyItem")),
+            Some(Followup::hierarchy(&["typeHierarchy/supertypes", "typeHierarchy/subtypes"])),
         ),
         ("monikerProvider", None, "textDocument/moniker", Position(none()), None),
         ("selectionRangeProvider", None, "textDocument/selectionRange", Positions, None),
@@ -188,14 +185,14 @@ fn table() -> Vec<Row> {
             None,
             "textDocument/codeLens",
             Document(none()),
-            Some(Followup::resolve(&["codeLens/resolve"], "CodeLens")),
+            Some(Followup::resolve(&["codeLens/resolve"])),
         ),
         (
             "documentLinkProvider",
             None,
             "textDocument/documentLink",
             Document(none()),
-            Some(Followup::resolve(&["documentLink/resolve"], "DocumentLink")),
+            Some(Followup::resolve(&["documentLink/resolve"])),
         ),
         ("colorProvider", None, "textDocument/documentColor", Document(none()), None),
         ("diagnosticProvider", None, "textDocument/diagnostic", Document(none()), None),
@@ -207,7 +204,7 @@ fn table() -> Vec<Row> {
             None,
             "textDocument/inlayHint",
             Range(none()),
-            Some(Followup::resolve(&["inlayHint/resolve"], "InlayHint")),
+            Some(Followup::resolve(&["inlayHint/resolve"])),
         ),
         ("semanticTokensProvider", Some("full"), "textDocument/semanticTokens/full", Document(none()), None),
         ("semanticTokensProvider", Some("range"), "textDocument/semanticTokens/range", Range(none()), None),
@@ -216,7 +213,7 @@ fn table() -> Vec<Row> {
             None,
             "workspace/symbol",
             Workspace(json!({"query": ""})),
-            Some(Followup::resolve(&["workspaceSymbol/resolve"], "WorkspaceSymbol")),
+            Some(Followup::resolve(&["workspaceSymbol/resolve"])),
         ),
     ]
 }
@@ -353,28 +350,22 @@ pub fn requests(caps: &Value, doc: &Document, spots: &[Spot], encoding: Encoding
     (requests, notes)
 }
 
-/// The methods a source answer leads to and the first item's wire type.
+/// The methods a source answer leads to, and whether they take its first
+/// item wrapped as `{item}` (the hierarchies) or as their params (resolve).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Followup {
     methods: &'static [&'static str],
-    item: &'static str,
     wrapped: bool,
 }
 
 impl Followup {
-    fn hierarchy(methods: &'static [&'static str], item: &'static str) -> Self {
-        Self { methods, item, wrapped: true }
+    fn hierarchy(methods: &'static [&'static str]) -> Self {
+        Self { methods, wrapped: true }
     }
 
-    fn resolve(methods: &'static [&'static str], item: &'static str) -> Self {
-        Self { methods, item, wrapped: false }
+    fn resolve(methods: &'static [&'static str]) -> Self {
+        Self { methods, wrapped: false }
     }
-}
-
-#[derive(Debug, PartialEq)]
-pub enum FollowupError {
-    Unusable(String),
-    Inconclusive(String),
 }
 
 impl Request {
@@ -386,45 +377,25 @@ impl Request {
         format!("follow-ups not sent for {} ({}): {why}", self.label, self.followup_methods().join(" and "))
     }
 
-    /// The source answer's first item and the meta-model type it must be
-    /// valid as before it is passed back (the caller checks that).
-    pub fn followup_item<'a>(&self, result: &'a Value) -> Result<(&'static str, &'a Value), FollowupError> {
-        use FollowupError::Unusable;
-        let Some(f) = self.followup else { return Err(Unusable("it has no follow-ups".into())) };
+    /// The source answer's first item, or why there is none: an array's
+    /// first element, or a `CompletionList`'s first item.
+    pub fn followup_item<'a>(&self, result: &'a Value) -> Result<&'a Value, String> {
+        if self.followup.is_none() {
+            return Err("it has no follow-ups".into());
+        }
         let items = match result {
-            Value::Null => return Err(Unusable("the answer was null".into())),
+            Value::Null => return Err("the answer was null".into()),
             Value::Array(items) => items,
             Value::Object(list) if self.method == "textDocument/completion" => match list.get("items") {
                 Some(Value::Array(items)) => items,
-                _ => return Err(Unusable("the answer had no items array".into())),
+                _ => return Err("the answer had no items array".into()),
             },
-            _ => return Err(Unusable("the answer wasn't an array".into())),
+            _ => return Err("the answer wasn't an array".into()),
         };
-        let Some(item) = items.first() else { return Err(Unusable("the answer was empty".into())) };
-        Ok((f.item, item))
+        items.first().ok_or_else(|| "the answer was empty".into())
     }
 
-    /// Why `item`, the first item [`Self::followup_item`] gave and a valid
-    /// instance of its type by the meta-model, isn't passed back, if it
-    /// isn't: it breaks a rule of the specification that the meta-model's
-    /// types can't express, or it may be of a type the follow-up doesn't take.
-    /// Members for client capabilities lspcheck didn't offer, and rules the
-    /// specification only recommends, don't count.
-    pub fn item_problem(&self, item: &Value) -> Option<String> {
-        let f = self.followup?;
-        if let Some(why) = item_flaw(f.item, item, &self.params["position"]) {
-            return Some(format!("its first item {why}, so it isn't a valid {}", f.item));
-        }
-        // workspace/symbol may answer SymbolInformation[] even with
-        // resolveProvider, and a SymbolInformation is also a valid
-        // WorkspaceSymbol, but only the latter can be resolved. Only a
-        // WorkspaceSymbol may have `data` or a location without a range.
-        (f.item == "WorkspaceSymbol" && item.get("data").is_none() && item["location"].get("range").is_some())
-            .then(|| "its first item may be a SymbolInformation, which workspaceSymbol/resolve doesn't take".into())
-    }
-
-    /// The follow-ups for `item`, which [`Self::item_problem`] passed, each
-    /// with the item exactly as received.
+    /// The follow-ups for `item`, each with the item exactly as received.
     pub fn followups(&self, item: &Value) -> Vec<Request> {
         let Some(f) = self.followup else { return Vec::new() };
         let params = if f.wrapped { json!({"item": item}) } else { item.clone() };
@@ -440,156 +411,17 @@ impl Request {
     }
 }
 
-/// A position as (line, character).
-type Place = (i64, i64);
+/// The longest excerpt of an item a note quotes, in characters.
+const ITEM_SHOWN: usize = 200;
 
-/// A range's start and end.
-type Span = (Place, Place);
-
-/// A `Position`-shaped value's line and character: integers, however
-/// spelled (`2` or `2.0`), as the meta-model reads them.
-fn place(p: &Value) -> Option<Place> {
-    let integer = |v: &Value| v.as_number().and_then(message::integer_value);
-    Some((integer(&p["line"])?, integer(&p["character"])?))
-}
-
-/// The ends of a `Range`-shaped value: an object whose `start` and `end` are
-/// `Position`-shaped.
-fn span(v: &Value) -> Option<Span> {
-    Some((place(&v["start"])?, place(&v["end"])?))
-}
-
-/// The longest path to a range a note names, in characters.
-const PATH_SHOWN: usize = 80;
-
-/// How `item`, a valid `ty` by the meta-model, breaks a rule of the
-/// specification the meta-model can't express, if it does. Completion text
-/// edits are judged against `position`, the completion's. A value lspcheck
-/// can't read where the rule needs one counts as breaking it.
-fn item_flaw(ty: &str, item: &Value, position: &Value) -> Option<String> {
-    if let Some(mut path) = disordered_range(item, &mut String::from("item")) {
-        if let Some((end, _)) = path.char_indices().nth(PATH_SHOWN) {
-            path.truncate(end);
-            path.push('…');
-        }
-        return Some(format!("has a range that ends before it starts ({path})"));
+/// `item` as compact JSON, cut short for a note.
+pub fn excerpt(item: &Value) -> String {
+    let mut text = item.to_string();
+    if let Some((end, _)) = text.char_indices().nth(ITEM_SHOWN) {
+        text.truncate(end);
+        text.push('…');
     }
-    match ty {
-        "CallHierarchyItem" | "TypeHierarchyItem" => match (span(&item["range"]), span(&item["selectionRange"])) {
-            (Some(range), Some(selection)) if range.0 <= selection.0 && selection.1 <= range.1 => None,
-            _ => Some("has a selectionRange outside its range".into()),
-        },
-        "CompletionItem" => completion_flaw(item, position),
-        "InlayHint" => {
-            let empty = match &item["label"] {
-                Value::String(label) => label.is_empty(),
-                Value::Array(parts) => {
-                    parts.is_empty() || parts.iter().any(|p| p["value"].as_str().is_none_or(str::is_empty))
-                }
-                _ => true,
-            };
-            if empty {
-                return Some("has an empty label".into());
-            }
-            let clashing =
-                item.get("textEdits").is_some_and(|edits| edit_spans(edits).is_none_or(|edits| clash(&edits, true)));
-            clashing.then(|| "has textEdits that overlap".into())
-        }
-        // The union `Location | {uri}` takes `{uri, range: null}` as the
-        // latter, which has no range.
-        "WorkspaceSymbol" => item["location"]
-            .get("range")
-            .is_some_and(|range| span(range).is_none())
-            .then(|| "has a location.range that isn't a Range".into()),
-        _ => None,
-    }
-}
-
-/// How a completion item's edits break their rules, if they do: its
-/// `textEdit` must be a `TextEdit` (lspcheck doesn't offer
-/// `insertReplaceSupport`) on one line, containing the completion's
-/// position, and its `additionalTextEdits` may neither overlap it or each
-/// other nor share a start with any of them.
-fn completion_flaw(item: &Value, position: &Value) -> Option<String> {
-    let edit = item.get("textEdit");
-    if edit.is_some_and(|e| e.get("insert").is_some() || e.get("replace").is_some()) {
-        return Some("has an InsertReplaceEdit textEdit, which lspcheck's client capabilities don't allow".into());
-    }
-    let main = edit.map(|e| span(&e["range"]));
-    if let Some(main) = main {
-        let Some((start, end)) = main.filter(|(start, end)| start.0 == end.0) else {
-            return Some("has a textEdit that isn't on one line".into());
-        };
-        if !place(position).is_some_and(|at| start <= at && at <= end) {
-            return Some("has a textEdit that doesn't contain the completion's position".into());
-        }
-    }
-    let additional = item.get("additionalTextEdits")?;
-    let edits = edit_spans(additional).map(|mut edits| {
-        edits.extend(main.flatten());
-        edits
-    });
-    edits
-        .is_none_or(|edits| clash(&edits, false))
-        .then(|| "has additionalTextEdits that overlap or share a start with each other or its textEdit".into())
-}
-
-/// The ranges of an array of text edits, in order, if every one has one.
-fn edit_spans(edits: &Value) -> Option<Vec<Span>> {
-    edits.as_array()?.iter().map(|e| span(&e["range"])).collect()
-}
-
-/// Whether ordered ranges `edits`, in array order, clash: one starts inside
-/// another, or several start at one place. With `inserts`, as for any
-/// `TextEdit[]`, several may start at one place if all but the last there
-/// are inserts (empty ranges).
-fn clash(edits: &[Span], inserts: bool) -> bool {
-    let mut order: Vec<usize> = (0..edits.len()).collect();
-    order.sort_by_key(|&i| (edits[i].0, i));
-    // The furthest end of the ranges that start before this place.
-    let mut furthest: Option<Place> = None;
-    for here in order.chunk_by(|&a, &b| edits[a].0 == edits[b].0) {
-        let start = edits[here[0]].0;
-        let earlier = &here[..here.len() - 1];
-        let shared = !earlier.is_empty() && !(inserts && earlier.iter().all(|&i| edits[i].1 == start));
-        if shared || furthest.is_some_and(|furthest| start < furthest) {
-            return true;
-        }
-        furthest = furthest.max(here.iter().map(|&i| edits[i].1).max());
-    }
-    false
-}
-
-/// The path of the first `Range`-shaped value in `value`, below `path`, that
-/// ends before it starts. The items' opaque `LSPAny` values, their `data`
-/// and a command's `arguments`, aren't looked into: they may hold anything.
-fn disordered_range(value: &Value, path: &mut String) -> Option<String> {
-    if span(value).is_some_and(|(start, end)| start > end) {
-        return Some(path.clone());
-    }
-    let len = path.len();
-    let below = |path: &mut String, v: &Value| {
-        let found = disordered_range(v, path);
-        path.truncate(len);
-        found
-    };
-    let opaque = |key: &str| key == "data" || key == "arguments";
-    match value {
-        Value::Object(members) => members.iter().filter(|(key, _)| !opaque(key)).find_map(|(key, v)| {
-            if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                path.push('.');
-                path.push_str(key);
-            } else {
-                path.push_str(&format!("[{}]", Value::from(key.as_str())));
-            }
-            below(path, v)
-        }),
-        Value::Array(items) => items.iter().enumerate().find_map(|(i, v)| {
-            path.push_str(&format!("[{i}]"));
-            below(path, v)
-        }),
-        _ => None,
-    }
+    text
 }
 
 /// How one of K1's requests went.
@@ -635,7 +467,7 @@ fn code_name(code: i64) -> Option<&'static str> {
 }
 
 /// The other errors, by code, each with the requests that got it.
-fn other_errors(asked: &[(String, Outcome)]) -> Option<String> {
+fn other_errors<'a>(asked: impl Iterator<Item = (&'a str, &'a Outcome)>) -> Option<String> {
     let mut by_code: Vec<(i64, Vec<&str>)> = Vec::new();
     for (label, outcome) in asked {
         if let Outcome::Error(code) = outcome
@@ -660,15 +492,60 @@ fn other_errors(asked: &[(String, Outcome)]) -> Option<String> {
     Some(format!("other errors, which are lawful: {}", each.join("; ")))
 }
 
-/// K1's verdict over the requests it sent, in order, with `notes` on what it
-/// didn't send. MethodNotFound for any of them is a failure seen, whatever
-/// happened to the rest. LSP sets no deadline for a response, so a delivered
-/// request with no response by the end of the session is inconclusive rather
-/// than a failure; one lspcheck couldn't deliver is an error too.
-pub fn judge(asked: &[(String, Outcome)], notes: &[String], inspection_errors: &[String]) -> Judgement {
+/// A follow-up K1 sent, with an [`excerpt`] of the item it echoed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FollowupAsked {
+    pub label: String,
+    pub outcome: Outcome,
+    pub item: String,
+}
+
+/// What became of the follow-ups, for K1's detail. They don't change K1's
+/// verdict: K1 can't tell whether an item the server produced is a valid
+/// param, so a MethodNotFound may be the server's answer to an invalid
+/// item rather than to the method.
+fn followup_notes(followups: &[FollowupAsked]) -> Vec<String> {
+    if followups.is_empty() {
+        return Vec::new();
+    }
+    let mut methods: Vec<&str> = followups.iter().map(|f| f.label.split(' ').next().unwrap_or(&f.label)).collect();
+    methods.sort_unstable();
+    methods.dedup();
+    let results = followups.iter().filter(|f| f.outcome == Outcome::Answered).count();
+    let mut notes = vec![format!(
+        "follow-ups, which don't change K1's verdict: {} sent for {} method(s), {results} answered with a result",
+        followups.len(),
+        methods.len()
+    )];
+    for f in followups {
+        match &f.outcome {
+            Outcome::Error(codes::METHOD_NOT_FOUND) => notes.push(format!(
+                "{} was answered MethodNotFound (not judged: K1 can't tell whether the item it echoed was valid); \
+                 item: {}",
+                f.label, f.item
+            )),
+            Outcome::Unanswered => {
+                notes.push(format!("no response to {} by the end of the session (not judged)", f.label))
+            }
+            Outcome::Undelivered(why) => notes.push(format!("lspcheck couldn't send {} ({why})", f.label)),
+            Outcome::Answered | Outcome::Error(_) => {}
+        }
+    }
+    notes
+}
+
+/// K1's verdict over the requests it sent, in order, with what became of
+/// their `followups` and `notes` on what it didn't send. MethodNotFound for
+/// any request is a failure seen, whatever happened to the rest. LSP sets no
+/// deadline for a response, so a delivered request with no response by the
+/// end of the session is inconclusive rather than a failure; one lspcheck
+/// couldn't deliver is an error too. Follow-ups are only reported.
+pub fn judge(asked: &[(String, Outcome)], followups: &[FollowupAsked], notes: &[String]) -> Judgement {
     let with_notes = |detail: String| {
         let mut parts = vec![detail];
-        parts.extend(other_errors(asked));
+        let errors = asked.iter().map(|(l, o)| (l.as_str(), o));
+        parts.extend(other_errors(errors.chain(followups.iter().map(|f| (f.label.as_str(), &f.outcome)))));
+        parts.extend(followup_notes(followups));
         parts.extend(notes.iter().cloned());
         parts.join("; ")
     };
@@ -690,9 +567,8 @@ pub fn judge(asked: &[(String, Outcome)], notes: &[String], inspection_errors: &
         let each = if unanswered.len() == 1 { "it" } else { "them" };
         format!("no response to {} by the end of the session, so K1 couldn't judge {each}", unanswered.join(", "))
     });
-    // Everything K1 couldn't judge.
-    let unjudged: Vec<String> =
-        unanswered_detail.into_iter().chain(undelivered).chain(inspection_errors.iter().cloned()).collect();
+    // Everything K1 couldn't judge: unanswered requests, then undelivered ones.
+    let unjudged: Vec<String> = unanswered_detail.into_iter().chain(undelivered).collect();
     if !not_found.is_empty() {
         let mut parts = vec![format!(
             "MethodNotFound (-32601) for {} advertised request(s): {}",
@@ -712,14 +588,8 @@ pub fn judge(asked: &[(String, Outcome)], notes: &[String], inspection_errors: &
         }
         return Judgement::NotExercised(detail);
     }
-    // Follow-ups come between their sources, so a method may recur apart.
-    let mut methods: Vec<&str> = Vec::new();
-    for (label, _) in asked {
-        let method = label.split(' ').next().unwrap_or(label);
-        if !methods.contains(&method) {
-            methods.push(method);
-        }
-    }
+    let mut methods: Vec<&str> = asked.iter().map(|(label, _)| label.split(' ').next().unwrap_or(label)).collect();
+    methods.dedup();
     Judgement::Pass(with_notes(format!(
         "{} request(s) for {} advertised method(s) were answered, none with MethodNotFound",
         asked.len(),
@@ -920,14 +790,9 @@ mod tests {
         }
     }
 
-    /// The follow-ups for a source answer whose first item is valid by the
-    /// meta-model.
-    fn plan(r: &Request, answer: &Value) -> Result<Vec<Request>, FollowupError> {
-        let item = r.followup_item(answer)?.1;
-        match r.item_problem(item) {
-            Some(why) => Err(FollowupError::Unusable(why)),
-            None => Ok(r.followups(item)),
-        }
+    /// The follow-ups for a source answer.
+    fn plan(r: &Request, answer: &Value) -> Result<Vec<Request>, String> {
+        r.followup_item(answer).map(|item| r.followups(item))
     }
 
     #[test]
@@ -943,305 +808,60 @@ mod tests {
             (completion, json!({"isIncomplete": false, "items": []}), "the answer was empty"),
             (completion, json!({"isIncomplete": false}), "the answer had no items array"),
         ] {
-            assert_eq!(r.followup_item(&answer), Err(FollowupError::Unusable(why.into())), "{answer}");
+            assert_eq!(r.followup_item(&answer), Err(why.into()), "{answer}");
         }
         let item = json!({"label": "a"});
-        assert_eq!(completion.followup_item(&json!([item])), Ok(("CompletionItem", &item)));
-    }
-
-    /// A range from `(start line, start character)` to `(end line, end
-    /// character)`, each number as given, so its spelling can vary.
-    fn range(start: (Value, Value), end: (Value, Value)) -> Value {
-        json!({"start": {"line": start.0, "character": start.1}, "end": {"line": end.0, "character": end.1}})
-    }
-
-    /// A range of plain integers.
-    fn at(sl: u32, sc: u32, el: u32, ec: u32) -> Value {
-        range((sl.into(), sc.into()), (el.into(), ec.into()))
-    }
-
-    /// Whether `r` follows up `item`, or else why not.
-    fn judged(r: &Request, item: &Value) -> Result<(), String> {
-        r.item_problem(item).map_or(Ok(()), Err)
+        assert_eq!(completion.followup_item(&json!([item])), Ok(&item));
     }
 
     #[test]
-    fn a_hierarchy_item_with_disordered_or_uncontained_ranges_gets_no_follow_up() {
-        let caps = json!({"callHierarchyProvider": true, "typeHierarchyProvider": true});
-        let requests = source_requests(&caps);
-        let item = |range: Value, selection: Value| json!({"name": "f", "kind": 12, "uri": "file:///w/a.txt", "range": range, "selectionRange": selection});
-        for r in &requests {
-            for (range, selection, why) in [
-                (at(1, 0, 0, 5), at(1, 0, 1, 0), Some("has a range that ends before it starts (item.range)")),
-                (at(0, 0, 2, 0), at(1, 4, 1, 2), Some("has a range that ends before it starts (item.selectionRange)")),
-                (at(1, 2, 3, 0), at(1, 1, 1, 4), Some("has a selectionRange outside its range")),
-                (at(1, 2, 3, 0), at(2, 0, 3, 1), Some("has a selectionRange outside its range")),
-                (at(1, 2, 3, 0), at(1, 2, 3, 0), None),
-                (at(1, 2, 3, 0), at(1, 9, 2, 0), None),
-            ] {
-                let got = plan(r, &json!([item(range.clone(), selection.clone())]));
-                match why {
-                    Some(why) => {
-                        let ty = if r.method.contains("Call") { "CallHierarchyItem" } else { "TypeHierarchyItem" };
-                        let why = format!("its first item {why}, so it isn't a valid {ty}");
-                        assert_eq!(got, Err(FollowupError::Unusable(why)), "{range} {selection}");
-                    }
-                    None => assert_eq!(got.map(|sent| sent.len()), Ok(2), "{range} {selection}"),
-                }
-            }
-        }
+    fn an_excerpt_of_an_item_is_cut_on_a_character_boundary() {
+        assert_eq!(excerpt(&json!({"label": "a", "data": 7})), r#"{"label":"a","data":7}"#);
+        let long = excerpt(&json!({"label": "é".repeat(300)}));
+        assert_eq!(long.chars().count(), ITEM_SHOWN + 1);
+        assert!(long.starts_with(r#"{"label":"éé"#) && long.ends_with("é…"), "{long}");
+    }
+
+    fn followup(label: &str, outcome: Outcome) -> FollowupAsked {
+        FollowupAsked { label: label.into(), outcome, item: r#"{"label":"a"}"#.into() }
     }
 
     #[test]
-    fn positions_are_compared_by_value_however_they_are_spelled() {
-        let caps = json!({"callHierarchyProvider": true});
-        let prepare = &source_requests(&caps)[0];
-        let item = |range: Value, selection: Value| json!({"name": "f", "kind": 12, "uri": "file:///w/a.txt", "range": range, "selectionRange": selection});
-        let n = |text: &str| -> Value { serde_json::from_str(text).unwrap() };
-        let zero = || (n("0"), n("0.0"));
-        // 0 to 2.0 is in order, and contains 1e0 to 2.0.
-        let valid = item(range(zero(), (n("2.0"), n("0"))), range((n("1e0"), n("0")), (n("2.0"), n("0.0"))));
-        assert_eq!(judged(prepare, &valid), Ok(()));
-        let inverted = item(range((n("3.0"), n("0")), (n("1.0"), n("0"))), range(zero(), zero()));
-        let why = "its first item has a range that ends before it starts (item.range), so it isn't a valid \
-                   CallHierarchyItem";
-        assert_eq!(judged(prepare, &inverted), Err(why.into()));
-        let outside = item(range(zero(), (n("2.0"), n("0"))), range((n("2"), n("0")), (n("2.0"), n("1"))));
-        let why = "its first item has a selectionRange outside its range, so it isn't a valid CallHierarchyItem";
-        assert_eq!(judged(prepare, &outside), Err(why.into()));
-    }
-
-    #[test]
-    fn a_range_anywhere_in_an_item_must_be_in_order_but_opaque_values_may_hold_anything() {
-        let caps = json!({"codeLensProvider": {"resolveProvider": true}});
-        let lenses = &source_requests(&caps)[0];
-        let ok = at(0, 0, 0, 1);
-        let backwards = at(2, 0, 1, 0);
-        let lens = |extra: Value| {
-            let mut lens = json!({"range": ok});
-            lens.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            lens
-        };
-        let invalid = |path: &str| {
-            Err(format!("its first item has a range that ends before it starts ({path}), so it isn't a valid CodeLens"))
-        };
-        assert_eq!(judged(lenses, &lens(json!({}))), Ok(()));
-        assert_eq!(judged(lenses, &json!({"range": backwards})), invalid("item.range"));
-        // Within the same line too.
-        assert_eq!(judged(lenses, &json!({"range": at(1, 4, 1, 3)})), invalid("item.range"));
-        assert_eq!(
-            judged(lenses, &lens(json!({"x-ext": {"nested": [1, backwards]}}))),
-            invalid("item[\"x-ext\"].nested[1]")
-        );
-        // `data` and a command's `arguments` are LSPAny, which may hold anything.
-        for opaque in [
-            json!({"data": {"range": backwards}}),
-            json!({"command": {"title": "t", "command": "c", "arguments": [backwards]}}),
-            // Not Range-shaped: the line isn't an integer.
-            json!({"x": {"start": {"line": 2.5, "character": 0}, "end": {"line": 1, "character": 0}}}),
-        ] {
-            assert_eq!(judged(lenses, &lens(opaque.clone())), Ok(()), "{opaque}");
-        }
-        // A long path is cut short.
-        let key = "k".repeat(200);
-        let Err(why) = judged(lenses, &lens(json!({key: backwards}))) else { panic!() };
-        assert!(why.contains(&format!("(item.{}…)", "k".repeat(75))), "{why}");
-    }
-
-    #[test]
-    fn a_completion_items_edits_must_be_valid_for_lspchecks_client_and_its_position() {
-        let caps = json!({"completionProvider": {"resolveProvider": true}});
-        // At 1:2, that is line 0, character 1.
-        let completion = &source_requests(&caps)[0];
-        let edit = |range: Value| json!({"range": range, "newText": "x"});
-        let item = |extra: Value| {
-            let mut item = json!({"label": "a"});
-            item.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            item
-        };
-        let invalid = |why: &str| Err(format!("its first item {why}, so it isn't a valid CompletionItem"));
-        for (extra, want) in [
-            (json!({"textEdit": edit(at(0, 0, 0, 1))}), Ok(())),
-            (json!({"textEdit": edit(at(0, 1, 0, 1))}), Ok(())),
-            (json!({"textEdit": edit(at(0, 1, 0, 2))}), Ok(())),
-            (json!({"textEdit": edit(at(0, 0, 1, 0))}), invalid("has a textEdit that isn't on one line")),
-            (
-                json!({"textEdit": edit(at(0, 2, 0, 3))}),
-                invalid("has a textEdit that doesn't contain the completion's position"),
-            ),
-            (
-                json!({"textEdit": {"newText": "x", "insert": at(0, 0, 0, 1), "replace": at(0, 0, 0, 2)}}),
-                invalid("has an InsertReplaceEdit textEdit, which lspcheck's client capabilities don't allow"),
-            ),
-            // Additional edits may touch, but neither overlap nor share a start.
-            (json!({"textEdit": edit(at(0, 1, 0, 2)), "additionalTextEdits": [edit(at(0, 0, 0, 1))]}), Ok(())),
-            (json!({"additionalTextEdits": [edit(at(1, 0, 1, 2)), edit(at(0, 0, 0, 0))]}), Ok(())),
-            (
-                json!({"textEdit": edit(at(0, 1, 0, 2)), "additionalTextEdits": [edit(at(0, 1, 0, 1))]}),
-                invalid("has additionalTextEdits that overlap or share a start with each other or its textEdit"),
-            ),
-            (
-                json!({"additionalTextEdits": [edit(at(3, 0, 3, 0)), edit(at(3, 0, 3, 0))]}),
-                invalid("has additionalTextEdits that overlap or share a start with each other or its textEdit"),
-            ),
-            (
-                json!({"additionalTextEdits": [edit(at(2, 0, 4, 0)), edit(at(1, 0, 2, 1))]}),
-                invalid("has additionalTextEdits that overlap or share a start with each other or its textEdit"),
-            ),
-            (
-                json!({"additionalTextEdits": [edit(at(3, 1, 3, 0))]}),
-                invalid("has a range that ends before it starts (item.additionalTextEdits[0].range)"),
-            ),
-        ] {
-            assert_eq!(judged(completion, &item(extra.clone())), want, "{extra}");
-        }
-    }
-
-    #[test]
-    fn an_inlay_hint_needs_a_label_and_edits_that_dont_overlap() {
-        let caps = json!({"inlayHintProvider": {"resolveProvider": true}});
-        let hints = &source_requests(&caps)[0];
-        let hint = |label: Value| json!({"position": {"line": 0, "character": 1}, "label": label});
-        let invalid = |why: &str| Err(format!("its first item {why}, so it isn't a valid InlayHint"));
-        for (label, want) in [
-            (json!("a"), Ok(())),
-            (json!([{"value": "a"}, {"value": "b"}]), Ok(())),
-            (json!(""), invalid("has an empty label")),
-            (json!([]), invalid("has an empty label")),
-            (json!([{"value": "a"}, {"value": ""}]), invalid("has an empty label")),
-            (
-                json!([{"value": "a", "location": {"uri": "file:///w/a.txt", "range": at(0, 3, 0, 2)}}]),
-                invalid("has a range that ends before it starts (item.label[0].location.range)"),
-            ),
-        ] {
-            assert_eq!(judged(hints, &hint(label.clone())), want, "{label}");
-        }
-        let edit = |range: Value| json!({"range": range, "newText": "x"});
-        for (edits, want) in [
-            (json!([edit(at(0, 0, 0, 1)), edit(at(0, 1, 0, 2))]), Ok(())),
-            // A TextEdit[] may insert several times at one place, before at
-            // most one other edit there.
-            (json!([edit(at(0, 1, 0, 1)), edit(at(0, 1, 0, 1)), edit(at(0, 1, 0, 3))]), Ok(())),
-            (json!([edit(at(0, 1, 0, 3)), edit(at(0, 1, 0, 1))]), invalid("has textEdits that overlap")),
-            (json!([edit(at(0, 0, 0, 3)), edit(at(0, 2, 0, 2))]), invalid("has textEdits that overlap")),
-        ] {
-            let mut item = hint(json!("a"));
-            item["textEdits"] = edits.clone();
-            assert_eq!(judged(hints, &item), want, "{edits}");
-        }
-    }
-
-    #[test]
-    fn only_a_symbol_that_cant_be_a_symbol_information_is_resolved() {
-        let caps = json!({"workspaceSymbolProvider": {"resolveProvider": true}});
-        let symbols = &source_requests(&caps)[0];
-        let uri = "file:///w/a.txt";
-        let full = json!({"uri": uri, "range": at(0, 0, 0, 1)});
-        let information = "its first item may be a SymbolInformation, which workspaceSymbol/resolve doesn't take";
-        let invalid = |why: &str| Err(format!("its first item {why}, so it isn't a valid WorkspaceSymbol"));
-        for (symbol, want) in [
-            (json!({"name": "s", "kind": 13, "location": full}), Err(information.into())),
-            (json!({"name": "s", "kind": 13, "location": full, "containerName": "c"}), Err(information.into())),
-            (json!({"name": "s", "kind": 13, "location": full, "data": null}), Ok(())),
-            (json!({"name": "s", "kind": 13, "location": {"uri": uri}}), Ok(())),
-            // The meta-model reads `{uri, range: null}` as the range-less
-            // location, which ignores the extra member.
-            (
-                json!({"name": "s", "kind": 13, "location": {"uri": uri, "range": null}, "data": 1}),
-                invalid("has a location.range that isn't a Range"),
-            ),
-            (
-                json!({"name": "s", "kind": 13, "location": {"uri": uri, "range": at(1, 0, 0, 0)}, "data": 1}),
-                invalid("has a range that ends before it starts (item.location.range)"),
-            ),
-        ] {
-            assert_eq!(judged(symbols, &symbol), want, "{symbol}");
-            if want.is_ok() {
-                assert_eq!(symbols.followups(&symbol)[0].params, symbol);
-            }
-        }
-    }
-
-    #[test]
-    fn the_items_hold_opaque_values_only_in_data_and_command_arguments() {
-        use crate::metamodel::{Type, model};
-        use std::collections::BTreeSet;
-        /// Adds the names of the members of `ty`, reached through `key`, whose
-        /// type is `LSPAny`.
-        fn opaque(ty: &Type, key: &str, within: &mut Vec<String>, found: &mut BTreeSet<String>) {
-            match ty {
-                Type::Reference { name } if name == "LSPAny" => {
-                    found.insert(key.into());
-                }
-                Type::Reference { name } if !within.contains(name) => {
-                    if let Some(s) = model().structures.get(name) {
-                        within.push(name.clone());
-                        for t in s.extends.iter().chain(&s.mixins) {
-                            opaque(t, key, within, found);
-                        }
-                        for p in &s.properties {
-                            opaque(&p.ty, &p.name, within, found);
-                        }
-                        within.pop();
-                    } else if let Some(alias) = model().aliases.get(name) {
-                        opaque(&alias.ty, key, within, found);
-                    }
-                }
-                Type::Array { element } => opaque(element, key, within, found),
-                Type::Map { value, .. } => opaque(value, key, within, found),
-                Type::And { items } | Type::Or { items } | Type::Tuple { items } => {
-                    for t in items {
-                        opaque(t, key, within, found);
-                    }
-                }
-                Type::Literal { value } => {
-                    for p in &value.properties {
-                        opaque(&p.ty, &p.name, within, found);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut found = BTreeSet::new();
-        for (.., followup) in table() {
-            if let Some(f) = followup {
-                opaque(&Type::Reference { name: f.item.into() }, "", &mut Vec::new(), &mut found);
-            }
-        }
-        assert_eq!(found, BTreeSet::from(["arguments".to_string(), "data".to_string()]));
-    }
-
-    #[test]
-    fn edits_clash_when_they_overlap_or_share_a_start() {
-        let span = |sl, sc, el, ec| ((sl, sc), (el, ec));
-        let apart = [span(0, 0, 0, 2), span(0, 2, 0, 3), span(1, 0, 1, 0)];
-        assert!(!clash(&apart, false) && !clash(&apart, true));
-        // Out of order, the later one runs into the earlier.
-        let into = [span(1, 0, 2, 0), span(0, 0, 1, 5)];
-        assert!(clash(&into, false) && clash(&into, true));
-        // An insert inside another edit.
-        let inside = [span(0, 0, 0, 3), span(0, 1, 0, 1)];
-        assert!(clash(&inside, false) && clash(&inside, true));
-        // Inserts at one place, then one other edit there: lawful only as a TextEdit[].
-        let inserts = [span(0, 1, 0, 1), span(0, 1, 0, 1), span(0, 1, 0, 4)];
-        assert!(clash(&inserts, false) && !clash(&inserts, true));
-        let replace_first = [span(0, 1, 0, 4), span(0, 1, 0, 1)];
-        assert!(clash(&replace_first, true));
-        let two_replaces = [span(0, 1, 0, 4), span(0, 1, 0, 2)];
-        assert!(clash(&two_replaces, true));
-        assert!(!clash(&[], false));
-    }
-
-    #[test]
-    fn a_pass_counts_each_method_once_though_follow_ups_come_between() {
+    fn follow_ups_are_reported_but_dont_change_k1s_verdict() {
         let asked = [
             answered("textDocument/completion at 1:2", Outcome::Answered),
-            answered("completionItem/resolve with the first item of textDocument/completion at 1:2", Outcome::Answered),
-            answered("textDocument/completion at 2:6", Outcome::Answered),
-            answered("completionItem/resolve with the first item of textDocument/completion at 2:6", Outcome::Answered),
+            answered("textDocument/codeLens", Outcome::Answered),
         ];
-        let Judgement::Pass(detail) = judge(&asked, &[], &[]) else { panic!() };
-        assert!(detail.starts_with("4 request(s) for 2 advertised method(s) were answered"), "{detail}");
+        let followups = [
+            followup(
+                "completionItem/resolve with the first item of textDocument/completion at 1:2",
+                Outcome::Error(-32601),
+            ),
+            followup("codeLens/resolve with the first item of textDocument/codeLens", Outcome::Unanswered),
+            followup("codeLens/resolve with the first item of textDocument/codeLens", Outcome::Error(-32803)),
+            followup("inlayHint/resolve with the first item of textDocument/inlayHint", Outcome::Answered),
+            followup(
+                "inlayHint/resolve with the first item of textDocument/inlayHint",
+                Outcome::Undelivered("the server's stdin is closed".into()),
+            ),
+        ];
+        let Judgement::Pass(detail) = judge(&asked, &followups, &[]) else { panic!() };
+        assert_eq!(
+            detail,
+            "2 request(s) for 2 advertised method(s) were answered, none with MethodNotFound; other errors, which are \
+             lawful: -32803 (RequestFailed) for codeLens/resolve with the first item of textDocument/codeLens; \
+             follow-ups, which don't change K1's verdict: 5 sent for 3 method(s), 1 answered with a result; \
+             completionItem/resolve with the first item of textDocument/completion at 1:2 was answered MethodNotFound \
+             (not judged: K1 can't tell whether the item it echoed was valid); item: {\"label\":\"a\"}; no response to \
+             codeLens/resolve with the first item of textDocument/codeLens by the end of the session (not judged); \
+             lspcheck couldn't send inlayHint/resolve with the first item of textDocument/inlayHint (the server's \
+             stdin is closed)"
+        );
+        // A table request's MethodNotFound still fails, with the follow-ups noted.
+        let asked = [answered("textDocument/completion at 1:2", Outcome::Error(-32601))];
+        let Judgement::Fail(detail) = judge(&asked, &followups[..1], &[]) else { panic!() };
+        assert!(detail.starts_with("MethodNotFound (-32601) for 1 advertised request(s): textDocument/completion"));
+        assert!(detail.contains("was answered MethodNotFound (not judged"), "{detail}");
     }
 
     fn answered(label: &str, outcome: Outcome) -> (String, Outcome) {
@@ -1260,17 +880,6 @@ mod tests {
         assert!(detail.starts_with("MethodNotFound (-32601) for 1 advertised request(s): textDocument/foldingRange"));
         assert!(detail.contains("no response to textDocument/documentColor by the end of the session"), "{detail}");
         assert!(detail.contains("-32803 (RequestFailed) for textDocument/codeLens"), "{detail}");
-    }
-
-    #[test]
-    fn a_local_follow_up_validation_limit_leaves_k1_inconclusive() {
-        let error = "follow-ups not sent for textDocument/inlayHint (inlayHint/resolve): its first item is too large";
-        let errors = [error.to_string()];
-        let mut asked = [answered("textDocument/inlayHint", Outcome::Answered)];
-        assert_eq!(judge(&asked, &[], &errors), Judgement::Error(error.into()));
-        asked[0].1 = Outcome::Error(codes::METHOD_NOT_FOUND);
-        let Judgement::Fail(detail) = judge(&asked, &[], &errors) else { panic!() };
-        assert!(detail.contains(error), "{detail}");
     }
 
     #[test]
@@ -1323,7 +932,7 @@ mod tests {
     #[test]
     fn nothing_advertised_is_not_exercised_and_answers_pass() {
         assert!(matches!(judge(&[], &[], &[]), Judgement::NotExercised(_)));
-        let Judgement::NotExercised(d) = judge(&[], &["not sent: x".into()], &[]) else { panic!() };
+        let Judgement::NotExercised(d) = judge(&[], &[], &["not sent: x".into()]) else { panic!() };
         assert!(d.contains("not sent: x"), "{d}");
         let asked = [
             answered("textDocument/hover at 1:1", Outcome::Answered),
