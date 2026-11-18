@@ -2757,7 +2757,8 @@ fn the_clean_standin_survives_mutation() {
     assert_eq!(
         r.report["mutation"],
         serde_json::json!({
-            "seed": 20261111, "format": 1, "cases": 4, "cases_run": 4, "stopped": null, "isolated": []
+            "seed": 20261111, "format": 1, "cases": 4, "cases_run": 4, "stopped": null, "isolated": [],
+            "messages": {"errors": 0, "warnings": 0, "first": []}
         })
     );
     assert!(r.stdout.lines().next().unwrap().ends_with("— mutation seed 20261111, 4 cases"), "{}", r.stdout);
@@ -2818,7 +2819,8 @@ fn the_seed_and_case_flags_override_the_profile() {
     let (r, t, _keep) = mutated(&[], &["--mutation-seed", "7", "--mutation-cases", "1", "--only", "M1,M2,M3"]);
     assert_eq!(
         r.report["mutation"],
-        serde_json::json!({"seed": 7, "format": 1, "cases": 1, "cases_run": 1, "stopped": null, "isolated": []})
+        serde_json::json!({"seed": 7, "format": 1, "cases": 1, "cases_run": 1, "stopped": null, "isolated": [],
+            "messages": {"errors": 0, "warnings": 0, "first": []}})
     );
     expect(&r, "M1", "pass");
     let plans = recorded_plans(&t);
@@ -3018,6 +3020,27 @@ fn a_case_that_fails_only_in_the_whole_run_is_not_reproduced_alone() {
             "detail": "not reproduced: M2 FAIL in textDocument/foldingRange and workspace/symbol not seen again"
         }])
     );
+}
+
+#[test]
+fn the_servers_error_and_warning_messages_are_reported_but_change_no_verdict() {
+    // The stand-in shows an Error and logs a Warning on the session's fourth
+    // didChange, case 1's first step.
+    let (clean, _, _keep) = mutated(&[], &[]);
+    let (r, _, _keep) = mutated(&["mutation-error-message"], &[]);
+    assert_eq!(r.verdicts, clean.verdicts, "{}", r.stdout);
+    assert_eq!(r.status, clean.status, "{}", r.stdout);
+    assert_eq!(
+        r.report["mutation"]["messages"],
+        serde_json::json!({"errors": 1, "warnings": 1, "first": [
+            {"case": 1, "type": "error", "method": "window/showMessage", "message": "contained crash"},
+            {"case": 1, "type": "warning", "method": "window/logMessage", "message": "recovered"},
+        ]})
+    );
+    let line = r#"  server messages: 1 error, 1 warning during mutation (first, case 1: "contained crash")"#;
+    assert_eq!(r.stdout.lines().nth(1), Some(line), "{}", r.stdout);
+    assert_eq!(clean.report["mutation"]["messages"], serde_json::json!({"errors": 0, "warnings": 0, "first": []}));
+    assert!(!clean.stdout.contains("server messages"), "{}", clean.stdout);
 }
 
 #[test]

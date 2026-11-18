@@ -616,6 +616,9 @@ pub struct MutationSummary {
     /// The first failing or erroring cases, each run again alone
     /// ([step 6](../docs/source-mutations.md#step-6)). Never a verdict.
     pub isolated: Vec<Isolated>,
+    /// The Error and Warning messages the server showed or logged during
+    /// the cases. Lawful, so never a verdict.
+    pub messages: ServerMessages,
     /// The checks each case's own evidence failed or made an error.
     #[serde(skip)]
     pub troubles: Vec<Trouble>,
@@ -728,6 +731,76 @@ pub struct Isolated {
 
 /// How many failing or erroring cases are run again alone.
 pub const ISOLATED_CASES: usize = 3;
+
+/// The Error (type 1) and Warning (type 2) messages the server sent in
+/// `window/showMessage`, `window/logMessage` and `window/showMessageRequest`
+/// from the first mutation's `didChange` until lspcheck began shutting down
+/// (M1's window), counted and the first few kept.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ServerMessages {
+    pub errors: u64,
+    pub warnings: u64,
+    /// The first [`FIRST_MESSAGES`], in the order read.
+    pub first: Vec<ServerMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ServerMessage {
+    /// The case under way when it was read, its restoration and recovery
+    /// included.
+    pub case: u64,
+    /// `"error"` or `"warning"`.
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub method: String,
+    /// Its text, cut to [`MESSAGE_CHARS`] characters.
+    pub message: String,
+}
+
+/// How many of the server's messages the summary keeps.
+pub const FIRST_MESSAGES: usize = 3;
+/// The most characters of each kept message.
+pub const MESSAGE_CHARS: usize = 200;
+
+/// The server's Error and Warning messages among `messages` read from
+/// `from` on, each in the last of `cases` (start, case) begun by then.
+/// Malformed params are K2's to judge, and aren't counted.
+fn server_messages(messages: &[(Duration, Message)], from: Duration, cases: &[(Duration, u64)]) -> ServerMessages {
+    let mut found = ServerMessages::default();
+    for (at, m) in messages.iter().filter(|(at, _)| *at >= from) {
+        let method = match &m.kind {
+            Kind::Notification { method } if method == "window/showMessage" || method == "window/logMessage" => method,
+            Kind::Request { method, .. } if method == "window/showMessageRequest" => method,
+            _ => continue,
+        };
+        let field = |key: &str| m.value.get("params").and_then(|p| p.get(key));
+        let (Some(kind), Some(text)) =
+            (field("type").and_then(Value::as_i64), field("message").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let Some(&(_, case)) = cases.iter().rev().find(|(start, _)| start <= at) else { continue };
+        let kind = match kind {
+            1 => {
+                found.errors += 1;
+                "error"
+            }
+            2 => {
+                found.warnings += 1;
+                "warning"
+            }
+            _ => continue,
+        };
+        if found.first.len() < FIRST_MESSAGES {
+            let message = match text.char_indices().nth(MESSAGE_CHARS) {
+                Some((end, _)) => format!("{}…", &text[..end]),
+                None => text.to_string(),
+            };
+            found.first.push(ServerMessage { case, kind, method: method.clone(), message });
+        }
+    }
+    found
+}
 
 /// An isolated run of one case: the case, what carried over into it, and
 /// the main run's deadline, which it keeps.
@@ -6009,6 +6082,9 @@ async fn leave_mutation(
     // Everything already read is taken in before M1 is judged: an end of
     // output queued behind it would otherwise go unseen.
     let drained = ctx.s.absorb_all().await;
+    if let Some(from) = first_change {
+        summary.messages = server_messages(&ctx.s.messages, from, &ext.cases);
+    }
     let id = ctx.s.fresh_id();
     let deadline = Instant::now() + ctx.cfg.request_timeout;
     let registered = ctx.s.begin_request(&id, "shutdown", deadline).await;
@@ -7270,6 +7346,49 @@ mod tests {
         r.settle_absent(|_, _| Some("a frame was skipped".into()));
         assert_eq!(r.verdict, Verdict::Error);
         assert_eq!(r.detail, "inconclusive, because a frame was skipped: as reported");
+    }
+
+    #[test]
+    fn mutation_counts_the_servers_errors_and_warnings_from_the_first_change_by_case() {
+        let ms = Duration::from_millis;
+        let message = |method: &str, id: Option<u64>, params: Value| {
+            let mut v = json!({"jsonrpc": "2.0", "method": method, "params": params});
+            if let Some(id) = id {
+                v["id"] = id.into();
+            }
+            Message::classify(v)
+        };
+        let show =
+            |kind: Value, text: &str| message("window/showMessage", None, json!({"type": kind, "message": text}));
+        let log = |kind: u64, text: &str| message("window/logMessage", None, json!({"type": kind, "message": text}));
+        let long = "é".repeat(MESSAGE_CHARS + 1);
+        let messages = vec![
+            // Before the first change.
+            (ms(5), show(1.into(), "early")),
+            (ms(10), log(2, "case 0's warning")),
+            // Info and Log, malformed params, and a showMessage sent as a request.
+            (ms(11), log(3, "info")),
+            (ms(12), log(4, "log")),
+            (ms(13), show("1".into(), "a string type")),
+            (ms(14), message("window/showMessage", None, json!({"type": 1}))),
+            (ms(15), message("window/showMessage", Some(7), json!({"type": 1, "message": "a request"}))),
+            (ms(20), message("window/showMessageRequest", Some(8), json!({"type": 1, "message": "asked"}))),
+            (ms(30), show(1.into(), &long)),
+            (ms(40), log(1, "kept count, not text")),
+        ];
+        let found = server_messages(&messages, ms(10), &[(ms(1), 0), (ms(20), 1)]);
+        assert_eq!((found.errors, found.warnings), (3, 1));
+        let first: Vec<(u64, &str, &str)> = found.first.iter().map(|m| (m.case, m.kind, m.method.as_str())).collect();
+        assert_eq!(
+            first,
+            [
+                (0, "warning", "window/logMessage"),
+                (1, "error", "window/showMessageRequest"),
+                (1, "error", "window/showMessage")
+            ]
+        );
+        assert_eq!(found.first[2].message, format!("{}…", "é".repeat(MESSAGE_CHARS)));
+        assert_eq!(server_messages(&messages, ms(41), &[(ms(1), 0)]), ServerMessages::default());
     }
 
     #[test]
