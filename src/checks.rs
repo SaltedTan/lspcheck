@@ -618,8 +618,7 @@ pub struct MutationSummary {
     /// The first failing or erroring cases, each run again alone
     /// ([step 6](../docs/source-mutations.md#step-6)). Never a verdict.
     pub isolated: Vec<Isolated>,
-    /// The Error and Warning messages the server showed or logged during
-    /// the cases. Lawful, so never a verdict.
+    /// Informational server message counts and samples from the main run.
     pub messages: ServerMessages,
     /// The checks each case's own evidence failed or made an error.
     #[serde(skip)]
@@ -638,6 +637,7 @@ pub struct MutationSummary {
     /// When the first successfully delivered mutation write began.
     #[serde(skip)]
     pub first_change: Option<Duration>,
+    /// When lspcheck attempted to write `shutdown`, after registration.
     #[serde(skip)]
     pub shutdown_at: Option<Duration>,
 }
@@ -739,10 +739,7 @@ pub struct Isolated {
 /// How many failing or erroring cases are run again alone.
 pub const ISOLATED_CASES: usize = 3;
 
-/// The Error (type 1) and Warning (type 2) messages the server sent in
-/// `window/showMessage`, `window/logMessage` and `window/showMessageRequest`
-/// from the first mutation's `didChange` until shutdown, counted
-/// and the first few kept.
+/// Counts and samples of the server's Error and Warning messages.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ServerMessages {
     pub errors: u64,

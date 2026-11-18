@@ -421,13 +421,15 @@ every delivery as taking its full write deadline, so a server slow to read (back
 already reserved, not the run's. The budget is a worst case: with the example profiles' 30 s request timeout it is
 over ten minutes per case, though a case usually takes seconds, which is why `run_timeout` defaults to an hour. A
 configuration whose case budget exceeds `run_timeout` is a usage error naming both (exit status 2), checked under
-`--mutate` when there is a seed file, before the server starts, so a run never silently admits no case. One that
-leaves less than a minute beyond the case budget starts cases only in the run's first seconds, so a slow machine may
-run fewer cases than asked with every verdict passing. Before starting the mutation scenario, `--mutate` tries to
-write a warning to stderr naming both, then proceeds within one second even if stderr is blocked. A test
-checks the stock example profiles' `[mutation]` sections against both. If a case's budget runs out anyway, no further
-step starts, but the restoration is still sent, with its own write deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the
-cases not run), so no case ever starts on a document lspcheck couldn't restore.
+`--mutate` when there is a seed file, before the server starts. If `run_timeout` leaves less than a minute beyond
+one case's budget, a slow machine may run fewer cases than requested while every verdict still passes. With no time
+left beyond that budget, even the first case may miss its start window. Before launching the mutation scenario,
+lspcheck attempts to write an advisory to stderr with the timeout, case budget and remaining start window. It waits
+up to one second for the write. A test checks that the stock example profiles leave at least a minute to start a case.
+
+If a case's budget runs out anyway, no further step starts, but the restoration is still sent, with its own write
+deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the cases not run), so no case ever
+starts on a document lspcheck couldn't restore.
 
 The written-bytes bound is a cap, not a threshold: everything lspcheck writes in the scenario counts (the seed
 `didOpen`s, baseline probes, every `didChange`, request, poll and answer to a server request, and `shutdown` and
@@ -459,16 +461,18 @@ The JSON report gains a top-level `"mutation"`: `null` when the scenario didn't 
 cases planned and run, and why the run stopped early, if it did. The terminal header adds
 `— mutation seed 20261109, 20 cases`. The schema id is unchanged, as when `"profile"` was added.
 
-A server may report a contained crash only as a message, which is lawful and judged by nothing, so the summary
-also counts the server's Error (type 1) and Warning (type 2) messages: `"messages": {"errors": 1, "warnings": 1,
-"first": [{"type": "error", "message": "contained crash"}, {"type": "warning", "message": "recovered"}]}`, always
-present. It counts every `window/showMessage`, `window/logMessage` and `window/showMessageRequest` of either type
-read from the first mutation's `didChange` until lspcheck begins writing `shutdown` in the main run, including
-messages read during restoration and recovery. It keeps the first three in full. The collector requires an integer
-`type` and a string `message`. K2 judges the rest of the params. Frames lspcheck skips (larger than
-`--max-frame-mib`) are unavailable to the collector. When there is at least one message, the terminal report adds
-`server messages: 1 error, 1 warning during mutation (first ones, "contained crash"; "recovered")` below its header,
-and the Markdown summary adds the same line above its counts. Verdicts stay the same.
+A server may report a contained crash only as a message. The JSON mutation summary always includes `messages`,
+with zero counts and an empty `first` array when no qualifying message was observed. For example,
+`"messages": {"errors": 1, "warnings": 1,
+"first": [{"type": "error", "message": "contained crash"}, {"type": "warning", "message": "recovered"}]}`.
+The summary counts `window/showMessage` and `window/logMessage` notifications and `window/showMessageRequest`
+requests with an integer `type` of 1 (Error) or 2 (Warning) and a string `message`. K2 validates the full params
+separately. It includes messages read in the main run from the start of the first successfully delivered mutation
+`didChange` until lspcheck attempts to write `shutdown`, including restoration and recovery. If lspcheck never
+attempts that write, it counts qualifying messages read through cleanup. The counts cover inspected output. The
+summary keeps the first three messages in full, in the order read. When any messages qualify, the terminal report adds
+`server messages: 1 error, 1 warning during mutation (first ones, "contained crash"; "recovered")` below its header.
+Markdown shows the same counts and quotes above its verdict counts. The summary is informational.
 
 The scenario's transcript, `mutation.jsonl`, is an ordinary session transcript, so `lspcheck replay mutation.jsonl --
 SERVER` replays it as it is: the workspace line recreates the seed files, and every `didChange`, request and poll is

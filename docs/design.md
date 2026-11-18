@@ -649,15 +649,14 @@ capabilities = "default"       # planned: or a path to a capabilities JSON
   vary between runs (some name the milliseconds at which evidence was seen).
   Text and attributes use XML 1.0 escaping: illegal characters become U+FFFD, and attribute LF, CR and tab characters
   become numeric character references (`&#10;`, `&#13;`, `&#9;`) to preserve arbitrary server text.
-- `--markdown`: a heading with pass/fail counts and the server command in a backtick-safe code span, followed by
-  the terminal report's counts line, then a table with failures
+- `--markdown`: a heading with pass/fail counts, the server command in a backtick-safe code span,
+  the terminal report's counts line, and a table with failures
   and errors first and every cell escaped for Markdown (including literal ampersands and tildes), then the transcript
   paths of failed or errored checks. Code spans display CR/LF as `\r`/`\n` so commands and paths stay within one paragraph.
 - Terminal, JUnit and Markdown evidence references use `transcript: PATH` for per-scenario failures and errors, and
   `transcripts: DIR` for cross-cutting failures and errors, using the shared parent of the recorded scenario paths.
-- With `--mutate`, stderr warns if [less than a minute remains](source-mutations.md#bounds) beyond one case's budget
-  in which a case can start. The JSON, terminal and Markdown reports include the main mutation run's Error and
-  Warning [message counts and first three quotes](source-mutations.md#reports-transcripts-and-reproduction).
+- For mutation runs, see the [stderr advisory](source-mutations.md#bounds) and
+  [server message summary](source-mutations.md#reports-transcripts-and-reproduction).
 - `--transcripts DIR`: one JSONL per session with direction, monotonic timestamp, raw bytes (base64 when not UTF-8),
   how the reader split them into frames, and stderr. Each file includes a meta line naming the workspace and the
   files it held, so a replay can recreate it. Each event takes a sequence number from a process-wide atomic counter:

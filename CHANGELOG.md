@@ -4,13 +4,10 @@
 
 ### Added
 
-- Under `--mutate`, lspcheck warns on stderr when `mutation.run_timeout` leaves less than a minute beyond one case's
-  budget in which cases can start, since a slow machine may then run fewer cases than asked with every verdict
-  passing. The run, its report and its exit status are unchanged.
-- Under `--mutate`, the report counts the Error and Warning messages the server sent with `window/showMessage`,
-  `window/logMessage` or `window/showMessageRequest` during the cases, so a contained crash the server reports only
-  as a message is visible. The JSON report's `mutation.messages` has the counts and the first three messages.
-  The terminal and Markdown reports quote those messages when there is at least one. Verdicts stay the same.
+- Mutation runs can flag a short `mutation.run_timeout` with a
+  [case start warning on stderr](https://github.com/SaltedTan/lspcheck/blob/main/docs/source-mutations.md#bounds).
+- The JSON, terminal and Markdown reports now include an informational
+  [summary of server Error and Warning messages during mutation](https://github.com/SaltedTan/lspcheck/blob/main/docs/source-mutations.md#reports-transcripts-and-reproduction).
 
 ### Fixed
 

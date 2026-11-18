@@ -348,13 +348,8 @@ impl Mutation {
             .saturating_add(CASE_MARGIN)
     }
 
-    /// A warning for a run whose `run_timeout` leaves less than
-    /// [`START_WINDOW_WARNING`] beyond one case's budget. A case starts only
-    /// while its whole budget fits in what is left of the run, so such a run
-    /// starts cases only in its first seconds, and on a slow machine runs
-    /// fewer than asked with every verdict still passing (even a single case
-    /// may not start when its budget leaves no room). `None` with no seed
-    /// file, when M1 to M3 are skipped.
+    /// The [case start advisory](../docs/source-mutations.md#bounds), if due.
+    /// A case can start only while its full budget fits in the remaining time.
     pub fn start_window_warning(&self, request_timeout: Duration) -> Option<String> {
         let budget = self.case_budget(request_timeout);
         let window = self.run_timeout.saturating_sub(budget);
@@ -1931,12 +1926,11 @@ mod tests {
     /// Every example profile with a `[mutation]` section validates, and its
     /// case budget fits its `run_timeout` at the profile's request timeout
     /// (`mutation_settings` refuses one that doesn't), so `--mutate` never
-    /// refuses to start, and leaves room to start every case, so it doesn't
-    /// warn. Its lexicon recognises its own seed text: at least one of its
-    /// keywords when it lists keywords, and a comment or string wherever the
-    /// seed contains one of the delimiters it declares. Every
-    /// server of the stock matrix has one, and a mutation verdict file beside
-    /// its default one.
+    /// refuses to start or warns about a short start window. Its lexicon
+    /// recognises at least one keyword if it lists any, and a comment or
+    /// string wherever the seed contains a declared delimiter. Every server
+    /// in the stock matrix has a profile with a `[mutation]` section and a
+    /// mutation verdict file beside its default one.
     #[test]
     fn the_example_mutation_sections_validate_and_fit_their_run() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
