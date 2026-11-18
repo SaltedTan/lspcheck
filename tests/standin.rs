@@ -72,6 +72,8 @@ struct Run {
     report: Value,
     /// What the server wrote to stderr, from every transcript.
     server_stderr: String,
+    /// What lspcheck wrote to stderr.
+    stderr: String,
     took: Duration,
 }
 
@@ -132,7 +134,8 @@ fn run_command_in(
             }
         }
     }
-    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, report: json, server_stderr, took }
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    Run { status: out.status.code().unwrap_or(-1), verdicts, stdout, report: json, server_stderr, stderr, took }
 }
 
 fn run(standin_args: &[&str], lspcheck_args: &[&str]) -> Run {
@@ -2696,6 +2699,28 @@ fn a_bad_mutation_setting_is_a_usage_error_before_any_server_starts() {
         let stderr = usage_error(args);
         assert!(stderr.contains("mutation.operators: \"explode\" isn't an operator"), "{stderr}");
     }
+}
+
+#[test]
+fn a_run_timeout_leaving_little_room_to_start_cases_is_warned_of_but_runs() {
+    // At a 2 s timeout the fixture's case budget is 53 s: 100 s leaves 47 s
+    // in which a case can start.
+    let (path, _keep) = mutation_variant(&[("[mutation]\n", "[mutation]\nrun_timeout = \"100s\"\n")]);
+    let args = ["--timeout", "2", "--only", "M1,M2,M3"];
+    let (r, _, _keep) = mutated_with(&path, &[], &args);
+    assert_eq!(
+        r.stderr,
+        "lspcheck: warning: mutation.run_timeout of 100 s leaves 47 s in which a case can start (a case may take up \
+         to 53 s with a request timeout of 2 s), so a slow machine may run fewer than the 4 cases asked; raise \
+         run_timeout (at most 4h), or lower mutation.steps, mutation.requests_per_step or the request timeout\n"
+    );
+    for id in MUTATION_CHECKS {
+        expect(&r, id, "pass");
+    }
+    assert_eq!((r.status, &r.report["mutation"]["cases_run"]), (0, &4.into()), "{}", r.stdout);
+    // The fixture's default hour leaves plenty, and nothing is printed.
+    let (r, _, _keep) = mutated(&[], &args);
+    assert_eq!((r.status, r.stderr.as_str()), (0, ""), "{}", r.stdout);
 }
 
 /// The stand-in's mutation profile: one seed document, mutated only by

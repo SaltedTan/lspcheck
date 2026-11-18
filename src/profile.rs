@@ -213,6 +213,9 @@ pub const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 pub const MAX_SETTLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// What a case's budget adds to the deadlines it counts.
 const CASE_MARGIN: Duration = Duration::from_secs(5);
+/// `--mutate` warns when `run_timeout` leaves less than this in which a case
+/// can start.
+pub const START_WINDOW_WARNING: Duration = Duration::from_secs(60);
 
 /// The mutation scenario's settings: `[mutation]`, or for `--mutate` without
 /// one, defaults for `[document]`'s file ([design](../docs/source-mutations.md#profile-schema)).
@@ -343,6 +346,30 @@ impl Mutation {
             .saturating_add(self.recovery_timeout(request_timeout))
             .saturating_add(request_timeout.saturating_mul(documents * requested_probes * 4))
             .saturating_add(CASE_MARGIN)
+    }
+
+    /// A warning for a run whose `run_timeout` leaves less than
+    /// [`START_WINDOW_WARNING`] beyond one case's budget. A case starts only
+    /// while its whole budget fits in what is left of the run, so such a run
+    /// starts cases only in its first seconds, and on a slow machine runs
+    /// fewer than asked with every verdict still passing. `None` with no seed
+    /// file (M1 to M3 are skipped) or a single case, which always starts.
+    pub fn start_window_warning(&self, request_timeout: Duration) -> Option<String> {
+        let budget = self.case_budget(request_timeout);
+        let window = self.run_timeout.saturating_sub(budget);
+        if self.seeds.is_empty() || self.cases < 2 || window >= START_WINDOW_WARNING {
+            return None;
+        }
+        Some(format!(
+            "mutation.run_timeout of {} leaves {} in which a case can start (a case may take up to {} with a \
+             request timeout of {}), so a slow machine may run fewer than the {} cases asked; raise run_timeout (at \
+             most 4h), or lower mutation.steps, mutation.requests_per_step or the request timeout",
+            seconds(self.run_timeout),
+            seconds(window),
+            seconds(budget),
+            seconds(request_timeout),
+            self.cases
+        ))
     }
 }
 
@@ -1848,6 +1875,36 @@ mod tests {
     }
 
     #[test]
+    fn a_run_timeout_leaving_under_a_minute_to_start_cases_is_warned_of() {
+        let secs = Duration::from_secs;
+        // 1055 s at 30 s per request.
+        let p = parse_here(&format!("{LUA}[mutation]\nrun_timeout = \"1114s\"\n")).unwrap();
+        let m = mutation_settings(&p, None, None, secs(30)).unwrap();
+        let w = m.start_window_warning(secs(30)).unwrap();
+        assert_eq!(
+            w,
+            "mutation.run_timeout of 1114 s leaves 59 s in which a case can start (a case may take up to 1055 s \
+             with a request timeout of 30 s), so a slow machine may run fewer than the 20 cases asked; raise \
+             run_timeout (at most 4h), or lower mutation.steps, mutation.requests_per_step or the request timeout"
+        );
+        // Exactly a minute is enough; so is a budget that just fits, for one case.
+        let p = parse_here(&format!("{LUA}[mutation]\nrun_timeout = \"1115s\"\n")).unwrap();
+        assert_eq!(mutation_settings(&p, None, None, secs(30)).unwrap().start_window_warning(secs(30)), None);
+        let p = parse_here(&format!("{LUA}[mutation]\nrun_timeout = \"1055s\"\n")).unwrap();
+        let m = mutation_settings(&p, None, None, secs(30)).unwrap();
+        assert!(m.start_window_warning(secs(30)).unwrap().contains(" leaves 0 s "));
+        let m = mutation_settings(&p, None, Some(1), secs(30)).unwrap();
+        assert_eq!(m.start_window_warning(secs(30)), None);
+        // Nothing to mutate: M1 to M3 are skipped.
+        let mut m = Mutation::defaults(Vec::new());
+        m.run_timeout = secs(60);
+        assert_eq!(m.start_window_warning(secs(30)), None);
+        // The default hour leaves plenty.
+        let m = mutation_settings(&parse_here(LUA).unwrap(), None, None, secs(30)).unwrap();
+        assert_eq!(m.start_window_warning(secs(30)), None);
+    }
+
+    #[test]
     fn an_inherited_settle_timeout_is_capped() {
         let secs = Duration::from_secs;
         let p = parse_here(&format!("[server]\nstartup_timeout = \"6m\"\n{LUA}[mutation]\n")).unwrap();
@@ -1869,9 +1926,10 @@ mod tests {
     /// Every example profile with a `[mutation]` section validates, and its
     /// case budget fits its `run_timeout` at the profile's request timeout
     /// (`mutation_settings` refuses one that doesn't), so `--mutate` never
-    /// refuses to start. Its lexicon recognises its own seed text: at least
-    /// one of its keywords when it lists keywords, and a comment or string
-    /// wherever the seed contains one of the delimiters it declares. Every
+    /// refuses to start, and leaves room to start every case, so it doesn't
+    /// warn. Its lexicon recognises its own seed text: at least one of its
+    /// keywords when it lists keywords, and a comment or string wherever the
+    /// seed contains one of the delimiters it declares. Every
     /// server of the stock matrix has one, and a mutation verdict file beside
     /// its default one.
     #[test]
@@ -1893,6 +1951,7 @@ mod tests {
             let m = mutation_settings(&p, Some(20261115), None, request_timeout)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             assert!(!m.seeds.is_empty(), "{}", path.display());
+            assert_eq!(m.start_window_warning(request_timeout), None, "{}", path.display());
             let lexicon = &m.planner.lexicon;
             let kinds: Vec<mutation::TokenKind> =
                 m.seeds.iter().flat_map(|s| lexicon.tokens(&s.text)).map(|t| t.kind).collect();

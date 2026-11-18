@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Under `--mutate`, lspcheck warns on stderr when `mutation.run_timeout` leaves less than a minute beyond one case's
+  budget in which cases can start, since a slow machine may then run fewer cases than asked with every verdict
+  passing. The run, its report and its exit status are unchanged.
+
 ### Fixed
 
 - Under `--mutate`, when some of M2's unanswered requests may have been answered in output lspcheck didn't see, its

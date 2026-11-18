@@ -421,8 +421,11 @@ every delivery as taking its full write deadline, so a server slow to read (back
 already reserved, not the run's. The budget is a worst case: with the example profiles' 30 s request timeout it is
 over ten minutes per case, though a case usually takes seconds, which is why `run_timeout` defaults to an hour. A
 configuration whose case budget exceeds `run_timeout` is a usage error naming both (exit status 2), checked under
-`--mutate` when there is a seed file, before the server starts, so a run never silently admits no case. A test
-checks the stock example profiles' `[mutation]` sections against it. If a case's budget runs out anyway, no further
+`--mutate` when there is a seed file, before the server starts, so a run never silently admits no case. One that
+leaves less than a minute beyond the case budget starts cases only in the run's first seconds, so a slow machine may
+run fewer cases than asked with every verdict passing; for more than one case, `--mutate` then prints a warning to
+stderr before the server starts, naming both, and the run, its report and its exit status are unchanged. A test
+checks the stock example profiles' `[mutation]` sections against both. If a case's budget runs out anyway, no further
 step starts, but the restoration is still sent, with its own write deadline; if it can't be delivered, the scenario ends there (`ERROR` for M3 and the
 cases not run), so no case ever starts on a document lspcheck couldn't restore.
 
