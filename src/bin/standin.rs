@@ -2678,8 +2678,8 @@ fn followup_data(kind: &str) -> Value {
     json!({"standin": kind, "nonce": [7, {"kept": true}]})
 }
 
-/// The answer to a request whose item K1 follows up: one item at the
-/// document's start, or none for followup-sources-empty.
+/// For position probes, put the requested position in the first item's name
+/// or label so the transcript test can distinguish source replies.
 fn followup_source(method: &str, uri: Value, position: &Value, empty: bool) -> Value {
     let at = range(0, 0, 0, 0);
     let name = format!("standin {}:{}", position["line"], position["character"]);

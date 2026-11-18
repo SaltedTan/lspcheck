@@ -237,12 +237,9 @@ A server that advertises no `selectionRangeProvider` leaves D6 `SKIP`; one that 
 no reply, or whose ranges can't be compared, leaves it `N/E`. A `selectionRange` request lspcheck couldn't send, or one
 cut off because the server's output closed, makes D6 `ERROR` unless it already failed.
 
-K1 checks that the server handles what it advertises: it opens a document (a profile's
-[`[document]`](#profiles), or a plain-text one of lspcheck's own) and probes advertised methods without judging the
-content of their results. It also sends the follow-ups some capabilities advertise, such as
-`callHierarchy/incomingCalls` or `completionItem/resolve`, passing back the first item of an earlier answer unchanged.
-See the [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage, follow-ups, MethodNotFound
-failures, late and duplicate replies, and details naming unanswered and undeliverable requests.
+K1 checks for MethodNotFound when probing advertised methods, including hierarchy and resolve follow-ups. For
+document probes it uses a profile's [`[document]`](#profiles) or a plain-text document of its own. See the
+[K1 reference](docs/design.md#capabilities-and-robustness) for request coverage and verdict rules.
 
 K2 checks server message types against the LSP 3.17 meta-model: results of known requests lspcheck sent, and params
 of known server-to-client requests and notifications. A failure names where the value is (`result.contents`), what

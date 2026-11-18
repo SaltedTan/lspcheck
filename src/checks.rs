@@ -2454,9 +2454,8 @@ async fn large_document_scenario(ctx: &mut Ctx<'_>) -> bool {
 /// generic positions fall on three different lines.
 const K1_TEXT: &str = "alpha\n    beta = 1\ngamma(beta)\nlast line\n";
 
-/// Initialize params for the capabilities scenario: the documents scenario's,
-/// plus client capabilities for every request K1 may send, so a server that
-/// advertises only what its client supports advertises them.
+/// Initialize params shared by the capabilities and mutation scenarios. The client
+/// capabilities here let servers advertise support for K1's initial probes.
 fn capabilities_initialize_params(root: &Path) -> Value {
     let mut params = documents_initialize_params(root);
     let doc = &mut params["capabilities"]["textDocument"];

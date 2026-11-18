@@ -223,7 +223,7 @@ fn table() -> Vec<Row> {
     ]
 }
 
-/// The methods K1 can ask, in the order of its table.
+/// The initial probe methods available to `[mutation].requests`, in K1's table order.
 pub fn methods() -> Vec<&'static str> {
     table().into_iter().map(|(_, _, method, ..)| method).collect()
 }
@@ -266,8 +266,8 @@ fn selects(selector: &Value, language_id: &str) -> bool {
     })
 }
 
-/// The requests K1 sends, in the order of the design's table, with notes on
-/// advertised ones it doesn't send. Every position is counted in `encoding`.
+/// Plans initial probes in table order and records why any advertised probe was excluded.
+/// Each probe carries any follow-up methods that its reply can trigger. Positions use `encoding`.
 pub fn requests(caps: &Value, doc: &Document, spots: &[Spot], encoding: Encoding) -> (Vec<Request>, Vec<String>) {
     let lines = text::split_lines(doc.text);
     let last = lines.len() - 1;

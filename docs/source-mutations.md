@@ -80,8 +80,9 @@ extends is selected and not skipped by the profile.
 
 ### The scenario
 
-1. Initialize with K1's client capabilities plus `window.workDoneProgress` and versioned `publishDiagnostics`. If the
-   server doesn't ask for `didOpen`, or takes no changes (`textDocumentSync` absent or `0`), M1 to M3 are `SKIP`.
+1. Initialize with the client capabilities shared with [K1's initial probes](design.md#capabilities-and-robustness),
+   plus `window.workDoneProgress` and versioned `publishDiagnostics`. If the server doesn't ask for `didOpen`, or
+   takes no changes (`textDocumentSync` absent or `0`), M1 to M3 are `SKIP`.
 2. Open each seed file at version 1 with the profile's language id. The files stay as they are on disk: lspcheck never
    writes mutated text, and `didOpen` puts the document's content under client ownership, so the server must not read
    it from disk while it is open.
@@ -186,7 +187,7 @@ runs: how many recovery polls are sent, and what the server answers.
 
 ### Requests and positions
 
-Each step sends `requests_per_step` requests, round robin over the advertised methods of K1's table that the profile's
+Each step sends `requests_per_step` requests, round robin over the advertised initial K1 probes that the profile's
 `requests` allows (default: all of them), with a cursor that runs across cases so every method is exercised. Their
 params are K1's. Positions are drawn from the current text: half inside an identifier, a tenth at the end of the
 document, the rest at any character boundary, never inside a character and never between `\r` and `\n`, counted in
@@ -355,7 +356,7 @@ cases = 20                     # default 20, at most 1000
 steps = 3                      # most steps per case, 1 to 3
 operators = ["delete-tokens", "unbalance-bracket", "open-string", "unicode", "line-ends", "rename"]  # default: all but nest, repeat-line, control
 fragments = ["0x", "1e", "..."]                  # for the fragment operator
-requests = ["textDocument/documentSymbol", "textDocument/hover", "textDocument/completion"]  # default: K1's advertised methods
+requests = ["textDocument/documentSymbol", "textDocument/hover", "textDocument/completion"]
 requests_per_step = 4          # at most 16
 max_document_kib = 64          # per document, seed included; at most 1024
 run_timeout = "1h"             # at most "4h"
@@ -380,7 +381,7 @@ That example mutates `main.lua`; [`lua-language-server.toml`](../examples/profil
 lexicon like it and the defaults for the rest.
 Validation refuses: a seed file the workspace doesn't provide or that isn't UTF-8; a seed larger than
 `max_document_kib`; no seed file and no `[document]`; an unknown operator, probe or method; a `requests` method that
-isn't in K1's table; `steps`, `cases` or `requests_per_step` out of range; an empty delimiter; a bracket entry that
+isn't an initial K1 probe; `steps`, `cases` or `requests_per_step` out of range; an empty delimiter; a bracket entry that
 isn't two characters; a delimiter or identifier character that is a line end; `expect` other than the two values.
 It also refuses: an empty list where one is given (`files`, `operators`, `requests`, `recovery.probes`), an entry
 listed twice in any of them, `max_document_kib` outside 1 to 1024, a negative `seed`, a `run_timeout` over `"4h"`

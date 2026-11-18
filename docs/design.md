@@ -339,7 +339,7 @@ it, and the detail names the scenario and case.
 ### Capabilities and robustness
 | ID | Basis | Check |
 |---|---|---|
-| K1 | MUST | A request the server advertises, sent with valid parameters about an open document, isn't answered with MethodNotFound (-32601). |
+| K1 | MUST | MethodNotFound (-32601) violates an advertised capability when the request has valid parameters. |
 | K2 | MUST | What the server sends validates against the LSP 3.17 [meta-model](../vendor/lsp-3.17/README.md): results of requests, and the params of its own requests and notifications. |
 | R1 | POLICY | A well-framed body that isn't JSON gets ParseError `-32700` with id `null` or is ignored, and the server keeps serving. |
 | R2 | POLICY | A request with parameters of the wrong types gets an error response (InvalidParams preferred), and the server keeps serving. |
@@ -356,7 +356,7 @@ positions are checked again against it, in case the fixture changed since the pr
 `ERROR`) and opens it with `didOpen` at version 1, when the server asks for `didOpen` and at least one request is
 about a document. A capability is advertised when its value is `true` or an object;
 `semanticTokensProvider` (always an object) advertises `full` and `range` separately, and `renameProvider` advertises
-`prepareRename` only with `prepareProvider: true`. For each advertised capability, in this order, K1 sends:
+`prepareRename` only with `prepareProvider: true`. K1 sends these initial probes in table order:
 
 | Capability | Method | Params beyond `textDocument` |
 |---|---|---|
@@ -399,8 +399,7 @@ command, a save, a trigger character or a stopped debugger, which K1 can't set u
 `codeAction/resolve`, which also needs the client capabilities `codeAction.resolveSupport` and
 `codeActionLiteralSupport`, which lspcheck doesn't offer.
 
-Some advertised capabilities also cover a **follow-up** request that needs an item from an earlier answer. When
-K1 matches the source answer before shutdown, it sends:
+Some advertised capabilities also cover a **follow-up** request that needs an item from a matched source reply:
 
 | Advertised | Source answer | Follow-ups, with params |
 |---|---|---|
@@ -412,35 +411,31 @@ K1 matches the source answer before shutdown, it sends:
 | inlayHintProvider.resolveProvider: true | textDocument/inlayHint: `InlayHint[]` | inlayHint/resolve, the item |
 | workspaceSymbolProvider.resolveProvider: true | workspace/symbol: `WorkspaceSymbol[]` | workspaceSymbol/resolve, the item |
 
-- The item is the source answer's first, passed back exactly as received (including its `data`), never rebuilt. One
-  set of follow-ups is sent per source answer, so per position for a position request.
-- A source answer that is null, empty, an error, or has no usable item gets no follow-up. K1 checks the first
-  item's type in the meta-model and passes through opaque JSON as received. The detail names the source request,
-  the follow-ups left unsent, and the reason.
-- A follow-up is judged like any other K1 request: one at a time with `--timeout`, and by the rules below, named by
-  its method and its source request with its position (`completionItem/resolve with the first item of
-  textDocument/completion at 1:2`). It is about the document only if its source request is, and a `documentSelector`
-  that excludes the source request excludes it too, since the source isn't sent.
+- K1 checks the first item's type against the meta-model without descending into opaque `LSPAny` values. It
+  passes the item back exactly as received, including its `data`, once per listed follow-up for each source request.
+- K1 skips follow-ups from null, empty or error replies and replies with an unusable first item. The detail names
+  the source request, the follow-ups left unsent, and the reason.
+- A follow-up's label includes its method and the source request's label, for example `completionItem/resolve with
+  the first item of textDocument/completion at 1:2`. A `documentSelector` that excludes the source excludes its
+  follow-ups too.
 
-For the follow-ups, the capabilities scenario's client capabilities also offer
-`completion.completionItem.resolveSupport` (`documentation`, `detail`), `inlayHint.resolveSupport` (`tooltip`,
-`textEdits`, `label.tooltip`, `label.location`, `label.command`) and `workspace.symbol.resolveSupport`
-(`location.range`); the other scenarios don't, because only K1 resolves. The follow-ups are sent only in the capabilities scenario, not about mutated documents under `--mutate`.
+Only the capabilities scenario sends follow-ups and adds client `resolveSupport` for completion items, inlay hints
+and workspace symbols. See [`k1_initialize_params`](../src/checks.rs) for the exact properties offered.
 
-Two things keep a request about the document from being sent, and the detail names them: a server that doesn't ask
-for `didOpen` has no open document to be asked about (only `workspace/symbol` is sent), and a static registration's
-`documentSelector` that doesn't select the document. A filter selects it when its `language` (if any) is the
-document's language id and its `scheme` (if any) is `file`; a filter with a glob `pattern`, or for notebooks, isn't
-evaluated and doesn't select it.
+Document probes require the server to ask for `didOpen`. If a capability supplies a non-null `documentSelector`,
+the selector must match the document. The detail names exclusions. A filter selects the document when its
+`language` (if any) matches the document's language id and its `scheme` (if any) is `file`. K1 excludes filters
+with glob `pattern`s and notebook filters. The workspace symbol probe and its resolve follow-up need no open document.
 
 The requests are sent one at a time, each waiting up to `--timeout` for its reply. After a wait expires, K1
 continues waiting for each source and follow-up, and sends the other requests without waiting for individual replies.
-Matched source replies can still trigger their follow-ups after their own wait expires. After the last request in the
-table, K1 waits up to one more `--timeout` for outstanding source replies. Only a delivery failure stops sending.
-LSP sets no deadline for a response, so a wait that ends is not evidence against the server. The scenario then shuts
-the server down gracefully (`shutdown`, then `exit`), answering the server's requests on the way. Once session
-cleanup has drained the final stdout, K1 judges every
-request by its matched response, including replies read during shutdown or the final drain. A MethodNotFound reply
+Matched source replies can still trigger follow-ups after their individual wait expires. After the initial probes,
+K1 uses a shared `--timeout` window to wait for outstanding source replies. A delivery failure stops sending early.
+When sending ends, K1 notes any outstanding sources' follow-ups as unsent, even if those sources reply during shutdown.
+
+LSP sets no deadline for a response, so a wait that ends is not evidence against the server. The scenario shuts the
+server down gracefully (`shutdown`, then `exit`), answering the server's requests on the way. Replies read during
+shutdown or the final stdout drain still count toward the verdict for requests already sent. A MethodNotFound reply
 counts when its id equals the request's exactly and it was read at or after the request was sent, even after another
 response with that id (the duplicate is J2's).
 
@@ -448,23 +443,21 @@ For either a failure or an error, the detail names every unanswered request. It 
 (including the server's exit status when observed) once, on the request lspcheck couldn't send, then lists the
 remaining requests in a single `not sent after that` note.
 
-- **fail:** a request, or a follow-up, was answered with an error whose code is -32601. The detail names each such
-  request (method and position). This is seen evidence and stands whatever happened to the other requests.
+- **fail:** a probe or follow-up was answered with an error whose code is -32601. The detail names each such request.
+  This is seen evidence and stands whatever happened to the other requests.
 - **error:** initialize didn't succeed, the server chose an encoding lspcheck didn't offer (see L2), the document
   couldn't be written, read or opened (`didOpen` not delivered), a request couldn't be delivered, or lspcheck
   couldn't complete validation of a source item. A delivered request with no response by the end of the session
-  is also `ERROR` (`no response to <method> at <position> by the
-  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1.
+  is also `ERROR`, unless another request got -32601, which fails K1.
 - **not-exercised:** the initialize result has no capabilities object, or the server advertises none of the requests
   above, or all advertised requests were excluded by the `didOpen` or selector rules (the detail says why).
-- **pass:** every request selected for delivery, follow-ups included, was answered with a result or another error by
-  the end of the session. The detail counts the requests and methods, lists the other errors by code with the
-  requests that got them, and notes the follow-ups not sent.
+- **pass:** with the error conditions above ruled out, every request sent was answered by the end of the session
+  with a result or an error other than -32601. The detail counts the requests and methods, lists the other errors
+  by code with the requests that got them, and notes the follow-ups left unsent.
 
-Responses to K1's requests are judged by J1, J2 and J5 like any other, and the scenario's input is all well formed,
-so it is included in J3. K1 judges only the error code, never a result's content; it only takes follow-ups' items
-from results. With `--mutate`, a MethodNotFound
-to a request about a mutated document also [fails K1](source-mutations.md#verdict-rules).
+J1, J2 and J5 judge responses to K1's requests. J3 covers the scenario's notifications. K1 uses result content to
+plan follow-ups and leaves result conformance to K2. With `--mutate`, a MethodNotFound to a request about a mutated
+document also [fails K1](source-mutations.md#verdict-rules).
 
 K2 is judged across every scenario, like J5, over every message lspcheck read. Its validator runs only when K2 is
 selected and not skipped by the profile. Its types come from `metaModel.json`
