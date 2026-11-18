@@ -129,6 +129,10 @@ const FAULTS: &[(&str, &str)] = &[
         "inflated-on-cancel",
         "before answering a cancelled request, start a frame whose 2 MiB body never comes, so it swallows the answer",
     ),
+    (
+        "half-written-shutdown-reply",
+        "lawful: write the shutdown reply's header and part of its body, and stay running without writing the rest",
+    ),
     ("shutdown-result", "return {} from shutdown"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
     ("big-frame-on-exit", "on exit, send one 2 MiB log message before exiting"),
@@ -136,6 +140,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("exit-status", "exit with status 3 on exit"),
     ("ignore-exit", "ignore exit and stay running"),
     ("inflated-on-exit", "on exit, start an inflated frame containing a progress request and stay running"),
+    (
+        "half-frame-in-leftover",
+        "on exit, leave behind a child that has written part of a frame to stdout and stays running, and exit",
+    ),
     ("split-header", "drop input when a read ends inside a header section, as if each header came in one read"),
     ("split-utf8", "decode each read as UTF-8 on its own, mangling characters split across reads"),
     (
@@ -430,6 +438,7 @@ fn main() {
         Some("--escaped-child") => return child(true),
         Some("--relay") => return relay(args[1].parse().unwrap()),
         Some("--reply-after-input") => return reply_after_input(&args[1]),
+        Some("--half-frame-child") => return half_frame_child(),
         _ => {}
     }
     let mut faults = Vec::new();
@@ -1105,6 +1114,22 @@ fn main() {
                     bytes.extend_from_slice(b"goodbye\n");
                     out.raw(&bytes);
                 }
+                if fault("half-frame-in-leftover") {
+                    // Exit only once the child has written, so the frame is
+                    // unfinished when lspcheck finds the child left behind.
+                    let mut ready = Command::new(std::env::current_exe().unwrap())
+                        .arg("--half-frame-child")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap()
+                        .stderr
+                        .unwrap();
+                    let mut line = [0u8; 6];
+                    ready.read_exact(&mut line).unwrap();
+                    assert_eq!(&line, b"ready\n");
+                }
                 let status = if fault("exit-status") {
                     3
                 } else if shut_down {
@@ -1585,6 +1610,15 @@ fn main() {
                 }
                 if fault("inflated-before-shutdown") {
                     out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
+                }
+                if fault("half-written-shutdown-reply") {
+                    // A slow server still writing its reply when lspcheck
+                    // gives up on it and stops it.
+                    let bytes = out.encode(&ok(&id, result));
+                    out.raw(&bytes[..bytes.len() - 10]);
+                    loop {
+                        std::thread::park();
+                    }
                 }
                 let mut reply = ok(&id, result);
                 if fault("shutdown-no-jsonrpc") {
@@ -2438,6 +2472,16 @@ fn child(escape: bool) {
     let _ = escape;
     println!("ready");
     let _ = std::io::stdout().flush();
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+/// A leftover child sharing the server's stdout: it writes part of a frame
+/// there, signals on stderr that it has, then sleeps for a minute.
+fn half_frame_child() {
+    let mut out = std::io::stdout().lock();
+    out.write_all(b"Content-Length: 52\r\n\r\n{\"jsonrpc\":\"2.0\",").unwrap();
+    out.flush().unwrap();
+    eprintln!("ready");
     std::thread::sleep(std::time::Duration::from_secs(60));
 }
 

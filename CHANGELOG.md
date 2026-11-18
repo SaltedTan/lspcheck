@@ -21,6 +21,10 @@
 - Likewise, when the reply to some of R4's unanswered odd-id requests may have been in output lspcheck didn't see, its
   failure detail lists as unanswered only the ids whose waits it saw in full, and the others as possibly answered,
   with why. The verdict is unchanged.
+- A frame the server (or a process it left behind) was still writing when lspcheck stopped it, such as a slow
+  `shutdown` reply that lspcheck had given up waiting for, no longer fails F1: lspcheck may have cut it short itself,
+  so F1 is now `error` and says how much of the frame arrived. A stream the server ends on its own inside a frame
+  still fails F1.
 
 ## 0.5.0 (2026-11-16)
 

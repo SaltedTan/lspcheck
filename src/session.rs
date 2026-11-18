@@ -256,6 +256,13 @@ struct Evidence {
     stopped: Option<(Duration, String)>,
     /// When the first readable frame with non-ASCII text in its body arrived.
     non_ascii: Option<Duration>,
+    /// When lspcheck first signalled processes that may hold stdout, if it
+    /// did: from then on, the stream may end because lspcheck stopped them.
+    signalled: Option<Duration>,
+    /// A frame the stream ended inside after lspcheck signalled: when, and
+    /// how much of it came. Too long a Content-Length looks the same, so it
+    /// is an inspection limit, not a problem.
+    cut_short: Option<(Duration, String)>,
     /// Frames whose body isn't JSON: when, the Content-Length, and where the body starts.
     unparsed: Vec<(Duration, usize, usize)>,
     /// lspcheck stopped reading stdout into the transcript before it ended.
@@ -340,6 +347,10 @@ pub struct Finish {
     pub abandoned_at: Option<Duration>,
     /// Every stream problem in the whole of stdout.
     pub problems: Vec<(Duration, Problem)>,
+    /// A frame still unfinished when the stream ended after lspcheck began
+    /// stopping the server, with when and how much of it came. It isn't
+    /// among `problems`: lspcheck may have cut it short itself.
+    pub cut_short: Option<(Duration, String)>,
     /// Responses that matched no outstanding request, with what explains them.
     pub unmatched: Vec<Unmatched>,
     /// Requests that were answered, with when their response was read.
@@ -1194,6 +1205,13 @@ impl Session {
         }
     }
 
+    /// Records that lspcheck is about to signal processes that may hold
+    /// stdout, unless it already has.
+    fn signalling(&self) {
+        let at = self.start.elapsed();
+        self.evidence.lock().expect("evidence lock").signalled.get_or_insert(at);
+    }
+
     /// Ends the session: stops the server if it is still running, waits up to
     /// `grace` for its descendants to exit, records any still alive, and stops them.
     pub async fn finish(mut self, grace: Duration) -> Finish {
@@ -1202,6 +1220,7 @@ impl Session {
         if self.is_alive() {
             killed = true;
             self.note(STOPPING_NOTE);
+            self.signalling();
             #[cfg(unix)]
             {
                 self.group.signal(nix::sys::signal::Signal::SIGTERM);
@@ -1250,6 +1269,11 @@ impl Session {
         let deadline = Instant::now() + Duration::from_secs(2);
         let me = std::process::id() as i32;
         let mut not_stopped = Vec::new();
+        // With none found, the signal below reaches no process that could
+        // hold stdout, so an end of the stream isn't lspcheck's doing.
+        if !leftovers.is_empty() || scan_error.is_some() {
+            self.signalling();
+        }
         loop {
             #[cfg(unix)]
             self.group.signal(nix::sys::signal::Signal::SIGKILL);
@@ -1350,6 +1374,7 @@ impl Session {
             j3_incomplete,
             abandoned_at: self.abandoned,
             problems: evidence.problems,
+            cut_short: evidence.cut_short,
             unmatched,
             answered: std::mem::take(&mut self.answered),
             answers: std::mem::take(&mut self.answers),
@@ -1446,6 +1471,17 @@ async fn read_stdout(
             Chunk::BadHeader { block, reason } => Problem::BadHeader { block, reason },
             Chunk::Truncated { headers, content_length, received } => {
                 content_types(&mut ev, &headers);
+                // The stream ended after lspcheck signalled the server, which
+                // may have been in the middle of writing this frame. Other
+                // checks see it as unread, as they would a problem.
+                if ev.signalled.is_some() {
+                    ev.lost.push((began, at, UNREAD.into()));
+                    let why = format!(
+                        "a frame was unfinished when lspcheck stopped the server: {received} of {content_length} body bytes"
+                    );
+                    ev.cut_short = Some((at, why));
+                    return;
+                }
                 Problem::Truncated { content_length, received }
             }
         };
