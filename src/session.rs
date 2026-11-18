@@ -1274,18 +1274,23 @@ impl Session {
         // and so can't have been replaced by another process. Stopping one can
         // orphan its own children, which are then adopted too, so repeat for
         // up to two seconds.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let me = std::process::id() as i32;
-        let mut not_stopped = Vec::new();
+        //
         // With none found and the server gone by itself, nothing should hold
         // stdout, so let the stdout task see its end first: a stream the
         // server ended itself is then judged as such. Whatever holds it still,
         // which the scans missed, the signals below may stop, and from then
-        // on an end of the stream may be lspcheck's doing.
-        if !killed && leftovers.is_empty() && scan_error.is_none() {
-            self.wait_for_stdout_end(Instant::now() + Duration::from_secs(5)).await;
+        // on an end of the stream may be lspcheck's doing. Elsewhere the sweep
+        // sends no signal, so the end of the stream stays the server's.
+        #[cfg(unix)]
+        {
+            if !killed && leftovers.is_empty() && scan_error.is_none() {
+                self.wait_for_stdout_end(Instant::now() + Duration::from_secs(5)).await;
+            }
+            self.signalling();
         }
-        self.signalling();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let me = std::process::id() as i32;
+        let mut not_stopped = Vec::new();
         loop {
             #[cfg(unix)]
             self.group.signal(nix::sys::signal::Signal::SIGKILL);

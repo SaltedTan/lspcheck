@@ -399,8 +399,9 @@ and when lspcheck couldn't finish writing to a server that stopped reading its i
 deliver gives `ERROR`, never `FAIL`. A header section longer than 1 MiB also stops inspection.
 When lspcheck sees stdout end inside a frame (its header section or its body) only after it has begun stopping the
 server's processes, it may have cut that frame short itself, so F1 is `ERROR`, not `FAIL`. What counts is when
-lspcheck saw the end: a server that ended its output mid-frame on its own and kept running is also given `ERROR`, while
-a header section already malformed before the end still fails F1.
+lspcheck saw the end. A server that closed stdout mid-frame and kept running still fails F1 if lspcheck saw the end
+before stopping it, and gets `ERROR` if lspcheck saw it only after, as when a process the server left behind still
+held stdout. A header section already malformed when the stream ended fails F1 either way.
 
 ### Verdicts
 
