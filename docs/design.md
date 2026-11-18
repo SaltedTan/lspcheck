@@ -394,7 +394,17 @@ the first three identifier-like tokens (`[A-Za-z_][A-Za-z0-9_]*`, matched leftmo
 start when it has none. Positions are counted in the negotiated encoding (the server's `positionEncoding`, or
 UTF-16), and the whole document's range ends at the end of its last line (the empty line after a final newline).
 K1 doesn't send `workspace/executeCommand`, `willSaveWaitUntil`, `onTypeFormatting` or `inlineValue`: they need a
-command, a save, a trigger character or a stopped debugger, which K1 can't set up faithfully.
+command, a save, a trigger character or a stopped debugger, which K1 can't set up faithfully. Nor does it send the
+requests that take an item from an earlier answer: `callHierarchy/incomingCalls` and `outgoingCalls`,
+`typeHierarchy/supertypes` and `subtypes`, and the `*/resolve` requests (completion items, code lenses, document
+links, inlay hints, workspace symbols, code actions). lspcheck can't establish that an item the server produced is
+a valid param (its URIs, its positions in the document's text and encoding, fields that depend on capabilities the
+client didn't offer), so a MethodNotFound answer to an echoed item can't be told from an InvalidParams one sent with
+the wrong code. And extra requests in K1's session can cost evidence it otherwise collects at shutdown (a server
+that crashes on one never sends a reply it was holding). A future version could send them only in a separate,
+opt-in server start, without a verdict until items can be checked against the document and the negotiated
+capabilities. ([PR #62](https://github.com/SaltedTan/lspcheck/pull/62) tried and was closed after five review
+rounds.)
 
 Two things keep a request about the document from being sent, and the detail names them: a server that doesn't ask
 for `didOpen` has no open document to be asked about (only `workspace/symbol` is sent), and a static registration's
