@@ -832,6 +832,61 @@ fn a_symbol_that_may_be_a_symbol_information_isnt_resolved() {
 }
 
 #[test]
+fn items_that_break_the_specifications_rules_arent_followed_up() {
+    // The meta-model's types don't show these flaws, but the items aren't
+    // valid params, so the MethodNotFound the stand-in would answer their
+    // follow-ups with mustn't be asked for.
+    let r = fault("followup-invalid-items");
+    passes_except(&r, &[]);
+    let k1 = detail(&r, "K1");
+    // The call hierarchy items' ranges are valid, though spelled with a
+    // decimal, so their follow-ups are sent and answered.
+    assert!(k1.starts_with("28 request(s) for 14 advertised method(s) were answered"), "{k1}");
+    assert!(!k1.contains("prepareCallHierarchy"), "{k1}");
+    let completion = "completionItem/resolve";
+    let mut notes = vec![
+        ("textDocument/completion at 1:2", completion, "has a textEdit that isn't on one line", "CompletionItem"),
+        (
+            "textDocument/completion at 2:6",
+            completion,
+            "has a textEdit that doesn't contain the completion's position",
+            "CompletionItem",
+        ),
+        (
+            "textDocument/completion at 3:2",
+            completion,
+            "has an InsertReplaceEdit textEdit, which lspcheck's client capabilities don't allow",
+            "CompletionItem",
+        ),
+        (
+            "textDocument/codeLens",
+            "codeLens/resolve",
+            "has a range that ends before it starts (item.range)",
+            "CodeLens",
+        ),
+        (
+            "textDocument/documentLink",
+            "documentLink/resolve",
+            "has a range that ends before it starts (item.range)",
+            "DocumentLink",
+        ),
+        ("textDocument/inlayHint", "inlayHint/resolve", "has an empty label", "InlayHint"),
+        ("workspace/symbol", "workspaceSymbol/resolve", "has a location.range that isn't a Range", "WorkspaceSymbol"),
+    ];
+    // Every number of their ranges is spelled as a decimal.
+    let hierarchy = "typeHierarchy/supertypes and typeHierarchy/subtypes";
+    let sources = ["1:2", "2:6", "3:2"].map(|at| format!("textDocument/prepareTypeHierarchy at {at}"));
+    for source in &sources {
+        notes.push((source, hierarchy, "has a range that ends before it starts (item.range)", "TypeHierarchyItem"));
+    }
+    for (source, methods, why, ty) in notes {
+        let note =
+            format!("follow-ups not sent for {source} ({methods}): its first item {why}, so it isn't a valid {ty}");
+        assert!(k1.contains(&note), "{note} missing in {k1}");
+    }
+}
+
+#[test]
 fn a_hierarchy_item_whose_selection_range_is_outside_its_range_isnt_followed_up() {
     // The items aren't valid params, so the MethodNotFound the stand-in
     // would answer their follow-ups with mustn't be asked for.

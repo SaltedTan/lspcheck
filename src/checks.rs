@@ -2689,6 +2689,7 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
     let mut sources: Vec<(&capabilities::Request, Id)> = Vec::new();
     let mut wait = true;
     let mut source_deadline = None;
+    let mut item_checks = ItemChecks::default();
     'requests: loop {
         if let Some(i) = sources.iter().position(|(_, id)| ctx.s.answer_to(id).is_some()) {
             use capabilities::FollowupError::{Inconclusive, Unusable};
@@ -2704,8 +2705,8 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
             };
             let followups = match item {
                 Ok((ty, item)) => {
-                    let deadline = Instant::now() + ctx.cfg.request_timeout;
-                    k1_check_item(ty, item.clone(), deadline).await.and_then(|()| r.followups(&item))
+                    let deadline = Instant::now() + K1_ITEM_CHECK;
+                    k1_check_item(&mut item_checks, r, ty, item.clone(), deadline).await.map(|()| r.followups(&item))
                 }
                 Err(e) => Err(e),
             };
@@ -2757,52 +2758,92 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
     K1Pending::Sent { asked, notes, inspection_errors }
 }
 
-/// Checks that a follow-up's item is a valid `ty`, so that K1 sends valid
-/// params, giving up at `deadline`: any limit lspcheck hits is inconclusive.
+/// How long K1 waits for a follow-up item's check. Far longer than
+/// [`metamodel::NODE_BUDGET`] steps take, so only a starved machine runs out;
+/// it doesn't depend on `--timeout`, which bounds the server's replies.
+const K1_ITEM_CHECK: Duration = Duration::from_secs(10);
+
+/// Checks that a follow-up's item is a valid `ty` by the meta-model and by
+/// the rules [`capabilities::Request::item_problem`] adds, so that K1 sends
+/// valid params, giving up at `deadline`: any limit lspcheck hits is
+/// inconclusive.
 async fn k1_check_item(
+    checks: &mut ItemChecks,
+    source: &capabilities::Request,
     ty: &'static str,
     item: std::sync::Arc<Value>,
     deadline: Instant,
 ) -> Result<(), capabilities::FollowupError> {
     use capabilities::FollowupError::{Inconclusive, Unusable};
-    match validate_until(deadline, move || metamodel::validate_followup_item(ty, &item)).await {
-        Ok(Ok(true)) => Ok(()),
-        Ok(Ok(false)) => Err(Unusable(format!("its first item isn't a valid {ty} (see K2)"))),
-        Ok(Err(TooLarge)) => Err(Inconclusive(format!("its first item is too large for lspcheck to check as a {ty}"))),
-        Err(Unfinished::Expired) => {
-            Err(Inconclusive(format!("lspcheck didn't finish checking its first item as a {ty} within --timeout")))
+    let source = source.clone();
+    let check = move || -> Result<Option<String>, TooLarge> {
+        if !metamodel::validate_followup_item(ty, &item)? {
+            return Ok(Some(format!("its first item isn't a valid {ty} (see K2)")));
         }
+        Ok(source.item_problem(&item))
+    };
+    match checks.run(deadline, check).await {
+        Ok(Ok(None)) => Ok(()),
+        Ok(Ok(Some(why))) => Err(Unusable(why)),
+        Ok(Err(TooLarge)) => Err(Inconclusive(format!("its first item is too large for lspcheck to check as a {ty}"))),
+        Err(Unfinished::Expired) => Err(Inconclusive(format!(
+            "lspcheck didn't finish checking its first item as a {ty} within {} s",
+            seconds(K1_ITEM_CHECK)
+        ))),
+        Err(Unfinished::Busy) => Err(Inconclusive(format!(
+            "lspcheck didn't check its first item as a {ty}: an earlier item check was still running"
+        ))),
         Err(Unfinished::Unstarted(e)) => Err(Inconclusive(format!("lspcheck couldn't check its first item ({e})"))),
     }
 }
 
-/// Why [`validate_until`] has no result.
+/// Why [`ItemChecks::run`] has no result.
 #[derive(Debug)]
 enum Unfinished {
     Unstarted(std::io::Error),
     Expired,
+    /// A check that outlived its deadline was still running.
+    Busy,
 }
 
-/// Runs `f`, which validates, on a thread with a [`metamodel::STACK`]-sized
-/// stack, and waits for it until `deadline`. Nothing joins the thread: after
-/// the deadline it finishes its budget-bounded work unobserved.
-async fn validate_until<R: Send + 'static>(
-    deadline: Instant,
-    f: impl FnOnce() -> R + Send + 'static,
-) -> Result<R, Unfinished> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("lspcheck-validate".into())
-        .stack_size(metamodel::STACK)
-        .spawn(move || {
-            let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
-        })
-        .map_err(Unfinished::Unstarted)?;
-    match tokio::time::timeout_at(deadline, rx).await {
-        Ok(Ok(Ok(result))) => Ok(result),
-        Ok(Ok(Err(panic))) => std::panic::resume_unwind(panic),
-        Ok(Err(_)) => unreachable!("the validation thread sends before it ends"),
-        Err(_) => Err(Unfinished::Expired),
+/// Runs checks on a thread with a [`metamodel::STACK`]-sized stack, one at a
+/// time. Nothing joins a thread: one that outlives its deadline finishes its
+/// budget-bounded work unobserved, and until it does no other check starts,
+/// so a slow machine doesn't pile up threads.
+#[derive(Default)]
+struct ItemChecks {
+    /// The thread of the last check, if it outlived its deadline.
+    late: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ItemChecks {
+    /// Runs `f` and waits for it until `deadline`.
+    async fn run<R: Send + 'static>(
+        &mut self,
+        deadline: Instant,
+        f: impl FnOnce() -> R + Send + 'static,
+    ) -> Result<R, Unfinished> {
+        if self.late.as_ref().is_some_and(|thread| !thread.is_finished()) {
+            return Err(Unfinished::Busy);
+        }
+        self.late = None;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("lspcheck-validate".into())
+            .stack_size(metamodel::STACK)
+            .spawn(move || {
+                let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
+            })
+            .map_err(Unfinished::Unstarted)?;
+        match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(panic))) => std::panic::resume_unwind(panic),
+            Ok(Err(_)) => unreachable!("the check's thread sends before it ends"),
+            Err(_) => {
+                self.late = Some(thread);
+                Err(Unfinished::Expired)
+            }
+        }
     }
 }
 
@@ -7427,22 +7468,58 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn k1_checks_a_follow_ups_item_and_gives_up_at_its_deadline() {
+    async fn k1_checks_a_follow_ups_item_by_the_meta_model_and_the_specs_rules() {
         use capabilities::FollowupError::Unusable;
-        let later = || Instant::now() + Duration::from_secs(60);
-        let valid = std::sync::Arc::new(json!({"label": "a", "data": {"deep": [1]}}));
-        assert_eq!(k1_check_item("CompletionItem", valid, later()).await, Ok(()));
-        let invalid = std::sync::Arc::new(json!({"detail": "no label"}));
+        let caps = json!({"completionProvider": {"resolveProvider": true}});
+        let doc = capabilities::Document { uri: "file:///w/a.txt", language_id: "go", text: "ab\n", opened: true };
+        let (requests, _) = capabilities::requests(&caps, &doc, &[Spot { line: 0, column: 1 }], Encoding::Utf16);
+        let completion = &requests[0];
+        let mut checks = ItemChecks::default();
+        let mut check = async |item: Value| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            k1_check_item(&mut checks, completion, "CompletionItem", std::sync::Arc::new(item), deadline).await
+        };
+        assert_eq!(check(json!({"label": "a", "data": {"deep": [1]}})).await, Ok(()));
         assert_eq!(
-            k1_check_item("CompletionItem", invalid, later()).await,
+            check(json!({"detail": "no label"})).await,
             Err(Unusable("its first item isn't a valid CompletionItem (see K2)".into()))
         );
-        // Validation that can't finish before the deadline: the thread waits
-        // for a message sent only after K1 has given up on it.
+        let elsewhere = json!({"range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 2}},
+                               "newText": "a"});
+        assert_eq!(
+            check(json!({"label": "a", "textEdit": elsewhere})).await,
+            Err(Unusable(
+                "its first item has a textEdit that doesn't contain the completion's position, so it isn't a valid \
+                 CompletionItem"
+                    .into()
+            ))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn item_checks_give_up_at_their_deadline_and_run_one_at_a_time() {
+        let mut checks = ItemChecks::default();
+        let later = || Instant::now() + Duration::from_secs(60);
+        // A check that can't finish before its deadline: the thread waits for
+        // a message sent only after K1 has given up on it.
         let (go, wait) = std::sync::mpsc::channel::<()>();
-        let blocked = validate_until(Instant::now() + Duration::from_millis(50), move || wait.recv()).await;
+        let blocked = checks.run(Instant::now() + Duration::from_millis(50), move || wait.recv()).await;
         assert!(matches!(blocked, Err(Unfinished::Expired)), "{blocked:?}");
-        drop(go);
+        // While its thread runs, no other check starts.
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = started.clone();
+        let busy = checks.run(later(), move || flag.store(true, std::sync::atomic::Ordering::SeqCst)).await;
+        assert!(matches!(busy, Err(Unfinished::Busy)), "{busy:?}");
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        // Once it has finished, checks start again.
+        go.send(()).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while !checks.late.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
+            assert!(std::time::Instant::now() < until, "the released check didn't finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(matches!(checks.run(later(), || 7).await, Ok(7)));
+        assert!(checks.late.is_none());
     }
 
     #[test]

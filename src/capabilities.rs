@@ -8,7 +8,7 @@
 //! Pure functions only; the scenario that sends the requests, and checks a
 //! follow-up's item against the meta-model, is in [`crate::checks`].
 
-use crate::message::codes;
+use crate::message::{self, codes};
 use crate::text::{self, Encoding, Position};
 use serde_json::{Value, json};
 
@@ -404,25 +404,31 @@ impl Request {
         Ok((f.item, item))
     }
 
-    /// The follow-ups for `item`, a valid instance of the type
-    /// [`Self::followup_item`] gave, which is passed back exactly as received.
-    pub fn followups(&self, item: &Value) -> Result<Vec<Request>, FollowupError> {
-        let Some(f) = self.followup else { return Ok(Vec::new()) };
-        if f.item == "WorkspaceSymbol" && !surely_workspace_symbol(item) {
-            // workspace/symbol may answer SymbolInformation[] even with
-            // resolveProvider, and a SymbolInformation is also a valid
-            // WorkspaceSymbol, but only the latter can be resolved.
-            return Err(FollowupError::Unusable(
-                "its first item may be a SymbolInformation, which workspaceSymbol/resolve doesn't take".into(),
-            ));
+    /// Why `item`, the first item [`Self::followup_item`] gave and a valid
+    /// instance of its type by the meta-model, isn't passed back, if it
+    /// isn't: it breaks a rule of the specification that the meta-model's
+    /// types can't express, or it may be of a type the follow-up doesn't take.
+    /// Members for client capabilities lspcheck didn't offer, and rules the
+    /// specification only recommends, don't count.
+    pub fn item_problem(&self, item: &Value) -> Option<String> {
+        let f = self.followup?;
+        if let Some(why) = item_flaw(f.item, item, &self.params["position"]) {
+            return Some(format!("its first item {why}, so it isn't a valid {}", f.item));
         }
-        if f.wrapped
-            && let Some(why) = hierarchy_ranges_problem(item)
-        {
-            return Err(FollowupError::Unusable(format!("its first item {why}, so it isn't a valid {}", f.item)));
-        }
+        // workspace/symbol may answer SymbolInformation[] even with
+        // resolveProvider, and a SymbolInformation is also a valid
+        // WorkspaceSymbol, but only the latter can be resolved. Only a
+        // WorkspaceSymbol may have `data` or a location without a range.
+        (f.item == "WorkspaceSymbol" && item.get("data").is_none() && item["location"].get("range").is_some())
+            .then(|| "its first item may be a SymbolInformation, which workspaceSymbol/resolve doesn't take".into())
+    }
+
+    /// The follow-ups for `item`, which [`Self::item_problem`] passed, each
+    /// with the item exactly as received.
+    pub fn followups(&self, item: &Value) -> Vec<Request> {
+        let Some(f) = self.followup else { return Vec::new() };
         let params = if f.wrapped { json!({"item": item}) } else { item.clone() };
-        Ok(f.methods
+        f.methods
             .iter()
             .map(|&method| Request {
                 method,
@@ -430,30 +436,160 @@ impl Request {
                 params: params.clone(),
                 followup: None,
             })
-            .collect())
+            .collect()
     }
 }
 
-/// Whether a valid `WorkspaceSymbol` can't be a `SymbolInformation`: it has
-/// `data`, or its location has no range, both of which only a
-/// `WorkspaceSymbol` may.
-fn surely_workspace_symbol(item: &Value) -> bool {
-    item.get("data").is_some() || item["location"].get("range").is_none()
+/// A position as (line, character).
+type Place = (i64, i64);
+
+/// A range's start and end.
+type Span = (Place, Place);
+
+/// A `Position`-shaped value's line and character: integers, however
+/// spelled (`2` or `2.0`), as the meta-model reads them.
+fn place(p: &Value) -> Option<Place> {
+    let integer = |v: &Value| v.as_number().and_then(message::integer_value);
+    Some((integer(&p["line"])?, integer(&p["character"])?))
 }
 
-/// What breaks a hierarchy item's rule that both ranges are well ordered and
-/// `selectionRange` is contained in `range`, if anything. The item is valid,
-/// so both ranges have numeric positions.
-fn hierarchy_ranges_problem(item: &Value) -> Option<String> {
-    let at = |p: &Value| (p["line"].as_u64(), p["character"].as_u64());
-    let ends = |name: &str| (at(&item[name]["start"]), at(&item[name]["end"]));
-    let (range, selection) = (ends("range"), ends("selectionRange"));
-    for (name, (start, end)) in [("range", range), ("selectionRange", selection)] {
-        if start > end {
-            return Some(format!("has a {name} that ends before it starts"));
+/// The ends of a `Range`-shaped value: an object whose `start` and `end` are
+/// `Position`-shaped.
+fn span(v: &Value) -> Option<Span> {
+    Some((place(&v["start"])?, place(&v["end"])?))
+}
+
+/// The longest path to a range a note names, in characters.
+const PATH_SHOWN: usize = 80;
+
+/// How `item`, a valid `ty` by the meta-model, breaks a rule of the
+/// specification the meta-model can't express, if it does. Completion text
+/// edits are judged against `position`, the completion's. A value lspcheck
+/// can't read where the rule needs one counts as breaking it.
+fn item_flaw(ty: &str, item: &Value, position: &Value) -> Option<String> {
+    if let Some(mut path) = disordered_range(item, &mut String::from("item")) {
+        if let Some((end, _)) = path.char_indices().nth(PATH_SHOWN) {
+            path.truncate(end);
+            path.push('…');
+        }
+        return Some(format!("has a range that ends before it starts ({path})"));
+    }
+    match ty {
+        "CallHierarchyItem" | "TypeHierarchyItem" => match (span(&item["range"]), span(&item["selectionRange"])) {
+            (Some(range), Some(selection)) if range.0 <= selection.0 && selection.1 <= range.1 => None,
+            _ => Some("has a selectionRange outside its range".into()),
+        },
+        "CompletionItem" => completion_flaw(item, position),
+        "InlayHint" => {
+            let empty = match &item["label"] {
+                Value::String(label) => label.is_empty(),
+                Value::Array(parts) => {
+                    parts.is_empty() || parts.iter().any(|p| p["value"].as_str().is_none_or(str::is_empty))
+                }
+                _ => true,
+            };
+            if empty {
+                return Some("has an empty label".into());
+            }
+            let clashing =
+                item.get("textEdits").is_some_and(|edits| edit_spans(edits).is_none_or(|edits| clash(&edits, true)));
+            clashing.then(|| "has textEdits that overlap".into())
+        }
+        // The union `Location | {uri}` takes `{uri, range: null}` as the
+        // latter, which has no range.
+        "WorkspaceSymbol" => item["location"]
+            .get("range")
+            .is_some_and(|range| span(range).is_none())
+            .then(|| "has a location.range that isn't a Range".into()),
+        _ => None,
+    }
+}
+
+/// How a completion item's edits break their rules, if they do: its
+/// `textEdit` must be a `TextEdit` (lspcheck doesn't offer
+/// `insertReplaceSupport`) on one line, containing the completion's
+/// position, and its `additionalTextEdits` may neither overlap it or each
+/// other nor share a start with any of them.
+fn completion_flaw(item: &Value, position: &Value) -> Option<String> {
+    let edit = item.get("textEdit");
+    if edit.is_some_and(|e| e.get("insert").is_some() || e.get("replace").is_some()) {
+        return Some("has an InsertReplaceEdit textEdit, which lspcheck's client capabilities don't allow".into());
+    }
+    let main = edit.map(|e| span(&e["range"]));
+    if let Some(main) = main {
+        let Some((start, end)) = main.filter(|(start, end)| start.0 == end.0) else {
+            return Some("has a textEdit that isn't on one line".into());
+        };
+        if !place(position).is_some_and(|at| start <= at && at <= end) {
+            return Some("has a textEdit that doesn't contain the completion's position".into());
         }
     }
-    (selection.0 < range.0 || selection.1 > range.1).then(|| "has a selectionRange outside its range".into())
+    let additional = item.get("additionalTextEdits")?;
+    let edits = edit_spans(additional).map(|mut edits| {
+        edits.extend(main.flatten());
+        edits
+    });
+    edits
+        .is_none_or(|edits| clash(&edits, false))
+        .then(|| "has additionalTextEdits that overlap or share a start with each other or its textEdit".into())
+}
+
+/// The ranges of an array of text edits, in order, if every one has one.
+fn edit_spans(edits: &Value) -> Option<Vec<Span>> {
+    edits.as_array()?.iter().map(|e| span(&e["range"])).collect()
+}
+
+/// Whether ordered ranges `edits`, in array order, clash: one starts inside
+/// another, or several start at one place. With `inserts`, as for any
+/// `TextEdit[]`, several may start at one place if all but the last there
+/// are inserts (empty ranges).
+fn clash(edits: &[Span], inserts: bool) -> bool {
+    let mut order: Vec<usize> = (0..edits.len()).collect();
+    order.sort_by_key(|&i| (edits[i].0, i));
+    // The furthest end of the ranges that start before this place.
+    let mut furthest: Option<Place> = None;
+    for here in order.chunk_by(|&a, &b| edits[a].0 == edits[b].0) {
+        let start = edits[here[0]].0;
+        let earlier = &here[..here.len() - 1];
+        let shared = !earlier.is_empty() && !(inserts && earlier.iter().all(|&i| edits[i].1 == start));
+        if shared || furthest.is_some_and(|furthest| start < furthest) {
+            return true;
+        }
+        furthest = furthest.max(here.iter().map(|&i| edits[i].1).max());
+    }
+    false
+}
+
+/// The path of the first `Range`-shaped value in `value`, below `path`, that
+/// ends before it starts. The items' opaque `LSPAny` values, their `data`
+/// and a command's `arguments`, aren't looked into: they may hold anything.
+fn disordered_range(value: &Value, path: &mut String) -> Option<String> {
+    if span(value).is_some_and(|(start, end)| start > end) {
+        return Some(path.clone());
+    }
+    let len = path.len();
+    let below = |path: &mut String, v: &Value| {
+        let found = disordered_range(v, path);
+        path.truncate(len);
+        found
+    };
+    let opaque = |key: &str| key == "data" || key == "arguments";
+    match value {
+        Value::Object(members) => members.iter().filter(|(key, _)| !opaque(key)).find_map(|(key, v)| {
+            if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                path.push('.');
+                path.push_str(key);
+            } else {
+                path.push_str(&format!("[{}]", Value::from(key.as_str())));
+            }
+            below(path, v)
+        }),
+        Value::Array(items) => items.iter().enumerate().find_map(|(i, v)| {
+            path.push_str(&format!("[{i}]"));
+            below(path, v)
+        }),
+        _ => None,
+    }
 }
 
 /// How one of K1's requests went.
@@ -784,9 +920,14 @@ mod tests {
         }
     }
 
-    /// The follow-ups for a source answer whose first item is valid.
+    /// The follow-ups for a source answer whose first item is valid by the
+    /// meta-model.
     fn plan(r: &Request, answer: &Value) -> Result<Vec<Request>, FollowupError> {
-        r.followups(r.followup_item(answer)?.1)
+        let item = r.followup_item(answer)?.1;
+        match r.item_problem(item) {
+            Some(why) => Err(FollowupError::Unusable(why)),
+            None => Ok(r.followups(item)),
+        }
     }
 
     #[test]
@@ -808,22 +949,37 @@ mod tests {
         assert_eq!(completion.followup_item(&json!([item])), Ok(("CompletionItem", &item)));
     }
 
+    /// A range from `(start line, start character)` to `(end line, end
+    /// character)`, each number as given, so its spelling can vary.
+    fn range(start: (Value, Value), end: (Value, Value)) -> Value {
+        json!({"start": {"line": start.0, "character": start.1}, "end": {"line": end.0, "character": end.1}})
+    }
+
+    /// A range of plain integers.
+    fn at(sl: u32, sc: u32, el: u32, ec: u32) -> Value {
+        range((sl.into(), sc.into()), (el.into(), ec.into()))
+    }
+
+    /// Whether `r` follows up `item`, or else why not.
+    fn judged(r: &Request, item: &Value) -> Result<(), String> {
+        r.item_problem(item).map_or(Ok(()), Err)
+    }
+
     #[test]
     fn a_hierarchy_item_with_disordered_or_uncontained_ranges_gets_no_follow_up() {
         let caps = json!({"callHierarchyProvider": true, "typeHierarchyProvider": true});
         let requests = source_requests(&caps);
-        let at = |sl: u32, sc: u32, el: u32, ec: u32| json!({"start": {"line": sl, "character": sc}, "end": {"line": el, "character": ec}});
         let item = |range: Value, selection: Value| json!({"name": "f", "kind": 12, "uri": "file:///w/a.txt", "range": range, "selectionRange": selection});
         for r in &requests {
             for (range, selection, why) in [
-                (at(1, 0, 0, 5), at(1, 0, 1, 0), Some("has a range that ends before it starts")),
-                (at(0, 0, 2, 0), at(1, 4, 1, 2), Some("has a selectionRange that ends before it starts")),
+                (at(1, 0, 0, 5), at(1, 0, 1, 0), Some("has a range that ends before it starts (item.range)")),
+                (at(0, 0, 2, 0), at(1, 4, 1, 2), Some("has a range that ends before it starts (item.selectionRange)")),
                 (at(1, 2, 3, 0), at(1, 1, 1, 4), Some("has a selectionRange outside its range")),
                 (at(1, 2, 3, 0), at(2, 0, 3, 1), Some("has a selectionRange outside its range")),
                 (at(1, 2, 3, 0), at(1, 2, 3, 0), None),
                 (at(1, 2, 3, 0), at(1, 9, 2, 0), None),
             ] {
-                let got = r.followups(&item(range.clone(), selection.clone()));
+                let got = plan(r, &json!([item(range.clone(), selection.clone())]));
                 match why {
                     Some(why) => {
                         let ty = if r.method.contains("Call") { "CallHierarchyItem" } else { "TypeHierarchyItem" };
@@ -837,25 +993,243 @@ mod tests {
     }
 
     #[test]
+    fn positions_are_compared_by_value_however_they_are_spelled() {
+        let caps = json!({"callHierarchyProvider": true});
+        let prepare = &source_requests(&caps)[0];
+        let item = |range: Value, selection: Value| json!({"name": "f", "kind": 12, "uri": "file:///w/a.txt", "range": range, "selectionRange": selection});
+        let n = |text: &str| -> Value { serde_json::from_str(text).unwrap() };
+        let zero = || (n("0"), n("0.0"));
+        // 0 to 2.0 is in order, and contains 1e0 to 2.0.
+        let valid = item(range(zero(), (n("2.0"), n("0"))), range((n("1e0"), n("0")), (n("2.0"), n("0.0"))));
+        assert_eq!(judged(prepare, &valid), Ok(()));
+        let inverted = item(range((n("3.0"), n("0")), (n("1.0"), n("0"))), range(zero(), zero()));
+        let why = "its first item has a range that ends before it starts (item.range), so it isn't a valid \
+                   CallHierarchyItem";
+        assert_eq!(judged(prepare, &inverted), Err(why.into()));
+        let outside = item(range(zero(), (n("2.0"), n("0"))), range((n("2"), n("0")), (n("2.0"), n("1"))));
+        let why = "its first item has a selectionRange outside its range, so it isn't a valid CallHierarchyItem";
+        assert_eq!(judged(prepare, &outside), Err(why.into()));
+    }
+
+    #[test]
+    fn a_range_anywhere_in_an_item_must_be_in_order_but_opaque_values_may_hold_anything() {
+        let caps = json!({"codeLensProvider": {"resolveProvider": true}});
+        let lenses = &source_requests(&caps)[0];
+        let ok = at(0, 0, 0, 1);
+        let backwards = at(2, 0, 1, 0);
+        let lens = |extra: Value| {
+            let mut lens = json!({"range": ok});
+            lens.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            lens
+        };
+        let invalid = |path: &str| {
+            Err(format!("its first item has a range that ends before it starts ({path}), so it isn't a valid CodeLens"))
+        };
+        assert_eq!(judged(lenses, &lens(json!({}))), Ok(()));
+        assert_eq!(judged(lenses, &json!({"range": backwards})), invalid("item.range"));
+        // Within the same line too.
+        assert_eq!(judged(lenses, &json!({"range": at(1, 4, 1, 3)})), invalid("item.range"));
+        assert_eq!(
+            judged(lenses, &lens(json!({"x-ext": {"nested": [1, backwards]}}))),
+            invalid("item[\"x-ext\"].nested[1]")
+        );
+        // `data` and a command's `arguments` are LSPAny, which may hold anything.
+        for opaque in [
+            json!({"data": {"range": backwards}}),
+            json!({"command": {"title": "t", "command": "c", "arguments": [backwards]}}),
+            // Not Range-shaped: the line isn't an integer.
+            json!({"x": {"start": {"line": 2.5, "character": 0}, "end": {"line": 1, "character": 0}}}),
+        ] {
+            assert_eq!(judged(lenses, &lens(opaque.clone())), Ok(()), "{opaque}");
+        }
+        // A long path is cut short.
+        let key = "k".repeat(200);
+        let Err(why) = judged(lenses, &lens(json!({key: backwards}))) else { panic!() };
+        assert!(why.contains(&format!("(item.{}…)", "k".repeat(75))), "{why}");
+    }
+
+    #[test]
+    fn a_completion_items_edits_must_be_valid_for_lspchecks_client_and_its_position() {
+        let caps = json!({"completionProvider": {"resolveProvider": true}});
+        // At 1:2, that is line 0, character 1.
+        let completion = &source_requests(&caps)[0];
+        let edit = |range: Value| json!({"range": range, "newText": "x"});
+        let item = |extra: Value| {
+            let mut item = json!({"label": "a"});
+            item.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            item
+        };
+        let invalid = |why: &str| Err(format!("its first item {why}, so it isn't a valid CompletionItem"));
+        for (extra, want) in [
+            (json!({"textEdit": edit(at(0, 0, 0, 1))}), Ok(())),
+            (json!({"textEdit": edit(at(0, 1, 0, 1))}), Ok(())),
+            (json!({"textEdit": edit(at(0, 1, 0, 2))}), Ok(())),
+            (json!({"textEdit": edit(at(0, 0, 1, 0))}), invalid("has a textEdit that isn't on one line")),
+            (
+                json!({"textEdit": edit(at(0, 2, 0, 3))}),
+                invalid("has a textEdit that doesn't contain the completion's position"),
+            ),
+            (
+                json!({"textEdit": {"newText": "x", "insert": at(0, 0, 0, 1), "replace": at(0, 0, 0, 2)}}),
+                invalid("has an InsertReplaceEdit textEdit, which lspcheck's client capabilities don't allow"),
+            ),
+            // Additional edits may touch, but neither overlap nor share a start.
+            (json!({"textEdit": edit(at(0, 1, 0, 2)), "additionalTextEdits": [edit(at(0, 0, 0, 1))]}), Ok(())),
+            (json!({"additionalTextEdits": [edit(at(1, 0, 1, 2)), edit(at(0, 0, 0, 0))]}), Ok(())),
+            (
+                json!({"textEdit": edit(at(0, 1, 0, 2)), "additionalTextEdits": [edit(at(0, 1, 0, 1))]}),
+                invalid("has additionalTextEdits that overlap or share a start with each other or its textEdit"),
+            ),
+            (
+                json!({"additionalTextEdits": [edit(at(3, 0, 3, 0)), edit(at(3, 0, 3, 0))]}),
+                invalid("has additionalTextEdits that overlap or share a start with each other or its textEdit"),
+            ),
+            (
+                json!({"additionalTextEdits": [edit(at(2, 0, 4, 0)), edit(at(1, 0, 2, 1))]}),
+                invalid("has additionalTextEdits that overlap or share a start with each other or its textEdit"),
+            ),
+            (
+                json!({"additionalTextEdits": [edit(at(3, 1, 3, 0))]}),
+                invalid("has a range that ends before it starts (item.additionalTextEdits[0].range)"),
+            ),
+        ] {
+            assert_eq!(judged(completion, &item(extra.clone())), want, "{extra}");
+        }
+    }
+
+    #[test]
+    fn an_inlay_hint_needs_a_label_and_edits_that_dont_overlap() {
+        let caps = json!({"inlayHintProvider": {"resolveProvider": true}});
+        let hints = &source_requests(&caps)[0];
+        let hint = |label: Value| json!({"position": {"line": 0, "character": 1}, "label": label});
+        let invalid = |why: &str| Err(format!("its first item {why}, so it isn't a valid InlayHint"));
+        for (label, want) in [
+            (json!("a"), Ok(())),
+            (json!([{"value": "a"}, {"value": "b"}]), Ok(())),
+            (json!(""), invalid("has an empty label")),
+            (json!([]), invalid("has an empty label")),
+            (json!([{"value": "a"}, {"value": ""}]), invalid("has an empty label")),
+            (
+                json!([{"value": "a", "location": {"uri": "file:///w/a.txt", "range": at(0, 3, 0, 2)}}]),
+                invalid("has a range that ends before it starts (item.label[0].location.range)"),
+            ),
+        ] {
+            assert_eq!(judged(hints, &hint(label.clone())), want, "{label}");
+        }
+        let edit = |range: Value| json!({"range": range, "newText": "x"});
+        for (edits, want) in [
+            (json!([edit(at(0, 0, 0, 1)), edit(at(0, 1, 0, 2))]), Ok(())),
+            // A TextEdit[] may insert several times at one place, before at
+            // most one other edit there.
+            (json!([edit(at(0, 1, 0, 1)), edit(at(0, 1, 0, 1)), edit(at(0, 1, 0, 3))]), Ok(())),
+            (json!([edit(at(0, 1, 0, 3)), edit(at(0, 1, 0, 1))]), invalid("has textEdits that overlap")),
+            (json!([edit(at(0, 0, 0, 3)), edit(at(0, 2, 0, 2))]), invalid("has textEdits that overlap")),
+        ] {
+            let mut item = hint(json!("a"));
+            item["textEdits"] = edits.clone();
+            assert_eq!(judged(hints, &item), want, "{edits}");
+        }
+    }
+
+    #[test]
     fn only_a_symbol_that_cant_be_a_symbol_information_is_resolved() {
         let caps = json!({"workspaceSymbolProvider": {"resolveProvider": true}});
         let symbols = &source_requests(&caps)[0];
-        let range = json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}});
-        let full = json!({"uri": "file:///w/a.txt", "range": range});
-        for (symbol, resolved) in [
-            (json!({"name": "s", "kind": 13, "location": full}), false),
-            (json!({"name": "s", "kind": 13, "location": full, "containerName": "c"}), false),
-            (json!({"name": "s", "kind": 13, "location": full, "data": null}), true),
-            (json!({"name": "s", "kind": 13, "location": {"uri": "file:///w/a.txt"}}), true),
+        let uri = "file:///w/a.txt";
+        let full = json!({"uri": uri, "range": at(0, 0, 0, 1)});
+        let information = "its first item may be a SymbolInformation, which workspaceSymbol/resolve doesn't take";
+        let invalid = |why: &str| Err(format!("its first item {why}, so it isn't a valid WorkspaceSymbol"));
+        for (symbol, want) in [
+            (json!({"name": "s", "kind": 13, "location": full}), Err(information.into())),
+            (json!({"name": "s", "kind": 13, "location": full, "containerName": "c"}), Err(information.into())),
+            (json!({"name": "s", "kind": 13, "location": full, "data": null}), Ok(())),
+            (json!({"name": "s", "kind": 13, "location": {"uri": uri}}), Ok(())),
+            // The meta-model reads `{uri, range: null}` as the range-less
+            // location, which ignores the extra member.
+            (
+                json!({"name": "s", "kind": 13, "location": {"uri": uri, "range": null}, "data": 1}),
+                invalid("has a location.range that isn't a Range"),
+            ),
+            (
+                json!({"name": "s", "kind": 13, "location": {"uri": uri, "range": at(1, 0, 0, 0)}, "data": 1}),
+                invalid("has a range that ends before it starts (item.location.range)"),
+            ),
         ] {
-            let got = symbols.followups(&symbol);
-            if resolved {
-                assert_eq!(got.unwrap()[0].params, symbol);
-            } else {
-                let why = "its first item may be a SymbolInformation, which workspaceSymbol/resolve doesn't take";
-                assert_eq!(got, Err(FollowupError::Unusable(why.into())), "{symbol}");
+            assert_eq!(judged(symbols, &symbol), want, "{symbol}");
+            if want.is_ok() {
+                assert_eq!(symbols.followups(&symbol)[0].params, symbol);
             }
         }
+    }
+
+    #[test]
+    fn the_items_hold_opaque_values_only_in_data_and_command_arguments() {
+        use crate::metamodel::{Type, model};
+        use std::collections::BTreeSet;
+        /// Adds the names of the members of `ty`, reached through `key`, whose
+        /// type is `LSPAny`.
+        fn opaque(ty: &Type, key: &str, within: &mut Vec<String>, found: &mut BTreeSet<String>) {
+            match ty {
+                Type::Reference { name } if name == "LSPAny" => {
+                    found.insert(key.into());
+                }
+                Type::Reference { name } if !within.contains(name) => {
+                    if let Some(s) = model().structures.get(name) {
+                        within.push(name.clone());
+                        for t in s.extends.iter().chain(&s.mixins) {
+                            opaque(t, key, within, found);
+                        }
+                        for p in &s.properties {
+                            opaque(&p.ty, &p.name, within, found);
+                        }
+                        within.pop();
+                    } else if let Some(alias) = model().aliases.get(name) {
+                        opaque(&alias.ty, key, within, found);
+                    }
+                }
+                Type::Array { element } => opaque(element, key, within, found),
+                Type::Map { value, .. } => opaque(value, key, within, found),
+                Type::And { items } | Type::Or { items } | Type::Tuple { items } => {
+                    for t in items {
+                        opaque(t, key, within, found);
+                    }
+                }
+                Type::Literal { value } => {
+                    for p in &value.properties {
+                        opaque(&p.ty, &p.name, within, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = BTreeSet::new();
+        for (.., followup) in table() {
+            if let Some(f) = followup {
+                opaque(&Type::Reference { name: f.item.into() }, "", &mut Vec::new(), &mut found);
+            }
+        }
+        assert_eq!(found, BTreeSet::from(["arguments".to_string(), "data".to_string()]));
+    }
+
+    #[test]
+    fn edits_clash_when_they_overlap_or_share_a_start() {
+        let span = |sl, sc, el, ec| ((sl, sc), (el, ec));
+        let apart = [span(0, 0, 0, 2), span(0, 2, 0, 3), span(1, 0, 1, 0)];
+        assert!(!clash(&apart, false) && !clash(&apart, true));
+        // Out of order, the later one runs into the earlier.
+        let into = [span(1, 0, 2, 0), span(0, 0, 1, 5)];
+        assert!(clash(&into, false) && clash(&into, true));
+        // An insert inside another edit.
+        let inside = [span(0, 0, 0, 3), span(0, 1, 0, 1)];
+        assert!(clash(&inside, false) && clash(&inside, true));
+        // Inserts at one place, then one other edit there: lawful only as a TextEdit[].
+        let inserts = [span(0, 1, 0, 1), span(0, 1, 0, 1), span(0, 1, 0, 4)];
+        assert!(clash(&inserts, false) && !clash(&inserts, true));
+        let replace_first = [span(0, 1, 0, 4), span(0, 1, 0, 1)];
+        assert!(clash(&replace_first, true));
+        let two_replaces = [span(0, 1, 0, 4), span(0, 1, 0, 2)];
+        assert!(clash(&two_replaces, true));
+        assert!(!clash(&[], false));
     }
 
     #[test]

@@ -402,6 +402,13 @@ const FAULTS: &[(&str, &str)] = &[
          MethodNotFound",
     ),
     (
+        "followup-invalid-items",
+        "lawful: give each item K1 follows up, but call hierarchy items, a flaw the meta-model's types don't show (a \
+         completion textEdit over two lines, away from the position or an InsertReplaceEdit, a range spelled with \
+         decimals or not that ends before it starts, an empty inlay hint label, a workspace symbol range of null), and \
+         answer their follow-ups with MethodNotFound; call hierarchy items have valid ranges spelled with a decimal",
+    ),
+    (
         "followup-method-not-found-at-shutdown",
         "hold the first completionItem/resolve and answer it with MethodNotFound when shutdown arrives",
     ),
@@ -1728,6 +1735,8 @@ fn main() {
                     json!([])
                 } else if fault("followup-symbol-information") {
                     json!([{"name": "standin", "kind": 13, "location": {"uri": ELSEWHERE, "range": range(0, 0, 0, 1)}}])
+                } else if fault("followup-invalid-items") {
+                    json!([{"name": "standin", "kind": 13, "location": {"uri": ELSEWHERE, "range": null}, "data": followup_data("workspaceSymbol")}])
                 } else {
                     json!([{"name": "standin", "kind": 13, "location": {"uri": ELSEWHERE}, "data": followup_data("workspaceSymbol")}])
                 };
@@ -1755,6 +1764,9 @@ fn main() {
                 {
                     item["selectionRange"] = range(0, 0, 1, 0);
                 }
+                if fault("followup-invalid-items") {
+                    flaw_followup_source(&method, &mut result, &msg["params"]["position"]);
+                }
                 let answer = ok(&id, result);
                 if method == "textDocument/completion" && std::mem::take(&mut defer_followup_source) {
                     held_followup_source = Some(answer);
@@ -1780,6 +1792,7 @@ fn main() {
                     && (fault("followup-hierarchy-method-not-found") || fault("followup-hierarchy-bad-ranges"))
                     || !hierarchy && fault("followup-resolve-method-not-found")
                     || method == "workspaceSymbol/resolve" && fault("followup-symbol-information")
+                    || fault("followup-invalid-items") && !method.starts_with("callHierarchy/")
                 {
                     out.frame(&err(&id, -32601, "method not found"));
                 } else if fault("followup-request-failed") {
@@ -2737,6 +2750,41 @@ fn followup_source(method: &str, uri: Value, position: &Value, empty: bool) -> V
         "textDocument/inlayHint" => {
             json!([{"position": {"line": 0, "character": 0}, "label": "standin", "data": followup_data("inlayHint")}])
         }
+        _ => unreachable!("not a source of K1's follow-ups: {method}"),
+    }
+}
+
+/// For followup-invalid-items: gives the first item of a source answer at
+/// `position` a flaw the meta-model's types don't show, but a call hierarchy
+/// item valid ranges spelled with a decimal.
+fn flaw_followup_source(method: &str, result: &mut Value, position: &Value) {
+    let n = |text: &str| -> Value { serde_json::from_str(text).expect("a JSON number") };
+    let item = if result.get("items").is_some() { &mut result["items"][0] } else { &mut result[0] };
+    match method {
+        "textDocument/prepareCallHierarchy" => {
+            item["range"] = json!({"start": {"line": 0, "character": 0}, "end": {"line": n("2.0"), "character": 0}});
+        }
+        "textDocument/prepareTypeHierarchy" => {
+            // Every number a decimal, so that reading them only as plain
+            // integers would see no order at all.
+            let at = |line: &str| json!({"line": n(line), "character": n("0.0")});
+            item["range"] = json!({"start": at("3.0"), "end": at("1.0")});
+            item["selectionRange"] = json!({"start": at("3.0"), "end": at("3.0")});
+        }
+        "textDocument/completion" => {
+            // K1 asks at lines 0, 1 and 2, at characters 1, 5 and 1.
+            let line = position["line"].as_u64().unwrap_or(0) as usize;
+            item["textEdit"] = match line {
+                0 => json!({"range": range(0, 0, 1, 0), "newText": "standin"}),
+                1 => json!({"range": range(1, 0, 1, 2), "newText": "standin"}),
+                _ => {
+                    json!({"newText": "standin", "insert": range(line, 0, line, 1), "replace": range(line, 0, line, 3)})
+                }
+            };
+        }
+        "textDocument/codeLens" => item["range"] = range(1, 0, 0, 0),
+        "textDocument/documentLink" => item["range"] = range(0, 3, 0, 1),
+        "textDocument/inlayHint" => item["label"] = json!(""),
         _ => unreachable!("not a source of K1's follow-ups: {method}"),
     }
 }

@@ -411,15 +411,29 @@ Some advertised capabilities also cover a **follow-up** request that needs an it
 | inlayHintProvider.resolveProvider: true | textDocument/inlayHint: `InlayHint[]` | inlayHint/resolve, the item |
 | workspaceSymbolProvider.resolveProvider: true | workspace/symbol: `WorkspaceSymbol[]` | workspaceSymbol/resolve, the item |
 
-- K1 checks the first item's type against the meta-model without descending into opaque `LSPAny` values. It
-  passes the item back exactly as received, including its `data`, once per listed follow-up for each source request.
-- That check runs on a thread of its own that K1 waits on for at most `--timeout`; one that doesn't finish in time
-  leaves K1 inconclusive, like an item too large to check.
-- A hierarchy item is followed up only if its `range` and `selectionRange` each start no later than they end and
-  `selectionRange` lies within `range`, since an item that breaks this isn't a valid parameter.
-- A workspace symbol is resolved only if it has `data` or a `location` without a `range`: anything else may be a
-  `SymbolInformation`, which `workspace/symbol` may answer with even when resolving, and which
-  workspaceSymbol/resolve doesn't take.
+- K1 passes the first item back exactly as received, including its `data`, once per listed follow-up for each
+  source request, but only if the item is a valid parameter. It checks the item's type against the meta-model,
+  without descending into opaque `LSPAny` values, and then the rules of the specification that types can't express:
+  - every range in the item starts no later than it ends. A range is any object whose `start` and `end` each have
+    an integer `line` and `character`, spelled `2` or `2.0` as the meta-model reads them, except within `data` and
+    a command's `arguments`, which are `LSPAny`;
+  - a hierarchy item's `selectionRange` lies within its `range`;
+  - a completion item's `textEdit` is a `TextEdit` (an `InsertReplaceEdit` needs `insertReplaceSupport`, which
+    lspcheck doesn't offer), on one line and containing the completion's position, and its `additionalTextEdits`
+    neither overlap nor share a start with each other or the `textEdit`;
+  - an inlay hint's `label` is a non-empty string or a non-empty array of parts with non-empty values, and its
+    `textEdits` don't overlap (as in any `TextEdit[]`, several may start at one place if all but the last there are
+    inserts);
+  - a workspace symbol's `location.range`, when present, is a range (the meta-model's `Location | {uri}` takes
+    `{uri, range: null}` as the latter), and the symbol has `data` or a `location` without a `range`: anything else
+    may be a `SymbolInformation`, which `workspace/symbol` may answer with even when resolving, and which
+    workspaceSymbol/resolve doesn't take.
+- Members for client capabilities lspcheck didn't offer (such as a completion item's `labelDetails` or
+  `insertTextMode`) and rules the specification only recommends (a code lens on one line) don't stop a follow-up:
+  such items are sent as received.
+- The check runs on a thread of its own that K1 waits on for at most 10 seconds, whatever `--timeout` is: far longer
+  than its step budget takes. One that doesn't finish in time leaves K1 inconclusive, like an item too large to
+  check, and while its thread still runs, later items aren't checked and leave K1 inconclusive too.
 - K1 skips follow-ups from null, empty or error replies and replies with an unusable first item. The detail names
   the source request, the follow-ups left unsent, and the reason.
 - A follow-up's label includes its method and the source request's label, for example `completionItem/resolve with
