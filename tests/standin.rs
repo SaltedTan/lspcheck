@@ -802,6 +802,58 @@ fn a_follow_up_answered_with_method_not_found_fails_k1() {
 }
 
 #[test]
+fn a_follow_ups_method_not_found_read_at_shutdown_fails_k1() {
+    // The stand-in holds the first completionItem/resolve past K1's wait and
+    // answers it with MethodNotFound only when shutdown arrives.
+    let r = fault("followup-method-not-found-at-shutdown");
+    only_fails(&r, &["K1"]);
+    let k1 = detail(&r, "K1");
+    assert!(
+        k1.starts_with(
+            "MethodNotFound (-32601) for 1 advertised request(s): completionItem/resolve with the first item of \
+             textDocument/completion at 1:2"
+        ),
+        "{k1}"
+    );
+}
+
+#[test]
+fn a_symbol_that_may_be_a_symbol_information_isnt_resolved() {
+    // workspace/symbol may answer SymbolInformation[], which a server that
+    // resolves WorkspaceSymbols needn't resolve: this one answers
+    // MethodNotFound, and K1 mustn't ask.
+    let r = fault("followup-symbol-information");
+    passes_except(&r, &[]);
+    let k1 = detail(&r, "K1");
+    assert!(k1.starts_with("40 request(s) for 20 advertised method(s) were answered"), "{k1}");
+    let note = "follow-ups not sent for workspace/symbol (workspaceSymbol/resolve): its first item may be a \
+                SymbolInformation, which workspaceSymbol/resolve doesn't take";
+    assert!(k1.contains(note), "{k1}");
+}
+
+#[test]
+fn a_hierarchy_item_whose_selection_range_is_outside_its_range_isnt_followed_up() {
+    // The items aren't valid params, so the MethodNotFound the stand-in
+    // would answer their follow-ups with mustn't be asked for.
+    let r = fault("followup-hierarchy-bad-ranges");
+    passes_except(&r, &[]);
+    let k1 = detail(&r, "K1");
+    assert!(k1.starts_with("29 request(s) for 17 advertised method(s) were answered"), "{k1}");
+    for (source, methods, ty) in [
+        ("textDocument/prepareCallHierarchy", "callHierarchy/incomingCalls and callHierarchy/outgoingCalls", "Call"),
+        ("textDocument/prepareTypeHierarchy", "typeHierarchy/supertypes and typeHierarchy/subtypes", "Type"),
+    ] {
+        for position in ["1:2", "2:6", "3:2"] {
+            let note = format!(
+                "follow-ups not sent for {source} at {position} ({methods}): its first item has a selectionRange \
+                 outside its range, so it isn't a valid {ty}HierarchyItem"
+            );
+            assert!(k1.contains(&note), "{note} missing in {k1}");
+        }
+    }
+}
+
+#[test]
 fn source_answers_without_items_leave_k1s_follow_ups_noted_not_sent() {
     let r = fault("followup-sources-empty");
     passes_except(&r, &[]);

@@ -2693,12 +2693,21 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
         if let Some(i) = sources.iter().position(|(_, id)| ctx.s.answer_to(id).is_some()) {
             use capabilities::FollowupError::{Inconclusive, Unusable};
             let (r, id) = sources.remove(i);
-            let followups = match &ctx.s.answer_to(&id).expect("matched source").kind {
-                Kind::Response { outcome: Outcome::Result(result), .. } => r.followups(result),
+            let item = match &ctx.s.answer_to(&id).expect("matched source").kind {
+                Kind::Response { outcome: Outcome::Result(result), .. } => {
+                    r.followup_item(result).map(|(ty, item)| (ty, std::sync::Arc::new(item.clone())))
+                }
                 Kind::Response { outcome: Outcome::Error { .. }, .. } => {
                     Err(Unusable("the answer was an error".into()))
                 }
                 _ => Err(Unusable("the answer wasn't a result".into())),
+            };
+            let followups = match item {
+                Ok((ty, item)) => {
+                    let deadline = Instant::now() + ctx.cfg.request_timeout;
+                    k1_check_item(ty, item.clone(), deadline).await.and_then(|()| r.followups(&item))
+                }
+                Err(e) => Err(e),
             };
             match followups {
                 Err(Unusable(why)) => notes.push(r.skipped_followups(&why)),
@@ -2746,6 +2755,55 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
     };
     notes.extend(sources.iter().map(|(r, _)| r.skipped_followups(why)));
     K1Pending::Sent { asked, notes, inspection_errors }
+}
+
+/// Checks that a follow-up's item is a valid `ty`, so that K1 sends valid
+/// params, giving up at `deadline`: any limit lspcheck hits is inconclusive.
+async fn k1_check_item(
+    ty: &'static str,
+    item: std::sync::Arc<Value>,
+    deadline: Instant,
+) -> Result<(), capabilities::FollowupError> {
+    use capabilities::FollowupError::{Inconclusive, Unusable};
+    match validate_until(deadline, move || metamodel::validate_followup_item(ty, &item)).await {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => Err(Unusable(format!("its first item isn't a valid {ty} (see K2)"))),
+        Ok(Err(TooLarge)) => Err(Inconclusive(format!("its first item is too large for lspcheck to check as a {ty}"))),
+        Err(Unfinished::Expired) => {
+            Err(Inconclusive(format!("lspcheck didn't finish checking its first item as a {ty} within --timeout")))
+        }
+        Err(Unfinished::Unstarted(e)) => Err(Inconclusive(format!("lspcheck couldn't check its first item ({e})"))),
+    }
+}
+
+/// Why [`validate_until`] has no result.
+#[derive(Debug)]
+enum Unfinished {
+    Unstarted(std::io::Error),
+    Expired,
+}
+
+/// Runs `f`, which validates, on a thread with a [`metamodel::STACK`]-sized
+/// stack, and waits for it until `deadline`. Nothing joins the thread: after
+/// the deadline it finishes its budget-bounded work unobserved.
+async fn validate_until<R: Send + 'static>(
+    deadline: Instant,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> Result<R, Unfinished> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("lspcheck-validate".into())
+        .stack_size(metamodel::STACK)
+        .spawn(move || {
+            let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
+        })
+        .map_err(Unfinished::Unstarted)?;
+    match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(Ok(result))) => Ok(result),
+        Ok(Ok(Err(panic))) => std::panic::resume_unwind(panic),
+        Ok(Err(_)) => unreachable!("the validation thread sends before it ends"),
+        Err(_) => Err(Unfinished::Expired),
+    }
 }
 
 /// Sends one of K1's requests, waiting up to `--timeout` if requested.
@@ -7367,6 +7425,25 @@ pub fn file_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn k1_checks_a_follow_ups_item_and_gives_up_at_its_deadline() {
+        use capabilities::FollowupError::Unusable;
+        let later = || Instant::now() + Duration::from_secs(60);
+        let valid = std::sync::Arc::new(json!({"label": "a", "data": {"deep": [1]}}));
+        assert_eq!(k1_check_item("CompletionItem", valid, later()).await, Ok(()));
+        let invalid = std::sync::Arc::new(json!({"detail": "no label"}));
+        assert_eq!(
+            k1_check_item("CompletionItem", invalid, later()).await,
+            Err(Unusable("its first item isn't a valid CompletionItem (see K2)".into()))
+        );
+        // Validation that can't finish before the deadline: the thread waits
+        // for a message sent only after K1 has given up on it.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let blocked = validate_until(Instant::now() + Duration::from_millis(50), move || wait.recv()).await;
+        assert!(matches!(blocked, Err(Unfinished::Expired)), "{blocked:?}");
+        drop(go);
+    }
 
     #[test]
     fn k1s_initialize_params_are_valid_and_k2_knows_its_follow_ups_results() {

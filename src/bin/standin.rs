@@ -392,6 +392,19 @@ const FAULTS: &[(&str, &str)] = &[
     ("followup-unanswered", "never answer codeLens/resolve"),
     ("followup-source-deferred", "lawful: hold the first completion reply until the next request"),
     ("followup-large-data", "lawful: attach a large opaque data array to a code lens"),
+    (
+        "followup-symbol-information",
+        "lawful: answer workspace/symbol with a SymbolInformation, and workspaceSymbol/resolve with MethodNotFound",
+    ),
+    (
+        "followup-hierarchy-bad-ranges",
+        "lawful: give hierarchy items a selectionRange outside their range, and answer their follow-ups with \
+         MethodNotFound",
+    ),
+    (
+        "followup-method-not-found-at-shutdown",
+        "hold the first completionItem/resolve and answer it with MethodNotFound when shutdown arrives",
+    ),
     ("defer-hover-until-shutdown", "lawful: answer hover requests only when shutdown arrives"),
     (
         "advertised-error-after-shutdown",
@@ -498,6 +511,8 @@ fn main() {
     let mut held_hovers: Vec<Value> = Vec::new();
     let mut defer_followup_source = fault("followup-source-deferred");
     let mut held_followup_source = None;
+    let mut hold_resolve = fault("followup-method-not-found-at-shutdown");
+    let mut held_resolve: Option<Value> = None;
     // Set by stop-after-unknown-cancel: requests are no longer answered.
     let mut no_more_answers = false;
     // For drop-first-request: whether the first document request was dropped.
@@ -1551,6 +1566,11 @@ fn main() {
         {
             out.frame(&err(&color, -32601, "method not found"));
         }
+        if method == "shutdown"
+            && let Some(resolve) = held_resolve.take()
+        {
+            out.frame(&err(&resolve, -32601, "method not found"));
+        }
         if method == "textDocument/hover" && fault("echo-positions") {
             let uri = msg.pointer("/params/textDocument/uri").and_then(Value::as_str).unwrap_or("");
             let position = &msg["params"]["position"];
@@ -1706,6 +1726,8 @@ fn main() {
             "workspace/symbol" if followups_advertised => {
                 let symbols = if fault("followup-sources-empty") {
                     json!([])
+                } else if fault("followup-symbol-information") {
+                    json!([{"name": "standin", "kind": 13, "location": {"uri": ELSEWHERE, "range": range(0, 0, 0, 1)}}])
                 } else {
                     json!([{"name": "standin", "kind": 13, "location": {"uri": ELSEWHERE}, "data": followup_data("workspaceSymbol")}])
                 };
@@ -1727,6 +1749,12 @@ fn main() {
                 {
                     lens["data"] = Value::Array(vec![Value::Null; 500_000]);
                 }
+                if method.ends_with("Hierarchy")
+                    && fault("followup-hierarchy-bad-ranges")
+                    && let Some(item) = result.get_mut(0)
+                {
+                    item["selectionRange"] = range(0, 0, 1, 0);
+                }
                 let answer = ok(&id, result);
                 if method == "textDocument/completion" && std::mem::take(&mut defer_followup_source) {
                     held_followup_source = Some(answer);
@@ -1746,8 +1774,12 @@ fn main() {
                 let hierarchy = !method.ends_with("/resolve");
                 if method == "codeLens/resolve" && fault("followup-unanswered") {
                     // Never answered.
-                } else if hierarchy && fault("followup-hierarchy-method-not-found")
+                } else if method == "completionItem/resolve" && std::mem::take(&mut hold_resolve) {
+                    held_resolve = Some(id);
+                } else if hierarchy
+                    && (fault("followup-hierarchy-method-not-found") || fault("followup-hierarchy-bad-ranges"))
                     || !hierarchy && fault("followup-resolve-method-not-found")
+                    || method == "workspaceSymbol/resolve" && fault("followup-symbol-information")
                 {
                     out.frame(&err(&id, -32601, "method not found"));
                 } else if fault("followup-request-failed") {

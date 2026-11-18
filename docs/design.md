@@ -413,6 +413,13 @@ Some advertised capabilities also cover a **follow-up** request that needs an it
 
 - K1 checks the first item's type against the meta-model without descending into opaque `LSPAny` values. It
   passes the item back exactly as received, including its `data`, once per listed follow-up for each source request.
+- That check runs on a thread of its own that K1 waits on for at most `--timeout`; one that doesn't finish in time
+  leaves K1 inconclusive, like an item too large to check.
+- A hierarchy item is followed up only if its `range` and `selectionRange` each start no later than they end and
+  `selectionRange` lies within `range`, since an item that breaks this isn't a valid parameter.
+- A workspace symbol is resolved only if it has `data` or a `location` without a `range`: anything else may be a
+  `SymbolInformation`, which `workspace/symbol` may answer with even when resolving, and which
+  workspaceSymbol/resolve doesn't take.
 - K1 skips follow-ups from null, empty or error replies and replies with an unusable first item. The detail names
   the source request, the follow-ups left unsent, and the reason.
 - A follow-up's label includes its method and the source request's label, for example `completionItem/resolve with

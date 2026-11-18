@@ -5,12 +5,10 @@
 //! document they are asked about, the follow-ups their answers lead to, and
 //! the verdict on how they were answered.
 //!
-//! Pure functions only (checking a follow-up's item against the meta-model
-//! runs on a validation thread); the scenario that sends the requests is in
-//! [`crate::checks`].
+//! Pure functions only; the scenario that sends the requests, and checks a
+//! follow-up's item against the meta-model, is in [`crate::checks`].
 
 use crate::message::codes;
-use crate::metamodel::{self, TooLarge};
 use crate::text::{self, Encoding, Position};
 use serde_json::{Value, json};
 
@@ -388,11 +386,11 @@ impl Request {
         format!("follow-ups not sent for {} ({}): {why}", self.label, self.followup_methods().join(" and "))
     }
 
-    /// Passes back the answer's first item exactly as received. The item
-    /// must match its meta-model type so that K1 sends valid params.
-    pub fn followups(&self, result: &Value) -> Result<Vec<Request>, FollowupError> {
-        use FollowupError::{Inconclusive, Unusable};
-        let Some(f) = self.followup else { return Ok(Vec::new()) };
+    /// The source answer's first item and the meta-model type it must be
+    /// valid as before it is passed back (the caller checks that).
+    pub fn followup_item<'a>(&self, result: &'a Value) -> Result<(&'static str, &'a Value), FollowupError> {
+        use FollowupError::Unusable;
+        let Some(f) = self.followup else { return Err(Unusable("it has no follow-ups".into())) };
         let items = match result {
             Value::Null => return Err(Unusable("the answer was null".into())),
             Value::Array(items) => items,
@@ -403,13 +401,25 @@ impl Request {
             _ => return Err(Unusable("the answer wasn't an array".into())),
         };
         let Some(item) = items.first() else { return Err(Unusable("the answer was empty".into())) };
-        match metamodel::on_validation_stack(|| metamodel::validate_followup_item(f.item, item)) {
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) => return Err(Unusable(format!("its first item isn't a valid {} (see K2)", f.item))),
-            Ok(Err(TooLarge)) => {
-                return Err(Inconclusive(format!("its first item is too large for lspcheck to check as a {}", f.item)));
-            }
-            Err(e) => return Err(Inconclusive(format!("lspcheck couldn't check its first item ({e})"))),
+        Ok((f.item, item))
+    }
+
+    /// The follow-ups for `item`, a valid instance of the type
+    /// [`Self::followup_item`] gave, which is passed back exactly as received.
+    pub fn followups(&self, item: &Value) -> Result<Vec<Request>, FollowupError> {
+        let Some(f) = self.followup else { return Ok(Vec::new()) };
+        if f.item == "WorkspaceSymbol" && !surely_workspace_symbol(item) {
+            // workspace/symbol may answer SymbolInformation[] even with
+            // resolveProvider, and a SymbolInformation is also a valid
+            // WorkspaceSymbol, but only the latter can be resolved.
+            return Err(FollowupError::Unusable(
+                "its first item may be a SymbolInformation, which workspaceSymbol/resolve doesn't take".into(),
+            ));
+        }
+        if f.wrapped
+            && let Some(why) = hierarchy_ranges_problem(item)
+        {
+            return Err(FollowupError::Unusable(format!("its first item {why}, so it isn't a valid {}", f.item)));
         }
         let params = if f.wrapped { json!({"item": item}) } else { item.clone() };
         Ok(f.methods
@@ -422,6 +432,28 @@ impl Request {
             })
             .collect())
     }
+}
+
+/// Whether a valid `WorkspaceSymbol` can't be a `SymbolInformation`: it has
+/// `data`, or its location has no range, both of which only a
+/// `WorkspaceSymbol` may.
+fn surely_workspace_symbol(item: &Value) -> bool {
+    item.get("data").is_some() || item["location"].get("range").is_none()
+}
+
+/// What breaks a hierarchy item's rule that both ranges are well ordered and
+/// `selectionRange` is contained in `range`, if anything. The item is valid,
+/// so both ranges have numeric positions.
+fn hierarchy_ranges_problem(item: &Value) -> Option<String> {
+    let at = |p: &Value| (p["line"].as_u64(), p["character"].as_u64());
+    let ends = |name: &str| (at(&item[name]["start"]), at(&item[name]["end"]));
+    let (range, selection) = (ends("range"), ends("selectionRange"));
+    for (name, (start, end)) in [("range", range), ("selectionRange", selection)] {
+        if start > end {
+            return Some(format!("has a {name} that ends before it starts"));
+        }
+    }
+    (selection.0 < range.0 || selection.1 > range.1).then(|| "has a selectionRange outside its range".into())
 }
 
 /// How one of K1's requests went.
@@ -731,7 +763,7 @@ mod tests {
         let other = json!({"name": "g", "kind": 12, "uri": "file:///w/a.txt", "range": at, "selectionRange": at});
         let requests = source_requests(&caps);
         let prepare = requests.iter().find(|r| r.method == "textDocument/prepareCallHierarchy").unwrap();
-        let sent = prepare.followups(&json!([item, other])).unwrap();
+        let sent = plan(prepare, &json!([item, other])).unwrap();
         let labels: Vec<&str> = sent.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -745,15 +777,20 @@ mod tests {
         let completion = requests.iter().find(|r| r.method == "textDocument/completion").unwrap();
         let first = json!({"label": "a", "data": 7});
         for answer in [json!([first, {"label": "b"}]), json!({"isIncomplete": true, "items": [first]})] {
-            let sent = completion.followups(&answer).unwrap();
+            let sent = plan(completion, &answer).unwrap();
             assert_eq!(sent.len(), 1);
             assert_eq!(sent[0].method, "completionItem/resolve");
             assert_eq!(sent[0].params, first, "the item itself is the params");
         }
     }
 
+    /// The follow-ups for a source answer whose first item is valid.
+    fn plan(r: &Request, answer: &Value) -> Result<Vec<Request>, FollowupError> {
+        r.followups(r.followup_item(answer)?.1)
+    }
+
     #[test]
-    fn an_answer_without_a_valid_first_item_gets_no_follow_up() {
+    fn an_answer_without_a_first_item_gets_no_follow_up() {
         let caps = json!({"callHierarchyProvider": true, "completionProvider": {"resolveProvider": true}});
         let requests = source_requests(&caps);
         let prepare = requests.iter().find(|r| r.method == "textDocument/prepareCallHierarchy").unwrap();
@@ -762,13 +799,62 @@ mod tests {
             (prepare, json!(null), "the answer was null"),
             (prepare, json!([]), "the answer was empty"),
             (prepare, json!({"name": "f"}), "the answer wasn't an array"),
-            (prepare, json!([{"name": "f", "kind": 12}]), "its first item isn't a valid CallHierarchyItem (see K2)"),
-            (prepare, json!([3]), "its first item isn't a valid CallHierarchyItem (see K2)"),
             (completion, json!({"isIncomplete": false, "items": []}), "the answer was empty"),
             (completion, json!({"isIncomplete": false}), "the answer had no items array"),
-            (completion, json!([{"detail": "no label"}]), "its first item isn't a valid CompletionItem (see K2)"),
         ] {
-            assert_eq!(r.followups(&answer), Err(FollowupError::Unusable(why.into())), "{answer}");
+            assert_eq!(r.followup_item(&answer), Err(FollowupError::Unusable(why.into())), "{answer}");
+        }
+        let item = json!({"label": "a"});
+        assert_eq!(completion.followup_item(&json!([item])), Ok(("CompletionItem", &item)));
+    }
+
+    #[test]
+    fn a_hierarchy_item_with_disordered_or_uncontained_ranges_gets_no_follow_up() {
+        let caps = json!({"callHierarchyProvider": true, "typeHierarchyProvider": true});
+        let requests = source_requests(&caps);
+        let at = |sl: u32, sc: u32, el: u32, ec: u32| json!({"start": {"line": sl, "character": sc}, "end": {"line": el, "character": ec}});
+        let item = |range: Value, selection: Value| json!({"name": "f", "kind": 12, "uri": "file:///w/a.txt", "range": range, "selectionRange": selection});
+        for r in &requests {
+            for (range, selection, why) in [
+                (at(1, 0, 0, 5), at(1, 0, 1, 0), Some("has a range that ends before it starts")),
+                (at(0, 0, 2, 0), at(1, 4, 1, 2), Some("has a selectionRange that ends before it starts")),
+                (at(1, 2, 3, 0), at(1, 1, 1, 4), Some("has a selectionRange outside its range")),
+                (at(1, 2, 3, 0), at(2, 0, 3, 1), Some("has a selectionRange outside its range")),
+                (at(1, 2, 3, 0), at(1, 2, 3, 0), None),
+                (at(1, 2, 3, 0), at(1, 9, 2, 0), None),
+            ] {
+                let got = r.followups(&item(range.clone(), selection.clone()));
+                match why {
+                    Some(why) => {
+                        let ty = if r.method.contains("Call") { "CallHierarchyItem" } else { "TypeHierarchyItem" };
+                        let why = format!("its first item {why}, so it isn't a valid {ty}");
+                        assert_eq!(got, Err(FollowupError::Unusable(why)), "{range} {selection}");
+                    }
+                    None => assert_eq!(got.map(|sent| sent.len()), Ok(2), "{range} {selection}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_symbol_that_cant_be_a_symbol_information_is_resolved() {
+        let caps = json!({"workspaceSymbolProvider": {"resolveProvider": true}});
+        let symbols = &source_requests(&caps)[0];
+        let range = json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}});
+        let full = json!({"uri": "file:///w/a.txt", "range": range});
+        for (symbol, resolved) in [
+            (json!({"name": "s", "kind": 13, "location": full}), false),
+            (json!({"name": "s", "kind": 13, "location": full, "containerName": "c"}), false),
+            (json!({"name": "s", "kind": 13, "location": full, "data": null}), true),
+            (json!({"name": "s", "kind": 13, "location": {"uri": "file:///w/a.txt"}}), true),
+        ] {
+            let got = symbols.followups(&symbol);
+            if resolved {
+                assert_eq!(got.unwrap()[0].params, symbol);
+            } else {
+                let why = "its first item may be a SymbolInformation, which workspaceSymbol/resolve doesn't take";
+                assert_eq!(got, Err(FollowupError::Unusable(why.into())), "{symbol}");
+            }
         }
     }
 
