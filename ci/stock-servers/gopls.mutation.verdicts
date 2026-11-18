@@ -1,6 +1,7 @@
 # gopls may exit after `exit` with a frame's header written and its body not: F1 then fails on
 # what it saw, and J1, J3, J5, J7 and K2 are inconclusive about that frame. Seen in CI, and in 2 of 3
-# local runs of K2's baseline (2026-11-09).
+# local runs of K2's baseline (2026-11-09). K1 is inconclusive too when it happens in K1's scenario:
+# the frame came after K1's requests, so it may have been a MethodNotFound for one of them.
 F1 pass|fail
 F2 pass
 F3 pass
@@ -39,7 +40,7 @@ D3 not-exercised
 D4 pass
 D5 not-exercised
 D6 pass
-K1 pass
+K1 pass|error
 K2 pass|error
 R1 fail
 R2 pass

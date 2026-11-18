@@ -568,6 +568,22 @@ fn method_not_found_after_a_result_still_fails_k1() {
 }
 
 #[test]
+fn a_skipped_frame_after_k1s_requests_leaves_k1_inconclusive() {
+    // The MethodNotFound that follows the result is over the inspection
+    // limit, so lspcheck skips it unread: it may have been the very
+    // MethodNotFound that fails K1, so K1 can't pass.
+    let r = run(&["--fault", "big-method-not-found-after-result"], &["--max-frame-mib", "1"]);
+    expect(&r, "K1", "error");
+    expect(&r, "F1", "error");
+    assert!(r.stdout.contains("a MethodNotFound for one of K1's requests may have been in output"), "{}", r.stdout);
+    // A frame skipped before initialize was answered, long before K1's
+    // requests were sent, can't have held their replies.
+    let r = run(&["--fault", "big-frame"], &["--max-frame-mib", "1", "--only", "K1,F1"]);
+    expect(&r, "K1", "pass");
+    expect(&r, "F1", "error");
+}
+
+#[test]
 fn an_advertised_request_left_unanswered_leaves_k1_inconclusive() {
     // LSP sets no deadline for a response, so a request answered neither with
     // MethodNotFound nor anything else by the end of the session is ERROR.

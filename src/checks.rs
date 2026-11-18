@@ -2579,8 +2579,27 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
                     a.outcome = capabilities::Outcome::Error(codes::METHOD_NOT_FOUND);
                 }
             }
+            // Output lspcheck missed after the first request was sent may
+            // have held a MethodNotFound for any of them.
+            let first_sent = finish
+                .sent
+                .iter()
+                .filter(|(_, id)| asked.iter().any(|a| a.id.as_ref() == Some(id)))
+                .map(|(at, _)| *at)
+                .min();
             let asked: Vec<(String, capabilities::Outcome)> = asked.into_iter().map(|a| (a.label, a.outcome)).collect();
-            Some(capabilities::judge(&asked, &notes))
+            match capabilities::judge(&asked, &notes) {
+                Judgement::Pass(detail) => {
+                    match first_sent.and_then(|from| finish.missed_output_within(from, Duration::MAX)) {
+                        Some(why) => Some(Judgement::Error(format!(
+                            "inconclusive, because {why}: a MethodNotFound for one of K1's requests may have been in \
+                             output lspcheck didn't see ({detail})"
+                        ))),
+                        None => Some(Judgement::Pass(detail)),
+                    }
+                }
+                judgement => Some(judgement),
+            }
         }
         K1Pending::Mutation { asked } => {
             let not_found = k1_not_found(&asked, finish);

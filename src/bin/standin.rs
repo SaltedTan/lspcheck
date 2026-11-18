@@ -392,6 +392,10 @@ const FAULTS: &[(&str, &str)] = &[
         "advertise colorProvider, answer textDocument/documentColor with a result, then again with MethodNotFound when \
          shutdown arrives",
     ),
+    (
+        "big-method-not-found-after-result",
+        "as method-not-found-after-result, but the MethodNotFound frame is over 2 MiB",
+    ),
     ("defer-hover-until-shutdown", "lawful: answer hover requests only when shutdown arrives"),
     (
         "advertised-error-after-shutdown",
@@ -1408,6 +1412,7 @@ fn main() {
                 "capability-other-error",
                 "ignores-advertised",
                 "method-not-found-after-result",
+                "big-method-not-found-after-result",
             ]
             .iter()
             .any(|f| fault(f))
@@ -1549,7 +1554,11 @@ fn main() {
         if method == "shutdown"
             && let Some(color) = answered_color.take()
         {
-            out.frame(&err(&color, -32601, "method not found"));
+            let mut reply = err(&color, -32601, "method not found");
+            if fault("big-method-not-found-after-result") {
+                reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
+            }
+            out.frame(&reply);
         }
         if method == "textDocument/hover" && fault("echo-positions") {
             let uri = msg.pointer("/params/textDocument/uri").and_then(Value::as_str).unwrap_or("");
@@ -1793,7 +1802,9 @@ fn main() {
                 out.frame(&err(&id, -32803, "no colors today"));
             }
             "textDocument/documentColor" if fault("ignores-advertised") => {}
-            "textDocument/documentColor" if fault("method-not-found-after-result") => {
+            "textDocument/documentColor"
+                if fault("method-not-found-after-result") || fault("big-method-not-found-after-result") =>
+            {
                 out.frame(&ok(&id, json!([])));
                 answered_color = Some(id);
             }

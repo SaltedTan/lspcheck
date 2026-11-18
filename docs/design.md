@@ -430,7 +430,10 @@ remaining requests in a single `not sent after that` note.
 - **error:** initialize didn't succeed, the server chose an encoding lspcheck didn't offer (see L2), the document
   couldn't be written, read or opened (`didOpen` not delivered), or a request couldn't be delivered. A delivered
   request with no response by the end of the session is also `ERROR` (`no response to <method> at <position> by the
-  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1.
+  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1. So is a run that
+  would pass when lspcheck missed some of the server's output after K1's first request was sent (a frame skipped over
+  `--max-frame-mib`, one it couldn't read, or reading that stopped), since that output may have held a -32601 for
+  one of its requests, even a duplicate; output missed earlier can't have, and leaves K1's verdict alone.
 - **not-exercised:** the initialize result has no capabilities object, or the server advertises none of the requests
   above, or all advertised requests were excluded by the `didOpen` or selector rules (the detail says why).
 - **pass:** every request selected for delivery was answered with a result or another error by the end of the

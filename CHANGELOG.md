@@ -15,6 +15,10 @@
 
 ### Fixed
 
+- K1 no longer passes when some of the server's output after K1's first request couldn't be read, such as a frame
+  over `--max-frame-mib`: that output may have held a MethodNotFound for one of K1's requests, even a duplicate after
+  a result, so K1 is now `error` and says why. A MethodNotFound lspcheck read still fails K1, and output missed before
+  K1's requests were sent doesn't affect it.
 - Under `--mutate`, when some of M2's unanswered requests may have been answered in output lspcheck didn't see, its
   failure detail now names and counts only the requests whose waits it saw in full, and says how many others may have
   been answered, and why. The verdict is unchanged.
