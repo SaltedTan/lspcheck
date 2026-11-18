@@ -133,6 +133,10 @@ const FAULTS: &[(&str, &str)] = &[
         "half-written-shutdown-reply",
         "lawful: write the shutdown reply's header and part of its body, and stay running without writing the rest",
     ),
+    (
+        "half-written-shutdown-header",
+        "lawful: write the first line of the shutdown reply's header section, and stay running without writing the rest",
+    ),
     ("shutdown-result", "return {} from shutdown"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
     ("big-frame-on-exit", "on exit, send one 2 MiB log message before exiting"),
@@ -140,6 +144,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("exit-status", "exit with status 3 on exit"),
     ("ignore-exit", "ignore exit and stay running"),
     ("inflated-on-exit", "on exit, start an inflated frame containing a progress request and stay running"),
+    ("half-header-on-exit", "on exit, write the first line of a header section and exit"),
     (
         "half-frame-in-leftover",
         "on exit, leave behind a child that has written part of a frame to stdout and stays running, and exit",
@@ -1114,6 +1119,9 @@ fn main() {
                     bytes.extend_from_slice(b"goodbye\n");
                     out.raw(&bytes);
                 }
+                if fault("half-header-on-exit") {
+                    out.raw(b"Content-Length: 52\r\n");
+                }
                 if fault("half-frame-in-leftover") {
                     // Exit only once the child has written, so the frame is
                     // unfinished when lspcheck finds the child left behind.
@@ -1611,11 +1619,17 @@ fn main() {
                 if fault("inflated-before-shutdown") {
                     out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
                 }
-                if fault("half-written-shutdown-reply") {
+                if fault("half-written-shutdown-reply") || fault("half-written-shutdown-header") {
                     // A slow server still writing its reply when lspcheck
-                    // gives up on it and stops it.
+                    // gives up on it and stops it: inside the body, or
+                    // after the header section's first line.
                     let bytes = out.encode(&ok(&id, result));
-                    out.raw(&bytes[..bytes.len() - 10]);
+                    let end = if fault("half-written-shutdown-reply") {
+                        bytes.len() - 10
+                    } else {
+                        bytes.windows(2).position(|w| w == b"\r\n").unwrap() + 2
+                    };
+                    out.raw(&bytes[..end]);
                     loop {
                         std::thread::park();
                     }

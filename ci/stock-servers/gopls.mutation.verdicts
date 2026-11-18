@@ -47,4 +47,6 @@ R3 pass
 R4 fail
 M1 pass
 M2 pass
-M3 pass
+# The same exit mid-frame leaves an unread span after the recovery probes' last publish, which could have held a
+# late diagnostic, so M3 is inconclusive whenever F1 fails. Seen in this file's CI job on PR #65 (2026-11-19).
+M3 pass|error

@@ -557,8 +557,8 @@ const K1_FILE: &str = "lspcheck-k1.txt";
 #[derive(Debug)]
 pub struct Observations {
     pub problems: Vec<(Duration, Problem)>,
-    /// A frame the stream ended inside after lspcheck began stopping the
-    /// server (see [`crate::session::Finish::cut_short`]).
+    /// A frame the stream was seen to end inside after lspcheck began
+    /// stopping the server's processes (see [`crate::session::Finish::cut_short`]).
     pub cut_short: Option<(Duration, String)>,
     pub content_types: Vec<(Duration, String)>,
     pub non_ascii: Option<Duration>,

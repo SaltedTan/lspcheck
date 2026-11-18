@@ -848,7 +848,11 @@ fn a_frame_cut_short_by_lspchecks_own_cleanup_doesnt_fail_f1() {
     // Content-Length would look the same, so F1 is inconclusive.
     let (r, t, _keep) = run_with_transcripts(&["--fault", "half-written-shutdown-reply"], &["--timeout", "1"]);
     expect(&r, "F1", "error");
-    assert!(r.stdout.contains("a frame was unfinished when lspcheck stopped the server: "), "{}", r.stdout);
+    assert!(
+        r.stdout.contains("lspcheck saw stdout end inside a frame after it began stopping the server's processes"),
+        "{}",
+        r.stdout
+    );
     assert!(!r.verdicts.values().any(|v| v == "fail"), "{}", r.stdout);
     // The transcript still shows the frame cut short, after the stop began.
     let events: Vec<Value> = std::fs::read_to_string(t.join("lifecycle.jsonl"))
@@ -861,6 +865,35 @@ fn a_frame_cut_short_by_lspchecks_own_cleanup_doesnt_fail_f1() {
     assert!(stopping < truncated, "{events:?}");
 }
 
+#[test]
+fn a_header_section_cut_short_by_lspchecks_own_cleanup_doesnt_fail_f1() {
+    // As above, but the stand-in stops after the header section's first
+    // line, before the blank line that ends it.
+    let r = run(&["--fault", "half-written-shutdown-header"], &["--timeout", "1"]);
+    expect(&r, "F1", "error");
+    assert!(
+        r.stdout.contains("lspcheck saw stdout end inside a frame after it began stopping the server's processes"),
+        "{}",
+        r.stdout
+    );
+    assert!(r.stdout.contains(" bytes of its header section came"), "{}", r.stdout);
+    assert!(!r.verdicts.values().any(|v| v == "fail"), "{}", r.stdout);
+}
+
+#[test]
+fn a_header_section_the_server_cuts_short_itself_fails_f1() {
+    // The server writes a header section's first line and exits on its own,
+    // before lspcheck signals it.
+    let r = fault("half-header-on-exit");
+    expect(&r, "F1", "fail");
+    assert!(r.stdout.contains("the stream ended inside a header section"), "{}", r.stdout);
+    for (id, v) in &r.verdicts {
+        if id != "F1" {
+            assert_ne!(v, "fail", "{id}\n{}", r.stdout);
+        }
+    }
+}
+
 /// The server exits by itself, but a child it left behind is still writing
 /// a frame to the same stdout when lspcheck stops it.
 #[cfg(unix)]
@@ -868,11 +901,7 @@ fn a_frame_cut_short_by_lspchecks_own_cleanup_doesnt_fail_f1() {
 fn a_frame_cut_short_by_stopping_a_leftover_doesnt_fail_f1() {
     let r = fault("half-frame-in-leftover");
     expect(&r, "F1", "error");
-    assert!(
-        r.stdout.contains("a frame was unfinished when lspcheck stopped the server: 17 of 52 body bytes"),
-        "{}",
-        r.stdout
-    );
+    assert!(r.stdout.contains("so it may have cut the frame short: 17 of 52 body bytes came"), "{}", r.stdout);
     expect(&r, "L9", "fail");
     for (id, v) in &r.verdicts {
         if id != "L9" {

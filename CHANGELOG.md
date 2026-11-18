@@ -22,9 +22,11 @@
   failure detail lists as unanswered only the ids whose waits it saw in full, and the others as possibly answered,
   with why. The verdict is unchanged.
 - A frame the server (or a process it left behind) was still writing when lspcheck stopped it, such as a slow
-  `shutdown` reply that lspcheck had given up waiting for, no longer fails F1: lspcheck may have cut it short itself,
-  so F1 is now `error` and says how much of the frame arrived. A stream the server ends on its own inside a frame
-  still fails F1.
+  `shutdown` reply that lspcheck had given up waiting for, no longer fails F1, whether the stream ended in the frame's
+  body or its header section: lspcheck may have cut it short itself, so F1 is now `error` and says how much of the
+  frame arrived. What counts is when lspcheck saw the stream end, so a server that ended its output mid-frame on its
+  own but kept running until lspcheck stopped it gets `error` too. A stream the server ends inside a frame and then
+  exits still fails F1, as does a header section already malformed when the stream ended.
 
 ## 0.5.0 (2026-11-16)
 
