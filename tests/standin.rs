@@ -297,10 +297,12 @@ fn the_clean_standin_passes_every_check() {
     assert!(r.stdout.contains("all 8 requests got responses with their exact ids"), "{}", r.stdout);
     assert!(r.stdout.contains("ParseError (-32700) response(s) with id null"), "{}", r.stdout);
     assert!(r.stdout.contains("following didOpen of a 4 MiB document"), "{}", r.stdout);
-    // K1 passed on evidence: three positions for hover and highlights, one
-    // selectionRange with all three, symbols, folding ranges and workspace symbols.
+    // K1 passed on evidence: three positions for hover, highlights, completion
+    // and both hierarchies, one selectionRange with all three, symbols, folding
+    // ranges, code lenses, document links, inlay hints and workspace symbols,
+    // with each follow-up: 26 requests for 12 methods, and 15 for 9.
     assert!(
-        r.stdout.contains("10 request(s) for 6 advertised method(s) were answered, none with MethodNotFound"),
+        r.stdout.contains("41 request(s) for 21 advertised method(s) were answered, none with MethodNotFound"),
         "{}",
         r.stdout
     );
@@ -643,7 +645,18 @@ fn k1_covers_all_requests_when_hover_waits_for_shutdown() {
     let r = run(&["--fault", "defer-hover-until-shutdown"], &["--only", "K1"]);
     expect(&r, "K1", "pass");
     assert_eq!(r.status, 0, "{}", r.stdout);
-    assert!(r.stdout.contains("10 request(s) for 6 advertised method(s) were answered"), "{}", r.stdout);
+    // Every row of the table, but no follow-up: once hover went unanswered,
+    // K1 no longer waited for the answers that would give their items.
+    assert!(r.stdout.contains("22 request(s) for 12 advertised method(s) were answered"), "{}", r.stdout);
+    let k1 = detail(&r, "K1");
+    assert!(
+        k1.contains(
+            "follow-ups not sent, because K1 didn't wait for the answer, after an earlier request went unanswered: \
+             completionItem/resolve for textDocument/completion at 1:2, 2:6, 3:2; "
+        ),
+        "{k1}"
+    );
+    assert!(k1.contains("; workspaceSymbol/resolve for workspace/symbol"), "{k1}");
 }
 
 #[test]
@@ -657,15 +670,181 @@ fn k1_names_every_unsent_request_after_an_unanswered_request_and_exit() {
     assert!(detail.contains("the server exited with status 17"), "{detail}");
     let unsent = "not sent after that: textDocument/hover at 3:2, textDocument/documentHighlight at 1:2, \
                   textDocument/documentHighlight at 2:6, textDocument/documentHighlight at 3:2, \
-                  textDocument/selectionRange";
+                  textDocument/completion at 1:2";
     assert!(detail.contains(unsent), "{detail}");
-    for label in
-        ["textDocument/documentSymbol", "textDocument/foldingRange", "textDocument/documentColor", "workspace/symbol"]
-    {
+    for label in [
+        "textDocument/prepareCallHierarchy at 3:2",
+        "textDocument/selectionRange",
+        "textDocument/documentSymbol",
+        "textDocument/foldingRange",
+        "textDocument/documentColor",
+        "workspace/symbol",
+    ] {
         assert!(detail.contains(&format!(", {label}")), "{label}: {detail}");
     }
     // The cause is given once, not repeated for each request left unsent.
     assert_eq!(detail.matches("exited with status 17").count(), 1, "{detail}");
+}
+
+/// The messages in a transcript, in order, each with its direction (`in` or
+/// `out`).
+fn transcript_messages(transcript: &std::path::Path) -> Vec<(String, Value)> {
+    let text = std::fs::read_to_string(transcript).unwrap();
+    let mut readers: BTreeMap<String, FrameReader> = BTreeMap::new();
+    let mut out = Vec::new();
+    for event in text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        let Some(dir) = event["dir"].as_str().filter(|d| ["in", "out"].contains(d)) else { continue };
+        let bytes = event["data"]
+            .as_str()
+            .map(|s| s.as_bytes().to_vec())
+            .or_else(|| event["data_base64"].as_str().and_then(lspcheck::transcript::base64_decode))
+            .unwrap_or_default();
+        for chunk in readers.entry(dir.into()).or_default().feed(&bytes) {
+            if let Chunk::Frame { body, .. } = chunk {
+                out.push((dir.to_string(), serde_json::from_slice(&body).unwrap()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn k1_passes_each_follow_up_the_first_item_exactly_as_received() {
+    let (r, transcripts, _dir) = run_with_transcripts(&[], &["--only", "K1"]);
+    expect(&r, "K1", "pass");
+    // The stand-in answers a follow-up whose item lost its `data` with
+    // InvalidParams, which K1 would note.
+    assert!(!detail(&r, "K1").contains("-32602"), "{}", r.stdout);
+    let sources = [
+        "textDocument/prepareCallHierarchy",
+        "textDocument/prepareTypeHierarchy",
+        "textDocument/completion",
+        "textDocument/codeLens",
+        "textDocument/documentLink",
+        "textDocument/inlayHint",
+        "workspace/symbol",
+    ];
+    let mut methods: BTreeMap<String, String> = BTreeMap::new();
+    let mut followups: BTreeMap<String, String> = BTreeMap::new();
+    // The first item of the last source answer read.
+    let mut item: Option<Value> = None;
+    let mut sent = 0;
+    for (dir, m) in transcript_messages(&transcripts.join("capabilities.jsonl")) {
+        let id = m["id"].to_string();
+        match (dir.as_str(), m["method"].as_str()) {
+            ("out", Some(method)) if m.get("id").is_some() => {
+                let followup = ["callHierarchy/", "typeHierarchy/", "/resolve"].iter().any(|p| method.contains(p));
+                if followup {
+                    // Sent right after its source's answer, with its first item.
+                    let params = if method.contains("Hierarchy/") { &m["params"]["item"] } else { &m["params"] };
+                    assert_eq!(Some(params), item.as_ref(), "{method}");
+                    assert!(params["data"]["nonce"].is_array(), "{params}");
+                    followups.insert(id.clone(), method.to_string());
+                    sent += 1;
+                }
+                methods.insert(id, method.to_string());
+            }
+            ("in", None) => {
+                let Some(method) = methods.get(&id) else { continue };
+                if sources.contains(&method.as_str()) {
+                    let result = &m["result"];
+                    let items = result.get("items").unwrap_or(result);
+                    item = items.get(0).cloned();
+                }
+                if followups.contains_key(&id) {
+                    assert!(m.get("result").is_some_and(|r| !r.is_null()), "{method}: {m}");
+                }
+            }
+            _ => {}
+        }
+    }
+    // Completion and both hierarchies at three positions, then four more.
+    assert_eq!(sent, 3 + 6 + 6 + 4, "{}", r.stdout);
+}
+
+#[test]
+fn a_follow_up_answered_with_method_not_found_fails_k1() {
+    for (fault_name, named, also) in [
+        (
+            "followup-hierarchy-method-not-found",
+            "MethodNotFound (-32601) for 12 advertised request(s): callHierarchy/incomingCalls with the first item of \
+             textDocument/prepareCallHierarchy at 1:2, callHierarchy/outgoingCalls with the first item of \
+             textDocument/prepareCallHierarchy at 1:2, ",
+            "typeHierarchy/subtypes with the first item of textDocument/prepareTypeHierarchy at 3:2",
+        ),
+        (
+            "followup-resolve-method-not-found",
+            "MethodNotFound (-32601) for 7 advertised request(s): completionItem/resolve with the first item of \
+             textDocument/completion at 1:2, ",
+            "workspaceSymbol/resolve with the first item of workspace/symbol",
+        ),
+    ] {
+        let r = fault(fault_name);
+        only_fails(&r, &["K1"]);
+        let k1 = detail(&r, "K1");
+        assert!(k1.starts_with(named), "{fault_name}: {k1}");
+        assert!(k1.contains(also), "{fault_name}: {k1}");
+    }
+}
+
+#[test]
+fn source_answers_without_items_leave_k1s_follow_ups_noted_not_sent() {
+    let r = fault("followup-sources-empty");
+    passes_except(&r, &[]);
+    let k1 = detail(&r, "K1");
+    assert!(k1.starts_with("22 request(s) for 12 advertised method(s) were answered"), "{k1}");
+    for note in [
+        "follow-ups not sent, because the answer was empty: completionItem/resolve for textDocument/completion at \
+         1:2, 2:6, 3:2; typeHierarchy/supertypes and typeHierarchy/subtypes for textDocument/prepareTypeHierarchy at \
+         1:2, 2:6, 3:2; codeLens/resolve for textDocument/codeLens; inlayHint/resolve for textDocument/inlayHint; \
+         workspaceSymbol/resolve for workspace/symbol",
+        "follow-ups not sent, because the answer was null: callHierarchy/incomingCalls and callHierarchy/outgoingCalls \
+         for textDocument/prepareCallHierarchy at 1:2, 2:6, 3:2; documentLink/resolve for textDocument/documentLink",
+    ] {
+        assert!(k1.contains(note), "{k1}");
+    }
+}
+
+#[test]
+fn a_follow_up_answered_with_another_error_is_lawful() {
+    let r = fault("followup-request-failed");
+    passes_except(&r, &[]);
+    let k1 = detail(&r, "K1");
+    assert!(
+        k1.starts_with("41 request(s) for 21 advertised method(s) were answered, none with MethodNotFound"),
+        "{k1}"
+    );
+    assert!(
+        k1.contains(
+            "other errors, which are lawful: -32803 (RequestFailed) for completionItem/resolve with the first item of \
+             textDocument/completion at 1:2"
+        ),
+        "{k1}"
+    );
+}
+
+#[test]
+fn a_follow_up_left_unanswered_leaves_k1_inconclusive() {
+    let r = fault("followup-unanswered");
+    passes_except(&r, &[("K1", "error")]);
+    assert_eq!(r.status, 2, "{}", r.stdout);
+    let k1 = detail(&r, "K1");
+    assert!(
+        k1.starts_with(
+            "no response to codeLens/resolve with the first item of textDocument/codeLens by the end of the session, \
+             so K1 couldn't judge it"
+        ),
+        "{k1}"
+    );
+    // The rest were sent without waiting, so their answers gave no items.
+    assert!(
+        k1.contains(
+            "follow-ups not sent, because K1 didn't wait for the answer, after an earlier request went unanswered: \
+             documentLink/resolve for textDocument/documentLink; inlayHint/resolve for textDocument/inlayHint; \
+             workspaceSymbol/resolve for workspace/symbol"
+        ),
+        "{k1}"
+    );
 }
 
 /// The hover positions the stand-in reported for `file`, in order.

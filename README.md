@@ -239,8 +239,10 @@ cut off because the server's output closed, makes D6 `ERROR` unless it already f
 
 K1 checks that the server handles what it advertises: it opens a document (a profile's
 [`[document]`](#profiles), or a plain-text one of lspcheck's own) and probes advertised methods without judging the
-content of their results. See the [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage,
-MethodNotFound failures, late and duplicate replies, and details naming unanswered and undeliverable requests.
+content of their results. It also sends the follow-ups some capabilities advertise, such as
+`callHierarchy/incomingCalls` or `completionItem/resolve`, passing back the first item of an earlier answer unchanged.
+See the [K1 reference](docs/design.md#capabilities-and-robustness) for request coverage, follow-ups, MethodNotFound
+failures, late and duplicate replies, and details naming unanswered and undeliverable requests.
 
 K2 checks server message types against the LSP 3.17 meta-model: results of known requests lspcheck sent, and params
 of known server-to-client requests and notifications. A failure names where the value is (`result.contents`), what

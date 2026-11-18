@@ -379,6 +379,17 @@ const FAULTS: &[(&str, &str)] = &[
         "advertise colorProvider, answer textDocument/documentColor with a result, then again with MethodNotFound when \
          shutdown arrives",
     ),
+    (
+        "followup-hierarchy-method-not-found",
+        "answer callHierarchy/incomingCalls, outgoingCalls and typeHierarchy/supertypes, subtypes with MethodNotFound",
+    ),
+    ("followup-resolve-method-not-found", "answer every resolve request K1 sends with MethodNotFound"),
+    (
+        "followup-sources-empty",
+        "lawful: answer the requests whose items K1 follows up with null, an empty array or an empty CompletionList",
+    ),
+    ("followup-request-failed", "lawful: answer every follow-up K1 sends with RequestFailed (-32803)"),
+    ("followup-unanswered", "never answer codeLens/resolve"),
     ("defer-hover-until-shutdown", "lawful: answer hover requests only when shutdown arrives"),
     (
         "advertised-error-after-shutdown",
@@ -502,6 +513,8 @@ fn main() {
     // The rest of a notification begun after the checks were done, written
     // only once `shutdown` arrives.
     let mut unfinished: Option<Vec<u8>> = None;
+    // Whether initialize advertised the requests K1 follows up.
+    let mut followups_advertised = false;
     // A documentColor request answered once, to answer again at shutdown.
     let mut answered_color: Option<Value> = None;
     // For inflated-on-first-probe.
@@ -1381,6 +1394,22 @@ fn main() {
             {
                 result["capabilities"]["colorProvider"] = json!(true);
             }
+            // Like a server that offers more to a client that supports more:
+            // what K1's follow-ups need, only to a client that resolves
+            // completion items lazily, which only K1's own scenario offers.
+            // The other scenarios ask what they asked before, and the mutation
+            // scenario's round robin stays as it was.
+            followups_advertised =
+                msg.pointer("/params/capabilities/textDocument/completion/completionItem/resolveSupport").is_some();
+            if followups_advertised {
+                let caps = &mut result["capabilities"];
+                caps["callHierarchyProvider"] = json!(true);
+                caps["typeHierarchyProvider"] = json!(true);
+                for name in ["completionProvider", "codeLensProvider", "documentLinkProvider", "inlayHintProvider"] {
+                    caps[name] = json!({"resolveProvider": true});
+                }
+                caps["workspaceSymbolProvider"] = json!({"resolveProvider": true});
+            }
             if fault("no-capabilities") {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
             }
@@ -1667,7 +1696,50 @@ fn main() {
                 let symbol = json!({"kind": 13, "location": {"uri": ELSEWHERE, "range": range(0, 0, 0, 1)}});
                 out.frame(&ok(&id, json!([symbol])));
             }
+            "workspace/symbol" if followups_advertised => {
+                let symbols = if fault("followup-sources-empty") {
+                    json!([])
+                } else {
+                    json!([{"name": "standin", "kind": 13, "location": {"uri": ELSEWHERE}, "data": followup_data("workspaceSymbol")}])
+                };
+                out.frame(&ok(&id, symbols));
+            }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
+            "textDocument/prepareCallHierarchy"
+            | "textDocument/prepareTypeHierarchy"
+            | "textDocument/completion"
+            | "textDocument/codeLens"
+            | "textDocument/documentLink"
+            | "textDocument/inlayHint" => {
+                let uri = msg.pointer("/params/textDocument/uri").cloned().unwrap_or(Value::Null);
+                out.frame(&ok(&id, followup_source(&method, uri, fault("followup-sources-empty"))));
+            }
+            "callHierarchy/incomingCalls"
+            | "callHierarchy/outgoingCalls"
+            | "typeHierarchy/supertypes"
+            | "typeHierarchy/subtypes"
+            | "completionItem/resolve"
+            | "codeLens/resolve"
+            | "documentLink/resolve"
+            | "inlayHint/resolve"
+            | "workspaceSymbol/resolve" => {
+                let hierarchy = !method.ends_with("/resolve");
+                if method == "codeLens/resolve" && fault("followup-unanswered") {
+                    // Never answered.
+                } else if hierarchy && fault("followup-hierarchy-method-not-found")
+                    || !hierarchy && fault("followup-resolve-method-not-found")
+                {
+                    out.frame(&err(&id, -32601, "method not found"));
+                } else if fault("followup-request-failed") {
+                    out.frame(&err(&id, -32803, "not today"));
+                } else {
+                    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                    out.frame(&match followup_answer(&method, params) {
+                        Some(result) => ok(&id, result),
+                        None => err(&id, -32602, "the item didn't come back with the data the stand-in gave it"),
+                    });
+                }
+            }
             "textDocument/documentSymbol"
             | "textDocument/foldingRange"
             | "textDocument/documentHighlight"
@@ -2578,6 +2650,81 @@ impl<W: Write> Writer<W> {
         header.extend_from_slice(&body);
         header
     }
+}
+
+/// The `data` the stand-in gives an item K1 follows up, which it checks when
+/// the item comes back: an item lspcheck rebuilt wouldn't carry it.
+fn followup_data(kind: &str) -> Value {
+    json!({"standin": kind, "nonce": [7, {"kept": true}]})
+}
+
+/// The answer to a request whose item K1 follows up: one item at the
+/// document's start, or none for followup-sources-empty.
+fn followup_source(method: &str, uri: Value, empty: bool) -> Value {
+    let at = range(0, 0, 0, 0);
+    match method {
+        "textDocument/prepareCallHierarchy" if empty => Value::Null,
+        "textDocument/documentLink" if empty => Value::Null,
+        "textDocument/completion" if empty => json!({"isIncomplete": false, "items": []}),
+        _ if empty => json!([]),
+        "textDocument/prepareCallHierarchy" => json!([{
+            "name": "standin", "kind": 12, "uri": uri, "range": at, "selectionRange": at,
+            "data": followup_data("callHierarchy"),
+        }]),
+        "textDocument/prepareTypeHierarchy" => json!([{
+            "name": "standin", "kind": 5, "uri": uri, "range": at, "selectionRange": at,
+            "data": followup_data("typeHierarchy"),
+        }]),
+        "textDocument/completion" => json!({
+            "isIncomplete": false,
+            "items": [{"label": "standin", "data": followup_data("completion")}],
+        }),
+        "textDocument/codeLens" => json!([{"range": at, "data": followup_data("codeLens")}]),
+        "textDocument/documentLink" => json!([{"range": at, "data": followup_data("documentLink")}]),
+        "textDocument/inlayHint" => {
+            json!([{"position": {"line": 0, "character": 0}, "label": "standin", "data": followup_data("inlayHint")}])
+        }
+        _ => unreachable!("not a source of K1's follow-ups: {method}"),
+    }
+}
+
+/// The answer to a follow-up, echoing its item to show it came back; `None`
+/// when the item doesn't carry the `data` the stand-in gave it.
+fn followup_answer(method: &str, params: Value) -> Option<Value> {
+    let (kind, item) = match method {
+        "callHierarchy/incomingCalls" | "callHierarchy/outgoingCalls" => ("callHierarchy", &params["item"]),
+        "typeHierarchy/supertypes" | "typeHierarchy/subtypes" => ("typeHierarchy", &params["item"]),
+        "completionItem/resolve" => ("completion", &params),
+        "codeLens/resolve" => ("codeLens", &params),
+        "documentLink/resolve" => ("documentLink", &params),
+        "inlayHint/resolve" => ("inlayHint", &params),
+        _ => ("workspaceSymbol", &params),
+    };
+    if item.get("data") != Some(&followup_data(kind)) {
+        return None;
+    }
+    let mut item = item.clone();
+    Some(match method {
+        "callHierarchy/incomingCalls" => json!([{"from": item, "fromRanges": []}]),
+        "callHierarchy/outgoingCalls" => json!([{"to": item, "fromRanges": []}]),
+        "typeHierarchy/supertypes" | "typeHierarchy/subtypes" => json!([item]),
+        "completionItem/resolve" => {
+            item["detail"] = json!("resolved by the stand-in");
+            item
+        }
+        "codeLens/resolve" => {
+            item["command"] = json!({"title": "standin", "command": "standin.noop"});
+            item
+        }
+        "documentLink/resolve" | "inlayHint/resolve" => {
+            item["tooltip"] = json!("resolved by the stand-in");
+            item
+        }
+        _ => {
+            item["location"]["range"] = range(0, 0, 0, 0);
+            item
+        }
+    })
 }
 
 fn ok(id: &Value, result: Value) -> Value {

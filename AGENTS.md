@@ -13,7 +13,7 @@ lifecycle, and whether it leaves processes behind. Read the [README](README.md) 
 | `src/message.rs` | JSON-RPC classification, ids compared by exact value, message builders. |
 | `src/process.rs` | Process groups, the Linux child subreaper, and the leftover-process search. |
 | `src/text.rs` | The text model: line splits, position encodings, content changes, where replies carry positions. |
-| `src/capabilities.rs` | K1: the requests advertised capabilities call for, their positions, and K1's verdict. |
+| `src/capabilities.rs` | K1: the requests advertised capabilities call for, their positions and follow-ups, and K1's verdict. |
 | `src/metamodel.rs` | K2: the vendored LSP 3.17 meta-model, parsed once, and validation of JSON values against its types. |
 | `vendor/lsp-3.17/` | The LSP 3.17 `metaModel.json`, unmodified (CC BY 4.0; attribution in its README). |
 | `src/mutation.rs` | The seeded mutation planner: SplitMix64, the lexicon, the operators, the changes that send an edit, where requests are asked, and how edits are recorded. The `mutation` scenario that runs it is in `src/checks.rs`. |

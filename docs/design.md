@@ -6,7 +6,8 @@ Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 [mutation implementation status](source-mutations.md) for current behavior and the
 [implementation plan](source-mutations.md#implementation-plan) for the remaining step,
 minimisation, which waits until isolation shows it is wanted.
-D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios.
+D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios, and K1 sends
+[follow-up requests](#capabilities-and-robustness) with the first item of an earlier answer.
 Mutation runs warn on stderr about a short case start window and summarize the server's Error and Warning messages
 in the [reports](#report).
 See the [changelog](../CHANGELOG.md) for changes by release.
@@ -394,7 +395,39 @@ the first three identifier-like tokens (`[A-Za-z_][A-Za-z0-9_]*`, matched leftmo
 start when it has none. Positions are counted in the negotiated encoding (the server's `positionEncoding`, or
 UTF-16), and the whole document's range ends at the end of its last line (the empty line after a final newline).
 K1 doesn't send `workspace/executeCommand`, `willSaveWaitUntil`, `onTypeFormatting` or `inlineValue`: they need a
-command, a save, a trigger character or a stopped debugger, which K1 can't set up faithfully.
+command, a save, a trigger character or a stopped debugger, which K1 can't set up faithfully. Nor does it send
+`codeAction/resolve`, which also needs the client capabilities `codeAction.resolveSupport` and
+`codeActionLiteralSupport`, which lspcheck doesn't offer.
+
+Some advertised capabilities also cover a **follow-up** request that needs an item from an earlier answer. Right after
+the answer to its source request, before the next row of the table above, K1 sends:
+
+| Advertised | Source answer | Follow-ups, with params |
+|---|---|---|
+| callHierarchyProvider | textDocument/prepareCallHierarchy: `CallHierarchyItem[]` | callHierarchy/incomingCalls and callHierarchy/outgoingCalls, `{item}` |
+| typeHierarchyProvider | textDocument/prepareTypeHierarchy: `TypeHierarchyItem[]` | typeHierarchy/supertypes and typeHierarchy/subtypes, `{item}` |
+| completionProvider.resolveProvider: true | textDocument/completion: `CompletionItem[]` or a `CompletionList`'s `items` | completionItem/resolve, the item |
+| codeLensProvider.resolveProvider: true | textDocument/codeLens: `CodeLens[]` | codeLens/resolve, the item |
+| documentLinkProvider.resolveProvider: true | textDocument/documentLink: `DocumentLink[]` | documentLink/resolve, the item |
+| inlayHintProvider.resolveProvider: true | textDocument/inlayHint: `InlayHint[]` | inlayHint/resolve, the item |
+| workspaceSymbolProvider.resolveProvider: true | workspace/symbol: `WorkspaceSymbol[]` | workspaceSymbol/resolve, the item |
+
+- The item is the source answer's first, passed back exactly as received (including its `data`), never rebuilt. One
+  set of follow-ups is sent per source answer, so per position for a position request.
+- A follow-up is sent only for a source answer read while K1 was waiting for it. A source answer that is null, empty,
+  an error, not of the shape above, or whose first item isn't of its type in the meta-model (K2 judges that answer)
+  gets no follow-up. Once a K1 request goes unanswered, later source answers aren't waited for, so their follow-ups
+  aren't sent either. The detail notes each follow-up not sent and why, grouped by reason, with the source request
+  and its positions.
+- A follow-up is judged like any other K1 request: one at a time with `--timeout`, and by the rules below, named by
+  its method and its source request with its position (`completionItem/resolve with the first item of
+  textDocument/completion at 1:2`). It is about the document only if its source request is, and a `documentSelector`
+  that excludes the source request excludes it too, since the source isn't sent.
+
+For the follow-ups, the capabilities scenario's client capabilities also offer
+`completion.completionItem.resolveSupport` (`documentation`, `detail`), `inlayHint.resolveSupport` (`tooltip`,
+`textEdits`, `label.tooltip`, `label.location`, `label.command`) and `workspace.symbol.resolveSupport`
+(`location.range`); the other scenarios don't, because only K1 resolves. The follow-ups are sent only in the capabilities scenario, not about mutated documents under `--mutate`.
 
 Two things keep a request about the document from being sent, and the detail names them: a server that doesn't ask
 for `didOpen` has no open document to be asked about (only `workspace/symbol` is sent), and a static registration's
@@ -415,20 +448,21 @@ For either a failure or an error, the detail names every unanswered request. It 
 (including the server's exit status when observed) once, on the request lspcheck couldn't send, then lists the
 remaining requests in a single `not sent after that` note.
 
-- **fail:** a request was answered with an error whose code is -32601. The detail names each such request (method
-  and position). This is seen evidence and stands whatever happened to the other requests.
+- **fail:** a request, or a follow-up, was answered with an error whose code is -32601. The detail names each such
+  request (method and position). This is seen evidence and stands whatever happened to the other requests.
 - **error:** initialize didn't succeed, the server chose an encoding lspcheck didn't offer (see L2), the document
   couldn't be written, read or opened (`didOpen` not delivered), or a request couldn't be delivered. A delivered
   request with no response by the end of the session is also `ERROR` (`no response to <method> at <position> by the
   end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1.
 - **not-exercised:** the initialize result has no capabilities object, or the server advertises none of the requests
   above, or all advertised requests were excluded by the `didOpen` or selector rules (the detail says why).
-- **pass:** every request selected for delivery was answered with a result or another error by the end of the
-  session. The detail counts the requests and methods, and lists the other errors by code with the requests that
-  got them.
+- **pass:** every request selected for delivery, follow-ups included, was answered with a result or another error by
+  the end of the session. The detail counts the requests and methods, lists the other errors by code with the
+  requests that got them, and notes the follow-ups not sent.
 
 Responses to K1's requests are judged by J1, J2 and J5 like any other, and the scenario's input is all well formed,
-so it is included in J3. K1 judges only the error code, never a result's content. With `--mutate`, a MethodNotFound
+so it is included in J3. K1 judges only the error code, never a result's content; it only takes follow-ups' items
+from results. With `--mutate`, a MethodNotFound
 to a request about a mutated document also [fails K1](source-mutations.md#verdict-rules).
 
 K2 is judged across every scenario, like J5, over every message lspcheck read. Its validator runs only when K2 is
@@ -690,7 +724,7 @@ Single crate, `src/` modules:
   ids cannot collide with them. Each call has one absolute deadline covering its write and its reply; each scenario
   has its own timeouts and a bounded cleanup. After a write stops partway through a frame, lspcheck sends nothing more.
 - `checks`: one module per area; each check declares id, basis, spec link, and a function over a `Session`.
-- `capabilities`: K1's request table, positions and verdict, as pure functions.
+- `capabilities`: K1's request table, positions, follow-ups and verdict, as pure functions.
 - `metamodel`: the vendored LSP 3.17 meta-model, parsed once into typed structures, and K2's validation of JSON values
   against its types, as pure functions.
 - `profile`: reads and validates a profile (`toml` with `serde`'s `deny_unknown_fields`), copies its files into each

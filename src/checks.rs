@@ -2495,6 +2495,21 @@ fn capabilities_initialize_params(root: &Path) -> Value {
     params
 }
 
+/// Initialize params for K1's own scenario: [`capabilities_initialize_params`],
+/// plus what its follow-ups need. Lazily resolved completion items, inlay
+/// hints and workspace symbols are offered only here, because only K1 resolves
+/// them; the hierarchies, code lenses and document links need nothing more.
+fn k1_initialize_params(root: &Path) -> Value {
+    let mut params = capabilities_initialize_params(root);
+    let caps = &mut params["capabilities"];
+    caps["textDocument"]["completion"]["completionItem"]["resolveSupport"] =
+        json!({"properties": ["documentation", "detail"]});
+    caps["textDocument"]["inlayHint"]["resolveSupport"] =
+        json!({"properties": ["tooltip", "textEdits", "label.tooltip", "label.location", "label.command"]});
+    caps["workspace"]["symbol"]["resolveSupport"] = json!({"properties": ["location.range"]});
+    params
+}
+
 /// A response's outcome, as K1 counts it.
 fn k1_outcome(m: &Message) -> capabilities::Outcome {
     match &m.kind {
@@ -2539,7 +2554,7 @@ enum K1Pending {
 /// requests. Ends with a graceful shutdown when initialize succeeded;
 /// judging waits for the final stdout drain (see [`K1Pending`]).
 async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
-    let params = capabilities_initialize_params(&ctx.root);
+    let params = k1_initialize_params(&ctx.root);
     let reply = match ctx.initialize_with(params).await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
@@ -2670,34 +2685,77 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
 
     let mut asked: Vec<K1Asked> = Vec::new();
     let mut wait = true;
-    for (i, r) in requests.iter().enumerate() {
-        let sent = match if wait {
-            ask(ctx, r.method, r.params.clone()).await.map(|(a, reply)| (a.id, reply.ok()))
-        } else {
-            ctx.s.request(r.method, Some(r.params.clone())).await.map(|id| (id, None))
-        } {
-            Ok((id, Some(m))) => K1Asked { label: r.label.clone(), id: Some(id), outcome: k1_outcome(&m) },
-            Ok((id, None)) => {
-                wait = false;
-                K1Asked { label: r.label.clone(), id: Some(id), outcome: capabilities::Outcome::Unanswered }
-            }
-            Err(e) => {
-                let why = if e == WriteError::Closed { with_exit(ctx, e.to_string()).await } else { e.to_string() };
-                K1Asked { label: r.label.clone(), id: None, outcome: capabilities::Outcome::Undelivered(why) }
-            }
-        };
+    // Why the follow-ups of a source request weren't sent.
+    let mut skipped: Vec<(String, &capabilities::Request)> = Vec::new();
+    'requests: for (i, r) in requests.iter().enumerate() {
+        let waited = wait;
+        let (sent, reply) = k1_send(ctx, r, &mut wait).await;
         let stop = matches!(sent.outcome, capabilities::Outcome::Undelivered(_));
         asked.push(sent);
         if stop {
-            // The cause is in the failed request's entry; name the rest once.
-            let rest: Vec<&str> = requests[i + 1..].iter().map(|remaining| remaining.label.as_str()).collect();
-            if !rest.is_empty() {
-                notes.insert(0, format!("not sent after that: {}", rest.join(", ")));
-            }
+            k1_not_sent_after(&mut notes, requests[i + 1..].iter());
             break;
         }
+        if capabilities::followup_methods(&caps, r.method).is_empty() {
+            continue;
+        }
+        // Each follow-up goes right after its source's answer, under the same
+        // waiting rule, so it is judged like any other K1 request.
+        let followups = match reply.as_ref().map(|m| &m.kind) {
+            Some(Kind::Response { outcome: Outcome::Result(result), .. }) => capabilities::followups(&caps, r, result),
+            Some(Kind::Response { outcome: Outcome::Error { .. }, .. }) => Err("the answer was an error".into()),
+            Some(_) => Err("the answer wasn't a result".into()),
+            None if waited => Err("no answer came while K1 waited".into()),
+            None => Err("K1 didn't wait for the answer, after an earlier request went unanswered".into()),
+        };
+        match followups {
+            Err(why) => skipped.push((why, r)),
+            Ok(followups) => {
+                for (j, f) in followups.iter().enumerate() {
+                    let (sent, _) = k1_send(ctx, f, &mut wait).await;
+                    let stop = matches!(sent.outcome, capabilities::Outcome::Undelivered(_));
+                    asked.push(sent);
+                    if stop {
+                        k1_not_sent_after(&mut notes, followups[j + 1..].iter().chain(&requests[i + 1..]));
+                        break 'requests;
+                    }
+                }
+            }
+        }
     }
+    notes.extend(capabilities::skipped_notes(&caps, &skipped));
     K1Pending::Sent { asked, notes }
+}
+
+/// Sends one of K1's requests, waiting up to `--timeout` for its reply while
+/// `wait` holds; once one goes unanswered, the rest are sent without waiting.
+/// Gives the reply, when one was read while waiting.
+async fn k1_send(ctx: &mut Ctx<'_>, r: &capabilities::Request, wait: &mut bool) -> (K1Asked, Option<Message>) {
+    let label = r.label.clone();
+    match if *wait {
+        ask(ctx, r.method, r.params.clone()).await.map(|(a, reply)| (a.id, reply.ok()))
+    } else {
+        ctx.s.request(r.method, Some(r.params.clone())).await.map(|id| (id, None))
+    } {
+        Ok((id, Some(m))) => (K1Asked { label, id: Some(id), outcome: k1_outcome(&m) }, Some(m)),
+        Ok((id, None)) => {
+            *wait = false;
+            (K1Asked { label, id: Some(id), outcome: capabilities::Outcome::Unanswered }, None)
+        }
+        Err(e) => {
+            let why = if e == WriteError::Closed { with_exit(ctx, e.to_string()).await } else { e.to_string() };
+            (K1Asked { label, id: None, outcome: capabilities::Outcome::Undelivered(why) }, None)
+        }
+    }
+}
+
+/// After a request lspcheck couldn't deliver, whose entry gives the cause,
+/// names the requests left unsent once.
+fn k1_not_sent_after<'a>(notes: &mut Vec<String>, rest: impl Iterator<Item = &'a capabilities::Request>) {
+    let rest: Vec<&str> = rest.map(|remaining| remaining.label.as_str()).collect();
+    if !rest.is_empty() {
+        notes.insert(0, format!("not sent after that: {}", rest.join(", ")));
+    }
 }
 
 /// The index in `messages` of the first response to `id` at or after `from`.
@@ -7291,6 +7349,39 @@ pub fn file_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn k1s_initialize_params_are_valid_and_k2_knows_its_follow_ups_results() {
+        let params = k1_initialize_params(Path::new("/w"));
+        let ty = metamodel::Type::Reference { name: "InitializeParams".into() };
+        let violations = metamodel::on_validation_stack(|| {
+            let v = metamodel::validate(&ty, &params, "params").unwrap();
+            (!v.is_empty()).then(|| format!("{:?}", v.first))
+        })
+        .unwrap();
+        assert_eq!(violations, None);
+        let completion = &params["capabilities"]["textDocument"]["completion"]["completionItem"];
+        assert_eq!(completion["snippetSupport"], false);
+        assert_eq!(completion["resolveSupport"]["properties"], json!(["documentation", "detail"]));
+        assert!(params.pointer("/capabilities/workspace/symbol/resolveSupport/properties").is_some());
+        assert!(params.pointer("/capabilities/textDocument/inlayHint/resolveSupport/properties").is_some());
+        // Only K1 resolves, so the mutation scenario's params don't offer it.
+        let shared = capabilities_initialize_params(Path::new("/w"));
+        assert!(shared.pointer("/capabilities/textDocument/completion/completionItem/resolveSupport").is_none());
+        for method in [
+            "callHierarchy/incomingCalls",
+            "callHierarchy/outgoingCalls",
+            "typeHierarchy/supertypes",
+            "typeHierarchy/subtypes",
+            "completionItem/resolve",
+            "codeLens/resolve",
+            "documentLink/resolve",
+            "inlayHint/resolve",
+            "workspaceSymbol/resolve",
+        ] {
+            assert!(metamodel::model().result(method).is_some(), "{method}");
+        }
+    }
 
     /// A failure about replies that never arrived, settled: it names only
     /// requests whose waits lspcheck read in full, the first and how many

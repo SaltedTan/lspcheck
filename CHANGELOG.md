@@ -12,6 +12,11 @@
   as a message is visible. The JSON report's `mutation.messages` has the counts and the first three, with the case
   each arrived in, cut to 200 characters; the terminal and Markdown reports add a line quoting them when there is at
   least one. They change no verdict.
+- K1 now also sends follow-up requests that need an item from an earlier answer, passing the answer's first item
+  back unchanged: `callHierarchy/incomingCalls` and `outgoingCalls`, `typeHierarchy/supertypes` and `subtypes`, and,
+  when their `resolveProvider` is `true`, `completionItem/resolve`, `codeLens/resolve`, `documentLink/resolve`,
+  `inlayHint/resolve` and `workspaceSymbol/resolve`. A server that answers one it advertises with MethodNotFound now
+  fails K1. A source answer with no usable item gets no follow-up, and the detail says so.
 
 ### Fixed
 
