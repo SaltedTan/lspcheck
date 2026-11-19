@@ -26,7 +26,7 @@ use crate::transcript;
 use crate::transport;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -2602,6 +2602,10 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
             }
         }
         K1Pending::Mutation { asked } => {
+            // Only requests lspcheck wrote whole are K1's: a write that
+            // failed part way asked the server nothing it must answer.
+            let sent: HashSet<&Id> = finish.sent.iter().map(|(_, id)| id).collect();
+            let asked: Vec<_> = asked.into_iter().filter(|(id, ..)| sent.contains(id)).collect();
             let not_found = k1_not_found(&asked, finish);
             if not_found.is_empty() {
                 // As in the capabilities scenario, output missed after the
@@ -8461,6 +8465,7 @@ while header := sys.stdin.buffer.readline():
             })
             .collect();
         asked.push((Id::Str("8".into()), Duration::from_millis(10), "textDocument/hover in case 8".into(), Some(8)));
+        finish.sent = asked.iter().map(|(id, at, ..)| (*at, id.clone())).collect();
         finish.messages = vec![
             (9, json!({"jsonrpc": "2.0", "id": 5, "error": {"code": -32601, "message": "early"}})),
             (20, json!({"jsonrpc": "2.0", "id": "7", "error": {"code": -32601, "message": "string id"}})),
@@ -8482,6 +8487,13 @@ while header := sys.stdin.buffer.readline():
             panic!("output missed after mutation K1's requests must leave it inconclusive");
         };
         assert!(detail.starts_with("inconclusive, because skipped: a MethodNotFound for one of the 8"), "{detail}");
+        // A request whose write failed part way asked nothing, so missed
+        // output after it leaves K1 alone, and isn't counted.
+        let unsent = (Id::int(9), Duration::from_millis(1), "textDocument/hover in case 9".to_string(), Some(9));
+        finish.lost = vec![(Duration::from_millis(2), Duration::from_millis(9), "skipped".into())];
+        assert!(judge_k1(K1Pending::Mutation { asked: vec![unsent.clone()] }, &finish).is_none());
+        let with_unsent: Vec<_> = asked.iter().cloned().chain([unsent]).collect();
+        assert!(judge_k1(K1Pending::Mutation { asked: with_unsent }, &finish).is_none());
         finish.lost.clear();
         for (at, value) in [
             (20, json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32601, "message": "fourth"}})),

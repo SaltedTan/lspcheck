@@ -605,7 +605,13 @@ fn stdout_still_open_after_the_final_drain_leaves_k1_inconclusive() {
         stdout
     });
     let env = format!("LSPCHECK_STANDIN_HOLD={}", hold.path().display());
-    let r = run_command(&["--only", "K1"], &["env", &env, STANDIN, "--fault", "stdout-held-on-exit"], None);
+    // The exit wait outlasts the stand-in's own 30 s wait for the holder, so
+    // lspcheck can't stop it before the holder has its stdout.
+    let r = run_command(
+        &["--only", "K1", "--exit-timeout", "40"],
+        &["env", &env, STANDIN, "--fault", "stdout-held-on-exit"],
+        None,
+    );
     // Held until lspcheck had finished: whatever the pipe carried after the
     // drain's deadline, such as a MethodNotFound, lspcheck never read.
     drop(holder.join().unwrap());

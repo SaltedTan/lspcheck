@@ -8,7 +8,8 @@ Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 minimisation, which waits until isolation shows it is wanted.
 D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios.
 Mutation runs warn on stderr about a short case start window and summarize the server's Error and Warning messages
-in the [reports](#report).
+in the [reports](#report). A frame that lspcheck's own cleanup cut short makes F1 `ERROR`, not `FAIL`, and K1 can't
+pass on output it didn't see.
 See the [changelog](../CHANGELOG.md) for changes by release.
 
 ## Purpose
