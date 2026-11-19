@@ -1,6 +1,7 @@
 # gopls may exit after `exit` with a frame's header written and its body not: F1 then fails on
-# what it saw, and J1, J3, J5, J7 and K2 are inconclusive about that frame. Seen in CI, and in 2 of 3
-# local runs of K2's baseline (2026-11-09).
+# what it saw, and J1, J5, J7 and K2 are inconclusive about that frame. Seen in CI, and in 2 of 3
+# local runs of K2's baseline (2026-11-09). With no body, no message can have been in it, so the
+# checks that ask only whether output was missed (J3, K1, M3) aren't affected.
 F1 pass|fail
 F2 pass
 F3 pass
@@ -11,7 +12,7 @@ F7 pass
 F8 pass
 J1 pass|error
 J2 fail
-J3 pass|error
+J3 pass
 J4 pass
 J5 pass|error
 J6 pass
@@ -47,7 +48,4 @@ R3 pass
 R4 fail
 M1 pass
 M2 pass
-# The same exit mid-frame leaves output in the mutation run that lspcheck couldn't read, after the recovery probes'
-# last publish, and it could have held a late diagnostic, so M3 is `error` whenever F1 fails. Seen in this file's CI
-# job on PR #65 (2026-11-19).
-M3 pass|error
+M3 pass

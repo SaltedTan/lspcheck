@@ -67,7 +67,8 @@ Existing checks keep being judged on the new scenario's evidence:
   (selection-range containment) and K1 (an advertised request isn't answered with MethodNotFound). Their rules don't
   depend on the text, only on knowing it, and lspcheck knows every version it sent. Each is judged per scenario, and
   the two verdicts combine as `fail` over `error` over `pass` over `not-exercised`
-  over `skip`; the detail names the scenario and case. K1 takes only its failure from the mutation scenario: an
+  over `skip`; the detail names the scenario and case. K1 takes its failure from the mutation scenario, and an
+  `ERROR` when output lspcheck missed after the scenario's first K1 request could have held a MethodNotFound; an
   unanswered mutation request is M2's, so it never makes K1 `ERROR`.
 - **Not extended:** D3 and D5 rest on documents built so that one specific mistake lands inside a character; a
   random edit can't make that diagnosis, so D1 judges those positions. D4, the C, L1 to L8 and R checks need their own
@@ -326,7 +327,8 @@ so a text is dropped only after everything read while it was kept has been judge
 dropped text is counted in the detail (`that may refer to a version older than the 64 whose texts lspcheck keeps,
 not judged`). A request left unanswered or undelivered is M1's or M2's: it makes none of the four `ERROR`, though
 missed evidence in that window can make D1, D2 or D6 `ERROR`, as in their own scenarios. D1 and D2 are
-judged once a seed document was opened, D6 once a `selectionRange` was sent, and K1 only when it fails; the scenario
+judged once a seed document was opened, D6 once a `selectionRange` was sent, and K1 only when it fails or missed
+output after its first request could have held a MethodNotFound; the scenario
 contributes nothing to them when it stops before opening a document. In the combined detail, each scenario's part
 starts with its verdict and name (`FAIL in the mutation scenario: …; PASS in the documents scenario: …`), the
 winning one first, and each position, publish or reply the mutation scenario names says its case: a reply its

@@ -1326,9 +1326,12 @@ impl Session {
         self.group.close();
         let mut evidence = std::mem::take(&mut *self.evidence.lock().expect("evidence lock"));
         let now = self.start.elapsed();
-        if !evidence.done && evidence.limit.is_none() {
-            evidence.limit =
-                Some((now, "stdout stayed open after the server exited, so later output wasn't inspected".into()));
+        // Reading stopped here, so anything sent from now on went unread,
+        // whatever made inspection incomplete earlier.
+        if !evidence.done {
+            let why = "stdout stayed open after the server exited, so later output wasn't inspected".to_string();
+            evidence.limit.get_or_insert((now, why.clone()));
+            evidence.stopped.get_or_insert((now, why));
         }
         // A frame still unfinished when reading ended may hold anything sent
         // since it began.
@@ -1513,7 +1516,10 @@ async fn read_stdout(
                 Problem::BadHeader { block, reason: "the stream ended inside a header section".into() }
             }
         };
-        if !matches!(problem, Problem::Garbage(_)) {
+        // A log line loses nothing; nor does a header section the server
+        // followed with no body before ending the stream itself, since a
+        // message would have had to be in the body.
+        if !matches!(problem, Problem::Garbage(_) | Problem::Truncated { received: 0, .. }) {
             ev.lost.push((began, at, UNREAD.into()));
         }
         ev.problems.push((at, problem.clone()));

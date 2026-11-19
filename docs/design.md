@@ -8,7 +8,8 @@ Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 minimisation, which waits until isolation shows it is wanted.
 D6's [candidate rules](#documents-and-positions) now apply in the documents and mutation scenarios.
 Mutation runs warn on stderr about a short case start window and summarize the server's Error and Warning messages
-in the [reports](#report).
+in the [reports](#report). A frame that lspcheck's own cleanup cut short makes F1 `ERROR`, not `FAIL`, and K1 can't
+pass on output it didn't see.
 See the [changelog](../CHANGELOG.md) for changes by release.
 
 ## Purpose
@@ -155,7 +156,10 @@ cancelled request until it is cancelled again, for C2 from its first cancel, and
 each until `exit`. A missing response is excused only by something missed while lspcheck was waiting for it.
 
 lspcheck times what it missed as spans, from the arrival of the first byte it couldn't inspect to the moment it knew
-it had missed them, so a frame that began before a wait and ended after it still counts for that wait. Some losses are
+it had missed them, so a frame that began before a wait and ended after it still counts for that wait. Reading stops,
+too, when stdout is still open as cleanup stops waiting for its end: anything sent from then on went unread. A header
+section the server followed with no body before ending its stream itself fails F1 but loses nothing, since a message
+would have been in the body. Some losses are
 found only later: a frame still arriving when a verdict is reached may turn out to be cut short when the stream ends.
 So every `PASS` and `NOT EXERCISED` that relied on nothing being missed in a window is checked again at the end of its
 scenario, once the server's output has been read to the end, and becomes `ERROR` if something missed falls in that
@@ -430,7 +434,11 @@ remaining requests in a single `not sent after that` note.
 - **error:** initialize didn't succeed, the server chose an encoding lspcheck didn't offer (see L2), the document
   couldn't be written, read or opened (`didOpen` not delivered), or a request couldn't be delivered. A delivered
   request with no response by the end of the session is also `ERROR` (`no response to <method> at <position> by the
-  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1.
+  end of the session, so K1 couldn't judge it`), unless another request got -32601, which fails K1. So is a run that
+  would pass when lspcheck missed some of the server's output after K1's first request was sent (a frame skipped over
+  `--max-frame-mib`, one it couldn't read, or reading that stopped, as when stdout stayed open after cleanup), since
+  that output may have held a -32601 for one of its requests, even a duplicate; output missed earlier can't have, and
+  leaves K1's verdict alone. With `--mutate`, the same holds for the mutation scenario's K1 requests.
 - **not-exercised:** the initialize result has no capabilities object, or the server advertises none of the requests
   above, or all advertised requests were excluded by the `didOpen` or selector rules (the detail says why).
 - **pass:** every request selected for delivery was answered with a result or another error by the end of the

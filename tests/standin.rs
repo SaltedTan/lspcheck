@@ -568,6 +568,65 @@ fn method_not_found_after_a_result_still_fails_k1() {
 }
 
 #[test]
+fn a_skipped_frame_after_k1s_requests_leaves_k1_inconclusive() {
+    // The MethodNotFound that follows the result is over the inspection
+    // limit, so lspcheck skips it unread: it may have been the very
+    // MethodNotFound that fails K1, so K1 can't pass.
+    let r = run(&["--fault", "big-method-not-found-after-result"], &["--max-frame-mib", "1"]);
+    expect(&r, "K1", "error");
+    expect(&r, "F1", "error");
+    assert!(r.stdout.contains("a MethodNotFound for one of K1's requests may have been in output"), "{}", r.stdout);
+    // A frame skipped before initialize was answered, long before K1's
+    // requests were sent, can't have held their replies.
+    let r = run(&["--fault", "big-frame"], &["--max-frame-mib", "1", "--only", "K1,F1"]);
+    expect(&r, "K1", "pass");
+    expect(&r, "F1", "error");
+}
+
+/// The stand-in waits on `exit` until this test has opened its stdout, then
+/// exits: the pipe stays open in a process lspcheck can't stop, so its final
+/// drain of stdout ends at its deadline, not at the end of the stream.
+#[cfg(target_os = "linux")]
+#[test]
+fn stdout_still_open_after_the_final_drain_leaves_k1_inconclusive() {
+    let hold = tempfile::tempdir().unwrap();
+    let dir = hold.path().to_path_buf();
+    let holder = std::thread::spawn(move || {
+        let deadline = Instant::now() + WATCHDOG;
+        let pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(dir.join("pid")) {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the stand-in never asked for its stdout to be held");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = std::fs::OpenOptions::new().write(true).open(format!("/proc/{pid}/fd/1")).unwrap();
+        std::fs::write(dir.join("held"), "").unwrap();
+        stdout
+    });
+    let env = format!("LSPCHECK_STANDIN_HOLD={}", hold.path().display());
+    // The exit wait outlasts the stand-in's own 30 s wait for the holder, so
+    // lspcheck can't stop it before the holder has its stdout.
+    let r = run_command(
+        &["--only", "K1", "--exit-timeout", "40"],
+        &["env", &env, STANDIN, "--fault", "stdout-held-on-exit"],
+        None,
+    );
+    // Held until lspcheck had finished: whatever the pipe carried after the
+    // drain's deadline, such as a MethodNotFound, lspcheck never read.
+    drop(holder.join().unwrap());
+    expect(&r, "K1", "error");
+    assert!(
+        detail(&r, "K1").starts_with(
+            "inconclusive, because stdout stayed open after the server exited, so later output wasn't inspected: \
+             a MethodNotFound for one of K1's requests"
+        ),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
 fn an_advertised_request_left_unanswered_leaves_k1_inconclusive() {
     // LSP sets no deadline for a response, so a request answered neither with
     // MethodNotFound nor anything else by the end of the session is ERROR.
@@ -892,6 +951,18 @@ fn a_header_section_the_server_cuts_short_itself_fails_f1() {
             assert_ne!(v, "fail", "{id}\n{}", r.stdout);
         }
     }
+}
+
+#[test]
+fn a_header_section_the_server_ends_its_stream_after_loses_no_output() {
+    // The server writes a whole header section and exits before any of its
+    // body. F1 fails on that frame, and the checks that judge every frame are
+    // inconclusive about it, as about any frame F1 fails. But a message would
+    // have been in the body, so the checks that ask only whether lspcheck
+    // missed output since a request (K1, J3) pass.
+    let r = fault("header-only-on-exit");
+    only_fails_unread(&r, &["F1"]);
+    assert!(r.stdout.contains("stream ended 0 bytes into a 52-byte body"), "{}", r.stdout);
 }
 
 /// The server exits by itself, but a child it left behind is still writing
@@ -2957,6 +3028,34 @@ fn an_isolated_transcript_that_cannot_be_written_leaves_the_report_alone() {
         )),
         "{}",
         r.stdout
+    );
+}
+
+#[test]
+fn a_skipped_frame_after_mutation_k1s_requests_leaves_k1_inconclusive() {
+    // The first request about a mutated document with unbalanced brackets is
+    // answered, and a MethodNotFound for it over the inspection limit follows
+    // at shutdown. lspcheck skips that frame unread, and it may have been the
+    // MethodNotFound that fails K1, so the mutation scenario's K1 is an error
+    // although the capabilities scenario's passes.
+    let fault = "big-method-not-found-after-unbalanced";
+    let (r, _, _keep) = mutated(&[fault], &["--max-frame-mib", "1", "--only", "K1"]);
+    expect(&r, "K1", "error");
+    let detail = detail(&r, "K1");
+    assert!(detail.starts_with("ERROR in the mutation scenario: inconclusive, because a "), "{detail}");
+    assert!(
+        detail.contains(
+            "-byte frame is over lspcheck's 1048576-byte inspection limit (--max-frame-mib), so it wasn't checked: a \
+             MethodNotFound for one of the "
+        ),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(
+            " advertised request(s) about the mutated documents may have been in output lspcheck didn't see; PASS in \
+             the capabilities scenario: "
+        ),
+        "{detail}"
     );
 }
 
