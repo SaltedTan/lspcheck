@@ -2,43 +2,46 @@
 
 ## Unreleased
 
+## 0.6.0 (2026-11-19)
+
+This release fixes verdicts that could be wrong when lspcheck didn't see all of the server's output, and makes two
+things easier to spot under `--mutate`. Some verdicts change from 0.5.0, each to what lspcheck actually observed:
+F1 can go from `fail` to `error`, K1 from `pass` to `error`, and J3, K1 or M3 from `error` to `pass`. The entries
+below say when.
+
 ### Added
 
 - Under `--mutate`, lspcheck warns on stderr when `mutation.run_timeout` leaves less than a minute beyond one case's
-  budget in which cases can start, since a slow machine may then run fewer cases than asked with every verdict
-  passing. The run, its report and its exit status are unchanged.
-- Under `--mutate`, the report counts the Error and Warning messages the server sent with `window/showMessage`,
-  `window/logMessage` or `window/showMessageRequest` during the cases, so a contained crash the server reports only
-  as a message is visible. The JSON report's `mutation.messages` has the counts and the first three, with the case
-  each arrived in, cut to 200 characters; the terminal and Markdown reports add a line quoting them when there is at
-  least one. They change no verdict.
+  budget in which cases can start. A slow machine could then run fewer cases than asked while every verdict passes.
+  The run, its report and its exit status are unchanged.
+- Under `--mutate`, the report counts the Error and Warning messages the server sends with `window/showMessage`,
+  `window/logMessage` or `window/showMessageRequest` from the first mutation until shutdown, so a contained crash the
+  server reports only as a message is visible. The JSON report's `mutation.messages` has the counts and the first
+  three messages, each with its case and method and cut to 200 characters; the terminal and Markdown reports add a
+  line quoting them when there is at least one. They change no verdict.
 
 ### Fixed
 
-- K1 no longer passes when some of the server's output after K1's first request couldn't be read, such as a frame
-  over `--max-frame-mib`: that output may have held a MethodNotFound for one of K1's requests, even a duplicate after
-  a result, so K1 is now `error` and says why. A MethodNotFound lspcheck read still fails K1, and output missed before
-  K1's requests were sent doesn't affect it. The same now holds for K1's requests in the mutation scenario under
-  `--mutate`, which could still pass on such output.
-- When the server's stdout stays open after its processes are stopped (held by a process lspcheck couldn't stop),
-  lspcheck now counts what it didn't read after giving up on it as missed: checks that pass only when nothing was
-  missed since some earlier point, such as K1, are `error` instead of passing.
-- A frame whose header section the server wrote and whose body it never began, because it ended its stdout first,
-  still fails F1, but no longer makes K1, J3, M3 or the other checks that ask whether output was missed `error`: it
-  can't have held a message.
-- Under `--mutate`, when some of M2's unanswered requests may have been answered in output lspcheck didn't see, its
+- **F1** no longer fails on a frame lspcheck may have cut short itself. When lspcheck stops a server (or a process it
+  left behind) that is still writing a frame, such as a slow `shutdown` reply lspcheck gave up waiting for, F1 is now
+  `error` and says how much of the frame arrived, whether the stream ended in the frame's body or its header section.
+  What counts is when lspcheck saw the stream end. A server that ends its output inside a frame by itself still fails
+  F1, if lspcheck saw the end before stopping it; so does a header section already malformed when the stream ended.
+- **K1** no longer passes when output lspcheck didn't read after K1's first request could have held a MethodNotFound
+  for one of its requests: a frame over `--max-frame-mib` (even a duplicate after a result), reading that stopped, or
+  stdout held open by a process lspcheck couldn't stop. K1 is then `error` and says why. A MethodNotFound lspcheck
+  read still fails K1, and output missed before K1's requests doesn't affect it. Under `--mutate`, the same applies to
+  K1's requests about the mutated documents.
+- When the server's stdout stays open after lspcheck has stopped its processes, what lspcheck didn't read after
+  giving up on it now counts as missed, so the checks that ask whether output was missed (K1 among them) are `error`
+  instead of passing.
+- A frame whose header the server wrote but whose body it never began, because it ended its output first, still
+  fails F1 but no longer makes K1, J3, M3 or the other checks that ask whether output was missed `error`: it can't
+  have held a message. gopls sometimes exits this way after `exit`.
+- Under `--mutate`, when some of M2's unanswered requests may have been answered in output lspcheck didn't see, M2's
   failure detail now names and counts only the requests whose waits it saw in full, and says how many others may have
-  been answered, and why. The verdict is unchanged.
-- Likewise, when the reply to some of R4's unanswered odd-id requests may have been in output lspcheck didn't see, its
-  failure detail lists as unanswered only the ids whose waits it saw in full, and the others as possibly answered,
-  with why. The verdict is unchanged.
-- A frame the server (or a process it left behind) was still writing when lspcheck stopped it, such as a slow
-  `shutdown` reply that lspcheck had given up waiting for, no longer fails F1, whether the stream ended in the frame's
-  body or its header section: lspcheck may have cut it short itself, so F1 is now `error` and says how much of the
-  frame arrived. What counts is when lspcheck saw the stream end: a server that closed its output mid-frame and kept
-  running still fails F1 if lspcheck saw the end before stopping it, and gets `error` if lspcheck saw it only after,
-  as when a leftover process was found. A stream the server ends inside a frame and then exits still fails F1, as does
-  a header section already malformed when the stream ended.
+  been answered, and why. Likewise R4's failure detail lists as unanswered only the ids whose waits it saw in full.
+  Neither verdict changes.
 
 ## 0.5.0 (2026-11-16)
 
