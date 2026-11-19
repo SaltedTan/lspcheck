@@ -396,7 +396,10 @@ once the server's output has been read to the end, that it missed something ther
 may turn out to be cut short). A failure lspcheck saw
 directly, such as a wrong result, stays `FAIL`. The same happens when some of the server's frames can't be read at all,
 and when lspcheck couldn't finish writing to a server that stopped reading its input: a request lspcheck couldn't
-deliver gives `ERROR`, never `FAIL`. A header section longer than 1 MiB also stops inspection.
+deliver gives `ERROR`, never `FAIL`. A header section longer than 1 MiB also stops inspection, and so does stdout
+still open (held by a process lspcheck couldn't stop) when lspcheck stops waiting for its end, 10 s after stopping the
+server's processes. A header section the server follows with no body before ending stdout itself fails F1, but
+loses nothing a check looks for: a message would have been in the body.
 When lspcheck sees stdout end inside a frame (its header section or its body) only after it has begun stopping the
 server's processes, it may have cut that frame short itself, so F1 is `ERROR`, not `FAIL`. What counts is when
 lspcheck saw the end. A server that closed stdout mid-frame and kept running still fails F1 if lspcheck saw the end

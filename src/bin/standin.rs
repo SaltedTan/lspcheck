@@ -145,6 +145,11 @@ const FAULTS: &[(&str, &str)] = &[
     ("ignore-exit", "ignore exit and stay running"),
     ("inflated-on-exit", "on exit, start an inflated frame containing a progress request and stay running"),
     ("half-header-on-exit", "on exit, write the first line of a header section and exit"),
+    ("header-only-on-exit", "on exit, write a whole header section and exit before writing any of its body"),
+    (
+        "stdout-held-on-exit",
+        "on exit, wait for the process named by LSPCHECK_STANDIN_HOLD (a directory) to hold stdout open, then exit",
+    ),
     (
         "half-frame-in-leftover",
         "on exit, leave behind a child that has written part of a frame to stdout and stays running, and exit",
@@ -396,6 +401,11 @@ const FAULTS: &[(&str, &str)] = &[
         "big-method-not-found-after-result",
         "as method-not-found-after-result, but the MethodNotFound frame is over 2 MiB",
     ),
+    (
+        "big-method-not-found-after-unbalanced",
+        "answer the first request about a document whose brackets are unbalanced as usual, then again with a \
+         MethodNotFound over 2 MiB when shutdown arrives",
+    ),
     ("defer-hover-until-shutdown", "lawful: answer hover requests only when shutdown arrives"),
     (
         "advertised-error-after-shutdown",
@@ -520,8 +530,8 @@ fn main() {
     // The rest of a notification begun after the checks were done, written
     // only once `shutdown` arrives.
     let mut unfinished: Option<Vec<u8>> = None;
-    // A documentColor request answered once, to answer again at shutdown.
-    let mut answered_color: Option<Value> = None;
+    // A request answered once, to answer again at shutdown.
+    let mut answer_again: Option<Value> = None;
     // For inflated-on-first-probe.
     let mut probed = false;
     // Messages read by await-progress-answer while it waited, to handle next.
@@ -1126,6 +1136,12 @@ fn main() {
                 if fault("half-header-on-exit") {
                     out.raw(b"Content-Length: 52\r\n");
                 }
+                if fault("header-only-on-exit") {
+                    out.raw(b"Content-Length: 52\r\n\r\n");
+                }
+                if fault("stdout-held-on-exit") {
+                    hold_stdout();
+                }
                 if fault("half-frame-in-leftover") {
                     // Exit only once the child has written, so the frame is
                     // unfinished when lspcheck finds the child left behind.
@@ -1180,6 +1196,9 @@ fn main() {
             .is_some_and(|(text, _)| !unmatched_brackets(text, units, split).is_empty());
         if unbalanced && fault("ignore-while-unbalanced") {
             continue;
+        }
+        if unbalanced && fault("big-method-not-found-after-unbalanced") && answer_again.is_none() {
+            answer_again = Some(id.clone());
         }
         let extra_square = msg
             .pointer("/params/textDocument/uri")
@@ -1552,10 +1571,10 @@ fn main() {
             out.raw(&rest);
         }
         if method == "shutdown"
-            && let Some(color) = answered_color.take()
+            && let Some(again) = answer_again.take()
         {
-            let mut reply = err(&color, -32601, "method not found");
-            if fault("big-method-not-found-after-result") {
+            let mut reply = err(&again, -32601, "method not found");
+            if fault("big-method-not-found-after-result") || fault("big-method-not-found-after-unbalanced") {
                 reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
             }
             out.frame(&reply);
@@ -1806,7 +1825,7 @@ fn main() {
                 if fault("method-not-found-after-result") || fault("big-method-not-found-after-result") =>
             {
                 out.frame(&ok(&id, json!([])));
-                answered_color = Some(id);
+                answer_again = Some(id);
             }
             _ if fault("early-replies") => out.frame(&ok(&id, Value::Null)),
             "lspcheck/unknownRequest" if fault("big-frame-before-unknown-reply") => {
@@ -2498,6 +2517,22 @@ fn child(escape: bool) {
     println!("ready");
     let _ = std::io::stdout().flush();
     std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+/// Has a process that isn't one of lspcheck's hold stdout open: writes this
+/// process's id to `pid` in the directory LSPCHECK_STANDIN_HOLD names, and
+/// waits until `held` appears there, which the holder creates once it has
+/// opened the same pipe.
+fn hold_stdout() {
+    let dir = std::path::PathBuf::from(std::env::var_os("LSPCHECK_STANDIN_HOLD").unwrap());
+    let tmp = dir.join("pid.tmp");
+    std::fs::write(&tmp, std::process::id().to_string()).unwrap();
+    std::fs::rename(&tmp, dir.join("pid")).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !dir.join("held").exists() {
+        assert!(std::time::Instant::now() < deadline, "standin: nothing held stdout");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// A leftover child sharing the server's stdout: it writes part of a frame

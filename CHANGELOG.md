@@ -18,7 +18,14 @@
 - K1 no longer passes when some of the server's output after K1's first request couldn't be read, such as a frame
   over `--max-frame-mib`: that output may have held a MethodNotFound for one of K1's requests, even a duplicate after
   a result, so K1 is now `error` and says why. A MethodNotFound lspcheck read still fails K1, and output missed before
-  K1's requests were sent doesn't affect it.
+  K1's requests were sent doesn't affect it. The same now holds for K1's requests in the mutation scenario under
+  `--mutate`, which could still pass on such output.
+- When the server's stdout stays open after its processes are stopped (held by a process lspcheck couldn't stop),
+  lspcheck now counts what it didn't read after giving up on it as missed: checks that pass only when nothing was
+  missed since some earlier point, such as K1, are `error` instead of passing.
+- A frame whose header section the server wrote and whose body it never began, because it ended its stdout first,
+  still fails F1, but no longer makes K1, J3, M3 or the other checks that ask whether output was missed `error`: it
+  can't have held a message.
 - Under `--mutate`, when some of M2's unanswered requests may have been answered in output lspcheck didn't see, its
   failure detail now names and counts only the requests whose waits it saw in full, and says how many others may have
   been answered, and why. The verdict is unchanged.

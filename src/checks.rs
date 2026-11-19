@@ -2604,7 +2604,16 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
         K1Pending::Mutation { asked } => {
             let not_found = k1_not_found(&asked, finish);
             if not_found.is_empty() {
-                return None;
+                // As in the capabilities scenario, output missed after the
+                // first request was sent may have held a MethodNotFound.
+                let first_sent = asked.iter().map(|(_, at, ..)| *at).min()?;
+                return finish.missed_output_within(first_sent, Duration::MAX).map(|why| {
+                    Judgement::Error(format!(
+                        "inconclusive, because {why}: a MethodNotFound for one of the {} advertised request(s) about \
+                         the mutated documents may have been in output lspcheck didn't see",
+                        asked.len()
+                    ))
+                });
             }
             let n = not_found.len();
             let more = n.saturating_sub(K1_NAMED);
@@ -6259,7 +6268,8 @@ async fn leave_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequ
 /// waiting for shutdown's reply or its write failed ([design](../docs/source-mutations.md#verdict-rules)).
 /// D1 and D2 are reported once a document was opened, D6 once a
 /// `selectionRange` was asked. K1's request metadata is retained until
-/// cleanup's final stdout drain, and it contributes only a MethodNotFound: an
+/// cleanup's final stdout drain, and it contributes only a MethodNotFound, or
+/// an error when output missed after its requests could have held one: an
 /// unanswered request is M2's, never K1's error. [`run`] combines these with
 /// the verdicts the checks' own scenarios give.
 fn judge_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest], end: Duration) {
@@ -8463,6 +8473,16 @@ while header := sys.stdin.buffer.readline():
         .map(|(at, value)| (Duration::from_millis(at), Message::classify(value)))
         .collect();
         assert!(judge_k1(K1Pending::Mutation { asked: asked.clone() }, &finish).is_none());
+        // Output missed only before the first request was sent leaves that
+        // alone; missed after it, nothing passes on that output's absence.
+        finish.lost = vec![(Duration::from_millis(2), Duration::from_millis(9), "skipped".into())];
+        assert!(judge_k1(K1Pending::Mutation { asked: asked.clone() }, &finish).is_none());
+        finish.lost = vec![(Duration::from_millis(2), Duration::from_millis(11), "skipped".into())];
+        let Some(Judgement::Error(detail)) = judge_k1(K1Pending::Mutation { asked: asked.clone() }, &finish) else {
+            panic!("output missed after mutation K1's requests must leave it inconclusive");
+        };
+        assert!(detail.starts_with("inconclusive, because skipped: a MethodNotFound for one of the 8"), "{detail}");
+        finish.lost.clear();
         for (at, value) in [
             (20, json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32601, "message": "fourth"}})),
             (20, json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32601, "message": "third"}})),
