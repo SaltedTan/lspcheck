@@ -183,12 +183,17 @@ const FAULTS: &[(&str, &str)] = &[
         "send only the id for the request after a cancelled one, then answer a $/cancelRequest for it with -32800",
     ),
     (
-        "cancelled-control-twice",
-        "answer the request after a cancelled one with -32800, and a $/cancelRequest for it with -32800 again",
+        "no-outcome-then-answer-after-cancelled",
+        "lawful for C2: send only the id for the request after a cancelled one, then answer it",
     ),
+    ("cancelled-empty-error", "answer a cancelled request with an \"error\" that has neither code nor message"),
     ("late-duplicate-cancelled-answer", "answer a cancelled request with -32800 again just before answering shutdown"),
     ("cancel-unknown-reply", "answer a $/cancelRequest for an id that isn't pending with an error carrying it"),
     ("stop-after-unknown-cancel", "stop answering requests after a $/cancelRequest for an id that isn't pending"),
+    (
+        "no-outcome-after-unknown-cancel",
+        "after a $/cancelRequest for an id that isn't pending, answer lspcheck/probe with only \"jsonrpc\" and the id",
+    ),
     ("cancel-finished-reply", "answer a $/cancelRequest for a request already answered with -32800 carrying its id"),
     (
         "cancel-finished-other",
@@ -202,12 +207,25 @@ const FAULTS: &[(&str, &str)] = &[
         "cancel-lookalike",
         "after the first $/cancelRequest, send an error with id null naming $/cancelRequestMetrics in its message",
     ),
+    (
+        "cancel-named-internal-error",
+        "after the first $/cancelRequest, send an InternalError (-32603) with id null naming $/cancelRequest",
+    ),
     ("no-outcome-for-id-zero", "answer a request with id 0 with only \"jsonrpc\" and the id, neither result nor error"),
     (
         "no-outcome-then-answer-id-zero",
         "lawful for R4: send id 0 with neither result nor error, then answer the request properly",
     ),
     ("null-error-for-id-zero", "answer a request with id 0 with \"error\": null"),
+    ("empty-error-for-id-zero", "answer a request with id 0 with an \"error\" that has neither code nor message"),
+    (
+        "early-reply-for-id-minus-one",
+        "answer id 0 together with an error for id -1, not yet sent, then send id -1 with neither result nor error",
+    ),
+    (
+        "no-outcome-then-answer-empty-id",
+        "lawful for R4: send the empty string id with neither result nor error, then answer the request properly",
+    ),
     ("reply-to-cancel", "answer every $/cancelRequest with an error whose id is null"),
     ("late-cancel-replies", "send what the cancel faults send only after answering the next request"),
     ("big-cancel-replies", "pad what the cancel faults send with 2 MiB of error data"),
@@ -525,7 +543,8 @@ fn main() {
         "cancelled-no-outcome-then-answer",
         "cancelled-both",
         "no-outcome-then-cancelled",
-        "cancelled-control-twice",
+        "no-outcome-then-answer-after-cancelled",
+        "cancelled-empty-error",
         "late-duplicate-cancelled-answer",
         "inflated-on-cancel",
     ]
@@ -553,6 +572,8 @@ fn main() {
     let mut held_hovers: Vec<Value> = Vec::new();
     // Set by stop-after-unknown-cancel: requests are no longer answered.
     let mut no_more_answers = false;
+    // Set by no-outcome-after-unknown-cancel: probes get only their id.
+    let mut outcomeless_probes = false;
     // For drop-first-request: whether the first document request was dropped.
     let mut dropped_first = false;
     // What the cancel faults send, and where: now, or after the next answer.
@@ -562,8 +583,8 @@ fn main() {
     let mut cancelled_again: Option<Value> = None;
     // The ids of the requests read, for the faults about cancelling a finished one.
     let mut requests_seen: Vec<Value> = Vec::new();
-    // For cancel-decoy and cancel-lookalike: whether the decoy is still to be sent.
-    let mut decoy = fault("cancel-decoy") || fault("cancel-lookalike");
+    // For cancel-decoy and its kin: whether the decoy is still to be sent.
+    let mut decoy = fault("cancel-decoy") || fault("cancel-lookalike") || fault("cancel-named-internal-error");
     // Whether a cancelled request was just settled and the next one not yet
     // read, and that next one's id, for the faults about it.
     let (mut after_cancelled, mut control) = (false, None::<Value>);
@@ -737,6 +758,8 @@ fn main() {
                 } else if fault("cancelled-no-outcome-then-answer") {
                     out.frame(&json!({"jsonrpc": "2.0", "id": deferred_id}));
                     cancel_out.send(&mut out, err(&deferred_id, -32800, "request cancelled"));
+                } else if fault("cancelled-empty-error") {
+                    out.frame(&json!({"jsonrpc": "2.0", "id": deferred_id, "error": {}}));
                 } else if fault("cancelled-both") {
                     let mut reply = err(&deferred_id, -32800, "request cancelled");
                     reply["result"] = Value::Null;
@@ -797,6 +820,8 @@ fn main() {
                     // An unrelated error that only mentions cancellation in passing.
                     if fault("cancel-lookalike") {
                         out.frame(&err(&Value::Null, -32603, "initialized failed to register $/cancelRequestMetrics"));
+                    } else if fault("cancel-named-internal-error") {
+                        out.frame(&err(&Value::Null, -32603, "initialized failed: could not register $/cancelRequest"));
                     } else {
                         let mut reply = err(&Value::Null, -32603, "internal error");
                         reply["error"]["data"] = json!({"feature": "cancelRequest statistics"});
@@ -805,6 +830,9 @@ fn main() {
                 }
                 if fault("stop-after-unknown-cancel") {
                     no_more_answers = true;
+                }
+                if fault("no-outcome-after-unknown-cancel") {
+                    outcomeless_probes = true;
                 }
                 continue;
             }
@@ -1256,6 +1284,10 @@ fn main() {
         if no_more_answers {
             continue;
         }
+        if outcomeless_probes && method == "lspcheck/probe" {
+            out.frame(&json!({"jsonrpc": "2.0", "id": id}));
+            continue;
+        }
         if fault("exit-at-version-42")
             && method.starts_with("textDocument/")
             && msg
@@ -1604,9 +1636,9 @@ fn main() {
                 control = Some(id.clone());
                 continue;
             }
-            if fault("cancelled-control-twice") {
-                out.frame(&err(&id, -32800, "request cancelled"));
-                control = Some(id.clone());
+            if fault("no-outcome-then-answer-after-cancelled") {
+                out.frame(&json!({"jsonrpc": "2.0", "id": id}));
+                out.frame(&err(&id, -32601, "method not found"));
                 continue;
             }
         }
@@ -1621,6 +1653,27 @@ fn main() {
         }
         if fault("null-error-for-id-zero") && id == json!(0) {
             out.frame(&json!({"jsonrpc": "2.0", "id": id, "error": null}));
+            continue;
+        }
+        if fault("empty-error-for-id-zero") && id == json!(0) {
+            out.frame(&json!({"jsonrpc": "2.0", "id": id, "error": {}}));
+            continue;
+        }
+        if fault("early-reply-for-id-minus-one") && (id == json!(0) || id == json!(-1)) {
+            if id == json!(0) {
+                // In one write, so lspcheck reads the reply for -1 before it sends -1.
+                let early = err(&json!(-1), -32601, "method not found");
+                let both = [out.encode(&err(&id, -32601, "method not found")), out.encode(&early)].concat();
+                out.raw(&both);
+            } else {
+                out.frame(&json!({"jsonrpc": "2.0", "id": id}));
+            }
+            continue;
+        }
+        // The id as sent: mangles-odd-ids can turn another into "".
+        if fault("no-outcome-then-answer-empty-id") && msg.get("id") == Some(&json!("")) {
+            out.frame(&json!({"jsonrpc": "2.0", "id": id}));
+            out.frame(&err(&id, -32601, "method not found"));
             continue;
         }
         if fault("oversized-reply-to-id-zero") && method == "lspcheck/probe" && id == json!(0) {

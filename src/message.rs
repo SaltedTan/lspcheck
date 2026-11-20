@@ -279,25 +279,6 @@ impl Message {
             _ => None,
         }
     }
-
-    /// Whether this is a response with a well-formed outcome: a `result`
-    /// (any value) or an `error` object, not both. Any other response carries
-    /// an id but answers nothing.
-    pub fn is_answer(&self) -> bool {
-        self.not_an_answer().is_none() && matches!(self.kind, Kind::Response { .. })
-    }
-
-    /// Why this response answers nothing, if it is a response that doesn't:
-    /// both `result` and `error`, neither, or an `error` that isn't an object.
-    pub fn not_an_answer(&self) -> Option<&str> {
-        match &self.kind {
-            Kind::Response { outcome: Outcome::Malformed(why), .. } => Some(why),
-            Kind::Response { outcome: Outcome::Error { error, .. }, .. } if !error.is_object() => {
-                Some("has an \"error\" that isn't an object")
-            }
-            _ => None,
-        }
-    }
 }
 
 fn classify_object(obj: &Map<String, Value>) -> Kind {
@@ -512,13 +493,6 @@ mod tests {
             Kind::Response { outcome: Outcome::Malformed(_), .. }
         ));
         assert!(matches!(k(r#"{"id":1,"result":null}"#), Kind::Invalid(_)));
-        let answer = |s: &str| Message::parse(s.as_bytes()).unwrap().is_answer();
-        assert!(answer(r#"{"jsonrpc":"2.0","id":1,"result":null}"#));
-        assert!(answer(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"x"}}"#));
-        assert!(!answer(r#"{"jsonrpc":"2.0","id":1}"#));
-        assert!(!answer(r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":-32601,"message":"x"}}"#));
-        assert!(!answer(r#"{"jsonrpc":"2.0","id":1,"error":null}"#));
-        assert!(!answer(r#"{"jsonrpc":"2.0","method":"m"}"#));
         assert!(matches!(k(r#"[]"#), Kind::Invalid(_)));
         assert!(Message::parse(b"{").is_err());
     }

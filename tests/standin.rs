@@ -1369,6 +1369,30 @@ fn an_answer_after_a_message_with_only_the_id_satisfies_r4() {
 }
 
 #[test]
+fn a_reply_read_before_its_request_was_sent_doesnt_satisfy_r4() {
+    // The reply for -1 comes with the answer to 0, before lspcheck sends -1,
+    // and -1 itself gets only a message with its id (J5). The early reply
+    // answers nothing lspcheck had sent (J2).
+    let r = fault("early-reply-for-id-minus-one");
+    only_fails(&r, &["R4", "J2", "J5"]);
+    let r4 = detail(&r, "R4");
+    assert!(r4.starts_with("delivered request id(s) -1 got no response with the exact id"), "{r4}");
+}
+
+#[test]
+fn r4_reports_a_mangled_id_that_an_answer_after_only_the_id_shares() {
+    // The empty string id gets a message with only the id, then its answer,
+    // which R4 takes. The non-ASCII id comes back as "" too: that reply is
+    // still a likely mangled id.
+    let r = run(&["--fault", "no-outcome-then-answer-empty-id", "--fault", "mangles-odd-ids"], &["--only", "R4"]);
+    expect(&r, "R4", "fail");
+    let r4 = detail(&r, "R4");
+    assert!(r4.contains(r#"response id(s) "" arrived meanwhile (likely id mangling)"#), "{r4}");
+    // Alone, the pair is J2's and J5's finding, not R4's.
+    only_fails(&fault("no-outcome-then-answer-empty-id"), &["J2", "J5"]);
+}
+
+#[test]
 fn odd_id_failures_survive_later_unreadable_output() {
     let r = run(
         &["--fault", "drops-negative-ids", "--fault", "big-frame-after-drop", "--fault", "char-length"],
@@ -1812,11 +1836,22 @@ fn a_message_with_neither_result_nor_error_doesnt_answer_a_cancelled_request() {
     only_fails(&r, &["C1", "J5"]);
     let c1 = detail(&r, "C1");
     assert!(c1.contains("no response after $/cancelRequest"), "{c1}");
-    assert!(c1.contains("a message with its id came, but it has neither \"result\" nor \"error\""), "{c1}");
+    assert!(c1.contains("a message with its id came, but it was a response that has neither \"result\" nor"), "{c1}");
     // Nor does one with both.
     let r = fault("cancelled-both");
     only_fails(&r, &["C1", "J5"]);
-    assert!(detail(&r, "C1").contains("but it has both \"result\" and \"error\""), "{}", r.stdout);
+    assert!(detail(&r, "C1").contains("but it was a response that has both \"result\" and \"error\""), "{}", r.stdout);
+}
+
+#[test]
+fn an_error_without_a_code_or_message_answers_nothing() {
+    // J5's rules decide what counts as an answer, for C1 and R4 alike.
+    let r = fault("cancelled-empty-error");
+    only_fails(&r, &["C1", "J5"]);
+    assert!(detail(&r, "C1").contains("but it was an error whose code isn't an integer"), "{}", r.stdout);
+    let r = fault("empty-error-for-id-zero");
+    only_fails(&r, &["R4", "J5"]);
+    assert!(detail(&r, "R4").starts_with("delivered request id(s) 0 got no response"), "{}", r.stdout);
 }
 
 #[test]
@@ -1848,9 +1883,9 @@ fn a_late_second_answer_to_the_cancelled_request_fails_c1_not_c2() {
 fn c2_cancels_a_finished_request_of_its_own_even_when_c1s_goes_unanswered() {
     // C1's request is never answered, but the plain request after it is, and
     // C2 cancels that one. The reply to its cancel is also a second response
-    // to it (J2).
+    // to it (J2), so C2 can't say which it is.
     let r = run(&["--fault", "cancelled-no-reply", "--fault", "cancel-finished-reply"], &[]);
-    only_fails(&r, &["C1", "C2", "J2"]);
+    passes_except(&r, &[("C1", "fail"), ("C2", "error"), ("J2", "fail")]);
     assert!(detail(&r, "C2").contains("for a finished request"), "{}", r.stdout);
 }
 
@@ -1861,9 +1896,32 @@ fn c2_cant_tell_a_reply_to_a_finished_requests_cancel_from_a_late_duplicate() {
     let r = run(&["--fault", "defer-until-next", "--fault", "cancel-finished-other"], &[]);
     passes_except(&r, &[("C2", "error"), ("J2", "fail")]);
     assert!(detail(&r, "C2").contains("may be a late second answer"), "{}", r.stdout);
-    // Even RequestCancelled, when the first answer was one too.
-    let r = fault("cancelled-control-twice");
+    // Even RequestCancelled: a server may send one for a request it was
+    // still tidying up after, whatever it answered first.
+    let r = run(&["--fault", "defer-until-next", "--fault", "cancel-finished-reply"], &[]);
     passes_except(&r, &[("C2", "error"), ("J2", "fail")]);
+    assert!(detail(&r, "C2").contains("error -32800"), "{}", r.stdout);
+}
+
+#[test]
+fn c2_counts_a_request_answered_after_a_message_with_only_its_id_as_finished() {
+    // The plain request C2 cancels first gets a message with its id but no
+    // outcome (J5), then its answer (a second response for J2). It is
+    // finished, so C2 cancels it.
+    let r = fault("no-outcome-then-answer-after-cancelled");
+    passes_except(&r, &[("J2", "fail"), ("J5", "fail")]);
+    assert!(detail(&r, "C2").contains("an id never sent and a finished request"), "{}", r.stdout);
+}
+
+#[test]
+fn c2_fails_when_a_request_after_a_cancel_gets_only_its_id() {
+    // After the cancel of an id never sent, the plain request gets a message
+    // with its id but no outcome (J5) and never an answer.
+    let r = run(&["--fault", "defer-until-next", "--fault", "no-outcome-after-unknown-cancel"], &[]);
+    passes_except(&r, &[("C2", "fail"), ("C3", "error"), ("J5", "fail")]);
+    let c2 = detail(&r, "C2");
+    assert!(c2.contains("stopped answering"), "{c2}");
+    assert!(c2.contains("a message with its id came, but it was a response that has neither"), "{c2}");
 }
 
 #[test]
@@ -1970,6 +2028,14 @@ fn c3_counts_only_an_error_message_naming_the_cancel() {
     // A message naming a longer method that begins with `$/cancelRequest`
     // doesn't name the cancel either.
     let r = fault("cancel-lookalike");
+    passes_except(&r, &[("C3", "error"), ("J3", "fail")]);
+}
+
+#[test]
+fn c3_counts_only_a_method_not_found_naming_the_cancel() {
+    // An InternalError naming `$/cancelRequest` may be `initialized` failing
+    // to set up cancellation rather than a reply to a cancel.
+    let r = fault("cancel-named-internal-error");
     passes_except(&r, &[("C3", "error"), ("J3", "fail")]);
 }
 

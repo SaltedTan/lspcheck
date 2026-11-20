@@ -91,10 +91,13 @@ null-id ParseError; a frame lspcheck skipped or couldn't read since `initialized
 error. A frame
 lspcheck couldn't read anywhere (F1) also makes a J1, J2, J5 or J7 pass an error: it might have held what they judge.
 
-A message with a request's id but no well-formed outcome (neither `result` nor `error`, both, or an `error` that
-isn't an object) ends lspcheck's wait for that request, so one such reply doesn't stall the waits after it. J5 fails
-it. C1 and R4, which ask for a result or an error, keep waiting past it for one with the same id until the request's
-deadline; if none comes, they fail as for a missing response and say in their detail that such a message came.
+A message with a request's id but no well-formed outcome ends lspcheck's wait for that request, so one such reply
+doesn't stall the waits after it. J5 fails it. A well-formed outcome is what J5 accepts: exactly one of `result` (any
+value, `null` included) and `error`, and the error an object with an integer `code` and a string `message`. C1, R4, and
+C2's plain requests, which ask for an answer, keep waiting past such a message for an answer with the same id until
+the request's deadline, the same deadline as the first wait. Only a response read once lspcheck registered the request
+counts, as for the session's own matching. If none comes, they treat the request as unanswered and say in their detail
+that such a message came.
 
 J7 treats an earlier request as unanswered when lspcheck never wrote its whole answer. For a completed answer,
 J7 times a reuse against when lspcheck began writing it: only a request read before then was certainly sent before
@@ -142,28 +145,33 @@ that began before the deadline but was only found truncated at the end of stdout
 C1 to C3 share one scenario. After `initialize` and a plain request, lspcheck sends one request (`workspace/symbol`
 when the server advertises `workspaceSymbolProvider`, otherwise an unknown-method probe) and its `$/cancelRequest`
 before reading anything, waits for the request's response, and sends a plain request. Next it cancels an id it never
-sent and then that plain request, if the server has answered it with a result or an error, each cancel followed by
-another plain request. Finally it shuts the server down. C2's finished request has an id of its own, and lspcheck never
+sent and then that plain request, if the server has answered it (with a well-formed outcome, as above, by its
+deadline), each cancel followed by another plain request. Finally it shuts the server down. C2's finished request has an id of its own, and lspcheck never
 names the cancelled request again, so a late second response to the cancelled request is C1's evidence and nothing
 else's. C2 tests both cases even when the cancelled request goes unanswered. A reply to a cancel can come at any time,
 so the verdicts are given at the end, over everything read before `exit` was sent:
 
 - the cancelled request's response is the first with its id and a well-formed outcome; a message with the id but none
   is J5's finding, not C1's response. A second response with a well-formed outcome fails C1, whenever it is read;
-- a response carrying the never-sent id fails C2, and so does a plain request that goes unanswered after the cancels.
-  One carrying the finished request's id read after its cancel may be a late second answer to that request (J2's
-  finding) rather than a reply to the cancel, whatever it holds, so C2 is `error`. The exception is a RequestCancelled
-  (-32800) error, which only the cancel can have caused, so it fails C2, unless the request's first answer was
-  RequestCancelled too. If the plain request got a message with its id but no well-formed outcome, it may still be
-  pending, and cancelling it would be lawful: lspcheck cancels only the never-sent id, and C2 is `error` (the finished
-  case wasn't exercised) unless that case fails it;
+- C2 fails on only two things: a response carrying the never-sent id, and a plain request after the cancels that gets
+  no answer by its deadline, with that wait read in full. A response carrying the finished request's id read after its
+  cancel may be a late second answer to that request (J2's finding) rather than a reply to the cancel, whatever it
+  holds, so C2 is `error`. That includes RequestCancelled (-32800): a server may send one for a request it was still
+  tidying up after. So C2 can't fail on the finished case, only be `error`. If the plain request got only a message with
+  its id but no well-formed outcome by its deadline, it may still be pending, and cancelling it would be lawful:
+  lspcheck cancels only the never-sent id, and C2 is `error` (the finished case wasn't exercised) unless that case fails
+  it;
 - a response without an id (`id` missing or `null`) can't be matched to the notification it answers, and until `exit`
   lspcheck sends only `initialized` (and, with a profile's settings, `workspace/didChangeConfiguration`) and the
-  cancels. C3 fails on one read after lspcheck began writing the first cancel whose error `message` names
-  `$/cancelRequest` as a whole token (as a MethodNotFound message usually does): not as the start of a longer name
-  such as `$/cancelRequestMetrics`, and not elsewhere in it, such as in the error's `data`. Any other is `error` for
-  C3, since it may answer `initialized` or the settings (answering any notification is J3's failure). One read before
-  that write began can't answer a cancel and is left to J3.
+  cancels. C3 fails only on a MethodNotFound (-32601) error read after lspcheck began writing the first cancel whose
+  `message` names `$/cancelRequest` as a whole token: not as the start of a longer name such as
+  `$/cancelRequestMetrics`, and not elsewhere in it, such as in the error's `data`. Any other is `error` for C3, since
+  it may answer `initialized` or the settings (answering any notification is J3's failure), and that includes an
+  error with another code that names `$/cancelRequest`, such as `initialized` failing to set up cancellation. One read
+  before that write began can't answer a cancel and is left to J3. C3 accepts one ambiguity: a server could answer
+  `initialized` or the settings with a MethodNotFound that names `$/cancelRequest`, and C3 would take it for a reply to
+  the cancel. Nothing in an id-less response says which notification it answers, and a server that names the cancel
+  in a MethodNotFound is almost always answering it.
 
 If the server stopped answering, what it didn't send can't be judged, so those checks are `error`. A pass is also
 `error` when lspcheck missed something where that check's evidence would be: a frame it skipped or couldn't read, a
@@ -564,12 +572,14 @@ one at a time: `0`, `-1`, `2147483647`, `-2147483648`, `""`, a 1000-character AS
 `"7"`. Each request waits for a response or its deadline before the next is sent; a closed output stream or a failed
 write stops the sequence. It passes only when every request gets a response with its exact id (a result or an error is
 acceptable). A message with the id but no well-formed outcome doesn't count, and the wait goes on past it until the
-request's deadline. Only delivered requests with no exact-id response can fail R4. The detail names unanswered ids,
-any unmatched response ids seen (likely mangled ids, except an answer after a message with its id but no well-formed
-outcome, which carries the exact id), and any unanswered id that got such a message; long strings are truncated. Each unanswered request retains its own wait window for
-the evidence recheck after cleanup; any fully inspected window establishes a failure. The detail then lists as
-unanswered only the ids whose windows were fully inspected, and the others as possibly answered unseen, with why. If
-every such window has incomplete evidence, the verdict is `ERROR`. Initialization or delivery failure is also `ERROR`
+request's deadline (see [JSON-RPC correlation](#json-rpc-correlation)); only a response read once the request was
+registered can answer it. Only delivered requests with no exact-id response can fail R4. The detail names unanswered
+ids, the unmatched response ids seen as likely mangled ids, and any unanswered id that got such a message; long
+strings are truncated. An answer R4 took after a message with only its id is unmatched in the session but carries the
+exact id, so it alone isn't listed; other unmatched responses with that id still are. Each unanswered request
+retains its own wait window for the evidence recheck after cleanup; any fully inspected window establishes a
+failure. The detail then lists as unanswered only the ids whose windows were fully inspected, and the others as
+possibly answered unseen, with why. If every such window has incomplete evidence, the verdict is `ERROR`. Initialization or delivery failure is also `ERROR`
 unless an earlier delivered request establishes a failure. J1 and J2 independently judge mismatched ids under their
 `MUST` rules. Numeric ids stay within LSP 3.17's signed 32-bit range, so `2^53` is deliberately excluded.
 

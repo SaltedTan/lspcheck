@@ -877,6 +877,17 @@ impl Session {
         self.used_ids.contains_key(id)
     }
 
+    /// When the session registered the request with this id, if it did: no
+    /// response read before then can answer it.
+    pub fn registered_at(&self, id: &Id) -> Option<Duration> {
+        self.used_ids.get(id).copied()
+    }
+
+    /// The indices in `messages` of unmatched responses read at or after `since`.
+    pub fn unmatched_indices(&self, since: Duration) -> impl Iterator<Item = usize> + '_ {
+        self.unmatched.iter().copied().filter(move |&i| self.messages[i].0 >= since)
+    }
+
     /// The ids of unmatched responses read at or after `since`.
     pub fn unmatched_ids(&self, since: Duration) -> Vec<Id> {
         self.unmatched_responses(since, Duration::MAX).filter_map(|m| m.response_id().cloned()).collect()
@@ -1134,7 +1145,17 @@ impl Session {
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Message, CallError> {
-        let deadline = Instant::now() + timeout;
+        self.call_with_id_until(id, method, params, Instant::now() + timeout).await
+    }
+
+    /// [`Session::call_with_id`] by a deadline the caller may also use after it.
+    pub async fn call_with_id_until(
+        &mut self,
+        id: &Id,
+        method: &str,
+        params: Option<Value>,
+        deadline: Instant,
+    ) -> Result<Message, CallError> {
         self.request_until(id, method, params, deadline).await.map_err(CallError::Write)?;
         self.wait_response(id, deadline).await.map_err(CallError::Wait)
     }
