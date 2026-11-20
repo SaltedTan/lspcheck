@@ -1790,9 +1790,10 @@ async fn not_json(ctx: &mut Ctx<'_>) {
     let status = if reply.is_err() { ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await } else { None };
     // A reply to the body may come late: what is read until lspcheck sends
     // exit counts, though the plain request had to be answered by `to`. Only
-    // what was read before shutdown was written is surely not about shutdown.
-    let shutdown_at = ctx.s.elapsed();
-    let replies_until = leave(ctx).await;
+    // what was read before lspcheck began writing shutdown, once it had
+    // answered what the server asked meanwhile, is surely not about shutdown.
+    let (began, replies_until) = leave_timed(ctx).await;
+    let shutdown_at = began.unwrap_or(replies_until);
     let s = &ctx.s;
     let messages: Vec<_> =
         s.unmatched_indices(since).map(|i| &s.messages[i]).filter(|(at, _)| *at <= replies_until).collect();
@@ -2232,13 +2233,15 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
     let params = ctx.with_options(initialize_params(&ctx.root));
     let id = ctx.s.fresh_id();
     let init = ctx.initialize_reply(&id, params).await;
-    let looked = ctx.s.elapsed();
+    // The window ends where the answer was in the stream, not when it was
+    // taken in: by then the reader may already be in the frames after it.
+    let looked = ctx.s.answered_at(&id).unwrap_or_else(|| ctx.s.elapsed());
     let read = ctx.s.messages.len();
     let init = match init {
         Ok(reply) => ctx.announce_initialized().await.map(|()| reply).map_err(InitFailure::Blocked),
         Err(e) => Err(e),
     };
-    let reply = ctx.s.messages[before..read].iter().find_map(|(_, x)| match &x.kind {
+    let reply = ctx.s.messages[before..read].iter().filter(|(at, _)| *at <= looked).find_map(|(_, x)| match &x.kind {
         Kind::Response { id, outcome } if !ctx.s.sent(id) => {
             Some(format!("{} with id {id}", describe_outcome(outcome)))
         }
@@ -3374,13 +3377,23 @@ fn idless_reply(at: &Duration, m: &Message) -> Option<String> {
 /// waiting for replies to what came before: when it sent `exit`, or gave up
 /// on `shutdown`. Everything read by then has been taken in.
 async fn leave(ctx: &mut Ctx<'_>) -> Duration {
-    let shut = ctx.s.call("shutdown", None, ctx.cfg.request_timeout).await.is_ok();
+    leave_timed(ctx).await.1
+}
+
+/// [`leave`], also returning when lspcheck began writing `shutdown`: after it
+/// had taken in what was already read and answered what that asked, so
+/// anything read before then can't be about shutdown. `None` if it never
+/// began.
+async fn leave_timed(ctx: &mut Ctx<'_>) -> (Option<Duration>, Duration) {
+    let id = ctx.s.fresh_id();
+    let shut = ctx.s.call_with_id(&id, "shutdown", None, ctx.cfg.request_timeout).await.is_ok();
+    let began = ctx.s.registered_at(&id);
     let end = ctx.s.elapsed();
     if shut && ctx.s.notify("exit", None).await.is_ok() {
         let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
     }
     ctx.s.take_in();
-    end
+    (began, end)
 }
 
 /// The method whose notifications carry diagnostics.

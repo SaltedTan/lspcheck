@@ -79,8 +79,9 @@
   `error`, and now say what couldn't be sent.
 - **R1** now counts a reply to the non-JSON body that arrives after the plain request's answer, up to when lspcheck
   sends `exit`. A late response with id null and another error code than ParseError (-32700), or a result, used to be
-  ignored and R1 passed saying the body was ignored. Read before lspcheck writes `shutdown`, it now fails R1; read
-  after, it may be the server's error about `shutdown`, so R1 is `error`. A late ParseError still passes, and the
+  ignored and R1 passed saying the body was ignored. Read before lspcheck begins writing `shutdown` (once it has
+  answered what the server asked meanwhile), it now fails R1; read after, it may be the server's error about
+  `shutdown`, so R1 is `error`. A late ParseError still passes, and the
   detail now counts it instead of saying the body was ignored. The plain request must still be answered within
   `--timeout`.
 - **R3** now fails, instead of being `error`, when the server leaves the plain request after the large document
