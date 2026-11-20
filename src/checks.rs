@@ -146,7 +146,13 @@ pub const CATALOGUE: &[CheckInfo] = &[
     ),
     check!("L2", Lifecycle, Must, "initialize returns capabilities and an offered position encoding", "initialize"),
     check!("L3", Lifecycle, Policy, "A second initialize gets an error and the server keeps serving", "initialize"),
-    check!("L4", Lifecycle, Must, "shutdown returns null and the server keeps running until exit", "shutdown"),
+    check!(
+        "L4",
+        Lifecycle,
+        Must,
+        "shutdown returns null (or an error) and the server keeps running until exit",
+        "shutdown"
+    ),
     check!("L5", Lifecycle, Should, "A request after shutdown gets InvalidRequest (-32600)", "shutdown"),
     check!("L6", Lifecycle, Should, "exit after shutdown ends the process with status 0", "exit"),
     check!("L7", Lifecycle, Should, "exit without shutdown ends the process with status 1", "exit"),
@@ -1510,6 +1516,14 @@ impl Ctx<'_> {
     }
 
     async fn initialize_prepared(&mut self, id: &Id, params: Value) -> Result<Message, InitFailure> {
+        let reply = self.initialize_reply(id, params).await?;
+        self.announce_initialized().await.map_err(InitFailure::Blocked)?;
+        Ok(reply)
+    }
+
+    /// Sends `initialize` and waits for its successful result, without
+    /// sending `initialized`.
+    async fn initialize_reply(&mut self, id: &Id, params: Value) -> Result<Message, InitFailure> {
         let t = self.cfg.startup_timeout;
         let offered = offered_encodings(&params);
         let reply = match self.s.call_with_id(id, "initialize", Some(params), t).await {
@@ -1540,31 +1554,46 @@ impl Ctx<'_> {
             _ => unreachable!("wait_response returns responses"),
         }
         self.offered = offered;
+        Ok(reply)
+    }
+
+    /// Sends `initialized`, and the profile's settings if it has any; why
+    /// not, if lspcheck couldn't.
+    async fn announce_initialized(&mut self) -> Result<(), String> {
         if let Err(e) = self.s.notify("initialized", Some(json!({}))).await {
-            return Err(InitFailure::Blocked(format!("initialized: {e}")));
+            return Err(format!("initialized: {e}"));
         }
         // Some servers read their settings only this way, not by asking.
         if let Some(settings) = &self.cfg.configuration {
             let params = json!({"settings": settings});
             if let Err(e) = self.s.notify("workspace/didChangeConfiguration", Some(params)).await {
-                return Err(InitFailure::Blocked(format!("workspace/didChangeConfiguration: {e}")));
+                return Err(format!("workspace/didChangeConfiguration: {e}"));
             }
         }
-        Ok(reply)
+        Ok(())
     }
 }
 
 /// Initialize, probe, shutdown, exit: the path every client takes.
 async fn lifecycle(ctx: &mut Ctx<'_>) {
     let since = ctx.s.elapsed();
-    let reply = match ctx.initialize().await {
+    let params = ctx.with_options(initialize_params(&ctx.root));
+    let id = ctx.s.fresh_id();
+    let reply = match ctx.initialize_reply(&id, params).await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why)) => return ctx.fail("L2", why),
         Err(InitFailure::Absent(why)) => return ctx.fail_absent("L2", since, why),
         Err(InitFailure::Blocked(why)) => return ctx.report("L2", Verdict::Error, why),
     };
+    // The result is judged whether or not what follows it can be sent.
     let (verdict, detail) = judge_l2(&reply, &ctx.offered);
     ctx.report("L2", verdict, detail);
+    if let Err(why) = ctx.announce_initialized().await {
+        for id in ["J4", "L4", "L6"] {
+            ctx.report(id, Verdict::Error, format!("not judged: couldn't send {why}"));
+        }
+        return;
+    }
 
     let t = ctx.cfg.request_timeout;
     let mut problems = Vec::new();
@@ -1603,11 +1632,25 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
     let since = ctx.s.elapsed();
     match ctx.s.call("shutdown", None, t).await {
         Ok(m) => match &m.kind {
-            Kind::Response { outcome: Outcome::Result(Value::Null), .. } => {
-                // The server must keep running so the reply can be delivered.
+            // LSP's shutdown response is null, or an error with a code and
+            // message "in case an exception happens during shutdown". Either
+            // way the server must keep running until exit.
+            Kind::Response { outcome, .. }
+                if matches!(
+                    outcome,
+                    Outcome::Result(Value::Null) | Outcome::Error { code: Some(_), message: Some(_), .. }
+                ) =>
+            {
+                let pass = match outcome {
+                    Outcome::Result(_) => String::new(),
+                    _ => format!(
+                        "shutdown returned {}, which LSP allows for an exception during shutdown, and the server kept running",
+                        describe_outcome(outcome)
+                    ),
+                };
                 let watch = Duration::from_millis(300);
                 match ctx.s.wait_exit(Instant::now() + watch).await {
-                    None => ctx.pass("L4"),
+                    None => ctx.pass_with("L4", pass),
                     Some(status) => ctx.fail(
                         "L4",
                         format!(
@@ -1699,21 +1742,23 @@ async fn not_json(ctx: &mut Ctx<'_>) {
     // A pipe can close before the process's exit status is available. Wait
     // before shutdown so only an unprompted exit can establish a failure.
     let status = if reply.is_err() { ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await } else { None };
-    leave(ctx).await;
-    let messages: Vec<_> = ctx.s.unmatched_responses(since, to).collect();
+    // A reply to the body may come late: what is read until lspcheck sends
+    // exit counts, though the plain request had to be answered by `to`.
+    let replies_until = leave(ctx).await;
+    let messages: Vec<_> = ctx.s.unmatched_responses(since, replies_until).collect();
     let parse_errors = messages.iter().filter(|message| is_parse_error(message)).count();
     let unexpected: Vec<String> = messages.iter().filter_map(|message| unexpected_after_non_json(message)).collect();
 
     if !unexpected.is_empty() {
         let detail = unexpected.join("; ");
-        ctx.report_judged("R1", since, to, |missed| {
+        ctx.report_judged("R1", since, replies_until, |missed| {
             (Verdict::Fail, format!("{detail}{}", missed.map_or(String::new(), |why| format!("; {why}"))))
         });
         return;
     }
 
     match (reply, status) {
-        (Ok(_), _) => ctx.report_judged("R1", since, to, |missed| {
+        (Ok(_), _) => ctx.report_judged("R1", since, replies_until, |missed| {
             if let Some(why) = missed {
                 (Verdict::Error, format!("inconclusive because {why}"))
             } else if parse_errors > 0 {
@@ -2107,6 +2152,7 @@ fn reply_to_notification(m: &Message) -> Option<String> {
 async fn pre_initialize(ctx: &mut Ctx<'_>) {
     let t = ctx.cfg.request_timeout;
     let before = ctx.s.messages.len();
+    let notified = ctx.s.elapsed();
     if let Err(e) = ctx.s.notify("workspace/didChangeConfiguration", Some(json!({"settings": {}}))).await {
         ctx.report("L1", Verdict::Error, format!("could not send a notification: {e}"));
         return;
@@ -2119,6 +2165,7 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
     // A reply to the notification can come after the request's answer, so
     // look at everything read until the answer to initialize.
     let init = ctx.initialize().await;
+    let looked = ctx.s.elapsed();
     let reply = ctx.s.messages[before..].iter().find_map(|(_, x)| match &x.kind {
         Kind::Response { id, outcome } if !ctx.s.sent(id) => {
             Some(format!("{} with id {id}", describe_outcome(outcome)))
@@ -2143,7 +2190,17 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
             }
             problems.extend(replied);
             if problems.is_empty() {
-                ctx.pass("L1");
+                // That the notification went unanswered rests on everything
+                // read until the answer to initialize.
+                ctx.report_judged("L1", notified, looked, |missed| match missed {
+                    Some(why) => (
+                        Verdict::Error,
+                        format!(
+                            "inconclusive: the request got ServerNotInitialized, but the notification may have been answered unseen, because {why}"
+                        ),
+                    ),
+                    None => (Verdict::Pass, String::new()),
+                });
             } else {
                 ctx.fail("L1", problems.join("; "));
             }
@@ -2496,7 +2553,12 @@ async fn large_document_scenario(ctx: &mut Ctx<'_>) -> bool {
                     CallError::Write(_) => ctx.fail("R3", detail),
                 }
             } else {
-                ctx.fail_call("R3", since, detail, &error);
+                // Only what lspcheck missed while it waited could have held
+                // the answer, not what came during the wait for an exit.
+                match error {
+                    CallError::Wait(_) => ctx.fail_absent_between("R3", since, waited, detail),
+                    CallError::Write(_) => ctx.report("R3", Verdict::Error, detail),
+                }
             }
         }
     }
@@ -4130,6 +4192,15 @@ async fn exit_without_shutdown(ctx: &mut Ctx<'_>) {
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
             return ctx.report("L7", Verdict::Error, format!("initialize didn't succeed: {why}"));
         }
+    }
+    // A status the process reached before exit says nothing about exit.
+    if !ctx.s.is_alive() {
+        let how = ctx
+            .s
+            .wait_exit(Instant::now())
+            .await
+            .map_or(String::new(), |status| format!(" with {}", session::describe_status(status)));
+        return ctx.report("L7", Verdict::NotExercised, format!("the server exited{how} before exit was sent"));
     }
     if let Err(e) = ctx.s.notify("exit", None).await {
         return ctx.report("L7", Verdict::Error, format!("could not send exit: {e}"));

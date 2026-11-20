@@ -35,7 +35,7 @@ lspcheck 0.6.0 — basedpyright-langserver --stdio
   PASS  L2  MUST    initialize returns capabilities and an offered position encoding
   FAIL  L3  POLICY  A second initialize gets an error and the server keeps serving
                      a second initialize got result "{\"capabilities\":{\"textDocumentSync\":{\"willSave\":true,\"change\":2,\"openClose\":true"… instead of an error
-  PASS  L4  MUST    shutdown returns null and the server keeps running until exit
+  PASS  L4  MUST    shutdown returns null (or an error) and the server keeps running until exit
   FAIL  L5  SHOULD  A request after shutdown gets InvalidRequest (-32600)
                      a request after shutdown got result "[]" instead of InvalidRequest
   PASS  L6  SHOULD  exit after shutdown ends the process with status 0

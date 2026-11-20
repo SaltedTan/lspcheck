@@ -31,6 +31,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("bad-json-reply-after-probe", "in one write, answer the probe after a non-JSON body then send InvalidRequest"),
     ("parse-error-with-initialize", "in one write, answer initialize then send a null-id ParseError"),
     ("silent-on-bad-json", "lawful: ignore a non-JSON body without answering it"),
+    (
+        "bad-json-reply-at-shutdown",
+        "lawful: hold the answer to a non-JSON body until shutdown arrives, and send it before shutdown's",
+    ),
     ("dies-on-bad-json", "exit when a non-JSON body arrives"),
     ("json-into-next-header", "send a correctly counted body that the next frame's first header line would complete"),
     ("json-into-bad-header", "like json-into-next-header, with a space before that header line, making it invalid"),
@@ -49,6 +53,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("ignore-pre-init-requests", "never answer requests before initialize"),
     ("reply-to-pre-init-notification", "answer a notification before initialize with an error whose id is null"),
     ("late-reply-to-pre-init-notification", "like reply-to-pre-init-notification, after the next request's answer"),
+    ("big-reply-to-pre-init-notification", "like reply-to-pre-init-notification, with 2 MiB of error data"),
     ("replay-gate", "ask a client request and answer it only after the client answers workspace/configuration"),
     ("reinitialize", "answer a second initialize as if it were the first"),
     ("exit-on-reinitialize", "exit on a second initialize"),
@@ -138,7 +143,20 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: write the first line of the shutdown reply's header section, and stay running without writing the rest",
     ),
     ("shutdown-result", "return {} from shutdown"),
+    (
+        "shutdown-exception",
+        "lawful: answer shutdown with InternalError (-32603), as for an exception, and wait for exit",
+    ),
+    ("shutdown-error-no-message", "answer shutdown with an error that has a code but no message"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
+    (
+        "close-stdin-before-initialize-reply",
+        "on initialize, close stdin, then send the result and exit, so initialized can't be sent",
+    ),
+    (
+        "exit-before-initialize-reply",
+        "on initialize, exit with status 1, leaving a child holding stdin to send the result once it is reparented",
+    ),
     ("big-frame-on-exit", "on exit, send one 2 MiB log message before exiting"),
     ("exit-flood", "on exit, write 100,000 small log messages and then a line outside any frame"),
     ("exit-status", "exit with status 3 on exit"),
@@ -276,6 +294,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("no-open-close", "don't ask for didOpen, but exit if one arrives"),
     ("dies-on-large-document", "exit when a document larger than 1 MiB is opened"),
     ("slow-large-document", "lawful: take 3 s to process a document larger than 1 MiB"),
+    (
+        "silent-after-large-document",
+        "never answer the plain request after a document larger than 1 MiB, and send a 2 MiB log message 3 s after it",
+    ),
     ("utf8-positions-as-utf16", "count positions in UTF-8 bytes while UTF-16 is negotiated"),
     ("codepoint-positions", "count positions in code points while UTF-16 is negotiated"),
     ("lf-only-lines", "split lines at \\n only; a \\r is an ordinary character"),
@@ -545,6 +567,7 @@ fn main() {
         Some("--escaped-child") => return child(true),
         Some("--nested-child") => return nested_child(),
         Some("--relay") => return relay(args[1].parse().unwrap()),
+        Some("--orphan-reply") => return orphan_reply(args[1].parse().unwrap(), &args[2]),
         Some("--reply-after-input") => return reply_after_input(&args[1]),
         Some("--half-frame-child") => return half_frame_child(),
         _ => {}
@@ -638,9 +661,13 @@ fn main() {
     // Wrongly typed params, a non-JSON body or a large document just came,
     // and the next probe not yet.
     let mut after_odd_input = false;
+    // A large document just came, and the next probe not yet.
+    let mut after_large = false;
     // The rest of a notification begun after the checks were done, written
     // only once `shutdown` arrives.
     let mut unfinished: Option<Vec<u8>> = None;
+    // For bad-json-reply-at-shutdown: the answer to a non-JSON body.
+    let mut reply_at_shutdown: Option<Value> = None;
     // A request answered once, to answer again at shutdown.
     let mut answer_again: Option<Value> = None;
     // For inflated-on-first-probe.
@@ -760,7 +787,12 @@ fn main() {
                 }
                 if !fault("silent-on-bad-json") && !fault("bad-json-reply-after-probe") {
                     let code = if fault("parse-error-wrong-code") { -32600 } else { -32700 };
-                    out.frame(&err(&Value::Null, code, "parse error"));
+                    let reply = err(&Value::Null, code, "parse error");
+                    if fault("bad-json-reply-at-shutdown") {
+                        reply_at_shutdown = Some(reply);
+                    } else {
+                        out.frame(&reply);
+                    }
                 }
                 after_odd_input = true;
                 continue;
@@ -913,6 +945,7 @@ fn main() {
             {
                 let large = text.len() > 1024 * 1024;
                 after_odd_input |= large;
+                after_large |= large;
                 if large && fault("dies-on-large-document") {
                     eprintln!("standin: dies-on-large-document");
                     std::process::exit(2);
@@ -929,21 +962,7 @@ fn main() {
                     // neither those diagnostics nor EOF can let lspcheck send
                     // didChange before the pipe's read end closes. Exiting
                     // alone can close stdout first, leaving a writable stdin.
-                    drop(input);
-                    #[cfg(unix)]
-                    {
-                        use std::os::fd::{AsRawFd, FromRawFd};
-                        // SAFETY: input was dropped and this process exits
-                        // below without using stdin again.
-                        drop(unsafe { std::fs::File::from_raw_fd(std::io::stdin().as_raw_fd()) });
-                    }
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::io::{AsRawHandle, FromRawHandle};
-                        // SAFETY: input was dropped and this process exits
-                        // below without using stdin again.
-                        drop(unsafe { std::fs::File::from_raw_handle(std::io::stdin().as_raw_handle()) });
-                    }
+                    close_stdin(input);
                     // A position inside the first character keeps D1's
                     // failure while the undeliverable change errors D3.
                     // Only the documents scenario's document carries "word";
@@ -1263,6 +1282,10 @@ fn main() {
                 out.frame(
                     &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32002, "message": "not initialized"}}),
                 );
+            }
+            if !initialized && fault("big-reply-to-pre-init-notification") {
+                let data = "x".repeat(2 * 1024 * 1024);
+                out.frame(&json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32002, "message": "not initialized", "data": data}}));
             }
             if method == "exit" && fault("inflated-on-exit") {
                 out.raw(b"Content-Length: 2097152\r\n\r\n");
@@ -1659,6 +1682,27 @@ fn main() {
             if fault("no-capabilities") {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
             }
+            if fault("close-stdin-before-initialize-reply") {
+                // Closed before the result is sent, so lspcheck can't write
+                // to the server once it has read the result.
+                close_stdin(input);
+                out.frame(&ok(&id, result));
+                std::process::exit(0);
+            }
+            if fault("exit-before-initialize-reply") {
+                // The child inherits stdin and stdout, so lspcheck can still
+                // write to the server after this process has exited.
+                let _helper = Command::new(std::env::current_exe().unwrap())
+                    .arg("--orphan-reply")
+                    .arg(std::process::id().to_string())
+                    .arg(serde_json::to_string(&ok(&id, result)).unwrap())
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                std::process::exit(1);
+            }
             if fault("fill-stdin-on-initialized") {
                 // In the same write as the result, so the client reads both at
                 // once and answers before its next request. `initialized` and
@@ -1831,6 +1875,17 @@ fn main() {
             out.frame(&err(&id, -32601, "method not found"));
         }
         let follows_odd_input = method == "lspcheck/probe" && std::mem::take(&mut after_odd_input);
+        if method == "lspcheck/probe" && std::mem::take(&mut after_large) && fault("silent-after-large-document") {
+            // Long enough after the request that lspcheck has given up on its
+            // answer, and is waiting to see whether the server exits.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            eprintln!("standin: silent-after-large-document logging");
+            let text = "x".repeat(2 * 1024 * 1024);
+            out.frame(
+                &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
+            );
+            continue;
+        }
         if follows_odd_input && fault("big-reply-then-exit") {
             let mut reply = err(&id, -32601, "method not found");
             reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
@@ -1851,6 +1906,11 @@ fn main() {
             && let Some(rest) = unfinished.take()
         {
             out.raw(&rest);
+        }
+        if method == "shutdown"
+            && let Some(reply) = reply_at_shutdown.take()
+        {
+            out.frame(&reply);
         }
         if method == "shutdown"
             && let Some(again) = answer_again.take()
@@ -1893,6 +1953,14 @@ fn main() {
                     out.frame(&json!({"jsonrpc": "2.0", "id": "configure-shutdown", "method": "workspace/configuration", "params": {"items": items}}));
                 }
                 let result = if fault("shutdown-result") { json!({}) } else { Value::Null };
+                let mut answer = if fault("shutdown-exception") || fault("shutdown-error-no-message") {
+                    err(&id, -32603, "exception during shutdown")
+                } else {
+                    ok(&id, result.clone())
+                };
+                if fault("shutdown-error-no-message") {
+                    answer["error"].as_object_mut().unwrap().remove("message");
+                }
                 if fault("exit-on-shutdown") {
                     // Exit first and have a helper deliver the reply, so the
                     // server is certainly gone by the time a client reads it.
@@ -1907,7 +1975,7 @@ fn main() {
                     // The helper's stdin stays open until this process is
                     // gone, which is how the helper knows it may deliver.
                     let mut pipe = helper.stdin.take().unwrap();
-                    pipe.write_all(&out.encode(&ok(&id, result))).unwrap();
+                    pipe.write_all(&out.encode(&answer)).unwrap();
                     pipe.flush().unwrap();
                     std::process::exit(0);
                 }
@@ -1944,7 +2012,7 @@ fn main() {
                         std::thread::park();
                     }
                 }
-                let mut reply = ok(&id, result);
+                let mut reply = answer;
                 if fault("shutdown-no-jsonrpc") {
                     reply.as_object_mut().unwrap().remove("jsonrpc");
                 }
@@ -2853,6 +2921,45 @@ fn reply_after_input(replies: &str) {
 fn relay(parent: u32) {
     let mut bytes = Vec::new();
     std::io::stdin().read_to_end(&mut bytes).unwrap();
+    await_reparenting(parent);
+    let mut out = std::io::stdout().lock();
+    out.write_all(&bytes).unwrap();
+    out.flush().unwrap();
+}
+
+/// Closes this process's stdin, so that writes to it fail. The caller exits
+/// without reading stdin again.
+fn close_stdin<R: Read>(input: Input<R>) {
+    drop(input);
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // SAFETY: input was dropped and the caller exits without using stdin
+        // again.
+        drop(unsafe { std::fs::File::from_raw_fd(std::io::stdin().as_raw_fd()) });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        // SAFETY: input was dropped and the caller exits without using stdin
+        // again.
+        drop(unsafe { std::fs::File::from_raw_handle(std::io::stdin().as_raw_handle()) });
+    }
+}
+
+/// Sends `reply` as a frame once `parent` has exited, then reads stdin until
+/// it ends, holding it open meanwhile. Only on Unix does it wait for the exit.
+fn orphan_reply(parent: u32, reply: &str) {
+    await_reparenting(parent);
+    let reply: Value = serde_json::from_str(reply).unwrap();
+    let mut out = Writer { out: std::io::stdout().lock(), faults: Vec::new(), holding: false, held: Vec::new() };
+    out.frame(&reply);
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+}
+
+/// Waits, for up to 10 s, until this process's parent is no longer `parent`,
+/// which happens as `parent` exits. Only on Unix; elsewhere it returns at once.
+fn await_reparenting(parent: u32) {
     #[cfg(unix)]
     {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2862,9 +2969,6 @@ fn relay(parent: u32) {
     }
     #[cfg(not(unix))]
     let _ = parent;
-    let mut out = std::io::stdout().lock();
-    out.write_all(&bytes).unwrap();
-    out.flush().unwrap();
 }
 
 /// Starts a leftover child with `stdin` and waits until it has set itself up.
