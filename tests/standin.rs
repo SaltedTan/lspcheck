@@ -1579,9 +1579,10 @@ fn r1_response_window_keeps_response_occurrences_separate() {
 #[test]
 fn r1_response_window_lasts_until_exit_is_sent() {
     // The answer to the non-JSON body comes only with shutdown's, after the
-    // plain request was answered.
+    // plain request was answered. A ParseError then is the body's; another
+    // code may be about shutdown, so it doesn't fail R1.
     let r = run(&["--fault", "bad-json-reply-at-shutdown", "--fault", "parse-error-wrong-code"], &["--only", "R1"]);
-    expect(&r, "R1", "fail");
+    expect(&r, "R1", "error");
     assert!(
         r.stdout.contains("unmatched response with id null wasn't ParseError (-32700): error -32600"),
         "{}",
@@ -1590,6 +1591,16 @@ fn r1_response_window_lasts_until_exit_is_sent() {
     let r = run(&["--fault", "bad-json-reply-at-shutdown"], &["--only", "R1"]);
     expect(&r, "R1", "pass");
     assert!(r.stdout.contains("returned 1 ParseError (-32700) response(s) with id null"), "{}", r.stdout);
+}
+
+#[test]
+fn a_null_id_error_read_after_shutdown_was_sent_leaves_r1_inconclusive() {
+    // The body was answered with ParseError at once; the InternalError comes
+    // as the server handles shutdown, so it may be about shutdown.
+    let r = run(&["--fault", "null-id-error-at-shutdown"], &["--only", "R1"]);
+    expect(&r, "R1", "error");
+    assert!(r.stdout.contains("wasn't ParseError (-32700): error -32603"), "{}", r.stdout);
+    assert!(r.stdout.contains("read after lspcheck wrote shutdown, so it may answer shutdown"), "{}", r.stdout);
 }
 
 #[test]
@@ -1652,7 +1663,7 @@ fn output_skipped_after_r3s_wait_doesnt_excuse_a_missing_answer() {
     // The probe goes unanswered for its whole one-second wait, read in full.
     // The oversized log comes 3 s after it, while lspcheck waits up to 8 s to
     // see whether the server exits, so it can't have held the answer.
-    let r = run(
+    let (r, transcripts, _dir) = run_with_transcripts(
         &["--fault", "silent-after-large-document"],
         &[
             "--only",
@@ -1670,6 +1681,24 @@ fn output_skipped_after_r3s_wait_doesnt_excuse_a_missing_answer() {
     expect(&r, "R3", "fail");
     assert!(r.server_stderr.contains("silent-after-large-document logging"), "{}", r.server_stderr);
     assert!(r.stdout.contains("didn't answer a plain request within 1 s"), "{}", r.stdout);
+    // The case was exercised: the log began arriving after the probe's wait
+    // and was skipped before lspcheck sent shutdown.
+    let events: Vec<Value> = std::fs::read_to_string(transcripts.join("large-document.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let at = |pred: &dyn Fn(&Value) -> bool| events.iter().position(pred).unwrap_or_else(|| panic!("{events:?}"));
+    let wrote = |method: &'static str| {
+        move |e: &Value| e["dir"] == "out" && e["data"].as_str().is_some_and(|d| d.contains(&format!("\"{method}\"")))
+    };
+    let probe = at(&wrote("lspcheck/probe"));
+    let shutdown = at(&wrote("shutdown"));
+    let first_in = events[probe..].iter().position(|e| e["dir"] == "in").map(|i| probe + i).unwrap();
+    let skipped = at(&|e| e["kind"] == "oversized");
+    let ms = |i: usize| events[i]["t_ms"].as_f64().unwrap();
+    assert!(ms(first_in) > ms(probe) + 1000.0, "{}, {}", ms(first_in), ms(probe));
+    assert!(skipped < shutdown, "{skipped} {shutdown}");
 }
 
 #[test]
@@ -1890,6 +1919,20 @@ fn a_skipped_reply_to_a_notification_before_initialize_makes_l1_inconclusive() {
 }
 
 #[test]
+fn a_frame_skipped_after_the_initialize_answer_leaves_l1_passing() {
+    // The server can write the frame only once it has read initialized,
+    // which lspcheck sends after reading the answer that ends L1's window.
+    // It writes the frame before reading on, so lspcheck can't finish
+    // sending the 1 MiB of settings after initialized until it has begun.
+    let (path, _keep) = profile(&format!("[client]\nconfiguration = {{ large = \"{}\" }}\n", "x".repeat(1 << 20)));
+    let r = run(
+        &["--fault", "big-frame-on-initialized"],
+        &["--profile", path.to_str().unwrap(), "--only", "L1", "--max-frame-mib", "1"],
+    );
+    expect(&r, "L1", "pass");
+}
+
+#[test]
 fn a_second_initialize_must_get_an_error_and_leave_the_server_serving() {
     only_fails(&fault("reinitialize"), &["L3"]);
     // Exiting fails L3, and leaves L5 unjudged rather than failed.
@@ -1920,7 +1963,19 @@ fn a_non_null_shutdown_result_fails_l4() {
     // is neither that nor null.
     let r = run(&["--fault", "shutdown-error-no-message"], &["--only", "L4"]);
     expect(&r, "L4", "fail");
-    assert!(r.stdout.contains("not null"), "{}", r.stdout);
+    assert!(r.stdout.contains("shutdown got an error whose message isn't a string"), "{}", r.stdout);
+    // Nor is an error J5 fails for its code.
+    let r = run(&["--fault", "shutdown-error-wide-code"], &["--only", "L4"]);
+    expect(&r, "L4", "fail");
+    assert!(r.stdout.contains("an error code 2147483648, outside LSP's integer range"), "{}", r.stdout);
+}
+
+#[test]
+fn method_not_found_for_shutdown_fails_l4() {
+    // A well-formed error, but every server must implement shutdown.
+    let r = run(&["--fault", "shutdown-method-not-found"], &["--only", "L4"]);
+    expect(&r, "L4", "fail");
+    assert!(r.stdout.contains("every server must implement shutdown"), "{}", r.stdout);
 }
 
 #[test]

@@ -59,14 +59,17 @@
   makes L9 `error` with "ps's output didn't end". lspcheck reads at most 16 MiB of it; more, or a read cut short,
   makes the search fail rather than judge from part of the list. Each search for leftover processes, and each `ps`
   run within it, now ends by a deadline.
-- **L4** no longer fails a server that answers `shutdown` with an error that has a code and a message, which LSP
-  allows when an exception happens during shutdown. L4 now passes if the server keeps running after it, and the detail
-  names the error. A result other than `null`, an error without a code or message, or exiting before `exit` still
-  fails L4. Its title, which JUnit reports use as the test name, now reads "shutdown returns null (or an
-  error) and the server keeps running until exit".
+- **L4** no longer fails a server that answers `shutdown` with an error, which LSP allows when an exception happens
+  during shutdown. L4 now passes if the server keeps running after it, and the detail names the error. The error must
+  be well formed by J5's rules (an integer code in the signed 32-bit range and a string message), and not
+  MethodNotFound (-32601), since every server must implement `shutdown`. A result other than `null`, any other error,
+  or exiting before `exit` still fails L4. L4 now passes only once lspcheck has seen the server still running just
+  before it writes `exit`, so a server that exits in between fails L4 too. Its title, which JUnit reports use as the
+  test name, now reads "shutdown returns null (or an error) and the server keeps running until exit".
 - **L1** no longer passes when output lspcheck didn't read, such as a frame over `--max-frame-mib`, arrived between
   the notification it sends before `initialize` and the answer to `initialize`: that output could have been a reply
-  to the notification. L1 is then `error` and says why. A reply lspcheck read still fails L1.
+  to the notification. L1 is then `error` and says why. Output that comes once lspcheck has read the answer, such as a
+  large log message on `initialized`, doesn't count. A reply lspcheck read still fails L1.
 - **L7** no longer judges an exit status the server reached before lspcheck sent `exit`, such as a server that exits
   while a child it left behind keeps the conversation going. L7 is then not exercised, and says the server exited
   before `exit` was sent, as L6 already does.
@@ -75,9 +78,11 @@
   `error` then; it now passes or fails on the result. J4, L4 and L6, which need the server initialized, are still
   `error`, and now say what couldn't be sent.
 - **R1** now counts a reply to the non-JSON body that arrives after the plain request's answer, up to when lspcheck
-  sends `exit`. A late reply with another error code than ParseError (-32700), or a result, used to be ignored and R1
-  passed saying the body was ignored; it now fails R1. A late ParseError still passes, and the detail now counts it
-  instead of saying the body was ignored. The plain request must still be answered within `--timeout`.
+  sends `exit`. A late response with id null and another error code than ParseError (-32700), or a result, used to be
+  ignored and R1 passed saying the body was ignored. Read before lspcheck writes `shutdown`, it now fails R1; read
+  after, it may be the server's error about `shutdown`, so R1 is `error`. A late ParseError still passes, and the
+  detail now counts it instead of saying the body was ignored. The plain request must still be answered within
+  `--timeout`.
 - **R3** now fails, instead of being `error`, when the server leaves the plain request after the large document
   unanswered for its whole wait, which lspcheck read in full, and then sends output lspcheck can't read while it waits
   to see whether the server exits. That output came too late to hold the answer. A server that exits was already

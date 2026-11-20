@@ -35,6 +35,7 @@ const FAULTS: &[(&str, &str)] = &[
         "bad-json-reply-at-shutdown",
         "lawful: hold the answer to a non-JSON body until shutdown arrives, and send it before shutdown's",
     ),
+    ("null-id-error-at-shutdown", "on shutdown, send an InternalError (-32603) with id null before the result"),
     ("dies-on-bad-json", "exit when a non-JSON body arrives"),
     ("json-into-next-header", "send a correctly counted body that the next frame's first header line would complete"),
     ("json-into-bad-header", "like json-into-next-header, with a space before that header line, making it invalid"),
@@ -46,6 +47,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("decimal-ids", "lawful: spell numeric response ids with a fraction, as 2.0"),
     ("flood", "write 2 MiB of log messages before replying to initialize"),
     ("big-frame", "lawful: send one 2 MiB log message before replying to initialize"),
+    ("big-frame-on-initialized", "lawful: send one 2 MiB log message on initialized"),
     ("init-error", "lawful: refuse to initialize with an InitializeError"),
     ("block-after-init", "after initialize, send a huge configuration request and stop reading"),
     ("block-on-config", "on initialize, send a huge configuration request and stop reading"),
@@ -148,6 +150,8 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: answer shutdown with InternalError (-32603), as for an exception, and wait for exit",
     ),
     ("shutdown-error-no-message", "answer shutdown with an error that has a code but no message"),
+    ("shutdown-error-wide-code", "answer shutdown with an error whose code, 2147483648, is outside LSP's integers"),
+    ("shutdown-method-not-found", "answer shutdown with MethodNotFound (-32601)"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
     (
         "close-stdin-before-initialize-reply",
@@ -1244,6 +1248,12 @@ fn main() {
                     }
                 }
             }
+            if method == "initialized" && fault("big-frame-on-initialized") {
+                let text = "x".repeat(2 * 1024 * 1024);
+                out.frame(
+                    &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
+                );
+            }
             if method == "initialized" && fault("needs-configuration") {
                 // Like a server that reads its settings before doing
                 // anything else: handle nothing until the answer comes.
@@ -1912,6 +1922,9 @@ fn main() {
         {
             out.frame(&reply);
         }
+        if method == "shutdown" && fault("null-id-error-at-shutdown") {
+            out.frame(&err(&Value::Null, -32603, "unrelated failure while shutting down"));
+        }
         if method == "shutdown"
             && let Some(again) = answer_again.take()
         {
@@ -1955,6 +1968,10 @@ fn main() {
                 let result = if fault("shutdown-result") { json!({}) } else { Value::Null };
                 let mut answer = if fault("shutdown-exception") || fault("shutdown-error-no-message") {
                     err(&id, -32603, "exception during shutdown")
+                } else if fault("shutdown-error-wide-code") {
+                    err(&id, 1 << 31, "exception during shutdown")
+                } else if fault("shutdown-method-not-found") {
+                    err(&id, -32601, "method not found")
                 } else {
                     ok(&id, result.clone())
                 };

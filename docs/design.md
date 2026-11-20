@@ -116,10 +116,10 @@ the server sent no requests or lspcheck sent none after completing an answer.
 ### Lifecycle
 | ID | Basis | Check |
 |---|---|---|
-| L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification sent before it (`workspace/didChangeConfiguration`) is dropped without a reply: no response other than those two answers may arrive before the answer to `initialize`. If lspcheck may have missed output in that time (a frame it skipped or couldn't read), L1 is `error` instead of passing. |
+| L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification sent before it (`workspace/didChangeConfiguration`) is dropped without a reply: no response other than those two answers may arrive before the answer to `initialize`. If lspcheck may have missed output in that time (a frame it skipped or couldn't read), L1 is `error` instead of passing. The time ends when the answer to `initialize` is read, before `initialized` and the profile's settings are sent. |
 | L2 | MUST | `initialize` returns an object with `capabilities`; a chosen `positionEncoding` is one the client offered (offer `utf-8` first, `utf-16` last). The result is judged even if lspcheck can't send `initialized` after it; the lifecycle checks that need the server initialized are then `error`. |
 | L3 | POLICY | A second `initialize` gets an error and the server keeps serving: a plain request answered before it is answered after it too. |
-| L4 | MUST | `shutdown` returns `null` and the process keeps running until `exit`. An error with a code and a message, which LSP allows for an exception during shutdown, passes too if the process keeps running; the detail names it. Any other result or error fails. |
+| L4 | MUST | `shutdown` returns `null` and the process keeps running until `exit`. An error, which LSP allows for an exception during shutdown, passes too if the process keeps running; the detail names it. The error must be well formed by J5's rules (an integer `code` in the signed 32-bit range and a string `message`), and not MethodNotFound (`-32601`), since every server must implement `shutdown`. Any other result or error fails. The process must still be running when lspcheck looks just before it writes `exit`. |
 | L5 | SHOULD | Requests after `shutdown` get error `-32600` InvalidRequest (tested with `workspace/symbol`, after L3 in the same scenario; if the server stopped answering at L3, L5 is `error`). |
 | L6 | SHOULD | `exit` after `shutdown` ends the process with status 0 within the deadline. |
 | L7 | SHOULD | `exit` without `shutdown` ends it with status 1. A process that already exited before lspcheck sent `exit` leaves L7 not exercised, as L6. |
@@ -601,7 +601,9 @@ with another error code than `-32700` (ParseError), or a result, fails R1. An un
 duplicate or unasked reply, which J2 judges, not R1. Both the response verdict and
 ParseError count use unmatched response occurrences read from the start of the malformed-body write until lspcheck
 sends `exit` after a graceful shutdown (or gives up on `shutdown`), so a late reply to the body counts; earlier and
-later reads are excluded, and a frame lspcheck missed in that time makes a pass `ERROR`. The plain request must be
+later reads are excluded, and a frame lspcheck missed in that time makes a pass `ERROR`. Only a response read before
+lspcheck writes `shutdown` can fail R1: one with id null and another code read after that may be the server's error
+about `shutdown`, so it makes R1 `ERROR`. A ParseError read then still counts as the body's reply. The plain request must be
 answered within its own wait. An exit before the answer or an unanswered delivered request
 fails; missing answers become `ERROR` when evidence from the start of the probe write through the end of its wait
 is incomplete. Output skipped before the probe write cannot have held its answer. An exit while a
