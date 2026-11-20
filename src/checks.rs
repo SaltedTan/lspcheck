@@ -15,11 +15,11 @@ use crate::documents::{self, Change, OpenDoc, Published, Source, SyncKind, Versi
 use crate::message::{self, Id, Kind, Message, Outcome, codes};
 use crate::metamodel::{self, TooLarge};
 use crate::mutation;
-use crate::process::{Coverage, ProcInfo, ServerCommand};
+use crate::process::{Coverage, ProcInfo, ServerCommand, Unconfirmed};
 use crate::profile::{self, Expect, Skip};
 use crate::recovery;
 use crate::session::{
-    self, CallError, Finish, Options, Problem, Recv, ServerRequest, Session, Unmatched, WaitError, WriteError,
+    self, CallError, ExitWait, Finish, Options, Problem, Recv, ServerRequest, Session, Unmatched, WaitError, WriteError,
 };
 use crate::text::{self, ContentChange, Encoding, Position};
 use crate::transcript;
@@ -365,6 +365,15 @@ pub enum Recheck {
         pushed: Vec<PushBaseline>,
         then: Box<Recheck>,
     },
+    /// L6 or L7's failure for a server lspcheck saw still running at the exit
+    /// deadline, `due`, judged `waited` seconds after `exit`: an error if the
+    /// server may have been waiting for an answer from lspcheck, or if
+    /// lspcheck missed some of what it wrote until `to`.
+    StillRunning {
+        due: Duration,
+        to: Duration,
+        waited: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -484,6 +493,21 @@ impl CheckResult {
                     self.detail = format!("{why}: {}", self.detail);
                 }
             }
+            Recheck::StillRunning { due, to, waited } => {
+                let why = match awaiting_answer(&finish.server_requests, due) {
+                    Some(r) => Some(format!(
+                        "lspcheck hadn't finished answering the server's {} request {}, read before then",
+                        r.method, r.id
+                    )),
+                    None => finish.missed_output_within(Duration::ZERO, to),
+                };
+                if let Some(why) = why {
+                    self.verdict = Verdict::Error;
+                    self.detail = format!(
+                        "inconclusive: still running {waited} s after exit, but {why}, so it may be waiting on lspcheck"
+                    );
+                }
+            }
             Recheck::Recovered { pushed, then } => match pushed
                 .iter()
                 .find_map(|p| p.unstable(&finish.messages, |from, to| finish.missed_output_within(from, to)))
@@ -566,6 +590,8 @@ pub struct Observations {
     pub unchecked: usize,
     pub killed: bool,
     pub leftovers: Vec<ProcInfo>,
+    /// Processes found only through parent links lspcheck couldn't confirm.
+    pub unconfirmed: Option<Unconfirmed>,
     pub coverage: Coverage,
     pub scan_error: Option<String>,
     pub not_stopped: Vec<ProcInfo>,
@@ -1319,6 +1345,7 @@ fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observatio
         unchecked: f.unchecked,
         killed: f.killed,
         leftovers: f.leftovers,
+        unconfirmed: f.unconfirmed,
         coverage: f.coverage,
         scan_error: f.scan_error,
         not_stopped: f.not_stopped,
@@ -1611,11 +1638,7 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
     if let Err(e) = ctx.s.notify("exit", None).await {
         return ctx.report("L6", Verdict::Error, format!("could not send exit: {e}"));
     }
-    match ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await {
-        Some(status) if status.code() == Some(0) => ctx.pass("L6"),
-        Some(status) => ctx.fail("L6", format!("exited with {}", session::describe_status(status))),
-        None => still_running(ctx, "L6"),
-    }
+    judge_exit(ctx, "L6", 0).await;
 }
 
 /// Concurrent requests, then notifications that must not be answered.
@@ -3982,24 +4005,55 @@ async fn end_of_input(ctx: &mut Ctx<'_>) {
     }
 }
 
-/// A server still running after `exit`, though lspcheck answered its requests
-/// while it waited. If lspcheck missed something the server sent, that may
-/// have been a request the server is still waiting on. An answer lspcheck
-/// couldn't write doesn't excuse it: a server waiting for an answer would be
-/// reading its input.
-fn still_running(ctx: &mut Ctx<'_>, id: &'static str) {
+/// Waits for the server to exit after the `exit` lspcheck has just sent, and
+/// judges `id`: it should exit with status `code` by the deadline. lspcheck
+/// can tell only if it saw the exit by then, or saw the server running then.
+/// A server still running fails only if it can't have been waiting on
+/// lspcheck, which is known once the session has ended ([`Recheck::StillRunning`]).
+async fn judge_exit(ctx: &mut Ctx<'_>, id: &'static str, code: i32) {
+    let sent = ctx.s.elapsed();
     let waited = seconds(ctx.cfg.exit_timeout);
-    let to = ctx.s.elapsed();
-    ctx.fail(id, format!("still running {waited} s after exit"));
-    let r = ctx.results.last_mut().expect("just reported");
-    r.unless_missed = Some(Recheck::UnlessMissed {
-        windows: vec![(Duration::ZERO, to)],
-        output_only: true,
-        verdict: Verdict::Error,
-        detail: format!(
-            "inconclusive: still running {waited} s after exit, but {MISSED}, so it may be waiting on lspcheck"
+    match ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await {
+        ExitWait::Exited(status) if status.code() == Some(code) => ctx.pass(id),
+        ExitWait::Exited(status) => ctx.fail(id, format!("exited with {}", session::describe_status(status))),
+        ExitWait::Running { due } => {
+            let to = ctx.s.elapsed();
+            ctx.fail(id, format!("still running {waited} s after exit"));
+            let r = ctx.results.last_mut().expect("just reported");
+            r.unless_missed = Some(Recheck::StillRunning { due, to, waited });
+        }
+        ExitWait::Unseen { running, exited, status } => {
+            let after = |at: Duration| format!("{} s after exit", seconds_3(at.saturating_sub(sent)));
+            let running = match running {
+                Some(at) if at >= sent => format!("last saw it running {}", after(at)),
+                _ => "didn't see it running after exit".into(),
+            };
+            ctx.report(
+                id,
+                Verdict::Error,
+                format!(
+                    "inconclusive: it exited with {}, but lspcheck {running} and saw that it had exited only {}, \
+                     past the {waited} s deadline, so it can't tell whether it exited in time",
+                    session::describe_status(status),
+                    after(exited)
+                ),
+            );
+        }
+        ExitWait::Unknown => ctx.report(
+            id,
+            Verdict::Error,
+            format!("inconclusive: lspcheck couldn't tell whether it was still running {waited} s after exit"),
         ),
-    });
+    }
+}
+
+/// A request the server sent before `due` whose answer lspcheck hadn't
+/// finished writing by then, if there is one: a server still running at
+/// `due` may have been waiting for it. The server's requests are known in
+/// full only once the session has ended: one read before `due` may have
+/// been queued, or still being decoded, then.
+fn awaiting_answer(requests: &[ServerRequest], due: Duration) -> Option<&ServerRequest> {
+    requests.iter().find(|r| r.at < due && r.answered_at.is_none_or(|at| at >= due))
 }
 
 /// exit without shutdown.
@@ -4013,11 +4067,7 @@ async fn exit_without_shutdown(ctx: &mut Ctx<'_>) {
     if let Err(e) = ctx.s.notify("exit", None).await {
         return ctx.report("L7", Verdict::Error, format!("could not send exit: {e}"));
     }
-    match ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await {
-        Some(status) if status.code() == Some(1) => ctx.pass("L7"),
-        Some(status) => ctx.fail("L7", format!("exited with {}", session::describe_status(status))),
-        None => still_running(ctx, "L7"),
-    }
+    judge_exit(ctx, "L7", 1).await;
 }
 
 /// A request every server answers: an unknown method gets MethodNotFound
@@ -7273,12 +7323,27 @@ fn judge_l9(runs: &[ScenarioRun], allowed: &[String]) -> CheckResult {
         .into_iter()
         .map(|(name, list)| format!("in {name}, still running after the server exited: {list}"))
         .collect();
-    // A leak seen in one scenario stands even if another's search failed.
+    // A leak seen in one scenario stands even if another's search failed,
+    // or found processes that may not be the server's.
     if failures.is_empty()
         && let Some((name, o)) = all.iter().find(|(_, o)| o.scan_error.is_some())
     {
         let why = o.scan_error.as_deref().unwrap_or("");
         return result("all", "L9", Verdict::Error, format!("in {name}, the process search failed: {why}"));
+    }
+    if failures.is_empty()
+        && let Some((name, u, list)) = all.iter().filter(|(_, o)| !o.killed).find_map(|(name, o)| {
+            let u = o.unconfirmed.as_ref()?;
+            let list: Vec<String> = u.processes.iter().filter(|p| !is_allowed(p)).map(ProcInfo::to_string).collect();
+            (!list.is_empty()).then(|| (name, u, list.join(", ")))
+        })
+    {
+        let detail = format!(
+            "inconclusive: in {name}, still running after the server exited, but found only through a parent link \
+             lspcheck couldn't confirm ({}): {list}",
+            u.why
+        );
+        return result("all", "L9", Verdict::Error, detail);
     }
     if failures.is_empty() && !all.is_empty() && all.iter().all(|(_, o)| o.killed) {
         return result(
@@ -7295,7 +7360,9 @@ fn judge_l9(runs: &[ScenarioRun], allowed: &[String]) -> CheckResult {
     }
     if all.iter().any(|(_, o)| o.coverage == Coverage::GroupOnly) {
         notes.push(
-            "searched the server's process group only; a descendant that called setsid wouldn't be seen here".into(),
+            "searched the server's process group and its members' descendants only; a descendant that called setsid \
+             wouldn't be seen here once its parent had exited"
+                .into(),
         );
     }
     let mut detail = notes.join("; ");
@@ -9286,6 +9353,7 @@ while header := sys.stdin.buffer.readline():
                 unchecked: 0,
                 killed: false,
                 leftovers,
+                unconfirmed: None,
                 coverage: Coverage::GroupAndEscaped,
                 scan_error: scan_error.map(str::to_string),
                 not_stopped: Vec::new(),
@@ -9410,6 +9478,44 @@ while header := sys.stdin.buffer.readline():
         // Without the leak, the failed search makes the result unknown.
         let runs = [observed_run("lifecycle", vec![], None), observed_run("pre-initialize", vec![], Some("no /proc"))];
         assert_eq!(judge_l9(&runs, &[]).verdict, Verdict::Error);
+    }
+
+    #[test]
+    fn a_server_may_wait_for_any_answer_lspcheck_hadnt_finished_by_the_exit_deadline() {
+        let due = Duration::from_millis(100);
+        let ids = |requests: &[ServerRequest]| awaiting_answer(requests, due).map(|r| r.id.to_string());
+        // Answered in full before the deadline, or asked only after it.
+        let answered = server_request(10, "1", Some(20));
+        assert_eq!(ids(&[answered.clone(), server_request(100, "2", None)]), None);
+        // Answered only in part by then, or not at all: still queued at the
+        // deadline, say, or left unanswered.
+        let mut partly = server_request(90, "3", Some(95));
+        partly.answered_at = Some(due);
+        assert_eq!(ids(&[answered.clone(), partly]), Some("\"3\"".into()));
+        assert_eq!(ids(&[answered, server_request(99, "4", None)]), Some("\"4\"".into()));
+    }
+
+    #[test]
+    fn a_process_found_through_an_unconfirmed_link_fails_nothing() {
+        // The group member 42 is the server's; 43 is listed as its child in
+        // another session, a link lspcheck couldn't confirm.
+        let member = ProcInfo { pid: 42, ppid: 1, pgid: 41, name: "worker".into() };
+        let linked = ProcInfo { pid: 43, ppid: 42, pgid: 43, name: "helper".into() };
+        let run = |leftovers: Vec<ProcInfo>| {
+            let mut run = observed_run("lifecycle", leftovers, None);
+            run.observed.as_mut().unwrap().unconfirmed =
+                Some(Unconfirmed { processes: vec![linked.clone()], why: "no confirming listing".into() });
+            [run]
+        };
+        let r = judge_l9(&run(vec![]), &[]);
+        assert_eq!(r.verdict, Verdict::Error, "{}", r.detail);
+        assert!(r.detail.contains("couldn't confirm (no confirming listing): pid 43 (helper)"), "{}", r.detail);
+        // A confirmed leftover still fails, and an allowed name is allowed
+        // whether or not the link holds.
+        let r = judge_l9(&run(vec![member.clone()]), &[]);
+        assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
+        assert!(r.detail.contains("pid 42 (worker)") && !r.detail.contains("helper"), "{}", r.detail);
+        assert_eq!(judge_l9(&run(vec![member]), &["worker".into(), "helper".into()]).verdict, Verdict::Pass);
     }
 
     #[test]

@@ -1043,8 +1043,11 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
     for id in ["F3", "F4", "F5", "F6", "F7"] {
         expect(&r, id, "error");
     }
-    // exit reached its pipe there, and the server never read it: that's real.
-    expect(&r, "L7", "fail");
+    // exit reached its pipe there, but lspcheck hadn't finished answering the
+    // configuration request, read before then, by the exit deadline: the
+    // server may be waiting for that answer.
+    expect(&r, "L7", "error");
+    assert!(detail(&r, "L7").contains("workspace/configuration request \"cfg\""), "{}", r.stdout);
     assert_eq!(r.status, 2, "no MUST failure\n{}", r.stdout);
 }
 
@@ -1676,6 +1679,40 @@ fn unfinished_output_makes_exit_timeouts_inconclusive_after_cleanup() {
     assert!(r.stdout.contains("so it may be waiting on lspcheck"), "{}", r.stdout);
 }
 
+// Unix only: the child the server leaves behind is stopped through its
+// process group.
+#[cfg(unix)]
+#[test]
+fn an_answer_lspcheck_is_still_writing_doesnt_hide_a_timely_exit() {
+    // The server exits once lspcheck begins answering its request after
+    // exit, and a child it leaves holds stdin unread, so the answer's write
+    // runs to the exit deadline. The server was gone well before it.
+    let (r, t, _keep) = run_with_transcripts(&["--fault", "answer-stuck-on-exit"], &["--only", "L6,L7"]);
+    expect(&r, "L6", "pass");
+    expect(&r, "L7", "pass");
+    for scenario in ["lifecycle", "exit-without-shutdown"] {
+        let transcript = std::fs::read_to_string(t.join(format!("{scenario}.jsonl"))).unwrap();
+        assert!(transcript.contains("lspcheck's write stopped partway through a frame"), "{scenario}");
+    }
+}
+
+// Unix only: the request comes in the same small write as the initialize
+// result, which a pipe there delivers whole.
+#[cfg(unix)]
+#[test]
+fn a_request_still_queued_at_the_exit_deadline_makes_a_running_server_inconclusive() {
+    // lspcheck reads the server's request with its initialize result, before
+    // it sends exit, and with no time to wait it is still queued at the
+    // deadline. The server exits only once the request is answered.
+    let r = run(&["--fault", "request-with-initialize-result"], &["--only", "L7", "--exit-timeout", "0"]);
+    expect(&r, "L7", "error");
+    let l7 = detail(&r, "L7");
+    assert!(
+        l7.contains("hadn't finished answering the server's window/workDoneProgress/create request \"with-result\""),
+        "{l7}"
+    );
+}
+
 #[test]
 fn a_server_request_reusing_an_unanswered_id_fails_j7() {
     // Both requests arrive in one write, before lspcheck has begun answering
@@ -1811,6 +1848,23 @@ fn a_child_that_leaves_the_group_with_a_non_utf8_name_still_fails_l9() {
     let r = fault("escaped-child");
     only_fails(&r, &["L9"]);
     assert!(r.stdout.contains("\u{fffd}standin"), "{}", r.stdout);
+}
+
+// Linux only: once its parent is stopped, only a subreaper can find and stop
+// the grandchild.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_descendant_that_left_the_group_is_found_through_its_living_parent() {
+    // The child stays in the server's group; the grandchild it starts calls
+    // setsid. Allowing the child (by its kernel command name) doesn't allow
+    // the grandchild.
+    let name: String = std::path::Path::new(STANDIN).file_name().unwrap().to_str().unwrap().chars().take(15).collect();
+    let (path, _keep) = profile(&format!("[allow]\ndescendants = [{name:?}]\n"));
+    let r = with_profile(&["nested-escaped-child"], &path);
+    only_fails(&r, &["L9"]);
+    let l9 = detail(&r, "L9");
+    assert!(l9.contains("still running after the server exited: pid ") && l9.contains("(\u{fffd}standin)"), "{l9}");
+    assert!(l9.contains("allowed by the profile to outlive the server") && l9.contains(&format!("({name})")), "{l9}");
 }
 
 #[test]

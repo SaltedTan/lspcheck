@@ -32,6 +32,32 @@
   including one with another code that names `$/cancelRequest` (such as `initialized` failing) or that mentions
   cancelRequest only in its `data`. One read before the cancel was written no longer counts for C3 at all (J3 still
   judges it).
+- **L6** and **L7** no longer fail a server that exited in time while lspcheck was still writing an answer to one of
+  its requests. A process the server left behind that holds its stdin without reading it can keep that write going
+  until the exit deadline, and lspcheck then reported the server still running without looking again. lspcheck now
+  watches for the exit while it writes, and judges by when it saw the exit. If it saw the exit only after the deadline,
+  and last saw the server running before it (while it prepared a large answer, say), the check is `error`, with both
+  times.
+- **L6** and **L7** no longer fail a server still running at the exit deadline that may have been waiting for
+  lspcheck's answer to one of its requests: one read before the deadline whose answer lspcheck hadn't finished writing
+  by then, because it was still queued behind other output, lspcheck couldn't write it, or left it unanswered. The
+  check is now `error`, naming the request.
+- **L9** no longer fails on a process that had exited before the 1 s grace after the server's exit ended, but that a
+  search begun before the end of the grace and finished after it (a slow `/proc` read or `ps`) had seen. Only a search
+  begun once the grace is over now counts a process as left behind. A search that fails earlier is tried again; if the
+  one begun after the grace fails, L9 is `error`.
+- **L9** now fails for a descendant that left the server's process group (with `setsid`, say) while its parent in the
+  group is still running. lspcheck missed it until its parent exited, so L9 passed when the parent's name was in
+  `allow.descendants`. lspcheck now finds every process descended from the group's members, and checks each one
+  against the list. A pid read as a parent may pass to an unrelated process while lspcheck lists processes, so on
+  Linux a process found through its parent counts only once a second listing shows the same parent, by pid and start
+  time, still named by the same child; one lspcheck can't confirm makes L9 `error` rather than fail it. On macOS,
+  where `ps` gives no start time precise enough, a process found through its parent always does.
+- On macOS, the `ps` lspcheck runs to find leftover processes now writes to a temporary file instead of a pipe. A
+  process left holding its output can no longer keep a thread reading it after the search has given up, and no longer
+  makes L9 `error` with "ps's output didn't end". lspcheck reads at most 16 MiB of it; more, or a read cut short,
+  makes the search fail rather than judge from part of the list. Each search for leftover processes, and each `ps`
+  run within it, now ends by a deadline.
 
 ## 0.6.0 (2026-11-19)
 
