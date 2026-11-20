@@ -1703,14 +1703,43 @@ fn an_answer_lspcheck_is_still_writing_doesnt_hide_a_timely_exit() {
 fn a_request_still_queued_at_the_exit_deadline_makes_a_running_server_inconclusive() {
     // lspcheck reads the server's request with its initialize result, before
     // it sends exit, and with no time to wait it is still queued at the
-    // deadline. The server exits only once the request is answered.
+    // deadline. The server exits only once the request is answered, which
+    // lspcheck does only past the deadline.
     let r = run(&["--fault", "request-with-initialize-result"], &["--only", "L7", "--exit-timeout", "0"]);
     expect(&r, "L7", "error");
     let l7 = detail(&r, "L7");
-    assert!(
-        l7.contains("hadn't finished answering the server's window/workDoneProgress/create request \"with-result\""),
-        "{l7}"
-    );
+    let answered = "lspcheck answered its window/workDoneProgress/create request \"with-result\" only";
+    assert!(l7.contains(answered) && l7.contains("past the 0 s deadline"), "{l7}");
+}
+
+#[test]
+fn a_server_that_asks_on_its_way_out_passes_l6_and_l7() {
+    // It asks after reading exit, and exits once lspcheck has answered.
+    only_fails(&fault("ask-on-exit"), &[]);
+}
+
+#[test]
+fn a_server_that_asks_on_exit_and_then_hangs_fails_l6_and_l7() {
+    // Once its question is answered it has all it needs, as
+    // lua-language-server has once its workspace/configuration request is.
+    let r = run(&["--fault", "ask-on-exit-then-ignore"], &["--only", "L6,L7"]);
+    for id in ["L6", "L7"] {
+        expect(&r, id, "fail");
+        let d = detail(&r, id);
+        assert!(d.contains("s since lspcheck answered its window/workDoneProgress/create request \"exit-ask\""), "{d}");
+    }
+}
+
+#[test]
+fn a_server_that_keeps_asking_after_exit_is_inconclusive() {
+    // It never stops for a whole timeout, so lspcheck can't tell whether it
+    // would have exited had it stopped waiting on lspcheck's answers.
+    let r = run(&["--fault", "requests-forever-after-exit"], &["--only", "L6,L7", "--exit-timeout", "1"]);
+    for id in ["L6", "L7"] {
+        expect(&r, id, "error");
+        let d = detail(&r, id);
+        assert!(d.contains("past the 1 s deadline, so the server may have been waiting on lspcheck"), "{d}");
+    }
 }
 
 #[test]

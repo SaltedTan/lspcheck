@@ -164,6 +164,15 @@ const FAULTS: &[(&str, &str)] = &[
         "on exit, leave behind a child holding stdin without reading it, ask a workspace/configuration request whose \
          answer is bigger than a pipe holds, and exit as usual once lspcheck begins writing the answer",
     ),
+    ("ask-on-exit", "lawful: on exit, ask window/workDoneProgress/create and exit as usual once it is answered"),
+    (
+        "ask-on-exit-then-ignore",
+        "on exit, ask window/workDoneProgress/create and, once it is answered, stay running and write nothing more",
+    ),
+    (
+        "requests-forever-after-exit",
+        "ignore exit, and ask window/workDoneProgress/create again each time the last one is answered",
+    ),
     ("split-header", "drop input when a read ends inside a header section, as if each header came in one read"),
     ("split-utf8", "decode each read as UTF-8 on its own, mangling characters split across reads"),
     (
@@ -1331,6 +1340,29 @@ fn main() {
                     let items = vec![json!({}); 100_000];
                     out.frame(&json!({"jsonrpc": "2.0", "id": "exit-config", "method": "workspace/configuration", "params": {"items": items}}));
                     while find(&input.buf, b"\"exit-config\"").is_none() && input.fill() {}
+                }
+                if fault("ask-on-exit") || fault("ask-on-exit-then-ignore") {
+                    // Like a server that asks the client one more thing on
+                    // its way out.
+                    let id = json!("exit-ask");
+                    let params = json!({"token": "exit"});
+                    out.frame(&json!({"jsonrpc": "2.0", "id": id, "method": "window/workDoneProgress/create", "params": params}));
+                    if input.await_answer(&id) && fault("ask-on-exit-then-ignore") {
+                        continue;
+                    }
+                }
+                if fault("requests-forever-after-exit") {
+                    // Each answer prompts the next request, so the answers
+                    // pace them.
+                    for n in 0u64.. {
+                        let id = json!(format!("forever-{n}"));
+                        let params = json!({"token": id});
+                        out.frame(&json!({"jsonrpc": "2.0", "id": id, "method": "window/workDoneProgress/create", "params": params}));
+                        if !input.await_answer(&id) {
+                            break;
+                        }
+                    }
+                    continue;
                 }
                 let status = if fault("exit-status") {
                     3
@@ -3080,6 +3112,19 @@ impl<R: Read> Input<R> {
                 }
             }
         }
+    }
+
+    /// Reads frames until the client answers the request with `id`, dropping
+    /// the rest; false if input ends first.
+    fn await_answer(&mut self, id: &Value) -> bool {
+        while let Some((_, body)) = self.next() {
+            let answer = serde_json::from_slice::<Value>(&body)
+                .is_ok_and(|v| v.get("method").is_none() && v.get("id") == Some(id));
+            if answer {
+                return true;
+            }
+        }
+        false
     }
 
     /// The Content-Length of a frame whose headers are buffered but not yet
