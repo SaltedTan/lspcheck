@@ -14,7 +14,7 @@
 //! incomplete.
 
 use crate::message::{self, Id, Kind, Message, codes};
-use crate::process::{self, Coverage, Group, ProcInfo, ServerCommand};
+use crate::process::{self, Coverage, Found, Group, ProcInfo, ServerCommand, Unconfirmed};
 use crate::transport::{self, Chunk, FrameReader, Header};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -190,6 +190,22 @@ pub enum WaitError {
     Closed,
 }
 
+/// How a wait for the server to exit by a deadline ended. Times are since
+/// the session started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitWait {
+    /// lspcheck saw it exit by the deadline.
+    Exited(ExitStatus),
+    /// lspcheck saw it still running at or after the deadline, `due`.
+    Running { due: Duration },
+    /// lspcheck saw it had exited only after the deadline, and last saw it
+    /// running (if ever) before the deadline, so it can't tell which side of
+    /// the deadline it exited on.
+    Unseen { running: Option<Duration>, exited: Duration, status: ExitStatus },
+    /// lspcheck couldn't look at the process at or after the deadline.
+    Unknown,
+}
+
 /// Why a write failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteError {
@@ -317,6 +333,9 @@ pub struct Finish {
     pub killed: bool,
     /// Descendants still alive after the grace period, before lspcheck stopped them.
     pub leftovers: Vec<ProcInfo>,
+    /// Processes found then only through parent links lspcheck couldn't
+    /// confirm: they may not have been the server's.
+    pub unconfirmed: Option<Unconfirmed>,
     /// What the leftover search could see.
     pub coverage: Coverage,
     /// Why the leftover search failed, if it did.
@@ -462,6 +481,11 @@ pub struct Session {
     server_requests: Vec<ServerRequest>,
     group: Group,
     exit: Option<ExitStatus>,
+    /// When lspcheck first saw that the server had exited. The exit came no
+    /// later than this.
+    exit_seen: Option<Instant>,
+    /// The last time lspcheck looked and found the server still running.
+    running_seen: Option<Instant>,
     opts: Options,
     /// Bytes that reached the server's stdin.
     written: u64,
@@ -556,6 +580,8 @@ impl Session {
             server_requests: Vec::new(),
             group,
             exit: None,
+            exit_seen: None,
+            running_seen: None,
             opts,
             written: 0,
             answer_cap: None,
@@ -767,36 +793,59 @@ impl Session {
             return Err(WriteError::Abandoned);
         }
         let Some(stdin) = self.stdin.as_mut() else { return Err(WriteError::Closed) };
-        let (t, start) = (&self.transcript, self.start);
+        let (t, start, child) = (&self.transcript, self.start, &mut self.child);
         let ends: Vec<usize> =
             cuts.iter().copied().filter(|&c| c > 0 && c < bytes.len()).chain([bytes.len()]).collect();
         // The piece being written: where it starts and when it began.
         let (mut written, mut piece, mut piece_at, mut piece_seq) = (0usize, 0usize, start.elapsed(), next_seq());
         let mut pieces = Vec::with_capacity(ends.len());
-        let result = timeout_at(deadline, async {
-            for (i, &end) in ends.iter().enumerate() {
-                if end <= written {
-                    continue;
-                }
-                if i > 0 && !pause.is_zero() {
-                    sleep(pause).await;
-                }
-                (piece_at, piece_seq) = (start.elapsed(), next_seq());
-                pieces.push(piece_at);
-                while written < end {
-                    let n = stdin.write(&bytes[written..end]).await?;
-                    if n == 0 {
-                        return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        // A write can last until its deadline, so watch for the server's exit
+        // meanwhile: one seen only afterwards can't be placed before it.
+        let watching = self.exit.is_none();
+        let mut exited = None;
+        let result = {
+            let mut write = std::pin::pin!(timeout_at(deadline, async {
+                for (i, &end) in ends.iter().enumerate() {
+                    if end <= written {
+                        continue;
                     }
-                    written += n;
+                    if i > 0 && !pause.is_zero() {
+                        sleep(pause).await;
+                    }
+                    (piece_at, piece_seq) = (start.elapsed(), next_seq());
+                    pieces.push(piece_at);
+                    while written < end {
+                        let n = stdin.write(&bytes[written..end]).await?;
+                        if n == 0 {
+                            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                        }
+                        written += n;
+                    }
+                    stdin.flush().await?;
+                    record_began(t, piece_at, piece_seq, EventKind::Sent(bytes[piece..written].to_vec()));
+                    piece = written;
                 }
-                stdin.flush().await?;
-                record_began(t, piece_at, piece_seq, EventKind::Sent(bytes[piece..written].to_vec()));
-                piece = written;
+                Ok(())
+            }));
+            // Waiting for the exit is cancel safe, and the write is never
+            // dropped here: it goes on after an exit, since a process the
+            // server left behind may still read it.
+            tokio::select! {
+                biased;
+                status = child.wait(), if watching => {
+                    if let Ok(status) = status {
+                        record(t, start.elapsed(), EventKind::Exited(describe_status(status)));
+                        exited = Some((status, Instant::now()));
+                    }
+                    write.await
+                }
+                result = &mut write => result,
             }
-            Ok(())
-        })
-        .await;
+        };
+        if let Some((status, seen)) = exited {
+            self.exit = Some(status);
+            self.exit_seen = Some(seen);
+        }
         if written > piece {
             record_began(&self.transcript, piece_at, piece_seq, EventKind::Sent(bytes[piece..written].to_vec()));
         }
@@ -1175,18 +1224,24 @@ impl Session {
         if self.exit.is_some() {
             return false;
         }
+        // Running when it was looked at means running now too.
+        let looked = Instant::now();
         match self.child.try_wait() {
             Ok(Some(status)) => {
                 self.exited(status);
                 false
             }
-            Ok(None) => true,
+            Ok(None) => {
+                self.running_seen = Some(looked);
+                true
+            }
             Err(_) => false,
         }
     }
 
     fn exited(&mut self, status: ExitStatus) {
         self.exit = Some(status);
+        self.exit_seen = Some(Instant::now());
         record(&self.transcript, self.start.elapsed(), EventKind::Exited(describe_status(status)));
     }
 
@@ -1195,36 +1250,47 @@ impl Session {
     /// request it sent just before reading `exit` (gopls waits for its
     /// progress token after `initialized`), so waiting without answering
     /// could keep it running through lspcheck's own doing.
-    pub async fn serve_until_exit(&mut self, deadline: Instant) -> Option<ExitStatus> {
-        loop {
-            if let Some(status) = self.exit {
-                return Some(status);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
+    ///
+    /// lspcheck watches for the exit while it waits and while it writes an
+    /// answer, but not while it prepares one, so the outcome rests on when it
+    /// saw the exit, not on when it looked. Whether the server was waiting
+    /// for an answer is for the caller to judge, from every request read
+    /// before the deadline, including those still queued then.
+    pub async fn serve_until_exit(&mut self, deadline: Instant) -> ExitWait {
+        // Each pass looks first, so an exit while an answer was prepared is
+        // seen as soon as lspcheck is free again.
+        while self.is_alive() && Instant::now() < deadline {
             if self.stdout_closed {
-                return self.wait_exit(deadline).await;
+                self.wait_exit(deadline).await;
+                break;
             }
             // Both futures are cancel safe: whichever loses is dropped
             // without losing a message or the exit status.
             let event = tokio::select! {
                 biased;
-                status = self.child.wait() => Err(status),
-                _ = sleep_until(deadline) => return None,
-                inbound = self.rx.recv() => Ok(inbound),
+                status = self.child.wait() => Some(Err(status)),
+                _ = sleep_until(deadline) => None,
+                inbound = self.rx.recv() => Some(Ok(inbound)),
             };
             match event {
-                Err(Ok(status)) => {
-                    self.exited(status);
-                    return Some(status);
-                }
-                Err(Err(_)) => return None,
-                Ok(None) => self.stdout_closed = true,
-                Ok(Some((at, inbound))) => {
+                None | Some(Err(Err(_))) => break,
+                Some(Err(Ok(status))) => self.exited(status),
+                Some(Ok(None)) => self.stdout_closed = true,
+                Some(Ok(Some((at, inbound)))) => {
                     self.handle(at, inbound, deadline).await;
                 }
             }
+        }
+        // A look at or after the deadline, unless the exit was seen already.
+        self.is_alive();
+        let since_start = |at: Instant| at.saturating_duration_since(self.start);
+        match (self.exit, self.exit_seen) {
+            (Some(status), Some(seen)) if seen <= deadline => ExitWait::Exited(status),
+            _ if self.running_seen.is_some_and(|at| at >= deadline) => ExitWait::Running { due: since_start(deadline) },
+            (Some(status), Some(seen)) => {
+                ExitWait::Unseen { running: self.running_seen.map(since_start), exited: since_start(seen), status }
+            }
+            _ => ExitWait::Unknown,
         }
     }
 
@@ -1279,36 +1345,43 @@ impl Session {
         let coverage = process::coverage();
         let mut scan_error = None;
         let pid = self.pid;
-        let scan = |group: &Group| -> Result<Vec<ProcInfo>, String> {
+        let scan = |group: &Group, deadline: Instant| -> Result<Found, String> {
             process::reap_adopted();
-            let mut left = group.members()?;
-            for p in process::adopted_orphans()? {
-                if !left.iter().any(|q| q.pid == p.pid) {
-                    left.push(p);
-                }
+            let mut found = group.descendants(deadline.into_std())?;
+            found.confirmed.retain(|p| p.pid != pid);
+            if let Some(u) = &mut found.unconfirmed {
+                u.processes.retain(|p| p.pid != pid);
             }
-            left.retain(|p| p.pid != pid);
-            Ok(left)
+            found.unconfirmed = found.unconfirmed.filter(|u| !u.processes.is_empty());
+            Ok(found)
         };
-        let deadline = Instant::now() + grace;
-        let leftovers = loop {
-            match scan(&self.group) {
-                Err(e) => {
-                    scan_error = Some(e);
-                    break Vec::new();
-                }
-                Ok(left) if left.is_empty() || Instant::now() >= deadline => break left,
-                Ok(_) => sleep(Duration::from_millis(50)).await,
+        // Every scan and every listing it makes ends by one deadline, which
+        // gives the scan begun as the grace ends the time a `ps` run may take.
+        let grace_ends = Instant::now() + grace;
+        let search_ends = grace_ends + Duration::from_secs(5);
+        let found = match settle(|| scan(&self.group, search_ends), grace_ends).await {
+            Ok(found) => found,
+            Err(e) => {
+                scan_error = Some(e);
+                Found::default()
             }
         };
+        let Found { confirmed: leftovers, unconfirmed } = found;
         for p in &leftovers {
             self.note(format!("still running after the server exited: {p}"));
+        }
+        if let Some(u) = &unconfirmed {
+            for p in &u.processes {
+                self.note(format!("still running after the server exited, found through its parent ({}): {p}", u.why));
+            }
         }
         // Stop what's left: the group by its id (safe while the sentinel holds
         // it), and adopted processes, which are lspcheck's unreaped children
         // and so can't have been replaced by another process. Stopping one can
         // orphan its own children, which are then adopted too, so repeat for
-        // up to two seconds.
+        // up to two seconds. A process outside the group, found only through
+        // its parent, isn't signalled by its id: once its parent is stopped it
+        // is adopted and stopped on Linux, and out of sight elsewhere.
         //
         // With none found and the server gone by itself, nothing should hold
         // stdout, so let the stdout task see its end first: a stream the
@@ -1318,7 +1391,7 @@ impl Session {
         // sends no signal, so the end of the stream stays the server's.
         #[cfg(unix)]
         {
-            if !killed && leftovers.is_empty() && scan_error.is_none() {
+            if !killed && leftovers.is_empty() && unconfirmed.is_none() && scan_error.is_none() {
                 self.wait_for_stdout_end(Instant::now() + Duration::from_secs(5)).await;
             }
             self.signalling();
@@ -1326,18 +1399,34 @@ impl Session {
         let deadline = Instant::now() + Duration::from_secs(2);
         let me = std::process::id() as i32;
         let mut not_stopped = Vec::new();
+        // The last scan's error, while no scan since has worked: a failed
+        // listing says nothing about what is left, so keep sweeping.
+        let mut sweep_error;
         loop {
             #[cfg(unix)]
             self.group.signal(nix::sys::signal::Signal::SIGKILL);
-            let left = scan(&self.group).unwrap_or_default();
+            let left = match scan(&self.group, deadline) {
+                Ok(left) => {
+                    sweep_error = None;
+                    left
+                }
+                Err(e) => {
+                    sweep_error = Some(e);
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+            };
             if left.is_empty() {
                 break;
             }
             if Instant::now() >= deadline {
-                not_stopped = left;
+                not_stopped = left.confirmed;
                 break;
             }
-            for p in left.iter().filter(|p| p.ppid == me) {
+            for p in left.confirmed.iter().filter(|p| p.ppid == me) {
                 if let Err(e) = process::kill_process(p) {
                     self.note(e);
                 }
@@ -1346,6 +1435,9 @@ impl Session {
         }
         for p in &not_stopped {
             self.note(format!("lspcheck couldn't stop {p}"));
+        }
+        if let Some(e) = sweep_error {
+            self.note(format!("lspcheck couldn't confirm that every process it started was stopped: {e}"));
         }
 
         // Let the stdout task see the end of the stream, so its evidence is
@@ -1413,6 +1505,7 @@ impl Session {
             exit: if killed { None } else { self.exit },
             killed,
             leftovers,
+            unconfirmed,
             coverage,
             scan_error,
             not_stopped,
@@ -1447,6 +1540,22 @@ impl Session {
             miscounted,
             unchecked,
         }
+    }
+}
+
+/// Scans for leftover processes until a scan finds none or `deadline` has
+/// passed. A process found by a scan begun before the deadline may have
+/// exited before it, so only one begun at or after the deadline can find a
+/// process still running then. For the same reason only that scan's failure
+/// counts: an earlier one is tried again.
+async fn settle(mut scan: impl FnMut() -> Result<Found, String>, deadline: Instant) -> Result<Found, String> {
+    loop {
+        let began = Instant::now();
+        let left = scan();
+        if began >= deadline || left.as_ref().is_ok_and(Found::is_empty) {
+            return left;
+        }
+        sleep_until(deadline.min(Instant::now() + Duration::from_millis(50))).await;
     }
 }
 
@@ -1908,9 +2017,120 @@ mod tests {
         let message = Message::classify(json!({"jsonrpc": "2.0", "method": "window/logMessage"}));
         assert!(tx.send((s.elapsed(), Inbound::Message(message))).is_ok());
         let got = s.serve_until_exit(Instant::now() - Duration::from_secs(1)).await;
-        assert!(got.is_none());
+        assert!(matches!(got, ExitWait::Running { .. }), "{got:?}");
         assert!(s.messages.is_empty());
         s.finish(Duration::from_millis(200)).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_exit_seen_only_after_the_deadline_is_not_credited() {
+        use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+        // Exits with status 1 once it has read a line.
+        let cmd = ServerCommand::new(&["sh".into(), "-c".into(), "read line; exit 1".into()]);
+        for busy in [true, false] {
+            let mut s = Session::start(&cmd, Options::default()).await.unwrap();
+            assert!(s.is_alive());
+            let looked = s.elapsed();
+            // Busy, the deadline passes just after lspcheck saw it running.
+            let deadline = if busy {
+                s.running_seen.unwrap() + Duration::from_nanos(1)
+            } else {
+                Instant::now() + Duration::from_secs(30)
+            };
+            s.write_raw(b"go\n").await.unwrap();
+            if busy {
+                // Wait for the exit without reaping it, so the session hasn't
+                // seen it, as if lspcheck had been preparing an answer while
+                // the deadline passed.
+                let pid = nix::unistd::Pid::from_raw(s.pid());
+                let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG;
+                let limit = std::time::Instant::now() + Duration::from_secs(30);
+                while waitid(Id::Pid(pid), flags).unwrap() == WaitStatus::StillAlive {
+                    assert!(std::time::Instant::now() < limit, "the script didn't exit");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let got = s.serve_until_exit(deadline).await;
+            if busy {
+                let ExitWait::Unseen { running: Some(running), exited, status } = got else { panic!("{got:?}") };
+                assert!(running <= looked, "{running:?} {looked:?}");
+                assert!(exited > deadline.duration_since(s.start), "{exited:?}");
+                assert_eq!(status.code(), Some(1));
+            } else {
+                assert!(matches!(got, ExitWait::Exited(status) if status.code() == Some(1)), "{got:?}");
+            }
+            s.finish(Duration::from_millis(200)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_answer_prepared_after_its_deadline_is_still_written() {
+        let id = Id::Str("configuration".into());
+        let request = message::request(&id, "workspace/configuration", Some(json!({"items": [{}]})));
+        let request = transport::encode(&serde_json::to_vec(&request).unwrap());
+        let script = format!("printf '%s' '{}'; sleep 30", String::from_utf8(request).unwrap());
+        let cmd = ServerCommand::new(&["sh".into(), "-c".into(), script.into()]);
+        let opts = Options { auto_respond: false, ..Options::default() };
+        let mut s = Session::start(&cmd, opts).await.unwrap();
+        let Recv::Message(request) = s.recv(Instant::now() + Duration::from_secs(5)).await else {
+            panic!("the script's request didn't arrive");
+        };
+        // lspcheck has written to the server before, as it has by the time
+        // it answers a request; the pipe has room for the answer.
+        s.notify("initialized", Some(json!({}))).await.unwrap();
+        let before = s.bytes_written();
+        // The deadline passed while the answer was prepared. The server may
+        // still read it, and J7 judges the requests that follow by it.
+        s.answer(&id, "workspace/configuration", &request.value, Instant::now()).await;
+        let r = &s.server_requests[0];
+        assert!(r.answer_began.is_some() && r.answered_at.is_some(), "{r:?}");
+        assert!(s.bytes_written() > before);
+        assert_eq!(s.own_limit, None);
+        s.finish(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_scan_begun_after_the_grace_deadline_finds_a_leftover() {
+        let helper =
+            Found { confirmed: vec![ProcInfo { pid: 7, ppid: 1, pgid: 7, name: "helper".into() }], unconfirmed: None };
+        // The first scan begins well before the deadline and sees the helper,
+        // which exits before the deadline, but the scan returns only after it.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut began = Vec::new();
+        let left = settle(
+            || {
+                began.push(Instant::now());
+                if began.len() > 1 {
+                    return Ok(Found::default());
+                }
+                std::thread::sleep((deadline + Duration::from_millis(10)).saturating_duration_since(Instant::now()));
+                Ok(helper.clone())
+            },
+            deadline,
+        )
+        .await;
+        assert_eq!(left, Ok(Found::default()));
+        assert!(began[0] < deadline && began[1] >= deadline);
+        // Seen by a scan begun after the deadline, it is left over; that
+        // scan's failure ends the search.
+        assert_eq!(settle(|| Ok(helper.clone()), Instant::now()).await, Ok(helper.clone()));
+        assert_eq!(settle(|| Err("no ps".into()), Instant::now()).await, Err("no ps".into()));
+        // A scan that fails before the deadline is tried again, and the one
+        // begun after it decides.
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut scans = 0;
+        let left = settle(
+            || {
+                scans += 1;
+                if Instant::now() < deadline { Err("busy".into()) } else { Ok(helper.clone()) }
+            },
+            deadline,
+        )
+        .await;
+        assert_eq!(left, Ok(helper));
+        assert!(scans > 1);
     }
 
     #[test]

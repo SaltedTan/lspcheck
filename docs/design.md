@@ -124,16 +124,48 @@ the server sent no requests or lspcheck sent none after completing an answer.
 | L6 | SHOULD | `exit` after `shutdown` ends the process with status 0 within the deadline. |
 | L7 | SHOULD | `exit` without `shutdown` ends it with status 1. |
 | L8 | POLICY | End of stdin without `exit`, after `initialize`, ends the process within the exit deadline, with any status (prevents orphaned servers). |
-| L9 | POLICY | After exit no descendant remains. Profiles can allow named long-lived daemons. Where lspcheck can't see an escape through `setsid`/double fork (macOS), a pass says so in its detail. |
+| L9 | POLICY | After exit no descendant remains. Profiles can allow named long-lived daemons. Where lspcheck can't see an escape through `setsid`/double fork whose parent has exited (macOS), a pass says so in its detail; where it can't confirm one found through its living parent (macOS), the check is `error`. |
 
 While it waits for the process to exit after `exit`, lspcheck keeps reading and answers the server's requests: a
 server may read `exit` but handle it only once a request it sent just before is answered (gopls does this with the
-progress token it asks for after `initialized`), and lspcheck sends `exit` without pausing. A server still running at
-the deadline fails L6 or L7, unless lspcheck missed some of its output (a frame it skipped or couldn't read, or reading
-that stopped), which may have held a request the server is waiting on; then the check is `error`. An answer
-lspcheck couldn't write doesn't excuse it: a server waiting for an answer would be reading its input.
-The exit deadline takes priority over queued output. Timeout verdicts are checked again after cleanup, so a frame
-that began before the deadline but was only found truncated at the end of stdout also makes L6 or L7 `error`.
+progress token it asks for after `initialized`), and lspcheck sends `exit` without pausing. The exit deadline takes
+priority over queued output. lspcheck watches for the exit while it waits and while it writes an answer, which can take
+until the deadline (a process the server left behind may hold its stdin without reading it), but not while it prepares
+one, which can take seconds for a large `configuration`. A check is judged by what lspcheck saw:
+
+- An exit it saw by the deadline is judged by the exit status.
+- An exit it saw only after the deadline, when it last saw the server running before it, is `error`, with both
+  times: lspcheck can't tell which side of the deadline the server exited on.
+- A server it saw running at or after the deadline fails L6 or L7, unless the server may have been waiting on
+  lspcheck. It may have been if it sent a request, read before the deadline, whose answer lspcheck hadn't finished
+  writing by then: one still queued or being decoded at the deadline, one whose answer lspcheck couldn't write, or one
+  it left unanswered. It may also have been if lspcheck missed some of its output (a frame it skipped or couldn't
+  read, or reading that stopped), which may have held such a request. Either makes the check `error`, naming the
+  request if there is one. Both are known only once the session has ended, so this verdict is settled after cleanup;
+  a frame that began before the deadline but was only found truncated at the end of stdout also makes it `error`.
+
+For L9, once the server has exited (by itself; a scenario where lspcheck had to stop it doesn't count), lspcheck
+searches for its descendants: the members of its process group, every process descended from one of them whatever its
+group (so a child that called `setsid` is found while its parent lives), and on Linux, where lspcheck is a child
+subreaper, processes reparented to lspcheck and their descendants. Group members and reparented processes are certain.
+A process found only through its parent is not: a listing of processes isn't taken at one instant, and a pid read as a
+parent may meanwhile pass to an unrelated process. On Linux such a process is confirmed once a second listing, begun
+after the first, shows the same parent (same pid and start time, in clock ticks since boot, which the wall clock
+doesn't move), still a group member or reparented if it was one, still named by the same child, and the child didn't
+start before the parent. While links keep changing, lspcheck lists again, a few times at most; what it confirmed
+meanwhile stays confirmed, and what it couldn't stays unconfirmed. On macOS `ps` gives start times only to the second,
+from a wall clock that may be stepped, which can't show that a pid stayed with one process, so a process found only
+through its parent is never confirmed there. L9 fails on a confirmed process whose name isn't allowed; when only
+unconfirmed processes are left, it is `error`, naming them and why their links weren't confirmed. Every search has one
+deadline, 5 s after the grace: no listing starts after it, and each `ps` run gets at most 5 s and no more than the time
+left. A listing already under way finishes, and a `ps` run that times out is given up to another second to be reaped,
+so a search can end a little past its deadline, but always within a bound. The final cleanup sweep keeps scanning
+for up to 2 s, retrying a listing that fails, and notes in the transcript if none worked. On macOS lspcheck reads at most 16 MiB of `ps`'s output; more, or a read cut short, makes the search fail.
+It searches again until it finds none or the 1 s grace has passed. A process counts as left behind only if a search
+begun once the grace is over still finds it, since one begun earlier may have seen a process that exited before the
+grace ended. For the same reason a search that fails earlier is tried again, and only the failure of one begun once
+the grace is over makes L9 `error`, unless another scenario showed a leftover. Allowed names are applied to each
+process found, confirmed or not.
 
 ### Cancellation
 | ID | Basis | Check |

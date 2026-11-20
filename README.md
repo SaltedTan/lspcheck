@@ -432,8 +432,12 @@ server's message, rather than as a failure; a [profile](#profiles) can give the 
 ## Platforms
 
 lspcheck runs on Linux, macOS and Windows. L9 finds the server's leftover processes through its process group on Linux
-and macOS. On Linux lspcheck also makes itself a child subreaper, so it finds descendants that left the group with
-`setsid`. On macOS such a descendant can't be seen, and the L9 result says so. On Windows L9 reports `N/E` for now.
+and macOS, together with every process descended from a member, so a descendant that left the group with `setsid` is
+found while its parent lives. On Linux lspcheck confirms that such a descendant is the server's by listing processes
+again, and also makes itself a child subreaper, so it finds the descendant after its parent has exited too. On macOS
+it can't confirm the link, since the parent's pid may have passed to another process, so the descendant makes L9
+`error` rather than fail it; once its parent has exited it can't be seen, and the L9 result says so. On Windows L9
+reports `N/E` for now.
 
 ## Development
 

@@ -154,6 +154,16 @@ const FAULTS: &[(&str, &str)] = &[
         "half-frame-in-leftover",
         "on exit, leave behind a child that has written part of a frame to stdout and stays running, and exit",
     ),
+    (
+        "request-with-initialize-result",
+        "answer initialize with no capabilities and, in the same write, ask window/workDoneProgress/create; on exit, \
+         exit only once it is answered",
+    ),
+    (
+        "answer-stuck-on-exit",
+        "on exit, leave behind a child holding stdin without reading it, ask a workspace/configuration request whose \
+         answer is bigger than a pipe holds, and exit as usual once lspcheck begins writing the answer",
+    ),
     ("split-header", "drop input when a read ends inside a header section, as if each header came in one read"),
     ("split-utf8", "decode each read as UTF-8 on its own, mangling characters split across reads"),
     (
@@ -447,6 +457,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("slow-reads", "lawful: pause 30 ms before each read of stdin"),
     ("orphan-child", "start a child process that outlives the server"),
     ("escaped-child", "start a child in a new session, with a non-UTF-8 name, that outlives the server"),
+    (
+        "nested-escaped-child",
+        "start a child that starts one of its own in a new session, with a non-UTF-8 name; both outlive the server",
+    ),
     ("empty-selection", "lawful: an empty range at each position, parent the whole line"),
     ("selection-outside", "the range is the word before the position, still on a boundary"),
     ("selection-short", "one entry fewer than the positions"),
@@ -520,6 +534,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("--child") => return child(false),
         Some("--escaped-child") => return child(true),
+        Some("--nested-child") => return nested_child(),
         Some("--relay") => return relay(args[1].parse().unwrap()),
         Some("--reply-after-input") => return reply_after_input(&args[1]),
         Some("--half-frame-child") => return half_frame_child(),
@@ -627,6 +642,8 @@ fn main() {
     let mut reused_id = false;
     // For needs-configuration: whether the client gave the setting it needs.
     let mut configured = !fault("needs-configuration");
+    // For request-with-initialize-result: whether its request was answered.
+    let mut with_result_answered = false;
     let mut children: Vec<Child> = Vec::new();
     // The text of each open document, with the version it was last sent at,
     // and how positions are counted.
@@ -743,6 +760,7 @@ fn main() {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
         // An answer to one of this server's own requests: nothing to do.
         if msg.get("method").is_none() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+            with_result_answered |= msg.get("id").is_some_and(|id| id == "with-result");
             // Once the first progress request is answered, its id is free again.
             if fault("reuse-answered-request-id") && !reused_id && msg.get("id") == Some(&json!(1)) {
                 reused_id = true;
@@ -1295,6 +1313,25 @@ fn main() {
                     ready.read_exact(&mut line).unwrap();
                     assert_eq!(&line, b"ready\n");
                 }
+                if fault("request-with-initialize-result") {
+                    // Like a server that finishes what it began before it exits.
+                    while !with_result_answered {
+                        let Some((_, body)) = input.next() else { break };
+                        with_result_answered = serde_json::from_slice::<Value>(&body).is_ok_and(|v| {
+                            v.get("method").is_none() && v.get("id").is_some_and(|id| id == "with-result")
+                        });
+                    }
+                }
+                if fault("answer-stuck-on-exit") {
+                    // Once this process is gone, the child keeps the answer
+                    // from being written whole. Exit only after lspcheck has
+                    // begun writing it (its id is in the first bytes), so it
+                    // is still writing when this process exits.
+                    children.push(spawn_child("--child", Stdio::inherit()));
+                    let items = vec![json!({}); 100_000];
+                    out.frame(&json!({"jsonrpc": "2.0", "id": "exit-config", "method": "workspace/configuration", "params": {"items": items}}));
+                    while find(&input.buf, b"\"exit-config\"").is_none() && input.fill() {}
+                }
                 let status = if fault("exit-status") {
                     3
                 } else if shut_down {
@@ -1446,10 +1483,13 @@ fn main() {
                 }));
             }
             if fault("orphan-child") {
-                children.push(spawn_child("--child"));
+                children.push(spawn_child("--child", Stdio::null()));
             }
             if fault("escaped-child") {
-                children.push(spawn_child("--escaped-child"));
+                children.push(spawn_child("--escaped-child", Stdio::null()));
+            }
+            if fault("nested-escaped-child") {
+                children.push(spawn_child("--nested-child", Stdio::null()));
             }
             if fault("flood") || fault("big-frame") {
                 let (count, size) = if fault("flood") { (8, 256 * 1024) } else { (1, 2 * 1024 * 1024) };
@@ -1603,6 +1643,14 @@ fn main() {
             if fault("parse-error-with-initialize") {
                 let mut bytes = out.encode(&ok(&id, result));
                 bytes.extend(out.encode(&err(&Value::Null, -32700, "early parse error")));
+                out.raw(&bytes);
+            } else if fault("request-with-initialize-result") {
+                // Small enough to be written at once (PIPE_BUF is 512 bytes
+                // on macOS), so the client reads the request with the result,
+                // before it can send exit.
+                let mut bytes = out.encode(&ok(&id, json!({"capabilities": {}})));
+                bytes.extend(out.encode(&json!({"jsonrpc": "2.0", "id": "with-result", "method": "window/workDoneProgress/create", "params": {"token": "t"}})));
+                assert!(bytes.len() <= 512);
                 out.raw(&bytes);
             } else {
                 out.frame(&ok(&id, result));
@@ -2721,6 +2769,16 @@ fn child(escape: bool) {
     std::thread::sleep(std::time::Duration::from_secs(60));
 }
 
+/// A leftover child that first starts a leftover of its own in a new session
+/// (as `--escaped-child`, which sleeps for a minute), then signals that it's
+/// ready and waits for it.
+fn nested_child() {
+    let mut escaped = spawn_child("--escaped-child", Stdio::null());
+    println!("ready");
+    let _ = std::io::stdout().flush();
+    let _ = escaped.wait();
+}
+
 /// Has a process that isn't one of lspcheck's hold stdout open: writes this
 /// process's id to `pid` in the directory LSPCHECK_STANDIN_HOLD names, and
 /// waits until `held` appears there, which the holder creates once it has
@@ -2777,11 +2835,11 @@ fn relay(parent: u32) {
     out.flush().unwrap();
 }
 
-/// Starts a leftover child and waits until it has set itself up.
-fn spawn_child(arg: &str) -> Child {
+/// Starts a leftover child with `stdin` and waits until it has set itself up.
+fn spawn_child(arg: &str, stdin: Stdio) -> Child {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg(arg)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
