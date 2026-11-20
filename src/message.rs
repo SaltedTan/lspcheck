@@ -279,6 +279,13 @@ impl Message {
             _ => None,
         }
     }
+
+    /// Whether this is a response with a `result` or an `error`. One with
+    /// neither carries an id but answers nothing.
+    pub fn is_answer(&self) -> bool {
+        matches!(self.kind, Kind::Response { .. })
+            && (self.value.get("result").is_some() || self.value.get("error").is_some())
+    }
 }
 
 fn classify_object(obj: &Map<String, Value>) -> Kind {
@@ -493,6 +500,11 @@ mod tests {
             Kind::Response { outcome: Outcome::Malformed(_), .. }
         ));
         assert!(matches!(k(r#"{"id":1,"result":null}"#), Kind::Invalid(_)));
+        let answer = |s: &str| Message::parse(s.as_bytes()).unwrap().is_answer();
+        assert!(answer(r#"{"jsonrpc":"2.0","id":1,"result":null}"#));
+        assert!(answer(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"x"}}"#));
+        assert!(!answer(r#"{"jsonrpc":"2.0","id":1}"#));
+        assert!(!answer(r#"{"jsonrpc":"2.0","method":"m"}"#));
         assert!(matches!(k(r#"[]"#), Kind::Invalid(_)));
         assert!(Message::parse(b"{").is_err());
     }

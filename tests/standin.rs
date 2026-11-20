@@ -991,8 +991,8 @@ fn verdicts_reached_before_a_frame_was_found_cut_short_are_inconclusive() {
     // is inconclusive where every such stream ends because lspcheck stops it.
     for (f, ids, f1) in [
         // The frame starts at shutdown, before the cancellation scenario's
-        // window ends; C1's ends at the cancel, earlier.
-        ("inflated-before-shutdown", &["C2", "C3"][..], "fail"),
+        // window ends; it may have held a second answer for C1.
+        ("inflated-before-shutdown", &["C1", "C2", "C3"][..], "fail"),
         // The frame starts at the change, while document A is open.
         ("inflated-on-change", &["D1", "D2", "D3", "D5", "D6"][..], "error"),
         // The frame swallows the framing scenario's plain request, which
@@ -1008,10 +1008,6 @@ fn verdicts_reached_before_a_frame_was_found_cut_short_are_inconclusive() {
             "{f}\n{}",
             r.stdout
         );
-        if f == "inflated-before-shutdown" {
-            // C1's window ended at the cancel, before the frame began.
-            expect(&r, "C1", "pass");
-        }
         expect(&r, "F1", f1);
         for (id, v) in &r.verdicts {
             if id != "F1" {
@@ -1340,6 +1336,16 @@ fn negative_integer_ids_must_get_a_response() {
     only_fails(&r, &["R4"]);
     expect(&r, "R4", "fail");
     assert!(r.stdout.contains("-1"), "{}", r.stdout);
+}
+
+#[test]
+fn an_odd_id_answered_with_neither_result_nor_error_fails_r4() {
+    // The message carries id 0 but answers nothing (and is malformed, J5).
+    let r = fault("no-outcome-for-id-zero");
+    only_fails(&r, &["R4", "J5"]);
+    let r4 = detail(&r, "R4");
+    assert!(r4.starts_with("delivered request id(s) 0 got no response with the exact id"), "{r4}");
+    assert!(r4.contains("id(s) 0 got a message with the id but neither \"result\" nor \"error\""), "{r4}");
 }
 
 #[test]
@@ -1779,9 +1785,45 @@ fn a_cancelled_request_still_gets_exactly_one_response() {
 }
 
 #[test]
+fn a_message_with_neither_result_nor_error_doesnt_answer_a_cancelled_request() {
+    // It carries the request's id, but no outcome: the request is never
+    // answered (C1), and the message is malformed (J5).
+    let r = fault("cancelled-no-outcome");
+    only_fails(&r, &["C1", "J5"]);
+    let c1 = detail(&r, "C1");
+    assert!(c1.contains("no response after $/cancelRequest"), "{c1}");
+    assert!(c1.contains("a message with its id came, but with neither \"result\" nor \"error\""), "{c1}");
+}
+
+#[test]
+fn a_late_second_answer_to_the_cancelled_request_fails_c1_not_c2() {
+    // The second answer comes at shutdown, after every cancel C2 sent. None
+    // of them named the cancelled request, so it is C1's finding (and a
+    // duplicate for J2), not a reply to C2's cancels.
+    let r = fault("late-duplicate-cancelled-answer");
+    only_fails(&r, &["C1", "J2"]);
+    assert!(detail(&r, "C1").contains("answered twice"), "{}", r.stdout);
+}
+
+#[test]
+fn c2_cancels_a_finished_request_of_its_own_even_when_c1s_goes_unanswered() {
+    // C1's request is never answered, but the plain request after it is, and
+    // C2 cancels that one. The reply to its cancel is also a second response
+    // to it (J2).
+    let r = run(&["--fault", "cancelled-no-reply", "--fault", "cancel-finished-reply"], &[]);
+    only_fails(&r, &["C1", "C2", "J2"]);
+    assert!(detail(&r, "C2").contains("for a finished request"), "{}", r.stdout);
+    // A reply that repeats the finished request's first answer may be a late
+    // duplicate rather than a reply to the cancel: J2 fails it, C2 can't say.
+    let r = run(&["--fault", "cancelled-no-reply", "--fault", "cancel-finished-repeat"], &[]);
+    passes_except(&r, &[("C1", "fail"), ("C2", "error"), ("J2", "fail")]);
+    assert!(detail(&r, "C2").contains("the same as its first answer"), "{}", r.stdout);
+}
+
+#[test]
 fn cancelling_an_unknown_or_finished_request_produces_nothing() {
     // Holding R's reply keeps C1's cancel from reaching a finished request, so
-    // these faults act only on C2's unknown id. That id was reserved by
+    // these faults act only on C2's cancels. The unknown id was reserved by
     // `fresh_id` but never sent, so the reply also carries an id lspcheck never
     // sent: J2's rule, as well as C2's.
     let r = run(&["--fault", "defer-until-next", "--fault", "cancel-unknown-reply"], &[]);
@@ -1854,6 +1896,16 @@ fn c3_counts_only_id_less_replies_read_after_the_first_cancel() {
     );
     // A malformed answer to shutdown still carries shutdown's id.
     expect(&fault("shutdown-no-jsonrpc"), "C3", "pass");
+}
+
+#[test]
+fn c3_counts_only_an_error_message_naming_the_cancel() {
+    // An id-less error read after the first cancel mentions cancelRequest
+    // only in its data. That doesn't say it answers a cancel rather than
+    // `initialized`, so C3 can't be judged; it answers a notification either
+    // way (J3).
+    let r = fault("cancel-decoy");
+    passes_except(&r, &[("C3", "error"), ("J3", "fail")]);
 }
 
 #[test]

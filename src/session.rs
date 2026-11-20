@@ -749,6 +749,18 @@ impl Session {
         pause: Duration,
         deadline: Instant,
     ) -> Result<(), WriteError> {
+        self.write_pieces(bytes, cuts, pause, deadline).await.map(drop)
+    }
+
+    /// [`Session::write_split`], returning when each piece began: nothing the
+    /// server sent before then can be about that piece.
+    pub async fn write_pieces(
+        &mut self,
+        bytes: &[u8],
+        cuts: &[usize],
+        pause: Duration,
+        deadline: Instant,
+    ) -> Result<Vec<Duration>, WriteError> {
         let deadline = deadline.min(Instant::now() + self.opts.write_timeout);
         let began = self.start.elapsed();
         if self.abandoned.is_some() {
@@ -760,6 +772,7 @@ impl Session {
             cuts.iter().copied().filter(|&c| c > 0 && c < bytes.len()).chain([bytes.len()]).collect();
         // The piece being written: where it starts and when it began.
         let (mut written, mut piece, mut piece_at, mut piece_seq) = (0usize, 0usize, start.elapsed(), next_seq());
+        let mut pieces = Vec::with_capacity(ends.len());
         let result = timeout_at(deadline, async {
             for (i, &end) in ends.iter().enumerate() {
                 if end <= written {
@@ -769,6 +782,7 @@ impl Session {
                     sleep(pause).await;
                 }
                 (piece_at, piece_seq) = (start.elapsed(), next_seq());
+                pieces.push(piece_at);
                 while written < end {
                     let n = stdin.write(&bytes[written..end]).await?;
                     if n == 0 {
@@ -788,7 +802,7 @@ impl Session {
         }
         self.written += written as u64;
         let outcome = match result {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => Ok(pieces),
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                 self.stdin = None;
                 Err(WriteError::Closed)
@@ -1019,6 +1033,9 @@ impl Session {
             self.answered_methods.insert(self.messages.len() - 1, method.clone());
         }
         match self.pending.get(id) {
+            // One with neither `result` nor `error` answers nothing, so the
+            // request stays outstanding (J5 judges the message itself).
+            Some(&sent) if at >= sent && !m.is_answer() => {}
             Some(&sent) if at >= sent => {
                 self.pending.remove(id);
                 self.answers.insert(id.clone(), self.messages.len() - 1);

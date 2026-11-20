@@ -172,8 +172,20 @@ const FAULTS: &[(&str, &str)] = &[
     ("cancelled-no-reply", "never answer a deferred request that is cancelled"),
     ("cancelled-reply-twice", "answer a cancelled request with both -32800 and a result"),
     ("cancelled-other-error", "lawful: answer a cancelled request with InternalError (-32603)"),
+    ("cancelled-no-outcome", "answer a cancelled request with only \"jsonrpc\" and its id, neither result nor error"),
+    ("late-duplicate-cancelled-answer", "answer a cancelled request with -32800 again just before answering shutdown"),
     ("cancel-unknown-reply", "answer a $/cancelRequest for an id that isn't pending with an error carrying it"),
     ("stop-after-unknown-cancel", "stop answering requests after a $/cancelRequest for an id that isn't pending"),
+    ("cancel-finished-reply", "answer a $/cancelRequest for a request already answered with -32800 carrying its id"),
+    (
+        "cancel-finished-repeat",
+        "answer a $/cancelRequest for a request already answered by repeating a probe's MethodNotFound answer",
+    ),
+    (
+        "cancel-decoy",
+        "after the first $/cancelRequest, send an error with id null that names cancelRequest only in its data",
+    ),
+    ("no-outcome-for-id-zero", "answer a request with id 0 with only \"jsonrpc\" and the id, neither result nor error"),
     ("reply-to-cancel", "answer every $/cancelRequest with an error whose id is null"),
     ("late-cancel-replies", "send what the cancel faults send only after answering the next request"),
     ("big-cancel-replies", "pad what the cancel faults send with 2 MiB of error data"),
@@ -487,6 +499,8 @@ fn main() {
         "cancelled-no-reply",
         "cancelled-reply-twice",
         "cancelled-other-error",
+        "cancelled-no-outcome",
+        "late-duplicate-cancelled-answer",
         "inflated-on-cancel",
     ]
     .iter()
@@ -518,6 +532,12 @@ fn main() {
     // What the cancel faults send, and where: now, or after the next answer.
     let mut cancel_out =
         CancelOut { late: fault("late-cancel-replies"), big: fault("big-cancel-replies"), held: Vec::new() };
+    // For late-duplicate-cancelled-answer: the answer to send again at shutdown.
+    let mut cancelled_again: Option<Value> = None;
+    // The ids of the requests read, for the faults about cancelling a finished one.
+    let mut requests_seen: Vec<Value> = Vec::new();
+    // For cancel-decoy: whether the decoy is still to be sent.
+    let mut decoy = fault("cancel-decoy");
     // Set when cancelled-no-reply drops a request, for big-frame-after-drop.
     let mut dropped = false;
     // For initialized-reply-after-cancel: a reply to `initialized` not sent yet.
@@ -683,11 +703,16 @@ fn main() {
                     dropped = true;
                 } else if fault("cancelled-other-error") {
                     out.frame(&err(&deferred_id, -32603, "internal error"));
+                } else if fault("cancelled-no-outcome") {
+                    out.frame(&json!({"jsonrpc": "2.0", "id": deferred_id}));
                 } else {
                     if fault("inflated-on-cancel") {
                         out.raw(b"Content-Length: 2097152\r\n\r\n{\"jsonrpc\":\"2.0\",");
                     }
                     out.frame(&err(&deferred_id, -32800, "request cancelled"));
+                    if fault("late-duplicate-cancelled-answer") {
+                        cancelled_again = Some(err(&deferred_id, -32800, "request cancelled"));
+                    }
                     if fault("big-frame-on-cancel") {
                         let text = "x".repeat(2 * 1024 * 1024);
                         out.frame(&json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}));
@@ -719,6 +744,20 @@ fn main() {
                     && fault("cancel-unknown-reply")
                 {
                     cancel_out.send(&mut out, err(cancelled, -32800, "request cancelled"));
+                }
+                if let Some(cancelled) = msg.pointer("/params/id").filter(|id| requests_seen.contains(id)) {
+                    if fault("cancel-finished-reply") {
+                        cancel_out.send(&mut out, err(cancelled, -32800, "request cancelled"));
+                    }
+                    if fault("cancel-finished-repeat") {
+                        cancel_out.send(&mut out, err(cancelled, -32601, "method not found"));
+                    }
+                }
+                if std::mem::take(&mut decoy) {
+                    // An unrelated error that only mentions cancellation in passing.
+                    let mut reply = err(&Value::Null, -32603, "internal error");
+                    reply["error"]["data"] = json!({"feature": "cancelRequest statistics"});
+                    out.frame(&reply);
                 }
                 if fault("stop-after-unknown-cancel") {
                     no_more_answers = true;
@@ -1169,6 +1208,7 @@ fn main() {
             }
             continue;
         };
+        requests_seen.push(id.clone());
         if no_more_answers {
             continue;
         }
@@ -1514,6 +1554,10 @@ fn main() {
             deferred = Some(id.clone());
             continue;
         }
+        if fault("no-outcome-for-id-zero") && id == json!(0) {
+            out.frame(&json!({"jsonrpc": "2.0", "id": id}));
+            continue;
+        }
         if fault("oversized-reply-to-id-zero") && method == "lspcheck/probe" && id == json!(0) {
             out.frame(&err(&id, -32601, &"x".repeat(2 * 1024 * 1024 + 1)));
             continue;
@@ -1564,6 +1608,11 @@ fn main() {
             reply["error"]["data"] = json!("x".repeat(2 * 1024 * 1024));
             out.frame(&reply);
             std::process::exit(0);
+        }
+        if method == "shutdown"
+            && let Some(again) = cancelled_again.take()
+        {
+            out.frame(&again);
         }
         if method == "shutdown"
             && let Some(rest) = unfinished.take()
