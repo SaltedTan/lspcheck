@@ -6597,11 +6597,12 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
 /// The position encodings lspcheck offers unless a profile changes them.
 const OFFERED_ENCODINGS: [&str; 3] = ["utf-8", "utf-32", "utf-16"];
 
-/// The string entries of `capabilities.general.positionEncodings` in these
-/// `initialize` params: none when it is absent or not an array.
+/// The `capabilities.general.positionEncodings` in these `initialize`
+/// params: none when it is absent or not an array of strings.
 fn offered_encodings(params: &Value) -> Vec<String> {
     let offer = params.pointer("/capabilities/general/positionEncodings").and_then(Value::as_array);
-    offer.into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect()
+    let names = offer.and_then(|o| o.iter().map(|v| v.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>());
+    names.unwrap_or_default()
 }
 
 /// L2's verdict and detail on an initialize result, given the
@@ -7382,6 +7383,9 @@ mod tests {
         assert_eq!(judge_l2(&utf8, &default), (Verdict::Pass, String::new()));
         // An offer that isn't an array of strings offers nothing.
         assert!(offered_encodings(&json!({"capabilities": {"general": {"positionEncodings": "utf-8"}}})).is_empty());
+        assert!(
+            offered_encodings(&json!({"capabilities": {"general": {"positionEncodings": ["utf-8", 7]}}})).is_empty()
+        );
         assert_eq!(judge_l2(&utf8, &[]).0, Verdict::Fail);
     }
 
