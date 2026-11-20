@@ -4,10 +4,10 @@
 
 ### Fixed
 
-- A message with a request's id but neither `result` nor `error` no longer counts as that request's response. It
-  still fails J5, and the request now stays unanswered for every check waiting on it. **C1** and **R4** therefore
-  go from `pass` to `fail` when nothing else answers the request (or to `error` when lspcheck missed output while
-  waiting), and their detail says that such a message came.
+- **C1** and **R4** no longer pass when the server answers their request with a message carrying the id but
+  neither `result` nor `error`. Such a message still fails J5; C1 and R4 now fail too, and their detail says such a
+  message came. Other checks still take it as the request's reply, so one malformed reply doesn't stall every later
+  wait.
 - **C2** now cancels a plain request of its own that the server has already answered, rather than C1's cancelled
   request. A second response to C1's request now fails **C1** whenever it arrives before `exit`; it used to fail C2
   instead when it came after C2's cancels. C2 no longer passes after cancelling only an id never sent when C1's

@@ -91,9 +91,9 @@ null-id ParseError; a frame lspcheck skipped or couldn't read since `initialized
 error. A frame
 lspcheck couldn't read anywhere (F1) also makes a J1, J2, J5 or J7 pass an error: it might have held what they judge.
 
-A message with a request's id but neither `result` nor `error` carries the id but answers nothing. J5 fails it, and
-every check that waits for a response treats the request as still unanswered; C1 and R4 say in their detail that such
-a message came.
+A message with a request's id but neither `result` nor `error` ends lspcheck's wait for that request, so one such
+reply doesn't stall the waits after it. J5 fails it, and C1 and R4, which ask for a result or an error, fail on it
+too and say so in their detail.
 
 J7 treats an earlier request as unanswered when lspcheck never wrote its whole answer. For a completed answer,
 J7 times a reuse against when lspcheck began writing it: only a request read before then was certainly sent before
@@ -162,7 +162,8 @@ given at the end, over everything read before `exit` was sent:
 If the server stopped answering, what it didn't send can't be judged, so those checks are `error`. A pass is also
 `error` when lspcheck missed something where that check's evidence would be: a frame it skipped or couldn't read, a
 server request it couldn't answer (the server may be waiting for it), or reading that stopped. For C1 and C3 that is
-from the cancelled request, and for C2 from its first cancel, each until `exit`. A missing response is excused only by something missed while lspcheck was waiting for it.
+from the cancelled request, and for C2 from its first cancel, each until `exit`. A missing response is excused only
+by something missed while lspcheck was waiting for it.
 
 lspcheck times what it missed as spans, from the arrival of the first byte it couldn't inspect to the moment it knew
 it had missed them, so a frame that began before a wait and ended after it still counts for that wait. Reading stops,

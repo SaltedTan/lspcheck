@@ -1777,6 +1777,13 @@ async fn odd_ids(ctx: &mut Ctx<'_>) -> bool {
     for (index, id) in ids.iter().enumerate() {
         let sent = ctx.s.elapsed();
         match ctx.s.call_with_id(id, PROBE, Some(json!({})), t).await {
+            // A message with the id but neither `result` nor `error` ends the
+            // wait (J5 judges its envelope), but it answers nothing.
+            Ok(m) if !m.is_answer() => {
+                missing.push(describe_odd_id(id));
+                missing_windows.push((sent, ctx.s.elapsed()));
+                outcomeless.push(describe_odd_id(id));
+            }
             Ok(_) => {}
             Err(CallError::Wait(error)) => {
                 missing.push(describe_odd_id(id));
@@ -2937,6 +2944,12 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     // A pass that assumed nothing was missed: rechecked at the end.
     let mut c1_again = None;
     let c1 = match (&answer, first) {
+        // It ended the wait (J5 judges its envelope), but it is neither a
+        // result nor an error, so it isn't the response C1 asks for.
+        (Ok(m), _) if !m.is_answer() => {
+            let at = outcomeless_at(msgs, &r, written_at).unwrap_or(r_waited);
+            (Verdict::Fail, format!("{which}: no response after $/cancelRequest; {}", describe_outcomeless(at)))
+        }
         (Err(wait), _) => {
             let e = CallError::Wait(*wait);
             let mut why = format!("{which}: no response after $/cancelRequest ({})", describe_call_error(&e, t));

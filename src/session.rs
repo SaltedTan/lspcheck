@@ -1033,9 +1033,6 @@ impl Session {
             self.answered_methods.insert(self.messages.len() - 1, method.clone());
         }
         match self.pending.get(id) {
-            // One with neither `result` nor `error` answers nothing, so the
-            // request stays outstanding (J5 judges the message itself).
-            Some(&sent) if at >= sent && !m.is_answer() => {}
             Some(&sent) if at >= sent => {
                 self.pending.remove(id);
                 self.answers.insert(id.clone(), self.messages.len() - 1);
