@@ -4,20 +4,25 @@
 
 ### Fixed
 
-- **C1** and **R4** no longer pass when the server answers their request with a message carrying the id but
-  neither `result` nor `error`. Such a message still fails J5; C1 and R4 now fail too, and their detail says such a
-  message came. Other checks still take it as the request's reply, so one malformed reply doesn't stall every later
-  wait.
-- **C2** now cancels a plain request of its own that the server has already answered, rather than C1's cancelled
-  request. A second response to C1's request now fails **C1** whenever it arrives before `exit`; it used to fail C2
-  instead when it came after C2's cancels. C2 no longer passes after cancelling only an id never sent when C1's
-  request went unanswered: it now tests both cases. If the reply to the cancel of the finished request repeats that
-  request's first answer exactly, C2 is `error`, since it may be a late duplicate (which J2 fails). C1 now watches
-  for a second response until `exit`, so output lspcheck missed anywhere in that span makes a C1 pass `error`.
-- **C3** now fails only on a response without an id whose error `message` names `$/cancelRequest`, read after
-  lspcheck began writing the first cancel. One that mentions cancelRequest anywhere else, such as in its error
-  `data`, now gives `error` rather than `fail`, like other responses without an id. One read before the cancel was
-  written no longer counts for C3 at all (J3 still judges it).
+- **C1** and **R4** no longer pass when the server answers their request with a message carrying the id but no
+  well-formed outcome: neither `result` nor `error`, both, or an `error` that isn't an object. Such a message still
+  fails J5. C1 and R4 now wait past it for a proper answer with that id until the request's deadline, and fail only if
+  none comes and they read the whole wait; their detail then says such a message came. Other checks still take it as
+  the request's reply, so one malformed reply doesn't stall every later wait. R4 no longer calls such an answer, which
+  carries the exact id, "likely id mangling".
+- **C2** now cancels a plain request of its own that the server has already answered with a result or an error, rather
+  than C1's cancelled request. A second response to C1's request now fails **C1** whenever it arrives before `exit`;
+  it used to fail C2 instead when it came after C2's cancels. C2 no longer passes after cancelling only an id never
+  sent when C1's request went unanswered: it now tests both cases. A response with the finished request's id after
+  its cancel makes C2 `error`, since it may be a late second answer (which J2 fails), unless it is a RequestCancelled
+  error, which fails C2. If the plain request got only a message with its id, C2 doesn't cancel it, since it may still
+  be pending, and is `error` unless cancelling the unknown id fails it. C1 now watches for a second response until
+  `exit`, so output lspcheck missed anywhere in that span makes a C1 pass `error`.
+- **C3** now fails only on a response without an id whose error `message` names `$/cancelRequest` as a whole word, not
+  as part of a longer name such as `$/cancelRequestMetrics`, read after lspcheck began writing the first cancel. One
+  that mentions cancelRequest anywhere else, such as in its error `data`, now gives `error` rather than `fail`, like
+  other responses without an id. One read before the cancel was written no longer counts for C3 at all (J3 still
+  judges it).
 
 ## 0.6.0 (2026-11-19)
 
