@@ -991,8 +991,8 @@ fn verdicts_reached_before_a_frame_was_found_cut_short_are_inconclusive() {
     // is inconclusive where every such stream ends because lspcheck stops it.
     for (f, ids, f1) in [
         // The frame starts at shutdown, before the cancellation scenario's
-        // window ends; C1's ends at the cancel, earlier.
-        ("inflated-before-shutdown", &["C2", "C3"][..], "fail"),
+        // window ends; it may have held a second answer for C1.
+        ("inflated-before-shutdown", &["C1", "C2", "C3"][..], "fail"),
         // The frame starts at the change, while document A is open.
         ("inflated-on-change", &["D1", "D2", "D3", "D5", "D6"][..], "error"),
         // The frame swallows the framing scenario's plain request, which
@@ -1008,10 +1008,6 @@ fn verdicts_reached_before_a_frame_was_found_cut_short_are_inconclusive() {
             "{f}\n{}",
             r.stdout
         );
-        if f == "inflated-before-shutdown" {
-            // C1's window ended at the cancel, before the frame began.
-            expect(&r, "C1", "pass");
-        }
         expect(&r, "F1", f1);
         for (id, v) in &r.verdicts {
             if id != "F1" {
@@ -1340,6 +1336,60 @@ fn negative_integer_ids_must_get_a_response() {
     only_fails(&r, &["R4"]);
     expect(&r, "R4", "fail");
     assert!(r.stdout.contains("-1"), "{}", r.stdout);
+}
+
+#[test]
+fn an_odd_id_answered_with_neither_result_nor_error_fails_r4() {
+    // The message carries id 0 but answers nothing (and is malformed, J5).
+    let r = fault("no-outcome-for-id-zero");
+    only_fails(&r, &["R4", "J5"]);
+    let r4 = detail(&r, "R4");
+    assert!(r4.starts_with("delivered request id(s) 0 got no response with the exact id"), "{r4}");
+    assert!(r4.contains("id(s) 0 got only a message with the id but no well-formed"), "{r4}");
+    // An "error" that isn't an object is no outcome either.
+    let r = fault("null-error-for-id-zero");
+    only_fails(&r, &["R4", "J5"]);
+    assert!(detail(&r, "R4").starts_with("delivered request id(s) 0 got no response"), "{}", r.stdout);
+}
+
+#[test]
+fn an_answer_after_a_message_with_only_the_id_satisfies_r4() {
+    // The first message carries id 0 but no outcome (J5), and the answer
+    // after it is a second response to the request (J2). R4 waits past the
+    // first for the answer.
+    let r = fault("no-outcome-then-answer-id-zero");
+    only_fails(&r, &["J2", "J5"]);
+    // When another id goes unanswered, the answer to id 0, which carries it
+    // exactly, isn't taken for a mangled id.
+    let r = run(&["--fault", "no-outcome-then-answer-id-zero", "--fault", "drops-negative-ids"], &["--only", "R4"]);
+    expect(&r, "R4", "fail");
+    let r4 = detail(&r, "R4");
+    assert!(r4.starts_with("delivered request id(s) -1, -2147483648 got no response"), "{r4}");
+    assert!(!r4.contains("mangling"), "{r4}");
+}
+
+#[test]
+fn a_reply_read_before_its_request_was_sent_doesnt_satisfy_r4() {
+    // The reply for -1 comes with the answer to 0, before lspcheck sends -1,
+    // and -1 itself gets only a message with its id (J5). The early reply
+    // answers nothing lspcheck had sent (J2).
+    let r = fault("early-reply-for-id-minus-one");
+    only_fails(&r, &["R4", "J2", "J5"]);
+    let r4 = detail(&r, "R4");
+    assert!(r4.starts_with("delivered request id(s) -1 got no response with the exact id"), "{r4}");
+}
+
+#[test]
+fn r4_reports_a_mangled_id_that_an_answer_after_only_the_id_shares() {
+    // The empty string id gets a message with only the id, then its answer,
+    // which R4 takes. The non-ASCII id comes back as "" too: that reply is
+    // still a likely mangled id.
+    let r = run(&["--fault", "no-outcome-then-answer-empty-id", "--fault", "mangles-odd-ids"], &["--only", "R4"]);
+    expect(&r, "R4", "fail");
+    let r4 = detail(&r, "R4");
+    assert!(r4.contains(r#"response id(s) "" arrived meanwhile (likely id mangling)"#), "{r4}");
+    // Alone, the pair is J2's and J5's finding, not R4's.
+    only_fails(&fault("no-outcome-then-answer-empty-id"), &["J2", "J5"]);
 }
 
 #[test]
@@ -1779,9 +1829,120 @@ fn a_cancelled_request_still_gets_exactly_one_response() {
 }
 
 #[test]
+fn a_message_with_neither_result_nor_error_doesnt_answer_a_cancelled_request() {
+    // It carries the request's id, but no outcome: the request is never
+    // answered (C1), and the message is malformed (J5).
+    let r = fault("cancelled-no-outcome");
+    only_fails(&r, &["C1", "J5"]);
+    let c1 = detail(&r, "C1");
+    assert!(c1.contains("no response after $/cancelRequest"), "{c1}");
+    assert!(c1.contains("a message with its id came, but it was a response that has neither \"result\" nor"), "{c1}");
+    // Nor does one with both.
+    let r = fault("cancelled-both");
+    only_fails(&r, &["C1", "J5"]);
+    assert!(detail(&r, "C1").contains("but it was a response that has both \"result\" and \"error\""), "{}", r.stdout);
+}
+
+#[test]
+fn an_error_without_a_code_or_message_answers_nothing() {
+    // J5's rules decide what counts as an answer, for C1 and R4 alike.
+    let r = fault("cancelled-empty-error");
+    only_fails(&r, &["C1", "J5"]);
+    assert!(detail(&r, "C1").contains("but it was an error whose code isn't an integer"), "{}", r.stdout);
+    let r = fault("empty-error-for-id-zero");
+    only_fails(&r, &["R4", "J5"]);
+    assert!(detail(&r, "R4").starts_with("delivered request id(s) 0 got no response"), "{}", r.stdout);
+}
+
+#[test]
+fn c1_waits_past_a_message_with_only_the_id_for_the_answer() {
+    // The answer after it satisfies C1. The message is J5's finding, and the
+    // answer is a second response to the request for J2, but not for C1.
+    let r = fault("cancelled-no-outcome-then-answer");
+    only_fails(&r, &["J2", "J5"]);
+    // An answer lspcheck skipped may be the one C1 waits for, so C1 can't
+    // fail; the answer is big, and only the cancellation scenario has it.
+    let r = run(
+        &["--fault", "cancelled-no-outcome-then-answer", "--fault", "big-cancel-replies"],
+        &["--max-frame-mib", "1", "--only", "C1"],
+    );
+    expect(&r, "C1", "error");
+}
+
+#[test]
+fn a_late_second_answer_to_the_cancelled_request_fails_c1_not_c2() {
+    // The second answer comes at shutdown, after every cancel C2 sent. None
+    // of them named the cancelled request, so it is C1's finding (and a
+    // duplicate for J2), not a reply to C2's cancels.
+    let r = fault("late-duplicate-cancelled-answer");
+    only_fails(&r, &["C1", "J2"]);
+    assert!(detail(&r, "C1").contains("answered twice"), "{}", r.stdout);
+}
+
+#[test]
+fn c2_cancels_a_finished_request_of_its_own_even_when_c1s_goes_unanswered() {
+    // C1's request is never answered, but the plain request after it is, and
+    // C2 cancels that one. The reply to its cancel is also a second response
+    // to it (J2), so C2 can't say which it is.
+    let r = run(&["--fault", "cancelled-no-reply", "--fault", "cancel-finished-reply"], &[]);
+    passes_except(&r, &[("C1", "fail"), ("C2", "error"), ("J2", "fail")]);
+    assert!(detail(&r, "C2").contains("for a finished request"), "{}", r.stdout);
+}
+
+#[test]
+fn c2_cant_tell_a_reply_to_a_finished_requests_cancel_from_a_late_duplicate() {
+    // Any second response to the finished request, after its cancel, may be
+    // a late second answer to it: J2 fails it, and C2 can't say.
+    let r = run(&["--fault", "defer-until-next", "--fault", "cancel-finished-other"], &[]);
+    passes_except(&r, &[("C2", "error"), ("J2", "fail")]);
+    assert!(detail(&r, "C2").contains("may be a late second answer"), "{}", r.stdout);
+    // Even RequestCancelled: a server may send one for a request it was
+    // still tidying up after, whatever it answered first.
+    let r = run(&["--fault", "defer-until-next", "--fault", "cancel-finished-reply"], &[]);
+    passes_except(&r, &[("C2", "error"), ("J2", "fail")]);
+    assert!(detail(&r, "C2").contains("error -32800"), "{}", r.stdout);
+}
+
+#[test]
+fn c2_counts_a_request_answered_after_a_message_with_only_its_id_as_finished() {
+    // The plain request C2 cancels first gets a message with its id but no
+    // outcome (J5), then its answer (a second response for J2). It is
+    // finished, so C2 cancels it.
+    let r = fault("no-outcome-then-answer-after-cancelled");
+    passes_except(&r, &[("J2", "fail"), ("J5", "fail")]);
+    assert!(detail(&r, "C2").contains("an id never sent and a finished request"), "{}", r.stdout);
+}
+
+#[test]
+fn c2_fails_when_a_request_after_a_cancel_gets_only_its_id() {
+    // After the cancel of an id never sent, the plain request gets a message
+    // with its id but no outcome (J5) and never an answer.
+    let r = run(&["--fault", "defer-until-next", "--fault", "no-outcome-after-unknown-cancel"], &[]);
+    passes_except(&r, &[("C2", "fail"), ("C3", "error"), ("J5", "fail")]);
+    let c2 = detail(&r, "C2");
+    assert!(c2.contains("stopped answering"), "{c2}");
+    assert!(c2.contains("a message with its id came, but it was a response that has neither"), "{c2}");
+}
+
+#[test]
+fn c2_doesnt_cancel_a_request_that_got_only_its_id() {
+    // The plain request C2 would cancel got a message with its id but no
+    // outcome (J5), so it may still be pending, and a reply to its cancel
+    // would be lawful. C2 cancels only the id never sent.
+    let r = fault("no-outcome-then-cancelled");
+    passes_except(&r, &[("C2", "error"), ("J5", "fail")]);
+    assert!(detail(&r, "C2").starts_with("not exercised for a finished request"), "{}", r.stdout);
+    // That case alone can still fail C2. The reply carries an id never sent
+    // (J2).
+    let r = run(&["--fault", "no-outcome-then-cancelled", "--fault", "cancel-unknown-reply"], &[]);
+    passes_except(&r, &[("C2", "fail"), ("J2", "fail"), ("J5", "fail")]);
+    assert!(detail(&r, "C2").contains("for an id never sent"), "{}", r.stdout);
+}
+
+#[test]
 fn cancelling_an_unknown_or_finished_request_produces_nothing() {
     // Holding R's reply keeps C1's cancel from reaching a finished request, so
-    // these faults act only on C2's unknown id. That id was reserved by
+    // these faults act only on C2's cancels. The unknown id was reserved by
     // `fresh_id` but never sent, so the reply also carries an id lspcheck never
     // sent: J2's rule, as well as C2's.
     let r = run(&["--fault", "defer-until-next", "--fault", "cancel-unknown-reply"], &[]);
@@ -1793,6 +1954,49 @@ fn cancelling_an_unknown_or_finished_request_produces_nothing() {
     expect(&r, "C2", "fail");
     expect(&r, "C3", "error");
     assert!(r.stdout.contains("stopped answering"), "{}", r.stdout);
+}
+
+#[test]
+fn an_answer_after_lspchecks_timeout_but_before_exit_still_answers_the_cancelled_request() {
+    // `--timeout` is lspcheck's own limit: the one answer, sent before the
+    // shutdown reply, still counts, and only once.
+    let r = run(&["--fault", "cancelled-answer-at-shutdown"], &["--only", "C1,C2,C3", "--timeout", "1"]);
+    expect(&r, "C1", "pass");
+}
+
+#[test]
+fn a_request_after_the_cancels_answered_only_after_lspchecks_timeout_leaves_c2_inconclusive() {
+    let r = run(
+        &["--fault", "defer-until-next", "--fault", "answer-probes-at-shutdown"],
+        &["--only", "C1,C2,C3", "--timeout", "1"],
+    );
+    expect(&r, "C2", "error");
+    assert!(detail(&r, "C2").contains("answered only after lspcheck stopped waiting"), "{}", r.stdout);
+    // The server didn't stop answering, so C3 is judged.
+    expect(&r, "C3", "pass");
+}
+
+#[test]
+fn a_late_answer_lspcheck_couldnt_read_leaves_c1_and_c2_inconclusive() {
+    // An answer read before exit would have counted, so one in a frame too
+    // large to read could have been it.
+    let r = run(
+        &["--fault", "cancelled-answer-at-shutdown", "--fault", "big-late-answers"],
+        &["--only", "C1,C2,C3", "--timeout", "1", "--max-frame-mib", "1"],
+    );
+    expect(&r, "C1", "error");
+    let r = run(
+        &["--fault", "defer-until-next", "--fault", "answer-probes-at-shutdown", "--fault", "big-late-answers"],
+        &["--only", "C1,C2,C3", "--timeout", "1", "--max-frame-mib", "1"],
+    );
+    expect(&r, "C2", "error");
+}
+
+#[test]
+fn c3_reads_a_method_not_found_code_by_value() {
+    // -32601.0 is the integer -32601, as J5 reads it.
+    let r = fault("cancel-not-found-float");
+    only_fails(&r, &["C3", "J3"]);
 }
 
 #[test]
@@ -1857,6 +2061,28 @@ fn c3_counts_only_id_less_replies_read_after_the_first_cancel() {
 }
 
 #[test]
+fn c3_counts_only_an_error_message_naming_the_cancel() {
+    // An id-less error read after the first cancel mentions cancelRequest
+    // only in its data. That doesn't say it answers a cancel rather than
+    // `initialized`, so C3 can't be judged; it answers a notification either
+    // way (J3).
+    let r = fault("cancel-decoy");
+    passes_except(&r, &[("C3", "error"), ("J3", "fail")]);
+    // A message naming a longer method that begins with `$/cancelRequest`
+    // doesn't name the cancel either.
+    let r = fault("cancel-lookalike");
+    passes_except(&r, &[("C3", "error"), ("J3", "fail")]);
+}
+
+#[test]
+fn c3_counts_only_a_method_not_found_naming_the_cancel() {
+    // An InternalError naming `$/cancelRequest` may be `initialized` failing
+    // to set up cancellation rather than a reply to a cancel.
+    let r = fault("cancel-named-internal-error");
+    passes_except(&r, &[("C3", "error"), ("J3", "fail")]);
+}
+
+#[test]
 fn a_frame_skipped_during_c1_leaves_c2_judged() {
     // The oversized log comes right after the cancelled request's answer, so
     // it is read before C2's cancels and can't be a reply to them.
@@ -1874,14 +2100,15 @@ fn a_frame_skipped_before_the_cancelled_request_doesnt_excuse_its_absence() {
 }
 
 #[test]
-fn a_frame_skipped_after_a_cancelled_request_went_unanswered_doesnt_excuse_it() {
-    // The oversized frame comes only after lspcheck stopped waiting for the
-    // cancelled request, so it can't have been its answer.
+fn a_frame_skipped_after_a_cancelled_request_went_unanswered_leaves_c1_inconclusive() {
+    // The oversized frame comes after lspcheck stopped waiting for the
+    // cancelled request, but an answer read before exit still counts, so it
+    // could have been one.
     let r = run(
         &["--fault", "cancelled-no-reply", "--fault", "big-frame-after-drop"],
         &["--max-frame-mib", "1", "--timeout", "3"],
     );
-    expect(&r, "C1", "fail");
+    expect(&r, "C1", "error");
     // It is read before C2's cancels, so C2 is still judged.
     expect(&r, "C2", "pass");
 }

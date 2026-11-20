@@ -749,6 +749,18 @@ impl Session {
         pause: Duration,
         deadline: Instant,
     ) -> Result<(), WriteError> {
+        self.write_pieces(bytes, cuts, pause, deadline).await.map(drop)
+    }
+
+    /// [`Session::write_split`], returning when each piece began: nothing the
+    /// server sent before then can be about that piece.
+    pub async fn write_pieces(
+        &mut self,
+        bytes: &[u8],
+        cuts: &[usize],
+        pause: Duration,
+        deadline: Instant,
+    ) -> Result<Vec<Duration>, WriteError> {
         let deadline = deadline.min(Instant::now() + self.opts.write_timeout);
         let began = self.start.elapsed();
         if self.abandoned.is_some() {
@@ -760,6 +772,7 @@ impl Session {
             cuts.iter().copied().filter(|&c| c > 0 && c < bytes.len()).chain([bytes.len()]).collect();
         // The piece being written: where it starts and when it began.
         let (mut written, mut piece, mut piece_at, mut piece_seq) = (0usize, 0usize, start.elapsed(), next_seq());
+        let mut pieces = Vec::with_capacity(ends.len());
         let result = timeout_at(deadline, async {
             for (i, &end) in ends.iter().enumerate() {
                 if end <= written {
@@ -769,6 +782,7 @@ impl Session {
                     sleep(pause).await;
                 }
                 (piece_at, piece_seq) = (start.elapsed(), next_seq());
+                pieces.push(piece_at);
                 while written < end {
                     let n = stdin.write(&bytes[written..end]).await?;
                     if n == 0 {
@@ -788,7 +802,7 @@ impl Session {
         }
         self.written += written as u64;
         let outcome = match result {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => Ok(pieces),
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                 self.stdin = None;
                 Err(WriteError::Closed)
@@ -861,6 +875,17 @@ impl Session {
     /// Whether lspcheck has sent a request with this id in this session.
     pub fn sent(&self, id: &Id) -> bool {
         self.used_ids.contains_key(id)
+    }
+
+    /// When the session registered the request with this id, if it did: no
+    /// response read before then can answer it.
+    pub fn registered_at(&self, id: &Id) -> Option<Duration> {
+        self.used_ids.get(id).copied()
+    }
+
+    /// The indices in `messages` of unmatched responses read at or after `since`.
+    pub fn unmatched_indices(&self, since: Duration) -> impl Iterator<Item = usize> + '_ {
+        self.unmatched.iter().copied().filter(move |&i| self.messages[i].0 >= since)
     }
 
     /// The ids of unmatched responses read at or after `since`.
@@ -1120,7 +1145,17 @@ impl Session {
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Message, CallError> {
-        let deadline = Instant::now() + timeout;
+        self.call_with_id_until(id, method, params, Instant::now() + timeout).await
+    }
+
+    /// [`Session::call_with_id`] by a deadline the caller may also use after it.
+    pub async fn call_with_id_until(
+        &mut self,
+        id: &Id,
+        method: &str,
+        params: Option<Value>,
+        deadline: Instant,
+    ) -> Result<Message, CallError> {
         self.request_until(id, method, params, deadline).await.map_err(CallError::Write)?;
         self.wait_response(id, deadline).await.map_err(CallError::Wait)
     }
