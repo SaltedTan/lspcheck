@@ -602,7 +602,7 @@ duplicate or unasked reply, which J2 judges, not R1. Both the response verdict a
 ParseError count use unmatched response occurrences read from the start of the malformed-body write until lspcheck
 sends `exit` after a graceful shutdown (or gives up on `shutdown`), so a late reply to the body counts; earlier and
 later reads are excluded, and a frame lspcheck missed in that time makes a pass `ERROR`. Only a response read before
-lspcheck writes `shutdown` can fail R1: one with id null and another code read after that may be the server's error
+lspcheck begins writing `shutdown`, once it has answered what the server asked meanwhile, can fail R1: one with id null and another code read after that may be the server's error
 about `shutdown`, so it makes R1 `ERROR`. A ParseError read then still counts as the body's reply. The plain request must be
 answered within its own wait. An exit before the answer or an unanswered delivered request
 fails; missing answers become `ERROR` when evidence from the start of the probe write through the end of its wait
