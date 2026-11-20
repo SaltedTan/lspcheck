@@ -93,7 +93,7 @@ lspcheck couldn't read anywhere (F1) also makes a J1, J2, J5 or J7 pass an error
 
 A message with a request's id but no well-formed outcome ends lspcheck's wait for that request, so one such reply
 doesn't stall the waits after it. J5 fails it. A well-formed outcome is what J5 accepts: exactly one of `result` (any
-value, `null` included) and `error`, and the error an object with an integer `code` and a string `message`. C1, R4, and
+value, `null` included) and `error`, and the error an object with an integer `code` in the signed 32-bit range and a string `message`. C1, R4, and
 C2's plain requests, which ask for an answer, keep waiting past such a message for an answer with the same id until
 the request's deadline, the same deadline as the first wait. Only a response read once lspcheck registered the request
 counts, as for the session's own matching. If none comes, they treat the request as unanswered and say in their detail
@@ -174,6 +174,9 @@ sent:
   the cancel. Nothing in an id-less response says which notification it answers, and a server that names the cancel
   in a MethodNotFound is almost always answering it.
 
+An answer to C1's cancelled request, or to one of C2's plain requests, read after lspcheck stopped waiting
+(`--timeout`) but before `exit` still answers it: the timeout is lspcheck's limit, not the protocol's. C1 judges such
+an answer as it would a timely one; a C2 plain request answered that way makes C2 `error`, not `fail`.
 If the server stopped answering, what it didn't send can't be judged, so those checks are `error`. A pass is also
 `error` when lspcheck missed something where that check's evidence would be: a frame it skipped or couldn't read, a
 server request it couldn't answer (the server may be waiting for it), or reading that stopped. For C1 and C3 that is

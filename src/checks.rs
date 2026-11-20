@@ -2824,7 +2824,9 @@ fn describe_outcomeless((at, why): &(Duration, String)) -> String {
 /// answers.
 fn cancel_not_found(m: &Message) -> bool {
     const NAME: &str = "$/cancelRequest";
-    if m.value.pointer("/error/code").and_then(Value::as_i64) != Some(codes::METHOD_NOT_FOUND) {
+    if m.value.pointer("/error/code").and_then(Value::as_number).and_then(message::integer_value)
+        != Some(codes::METHOD_NOT_FOUND)
+    {
         return false;
     }
     let part_of_name = |c: char| c.is_alphanumeric() || matches!(c, '_' | '/' | '$' | '-');
@@ -3029,6 +3031,11 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     let mut c1_absent = None;
     // A pass that assumed nothing was missed: rechecked at the end.
     let mut c1_again = None;
+    // An answer read after lspcheck stopped waiting but before `exit` still
+    // answers R: `--timeout` is lspcheck's limit, not the protocol's.
+    let late_answer = |id: &Id| window(0).find(|&i| is_answer(&msgs[i].1) && msgs[i].1.response_id() == Some(id));
+    let answer = answer.or_else(|wait| late_answer(&r).ok_or(wait));
+    let live_answered_late = c2_problem.as_ref().is_some_and(|(_, live, _, _)| late_answer(live).is_some());
     let c1 = match answer {
         Err(wait) => {
             let e = CallError::Wait(wait);
@@ -3113,6 +3120,13 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             (CallError::Wait(_), Some(missed)) => {
                 ctx.report("C2", Verdict::Error, format!("inconclusive, because {missed}: {why}"))
             }
+            (CallError::Wait(_), None) if live_answered_late => ctx.report(
+                "C2",
+                Verdict::Error,
+                format!(
+                    "inconclusive: the request was answered only after lspcheck stopped waiting, before exit: {why}"
+                ),
+            ),
             (CallError::Wait(_), None) => ctx.fail_absent_between("C2", asked, waited, why),
         }
     } else if let Some((id, what)) = ambiguous {

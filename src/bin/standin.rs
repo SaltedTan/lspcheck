@@ -170,6 +170,15 @@ const FAULTS: &[(&str, &str)] = &[
     ("answers-reordered", "lawful: answer requests that arrive together in reverse order"),
     ("defer-until-next", "lawful: hold a workspace/symbol reply until the next message, cancelling it if asked"),
     ("cancelled-no-reply", "never answer a deferred request that is cancelled"),
+    (
+        "cancelled-answer-at-shutdown",
+        "answer a deferred request that is cancelled only when shutdown arrives, before the shutdown reply",
+    ),
+    (
+        "answer-probes-at-shutdown",
+        "after a $/cancelRequest for an id that isn't pending, hold probes and answer them only when shutdown arrives",
+    ),
+    ("cancel-not-found-float", "answer every $/cancelRequest with a MethodNotFound whose id is null and code -32601.0"),
     ("cancelled-reply-twice", "answer a cancelled request with both -32800 and a result"),
     ("cancelled-other-error", "lawful: answer a cancelled request with InternalError (-32603)"),
     ("cancelled-no-outcome", "answer a cancelled request with only \"jsonrpc\" and its id, neither result nor error"),
@@ -537,6 +546,7 @@ fn main() {
     let holds = [
         "defer-until-next",
         "cancelled-no-reply",
+        "cancelled-answer-at-shutdown",
         "cancelled-reply-twice",
         "cancelled-other-error",
         "cancelled-no-outcome",
@@ -572,6 +582,9 @@ fn main() {
     let mut held_hovers: Vec<Value> = Vec::new();
     // Set by stop-after-unknown-cancel: requests are no longer answered.
     let mut no_more_answers = false;
+    // Set by answer-probes-at-shutdown: probes held until shutdown arrives.
+    let mut holding_probes = false;
+    let mut held_probes: Vec<Value> = Vec::new();
     // Set by no-outcome-after-unknown-cancel: probes get only their id.
     let mut outcomeless_probes = false;
     // For drop-first-request: whether the first document request was dropped.
@@ -751,6 +764,8 @@ fn main() {
                 deferred = None;
                 if fault("cancelled-no-reply") {
                     dropped = true;
+                } else if fault("cancelled-answer-at-shutdown") {
+                    cancelled_again = Some(ok(&deferred_id, Value::Null));
                 } else if fault("cancelled-other-error") {
                     out.frame(&err(&deferred_id, -32603, "internal error"));
                 } else if fault("cancelled-no-outcome") {
@@ -800,6 +815,10 @@ fn main() {
                 if fault("reply-to-cancel") {
                     cancel_out.send(&mut out, cancel_reply());
                 }
+                if fault("cancel-not-found-float") {
+                    let reply = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32601.0, "message": "Unhandled method $/cancelRequest"}});
+                    cancel_out.send(&mut out, reply);
+                }
                 if let Some(cancelled) = msg.pointer("/params/id")
                     && fault("cancel-unknown-reply")
                 {
@@ -830,6 +849,9 @@ fn main() {
                 }
                 if fault("stop-after-unknown-cancel") {
                     no_more_answers = true;
+                }
+                if fault("answer-probes-at-shutdown") {
+                    holding_probes = true;
                 }
                 if fault("no-outcome-after-unknown-cancel") {
                     outcomeless_probes = true;
@@ -1284,6 +1306,10 @@ fn main() {
         if no_more_answers {
             continue;
         }
+        if holding_probes && method == "lspcheck/probe" {
+            held_probes.push(id);
+            continue;
+        }
         if outcomeless_probes && method == "lspcheck/probe" {
             out.frame(&json!({"jsonrpc": "2.0", "id": id}));
             continue;
@@ -1731,6 +1757,11 @@ fn main() {
             && let Some(again) = cancelled_again.take()
         {
             out.frame(&again);
+        }
+        if method == "shutdown" {
+            for held in held_probes.drain(..) {
+                out.frame(&ok(&held, Value::Null));
+            }
         }
         if method == "shutdown"
             && let Some(rest) = unfinished.take()

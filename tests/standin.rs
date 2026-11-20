@@ -1957,6 +1957,31 @@ fn cancelling_an_unknown_or_finished_request_produces_nothing() {
 }
 
 #[test]
+fn an_answer_after_lspchecks_timeout_but_before_exit_still_answers_the_cancelled_request() {
+    // `--timeout` is lspcheck's own limit: the one answer, sent before the
+    // shutdown reply, still counts, and only once.
+    let r = run(&["--fault", "cancelled-answer-at-shutdown"], &["--only", "C1,C2,C3", "--timeout", "1"]);
+    expect(&r, "C1", "pass");
+}
+
+#[test]
+fn a_request_after_the_cancels_answered_only_after_lspchecks_timeout_leaves_c2_inconclusive() {
+    let r = run(
+        &["--fault", "defer-until-next", "--fault", "answer-probes-at-shutdown"],
+        &["--only", "C1,C2,C3", "--timeout", "1"],
+    );
+    expect(&r, "C2", "error");
+    assert!(detail(&r, "C2").contains("answered only after lspcheck stopped waiting"), "{}", r.stdout);
+}
+
+#[test]
+fn c3_reads_a_method_not_found_code_by_value() {
+    // -32601.0 is the integer -32601, as J5 reads it.
+    let r = fault("cancel-not-found-float");
+    only_fails(&r, &["C3", "J3"]);
+}
+
+#[test]
 fn replying_to_a_cancel_notification_fails_c3() {
     // The reply has no id, so it also answers a notification (J3).
     only_fails(&fault("reply-to-cancel"), &["C3", "J3"]);

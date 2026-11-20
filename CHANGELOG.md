@@ -6,10 +6,10 @@
 
 - **C1** and **R4** no longer pass when the server answers their request with a message carrying the id but no
   well-formed outcome, by J5's rules: exactly one of `result` and `error`, and the error an object with an integer
-  `code` and a string `message`. So neither, both, `error: null` and `error: {}` don't count. Such a message still
+  `code` (signed 32-bit) and a string `message`. So neither, both, `error: null` and `error: {}` don't count. Such a message still
   fails J5. C1 and R4 now wait past it for a proper answer with that id until the request's deadline, and fail only if
   none comes and they read the whole wait; their detail then says such a message came. Only a response read once
-  lspcheck sent the request counts, so R4 no longer takes a reply that came before it. Other checks still take such a
+  lspcheck registered the request (just before writing it) counts, so R4 no longer takes a reply that came before it. Other checks still take such a
   message as the request's reply, so one malformed reply doesn't stall every later wait. R4 no longer calls the answer
   it took after such a message "likely id mangling", but still lists any other response with that id.
 - **C2** can now fail only on a response carrying an id never sent, or on a plain request after the cancels that gets
@@ -21,9 +21,12 @@
   it now tests both cases. A second response to C1's request now fails **C1** whenever it arrives before `exit`; it
   used to fail C2 instead when it came after C2's cancels. C1 now watches for a second response until `exit`, so
   output lspcheck missed anywhere in that span makes a C1 pass `error`.
+- **C1** and **C2** no longer fail when an answer they waited for arrives after `--timeout` but before `exit`.
+  `--timeout` is lspcheck's limit, not the protocol's: C1 judges such an answer as usual, and a plain request after
+  C2's cancels answered that late makes C2 `error`.
 - **C3** now fails only on a MethodNotFound (-32601) response without an id whose error `message` names
   `$/cancelRequest` as a whole word, not as part of a longer name such as `$/cancelRequestMetrics`, read after
-  lspcheck began writing the first cancel. Any other response without an id now gives `error` rather than `fail`,
+  lspcheck began writing the first cancel, its code read by value as J5 does (so `-32601.0` counts). Any other response without an id now gives `error` rather than `fail`,
   including one with another code that names `$/cancelRequest` (such as `initialized` failing) or that mentions
   cancelRequest only in its `data`. One read before the cancel was written no longer counts for C3 at all (J3 still
   judges it).
