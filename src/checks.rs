@@ -19,7 +19,8 @@ use crate::process::{Coverage, ProcInfo, ServerCommand, Unconfirmed};
 use crate::profile::{self, Expect, Skip};
 use crate::recovery;
 use crate::session::{
-    self, CallError, ExitWait, Finish, Options, Problem, Recv, ServerRequest, Session, Unmatched, WaitError, WriteError,
+    self, CallError, ExitWait, Finish, Options, Problem, Quiet, Recv, ServerRequest, Session, Unmatched, WaitError,
+    WriteError,
 };
 use crate::text::{self, ContentChange, Encoding, Position};
 use crate::transcript;
@@ -365,15 +366,11 @@ pub enum Recheck {
         pushed: Vec<PushBaseline>,
         then: Box<Recheck>,
     },
-    /// L6 or L7's failure for a server lspcheck saw still running at the exit
-    /// deadline, `due`, judged `waited` seconds after `exit`: an error if the
-    /// server may have been waiting for an answer from lspcheck, or if
-    /// lspcheck missed some of what it wrote until `to`.
-    StillRunning {
-        due: Duration,
-        to: Duration,
-        waited: String,
-    },
+    /// L6 or L7's failure for a server lspcheck saw still running a whole
+    /// exit timeout after it went quiet: an error if, once the session has
+    /// ended, the server may still have been waiting on lspcheck then (see
+    /// [`unquiet`]).
+    StillRunning(Quiet),
 }
 
 #[derive(Debug, Clone)]
@@ -493,18 +490,14 @@ impl CheckResult {
                     self.detail = format!("{why}: {}", self.detail);
                 }
             }
-            Recheck::StillRunning { due, to, waited } => {
-                let why = match awaiting_answer(&finish.server_requests, due) {
-                    Some(r) => Some(format!(
-                        "lspcheck hadn't finished answering the server's {} request {}, read before then",
-                        r.method, r.id
-                    )),
-                    None => finish.missed_output_within(Duration::ZERO, to),
-                };
-                if let Some(why) = why {
+            Recheck::StillRunning(quiet) => {
+                let missed = finish.missed_output_within(Duration::ZERO, quiet.seen);
+                if let Some(why) = unquiet(&quiet, finish.last_read, &finish.server_requests, &finish.messages, missed)
+                {
                     self.verdict = Verdict::Error;
                     self.detail = format!(
-                        "inconclusive: still running {waited} s after exit, but {why}, so it may be waiting on lspcheck"
+                        "inconclusive: still running {} s after exit, but {why}, so it may be waiting on lspcheck",
+                        seconds_3(quiet.seen.saturating_sub(quiet.sent))
                     );
                 }
             }
@@ -4007,23 +4000,47 @@ async fn end_of_input(ctx: &mut Ctx<'_>) {
 
 /// Waits for the server to exit after the `exit` lspcheck has just sent, and
 /// judges `id`: it should exit with status `code` by the deadline. lspcheck
-/// can tell only if it saw the exit by then, or saw the server running then.
-/// A server still running fails only if it can't have been waiting on
-/// lspcheck, which is known once the session has ended ([`Recheck::StillRunning`]).
+/// can tell only if it saw the exit by then, or saw the server still running
+/// a whole exit timeout after it went quiet ([`Session::serve_after_exit`]).
+/// Such a server fails only if it can't have been waiting on lspcheck, which
+/// is known once the session has ended ([`Recheck::StillRunning`]).
 async fn judge_exit(ctx: &mut Ctx<'_>, id: &'static str, code: i32) {
     let sent = ctx.s.elapsed();
     let waited = seconds(ctx.cfg.exit_timeout);
-    match ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await {
+    let after = |at: Duration| format!("{} s after exit", seconds_3(at.saturating_sub(sent)));
+    match ctx.s.serve_after_exit(ctx.cfg.exit_timeout).await {
         ExitWait::Exited(status) if status.code() == Some(code) => ctx.pass(id),
         ExitWait::Exited(status) => ctx.fail(id, format!("exited with {}", session::describe_status(status))),
-        ExitWait::Running { due } => {
-            let to = ctx.s.elapsed();
-            ctx.fail(id, format!("still running {waited} s after exit"));
+        ExitWait::Running(quiet) => {
+            let running = format!("still running {}", after(quiet.seen));
+            let detail = match &quiet.after {
+                None => format!("{running}, quiet on stdout throughout"),
+                Some(what) => format!(
+                    "{running}, and quiet on stdout for {} s since {what}",
+                    seconds_3(quiet.seen.saturating_sub(quiet.since))
+                ),
+            };
+            ctx.fail(id, detail);
             let r = ctx.results.last_mut().expect("just reported");
-            r.unless_missed = Some(Recheck::StillRunning { due, to, waited });
+            r.unless_missed = Some(Recheck::StillRunning(quiet));
         }
+        ExitWait::Busy { at, what } => ctx.report(
+            id,
+            Verdict::Error,
+            format!(
+                "inconclusive: {what} only {}, past the {waited} s deadline, so the server may have been waiting on \
+                 lspcheck until then",
+                after(at)
+            ),
+        ),
         ExitWait::Unseen { running, exited, status } => {
-            let after = |at: Duration| format!("{} s after exit", seconds_3(at.saturating_sub(sent)));
+            // Seen running past the deadline, it hadn't been quiet for a
+            // whole timeout yet, or lspcheck would have looked.
+            let why = if running.is_some_and(|at| at >= sent + ctx.cfg.exit_timeout) {
+                format!("but before it had been quiet for {waited} s, so it may have been waiting on lspcheck")
+            } else {
+                "so it can't tell whether it exited in time".into()
+            };
             let running = match running {
                 Some(at) if at >= sent => format!("last saw it running {}", after(at)),
                 _ => "didn't see it running after exit".into(),
@@ -4033,7 +4050,7 @@ async fn judge_exit(ctx: &mut Ctx<'_>, id: &'static str, code: i32) {
                 Verdict::Error,
                 format!(
                     "inconclusive: it exited with {}, but lspcheck {running} and saw that it had exited only {}, \
-                     past the {waited} s deadline, so it can't tell whether it exited in time",
+                     past the {waited} s deadline, {why}",
                     session::describe_status(status),
                     after(exited)
                 ),
@@ -4047,13 +4064,63 @@ async fn judge_exit(ctx: &mut Ctx<'_>, id: &'static str, code: i32) {
     }
 }
 
-/// A request the server sent before `due` whose answer lspcheck hadn't
-/// finished writing by then, if there is one: a server still running at
-/// `due` may have been waiting for it. The server's requests are known in
-/// full only once the session has ended: one read before `due` may have
-/// been queued, or still being decoded, then.
-fn awaiting_answer(requests: &[ServerRequest], due: Duration) -> Option<&ServerRequest> {
-    requests.iter().find(|r| r.at < due && r.answered_at.is_none_or(|at| at >= due))
+/// Why a server lspcheck saw still running after `exit`, a whole timeout
+/// after it went quiet at Q (`quiet.since`), may have been waiting on
+/// lspcheck all that time, if it may: judged once the session has ended,
+/// from when lspcheck last read its stdout, its requests and messages, and
+/// why lspcheck may have missed some of its output up to the look.
+///
+/// It had all it needed by Q if lspcheck read nothing of its stdout after Q
+/// (a pipe is first in, first out, so every request it ever wrote was read
+/// by then, and it wasn't blocked writing more), answered every request in
+/// full by Q, and missed nothing that could have held a request: no frame
+/// lost or unreadable, no inspection stopped, and no message that isn't
+/// JSON-RPC, which lspcheck doesn't answer. `exit` was written before Q.
+fn unquiet(
+    quiet: &Quiet,
+    last_read: Option<Duration>,
+    requests: &[ServerRequest],
+    messages: &[(Duration, Message)],
+    missed: Option<String>,
+) -> Option<String> {
+    let after = |at: Duration| format!("{} s after exit", seconds_3(at.saturating_sub(quiet.sent)));
+    let timeout = quiet.due.saturating_sub(quiet.sent);
+    if quiet.since > quiet.due {
+        return Some(format!(
+            "lspcheck was still handling its output {}, past the {} s deadline",
+            after(quiet.since),
+            seconds(timeout)
+        ));
+    }
+    if quiet.seen < quiet.since + timeout {
+        return Some(format!(
+            "lspcheck saw it running only {}, less than {} s after it went quiet",
+            after(quiet.seen),
+            seconds(timeout)
+        ));
+    }
+    if let Some(read) = last_read.filter(|&at| at > quiet.since) {
+        return Some(format!(
+            "lspcheck read more of its stdout {}, after it had gone quiet {}",
+            after(read),
+            after(quiet.since)
+        ));
+    }
+    if let Some(r) = requests.iter().find(|r| r.answered_at.is_none_or(|at| at > quiet.since)) {
+        return Some(match r.answered_at {
+            Some(at) => format!("lspcheck finished answering its {} request {} only {}", r.method, r.id, after(at)),
+            None => format!("lspcheck never finished answering its {} request {}", r.method, r.id),
+        });
+    }
+    if missed.is_some() {
+        return missed;
+    }
+    messages.iter().find_map(|(_, m)| match &m.kind {
+        Kind::Invalid(why) => {
+            Some(format!("it sent a message that isn't JSON-RPC ({why}), which lspcheck doesn't answer"))
+        }
+        _ => None,
+    })
 }
 
 /// exit without shutdown.
@@ -9481,18 +9548,106 @@ while header := sys.stdin.buffer.readline():
     }
 
     #[test]
-    fn a_server_may_wait_for_any_answer_lspcheck_hadnt_finished_by_the_exit_deadline() {
-        let due = Duration::from_millis(100);
-        let ids = |requests: &[ServerRequest]| awaiting_answer(requests, due).map(|r| r.id.to_string());
-        // Answered in full before the deadline, or asked only after it.
-        let answered = server_request(10, "1", Some(20));
-        assert_eq!(ids(&[answered.clone(), server_request(100, "2", None)]), None);
-        // Answered only in part by then, or not at all: still queued at the
-        // deadline, say, or left unanswered.
-        let mut partly = server_request(90, "3", Some(95));
-        partly.answered_at = Some(due);
-        assert_eq!(ids(&[answered.clone(), partly]), Some("\"3\"".into()));
-        assert_eq!(ids(&[answered, server_request(99, "4", None)]), Some("\"4\"".into()));
+    fn a_server_still_running_after_a_quiet_timeout_fails_only_if_it_had_all_it_needed() {
+        let ms = Duration::from_millis;
+        // exit was written at 1 s, with a 100 ms timeout. The server asked
+        // just after it, lspcheck answered in full by 1009 ms and went quiet
+        // at 1010 ms, and saw the server running a whole timeout later.
+        let quiet = Quiet {
+            sent: ms(1000),
+            due: ms(1100),
+            since: ms(1010),
+            after: Some("lspcheck answered its window/workDoneProgress/create request \"ask\"".into()),
+            seen: ms(1111),
+        };
+        let early = server_request(10, "early", Some(20));
+        let ask = server_request(1005, "ask", Some(1008));
+        let log = (ms(500), Message::classify(json!({"jsonrpc": "2.0", "method": "window/logMessage"})));
+        let judge = |quiet: &Quiet, read: u64, requests: &[ServerRequest], messages: &[_], missed: Option<&str>| {
+            unquiet(quiet, Some(ms(read)), requests, messages, missed.map(str::to_string))
+        };
+        let breach = |why: Option<String>, says: &str| {
+            let why = why.unwrap_or_else(|| panic!("no breach where one says {says:?}"));
+            assert!(why.contains(says), "{why}");
+        };
+        let (requests, messages) = ([early.clone(), ask.clone()], [log.clone()]);
+        assert_eq!(judge(&quiet, 1005, &requests, &messages, None), None);
+        // A request read after Q, still queued when lspcheck looked.
+        let late = server_request(1050, "late", None);
+        breach(judge(&quiet, 1050, &[early.clone(), ask.clone(), late], &messages, None), "stdout 0.050 s after exit");
+        // One read before Q but answered after it, and one never answered.
+        let mut slow = ask.clone();
+        slow.answered_at = Some(ms(1050));
+        let says = "finished answering its window/workDoneProgress/create request \"ask\" only 0.050 s after exit";
+        breach(judge(&quiet, 1005, &[early.clone(), slow], &messages, None), says);
+        let unanswered = server_request(1005, "ask", None);
+        breach(judge(&quiet, 1005, &[early, unanswered], &messages, None), "never finished answering");
+        // A stdout byte read after lspcheck began stopping the server.
+        breach(judge(&quiet, 1200, &requests, &messages, None), "read more of its stdout 0.200 s after exit");
+        // A lost span, which (like stopped inspection) comes as `missed`.
+        breach(judge(&quiet, 1005, &requests, &messages, Some("a frame was skipped")), "a frame was skipped");
+        // A message that isn't JSON-RPC, which lspcheck doesn't answer.
+        let invalid = (ms(500), Message::classify(json!({"id": 1, "method": "x"})));
+        breach(judge(&quiet, 1005, &requests, &[log, invalid], None), "isn't JSON-RPC");
+        // Q after the deadline, or a look less than a whole timeout after Q.
+        let busy = Quiet { since: ms(1101), seen: ms(1202), ..quiet.clone() };
+        breach(judge(&busy, 1005, &requests, &messages, None), "output 0.101 s after exit, past the 0.1 s deadline");
+        let hasty = Quiet { seen: ms(1105), ..quiet };
+        breach(judge(&hasty, 1005, &requests, &messages, None), "running only 0.105 s after exit");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_read_only_after_the_exit_deadline_keeps_a_running_server_from_failing() {
+        // On exit, the server asks a request, creates the marker, and exits
+        // once it reads an answer.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("asked");
+        let script = r#"import json, os, sys
+def read():
+    header = sys.stdin.buffer.readline()
+    if not header:
+        return None
+    length = int(header.split(b':')[1])
+    sys.stdin.buffer.readline()
+    return json.loads(sys.stdin.buffer.read(length))
+while (message := read()) is not None:
+    if message.get('method') == 'exit':
+        body = json.dumps({'jsonrpc': '2.0', 'id': 'asked', 'method': 'window/workDoneProgress/create',
+                           'params': {'token': 't'}}).encode()
+        os.write(1, b'Content-Length: %d\r\n\r\n' % len(body) + body)
+        open(sys.argv[1], 'w').close()
+        if read() is not None:
+            sys.exit(1)
+"#;
+        let mut cfg = mutation_test_config("exit 0");
+        cfg.exit_timeout = Duration::ZERO;
+        cfg.server = ServerCommand::new(&[
+            "python3".into(),
+            "-I".into(),
+            "-c".into(),
+            script.into(),
+            marker.to_str().unwrap().into(),
+        ]);
+        let mut ctx = mutation_test_ctx(&cfg, 1024 * 1024).await;
+        ctx.s.notify("exit", None).await.unwrap();
+        // Block without awaiting, as lspcheck does while it decodes a large
+        // frame: the request is in the pipe, and can be read only once the
+        // wait has begun, which with no timeout is past its deadline.
+        let limit = std::time::Instant::now() + Duration::from_secs(30);
+        while !marker.exists() {
+            assert!(std::time::Instant::now() < limit, "the script didn't ask");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        judge_exit(&mut ctx, "L7", 1).await;
+        let Ctx { s, mut results, .. } = ctx;
+        let finish = s.finish(Duration::from_millis(200)).await;
+        for r in &mut results {
+            r.settle(&finish);
+        }
+        let r = &results[0];
+        assert_eq!(r.verdict, Verdict::Error, "{}", r.detail);
+        assert!(r.detail.contains("waiting on lspcheck"), "{}", r.detail);
     }
 
     #[test]

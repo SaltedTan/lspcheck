@@ -128,21 +128,35 @@ the server sent no requests or lspcheck sent none after completing an answer.
 
 While it waits for the process to exit after `exit`, lspcheck keeps reading and answers the server's requests: a
 server may read `exit` but handle it only once a request it sent just before is answered (gopls does this with the
-progress token it asks for after `initialized`), and lspcheck sends `exit` without pausing. The exit deadline takes
-priority over queued output. lspcheck watches for the exit while it waits and while it writes an answer, which can take
-until the deadline (a process the server left behind may hold its stdin without reading it), but not while it prepares
-one, which can take seconds for a large `configuration`. A check is judged by what lspcheck saw:
+progress token it asks for after `initialized`), and lspcheck sends `exit` without pausing. lspcheck watches for the
+exit while it waits and while it writes an answer, which can take until the deadline (a process the server left behind
+may hold its stdin without reading it), but not while it prepares one, which can take seconds for a large
+`configuration`. A check is judged by what lspcheck saw:
 
 - An exit it saw by the deadline is judged by the exit status.
-- An exit it saw only after the deadline, when it last saw the server running before it, is `error`, with both
-  times: lspcheck can't tell which side of the deadline the server exited on.
-- A server it saw running at or after the deadline fails L6 or L7, unless the server may have been waiting on
-  lspcheck. It may have been if it sent a request, read before the deadline, whose answer lspcheck hadn't finished
-  writing by then: one still queued or being decoded at the deadline, one whose answer lspcheck couldn't write, or one
-  it left unanswered. It may also have been if lspcheck missed some of its output (a frame it skipped or couldn't
-  read, or reading that stopped), which may have held such a request. Either makes the check `error`, naming the
-  request if there is one. Both are known only once the session has ended, so this verdict is settled after cleanup;
-  a frame that began before the deadline but was only found truncated at the end of stdout also makes it `error`.
+- A server still running fails L6 or L7 only if lspcheck saw it running a whole exit timeout after Q, the last time
+  lspcheck went back to waiting with nothing of the server's left to handle (after it wrote `exit`, after each message
+  it took in, and so after each answer it wrote in full), with Q no later than the deadline. lspcheck looks once the
+  server has been quiet that long, counting its reads of the server's stdout and stderr too; just before it looks, it
+  idles 20 ms so its readers can catch up (a bare yield could let it look before readers the I/O driver had just
+  woken, as after lspcheck itself stalled while the server was blocked writing to a full stderr pipe; a 20 ms idle
+  that overran three times over is repeated), takes in what they queued, and if there was anything it waits again. A server quiet
+  since `exit` is looked at by the deadline. One that spoke after it, as lua-language-server does when it asks for
+  `workspace/configuration`, is looked at up to twice the timeout after `exit`. Building an answer to a server request isn't interrupted, so a
+  very large one (such as a big `[client].configuration`) can extend the wait by the time it takes; its write is
+  bounded as usual. Once the session has ended, the
+  failure stands only if lspcheck read no byte of stdout after Q, up to the end of the session (whether or not it
+  inspected it, and even as it stopped the server); every request the server sent in the session had its answer
+  written in full by Q; and lspcheck lost nothing that could have held a request: no frame skipped or unreadable, no
+  inspection stopped before the look, and no message that isn't JSON-RPC, which lspcheck doesn't answer. The server
+  then had `exit` and every answer for a whole timeout: a pipe is first in, first out, so every request it ever wrote
+  was read by Q, and it wasn't blocked writing more. Otherwise the check is `error`, saying which condition didn't
+  hold.
+- Anything else is `error`: output lspcheck was still handling, or reading, past the deadline (the wait ends then, as
+  the server can no longer show a whole quiet timeout by twice the timeout); an exit lspcheck saw only after the
+  deadline, with both times, whatever its status; or a process lspcheck couldn't look at. So a server that ignores
+  `exit` but writes to stdout more often than once per timeout, or writes to it as lspcheck stops it, is `error`, not
+  failed. Stderr counts only during the wait, since terraform-ls writes to it as lspcheck stops it.
 
 For L9, once the server has exited (by itself; a scenario where lspcheck had to stop it doesn't count), lspcheck
 searches for its descendants: the members of its process group, every process descended from one of them whatever its

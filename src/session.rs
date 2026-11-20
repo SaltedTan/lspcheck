@@ -190,20 +190,41 @@ pub enum WaitError {
     Closed,
 }
 
-/// How a wait for the server to exit by a deadline ended. Times are since
-/// the session started.
+/// How L6 and L7's wait for the server to exit after `exit` ended (see
+/// [`Session::serve_after_exit`]). Times are since the session started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitWait {
     /// lspcheck saw it exit by the deadline.
     Exited(ExitStatus),
-    /// lspcheck saw it still running at or after the deadline, `due`.
-    Running { due: Duration },
-    /// lspcheck saw it had exited only after the deadline, and last saw it
-    /// running (if ever) before the deadline, so it can't tell which side of
-    /// the deadline it exited on.
+    /// lspcheck saw it still running a whole timeout after it went quiet.
+    Running(Quiet),
+    /// lspcheck was still busy with the server's output at `at`, past the
+    /// deadline, doing `what`, so it can't see the server quiet for a whole
+    /// timeout by twice the timeout. It stopped waiting then.
+    Busy { at: Duration, what: String },
+    /// lspcheck saw that it had exited only after the deadline, and last saw
+    /// it running at `running`, if it did.
     Unseen { running: Option<Duration>, exited: Duration, status: ExitStatus },
-    /// lspcheck couldn't look at the process at or after the deadline.
+    /// lspcheck couldn't look at the process.
     Unknown,
+}
+
+/// What L6 and L7's wait saw of a server still running after `exit`. Times
+/// are since the session started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Quiet {
+    /// When lspcheck began waiting, having written `exit`.
+    pub sent: Duration,
+    /// The deadline: `sent` and the exit timeout.
+    pub due: Duration,
+    /// Q: when lspcheck last went back to waiting with nothing of the
+    /// server's left to handle, and what it had just done then, if it had
+    /// done anything since `exit`.
+    pub since: Duration,
+    pub after: Option<String>,
+    /// When lspcheck looked and saw it running: a whole timeout or more after
+    /// `since`, and after its last read of the server's stdout or stderr.
+    pub seen: Duration,
 }
 
 /// Why a write failed.
@@ -270,6 +291,8 @@ struct Evidence {
     partial_since: Option<Duration>,
     /// When and why lspcheck stopped reading stdout, if it did.
     stopped: Option<(Duration, String)>,
+    /// When lspcheck last read bytes from stdout, inspected or not.
+    last_read: Option<Duration>,
     /// When the first readable frame with non-ASCII text in its body arrived.
     non_ascii: Option<Duration>,
     /// When lspcheck began signalling processes that may hold stdout: an
@@ -354,6 +377,9 @@ pub struct Finish {
     pub lost: Vec<(Duration, Duration, String)>,
     /// When and why lspcheck stopped reading stdout, if it did.
     pub stopped: Option<(Duration, String)>,
+    /// When lspcheck last read bytes from stdout, inspected or not, up to the
+    /// end of the session.
+    pub last_read: Option<Duration>,
     pub transcript: Vec<Event>,
     /// Every message the session consumed.
     pub messages: Vec<(Duration, Message)>,
@@ -450,6 +476,8 @@ pub struct Session {
     start: Instant,
     transcript: Transcript,
     evidence: Arc<Mutex<Evidence>>,
+    /// When lspcheck last read bytes from stderr, if it has.
+    stderr_read: Arc<Mutex<Option<Duration>>>,
     /// Every message consumed, in order.
     pub messages: Vec<(Duration, Message)>,
     /// When lspcheck sent `initialized`, if it did.
@@ -534,6 +562,8 @@ impl Session {
         let mut stderr = child.stderr.take().expect("piped stderr");
         let t = transcript.clone();
         let limit = opts.stderr_limit;
+        let stderr_read: Arc<Mutex<Option<Duration>>> = Arc::default();
+        let read = stderr_read.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 16 * 1024];
             let (mut kept, mut dropped) = (0usize, 0usize);
@@ -541,9 +571,11 @@ impl Session {
                 match stderr.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        let at = start.elapsed();
+                        *read.lock().expect("stderr lock") = Some(at);
                         let keep = n.min(limit.saturating_sub(kept));
                         if keep > 0 {
-                            record(&t, start.elapsed(), EventKind::Stderr(buf[..keep].to_vec()));
+                            record(&t, at, EventKind::Stderr(buf[..keep].to_vec()));
                         }
                         kept += keep;
                         dropped += n - keep;
@@ -564,6 +596,7 @@ impl Session {
             start,
             transcript,
             evidence,
+            stderr_read,
             messages: Vec::new(),
             initialized_at: None,
             own_limit: None,
@@ -1246,17 +1279,12 @@ impl Session {
     }
 
     /// Waits for the server to exit by `deadline`, reading what it sends
-    /// meanwhile and answering its requests. A server may be blocked on a
-    /// request it sent just before reading `exit` (gopls waits for its
-    /// progress token after `initialized`), so waiting without answering
-    /// could keep it running through lspcheck's own doing.
-    ///
-    /// lspcheck watches for the exit while it waits and while it writes an
-    /// answer, but not while it prepares one, so the outcome rests on when it
-    /// saw the exit, not on when it looked. Whether the server was waiting
-    /// for an answer is for the caller to judge, from every request read
-    /// before the deadline, including those still queued then.
-    pub async fn serve_until_exit(&mut self, deadline: Instant) -> ExitWait {
+    /// meanwhile and answering its requests, and gives its status if it
+    /// exited. A server may be blocked on a request it sent just before
+    /// reading `exit` (gopls waits for its progress token after
+    /// `initialized`), so waiting without answering could keep it running
+    /// through lspcheck's own doing.
+    pub async fn serve_until_exit(&mut self, deadline: Instant) -> Option<ExitStatus> {
         // Each pass looks first, so an exit while an answer was prepared is
         // seen as soon as lspcheck is free again.
         while self.is_alive() && Instant::now() < deadline {
@@ -1281,17 +1309,153 @@ impl Session {
                 }
             }
         }
-        // A look at or after the deadline, unless the exit was seen already.
-        self.is_alive();
+        self.exit
+    }
+
+    /// How long the exit wait idles before it looks at a server that seems
+    /// quiet, so the readers can take in anything already written.
+    const SETTLE: Duration = Duration::from_millis(20);
+
+    /// L6 and L7's wait, after the `exit` lspcheck has just written. Like
+    /// [`Session::serve_until_exit`], it reads what the server sends and
+    /// answers its requests, but a server still running is looked at only
+    /// once it has been quiet for a whole `timeout`, not merely once
+    /// `timeout` has passed: lspcheck may have been busy with what the
+    /// server sent, and the server waiting on lspcheck meanwhile.
+    ///
+    /// Quiet is counted from Q, the last time lspcheck went back to waiting
+    /// with nothing of the server's left to handle: from now, then from after
+    /// each thing it takes in, and so after each answer it writes in full;
+    /// and from the last read of the server's stdout or stderr, if later.
+    /// Just before it looks, lspcheck lets those reads happen and takes in
+    /// what they queued, and if there was anything, it counts again. A
+    /// server quiet since `exit` is looked at by the deadline, `timeout`
+    /// from now. Anything after the deadline ends the wait at once, so it
+    /// lasts at most twice `timeout`.
+    ///
+    /// lspcheck watches for the exit while it waits and while it writes an
+    /// answer, but not while it prepares one, so an exit is judged by when
+    /// lspcheck saw it. Whether a server still running had really been left
+    /// nothing to wait for is known only once the session has ended.
+    pub async fn serve_after_exit(&mut self, timeout: Duration) -> ExitWait {
+        let sent = self.start.elapsed();
+        let due = sent + timeout;
+        let deadline = self.start + due;
+        let (mut since, mut after) = (sent, None);
+        loop {
+            // An exit seen while an answer was written decides, though the
+            // write went on past the deadline.
+            if self.exit.is_some() {
+                break;
+            }
+            let heard = self.heard();
+            let quiet = heard.as_ref().map_or(since, |(at, _)| since.max(*at));
+            if quiet > due {
+                let what = match heard {
+                    Some((at, stream)) if at > since => format!("lspcheck read its {stream}"),
+                    _ => after.clone().unwrap_or_default(),
+                };
+                return ExitWait::Busy { at: quiet, what };
+            }
+            if !self.is_alive() {
+                break;
+            }
+            let look = self.start + quiet + timeout;
+            if Instant::now() >= look {
+                // Let the readers take in what the server has written, so a
+                // backlog isn't mistaken for quiet. A yield isn't enough: on
+                // this runtime the waiting task can be polled before readers
+                // the I/O driver has just woken, as after lspcheck itself
+                // stalled across the look while the server was blocked
+                // writing to a full stderr pipe. An idle sleep parks the
+                // runtime on the driver, which runs every ready reader; one
+                // that itself overran was stalled too, so it is repeated
+                // (the 2 x timeout cap still ends the wait).
+                loop {
+                    let nap = Instant::now();
+                    sleep(Self::SETTLE).await;
+                    if nap.elapsed() < Self::SETTLE * 3 || Instant::now() >= self.start + due + timeout {
+                        break;
+                    }
+                }
+                if let Ok((at, inbound)) = self.rx.try_recv() {
+                    if let Some(what) = self.take_after_exit(at, inbound, deadline).await {
+                        (since, after) = (self.start.elapsed(), Some(what));
+                    }
+                    continue;
+                }
+                if self.heard().map(|(at, _)| at) > Some(quiet) {
+                    continue;
+                }
+                if self.is_alive() {
+                    let seen = self.running_seen.expect("just seen running").saturating_duration_since(self.start);
+                    return ExitWait::Running(Quiet { sent, due, since, after, seen });
+                }
+                break;
+            }
+            if self.stdout_closed {
+                self.wait_exit(look).await;
+                continue;
+            }
+            // Both futures are cancel safe: whichever loses is dropped
+            // without losing a message or the exit status.
+            let event = tokio::select! {
+                biased;
+                status = self.child.wait() => Some(Err(status)),
+                _ = sleep_until(look) => None,
+                inbound = self.rx.recv() => Some(Ok(inbound)),
+            };
+            match event {
+                None => {}
+                Some(Err(Ok(status))) => self.exited(status),
+                Some(Err(Err(_))) => return ExitWait::Unknown,
+                Some(Ok(None)) => self.stdout_closed = true,
+                Some(Ok(Some((at, inbound)))) => {
+                    if let Some(what) = self.take_after_exit(at, inbound, deadline).await {
+                        (since, after) = (self.start.elapsed(), Some(what));
+                    }
+                }
+            }
+        }
         let since_start = |at: Instant| at.saturating_duration_since(self.start);
         match (self.exit, self.exit_seen) {
             (Some(status), Some(seen)) if seen <= deadline => ExitWait::Exited(status),
-            _ if self.running_seen.is_some_and(|at| at >= deadline) => ExitWait::Running { due: since_start(deadline) },
             (Some(status), Some(seen)) => {
                 ExitWait::Unseen { running: self.running_seen.map(since_start), exited: since_start(seen), status }
             }
             _ => ExitWait::Unknown,
         }
+    }
+
+    /// Takes in one thing the stdout task sent while lspcheck waits for the
+    /// server to exit, answering a request, and says what lspcheck did with
+    /// it; nothing for the end of stdout, which needs nothing more.
+    async fn take_after_exit(&mut self, at: Duration, inbound: Inbound, deadline: Instant) -> Option<String> {
+        let what = match &inbound {
+            Inbound::Closed | Inbound::Stopped => None,
+            Inbound::Problem(p) => Some(format!("lspcheck read output it couldn't take as a message ({p})")),
+            Inbound::Message(m) => Some(match &m.kind {
+                Kind::Request { id, method } => format!("its {method} request {id}"),
+                Kind::Notification { method } => format!("lspcheck read its {method} notification"),
+                Kind::Response { .. } => "lspcheck read a response from it".into(),
+                Kind::Invalid(_) => "lspcheck read a message from it that isn't JSON-RPC".into(),
+            }),
+        };
+        let request = matches!(&inbound, Inbound::Message(m) if matches!(m.kind, Kind::Request { .. }));
+        self.handle(at, inbound, deadline).await;
+        if !request {
+            return what;
+        }
+        let answered = self.server_requests.last().is_some_and(|r| r.answered_at.is_some());
+        what.map(|r| if answered { format!("lspcheck answered {r}") } else { format!("lspcheck didn't answer {r}") })
+    }
+
+    /// When lspcheck last read bytes from the server's stdout or stderr, and
+    /// which, if it has.
+    fn heard(&self) -> Option<(Duration, &'static str)> {
+        let stdout = self.evidence.lock().expect("evidence lock").last_read.map(|at| (at, "stdout"));
+        let stderr = self.stderr_read.lock().expect("stderr lock").map(|at| (at, "stderr"));
+        stdout.into_iter().chain(stderr).max_by_key(|(at, _)| *at)
     }
 
     pub async fn wait_exit(&mut self, deadline: Instant) -> Option<ExitStatus> {
@@ -1513,6 +1677,7 @@ impl Session {
             own_limit: self.own_limit.take(),
             lost: evidence.lost,
             stopped: evidence.stopped,
+            last_read: evidence.last_read,
             transcript,
             messages: std::mem::take(&mut self.messages),
             initialized_at: self.initialized_at,
@@ -1675,10 +1840,13 @@ async fn read_stdout(
             Ok(n) => n,
         };
         total += n;
+        let at = start.elapsed();
+        // Bytes past an inspection limit count too: L6 and L7 ask whether
+        // the server wrote anything at all after a given time.
+        evidence.lock().expect("evidence lock").last_read = Some(at);
         if stopped {
             continue;
         }
-        let at = start.elapsed();
         if total > opts.max_output {
             stopped = true;
             stop(
@@ -2017,7 +2185,7 @@ mod tests {
         let message = Message::classify(json!({"jsonrpc": "2.0", "method": "window/logMessage"}));
         assert!(tx.send((s.elapsed(), Inbound::Message(message))).is_ok());
         let got = s.serve_until_exit(Instant::now() - Duration::from_secs(1)).await;
-        assert!(matches!(got, ExitWait::Running { .. }), "{got:?}");
+        assert!(got.is_none(), "{got:?}");
         assert!(s.messages.is_empty());
         s.finish(Duration::from_millis(200)).await;
     }
@@ -2032,17 +2200,13 @@ mod tests {
             let mut s = Session::start(&cmd, Options::default()).await.unwrap();
             assert!(s.is_alive());
             let looked = s.elapsed();
-            // Busy, the deadline passes just after lspcheck saw it running.
-            let deadline = if busy {
-                s.running_seen.unwrap() + Duration::from_nanos(1)
-            } else {
-                Instant::now() + Duration::from_secs(30)
-            };
+            // Busy, the deadline is when the wait begins.
+            let timeout = if busy { Duration::ZERO } else { Duration::from_secs(30) };
             s.write_raw(b"go\n").await.unwrap();
             if busy {
-                // Wait for the exit without reaping it, so the session hasn't
-                // seen it, as if lspcheck had been preparing an answer while
-                // the deadline passed.
+                // Wait for the exit without reaping it, so the session sees
+                // it only after the deadline, as if lspcheck had been
+                // preparing an answer while the deadline passed.
                 let pid = nix::unistd::Pid::from_raw(s.pid());
                 let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG;
                 let limit = std::time::Instant::now() + Duration::from_secs(30);
@@ -2051,11 +2215,12 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
-            let got = s.serve_until_exit(deadline).await;
+            let began = s.elapsed();
+            let got = s.serve_after_exit(timeout).await;
             if busy {
                 let ExitWait::Unseen { running: Some(running), exited, status } = got else { panic!("{got:?}") };
                 assert!(running <= looked, "{running:?} {looked:?}");
-                assert!(exited > deadline.duration_since(s.start), "{exited:?}");
+                assert!(exited > began, "{exited:?}");
                 assert_eq!(status.code(), Some(1));
             } else {
                 assert!(matches!(got, ExitWait::Exited(status) if status.code() == Some(1)), "{got:?}");
