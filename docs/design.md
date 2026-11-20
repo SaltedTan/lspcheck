@@ -146,10 +146,11 @@ C1 to C3 share one scenario. After `initialize` and a plain request, lspcheck se
 when the server advertises `workspaceSymbolProvider`, otherwise an unknown-method probe) and its `$/cancelRequest`
 before reading anything, waits for the request's response, and sends a plain request. Next it cancels an id it never
 sent and then that plain request, if the server has answered it (with a well-formed outcome, as above, by its
-deadline), each cancel followed by another plain request. Finally it shuts the server down. C2's finished request has an id of its own, and lspcheck never
-names the cancelled request again, so a late second response to the cancelled request is C1's evidence and nothing
-else's. C2 tests both cases even when the cancelled request goes unanswered. A reply to a cancel can come at any time,
-so the verdicts are given at the end, over everything read before `exit` was sent:
+deadline), each cancel followed by another plain request. Finally it shuts the server down. C2's finished request has
+an id of its own, and lspcheck never names the cancelled request again, so a late second response to the cancelled
+request is C1's evidence and nothing else's. C2 tests both cases even when the cancelled request goes unanswered. A
+reply to a cancel can come at any time, so the verdicts are given at the end, over everything read before `exit` was
+sent:
 
 - the cancelled request's response is the first with its id and a well-formed outcome; a message with the id but none
   is J5's finding, not C1's response. A second response with a well-formed outcome fails C1, whenever it is read;
