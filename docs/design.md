@@ -176,7 +176,9 @@ sent:
 
 An answer to C1's cancelled request, or to one of C2's plain requests, read after lspcheck stopped waiting
 (`--timeout`) but before `exit` still answers it: the timeout is lspcheck's limit, not the protocol's. C1 judges such
-an answer as it would a timely one; a C2 plain request answered that way makes C2 `error`, not `fail`.
+an answer as it would a timely one; a C2 plain request answered that way makes C2 `error`, not `fail`, and no longer
+keeps C3 from being judged. So a missing answer is excused by output lspcheck missed any time before `exit`, not only
+while it waited. Only a response read once the session registered the request counts.
 If the server stopped answering, what it didn't send can't be judged, so those checks are `error`. A pass is also
 `error` when lspcheck missed something where that check's evidence would be: a frame it skipped or couldn't read, a
 server request it couldn't answer (the server may be waiting for it), or reading that stopped. For C1 and C3 that is

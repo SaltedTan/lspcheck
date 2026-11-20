@@ -2950,9 +2950,6 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     // A message with R's id but no outcome isn't the response C1 asks for,
     // so the wait goes on past it until R's deadline.
     let answer = wait_answer(&mut ctx.s, &r, deadline).await;
-    // When lspcheck stopped waiting for R: only a frame it missed between
-    // writing R and then could have been R's answer.
-    let r_waited = ctx.s.elapsed();
 
     // Whether the server still answers, without which nothing it didn't
     // send can be judged. Once answered (see `is_answer`), this plain request
@@ -2987,8 +2984,8 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     // it read after then can answer that cancel.
     let mut finished_cancelled_at: Option<Duration> = None;
     // A plain request in C2 that went unanswered (see `is_answer`): the
-    // error, its id, and when it was sent and when lspcheck stopped waiting.
-    let mut c2_problem: Option<(CallError, Id, Duration, Duration)> = None;
+    // error, its id, and when it was sent.
+    let mut c2_problem: Option<(CallError, Id, Duration)> = None;
     let mut c2_unsent: Option<WriteError> = None;
     // When C2's first cancel was sent: only what came after can be about it.
     let mut c2_started: Option<Duration> = None;
@@ -3007,7 +3004,7 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             let asked = ctx.s.elapsed();
             let live = ctx.s.fresh_id();
             if let Err(e) = call_for_answer(&mut ctx.s, &live, t).await {
-                c2_problem = Some((e, live, asked, ctx.s.elapsed()));
+                c2_problem = Some((e, live, asked));
                 stopped = Some("the server stopped answering (see C2)".into());
                 break;
             }
@@ -3033,9 +3030,18 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
     let mut c1_again = None;
     // An answer read after lspcheck stopped waiting but before `exit` still
     // answers R: `--timeout` is lspcheck's limit, not the protocol's.
-    let late_answer = |id: &Id| window(0).find(|&i| is_answer(&msgs[i].1) && msgs[i].1.response_id() == Some(id));
+    // Only one read once the session registered the request can answer it.
+    let late_answer = |id: &Id| {
+        let since = ctx.s.registered_at(id)?;
+        window(0).find(|&i| msgs[i].0 >= since && is_answer(&msgs[i].1) && msgs[i].1.response_id() == Some(id))
+    };
     let answer = answer.or_else(|wait| late_answer(&r).ok_or(wait));
-    let live_answered_late = c2_problem.as_ref().is_some_and(|(_, live, _, _)| late_answer(live).is_some());
+    let live_answered_late = c2_problem.as_ref().is_some_and(|(_, live, _)| late_answer(live).is_some());
+    // The server didn't stop: it answered C2's request late, so C3 isn't
+    // left waiting on a reply that could still come.
+    if live_answered_late {
+        stopped = None;
+    }
     let c1 = match answer {
         Err(wait) => {
             let e = CallError::Wait(wait);
@@ -3043,10 +3049,12 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
             if let Some(came) = outcomeless(&ctx.s, &r) {
                 why.push_str(&format!("; {}", describe_outcomeless(&came)));
             }
-            match ctx.s.incomplete_within(written_at, r_waited) {
+            // An answer read any time before `exit` would have counted, so
+            // only a frame missed before then could have been it.
+            match ctx.s.incomplete_within(written_at, end) {
                 Some(missed) => (Verdict::Error, format!("inconclusive, because {missed}: {why}")),
                 None => {
-                    c1_absent = Some((written_at, r_waited));
+                    c1_absent = Some((written_at, end));
                     (Verdict::Fail, why)
                 }
             }
@@ -3106,7 +3114,7 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         ctx.report("C2", Verdict::Error, "not judged: the server stopped answering (see C1)");
     } else if let Some(e) = c2_unsent {
         ctx.report("C2", Verdict::Error, format!("lspcheck couldn't send a $/cancelRequest: {e}"));
-    } else if let Some((e, live, asked, waited)) = c2_problem {
+    } else if let Some((e, live, asked)) = c2_problem {
         let mut why = format!(
             "the server stopped answering after cancelling an unknown or finished request ({})",
             describe_call_error(&e, t)
@@ -3114,8 +3122,9 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
         if let Some(came) = outcomeless(&ctx.s, &live) {
             why.push_str(&format!("; {}", describe_outcomeless(&came)));
         }
-        // Only a frame lspcheck missed while waiting could have been the answer.
-        match (e, ctx.s.incomplete_within(asked, waited)) {
+        // An answer read before `exit` would have made C2 inconclusive, so a
+        // frame missed any time before then could have been it.
+        match (e, ctx.s.incomplete_within(asked, end)) {
             (CallError::Write(_), _) => ctx.report("C2", Verdict::Error, why),
             (CallError::Wait(_), Some(missed)) => {
                 ctx.report("C2", Verdict::Error, format!("inconclusive, because {missed}: {why}"))
@@ -3127,7 +3136,7 @@ async fn cancellation(ctx: &mut Ctx<'_>) {
                     "inconclusive: the request was answered only after lspcheck stopped waiting, before exit: {why}"
                 ),
             ),
-            (CallError::Wait(_), None) => ctx.fail_absent_between("C2", asked, waited, why),
+            (CallError::Wait(_), None) => ctx.fail_absent_between("C2", asked, end, why),
         }
     } else if let Some((id, what)) = ambiguous {
         let why = format!(

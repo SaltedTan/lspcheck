@@ -23,7 +23,9 @@
   output lspcheck missed anywhere in that span makes a C1 pass `error`.
 - **C1** and **C2** no longer fail when an answer they waited for arrives after `--timeout` but before `exit`.
   `--timeout` is lspcheck's limit, not the protocol's: C1 judges such an answer as usual, and a plain request after
-  C2's cancels answered that late makes C2 `error`.
+  C2's cancels answered that late makes C2 `error` (and C3 is then judged as usual). Output lspcheck missed before
+  `exit`, such as a frame over `--max-frame-mib`, could have held such an answer, so it now makes a missing answer
+  `error` rather than `fail`.
 - **C3** now fails only on a MethodNotFound (-32601) response without an id whose error `message` names
   `$/cancelRequest` as a whole word, not as part of a longer name such as `$/cancelRequestMetrics`, read after
   lspcheck began writing the first cancel, its code read by value as J5 does (so `-32601.0` counts). Any other response without an id now gives `error` rather than `fail`,

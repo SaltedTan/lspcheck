@@ -1972,6 +1972,24 @@ fn a_request_after_the_cancels_answered_only_after_lspchecks_timeout_leaves_c2_i
     );
     expect(&r, "C2", "error");
     assert!(detail(&r, "C2").contains("answered only after lspcheck stopped waiting"), "{}", r.stdout);
+    // The server didn't stop answering, so C3 is judged.
+    expect(&r, "C3", "pass");
+}
+
+#[test]
+fn a_late_answer_lspcheck_couldnt_read_leaves_c1_and_c2_inconclusive() {
+    // An answer read before exit would have counted, so one in a frame too
+    // large to read could have been it.
+    let r = run(
+        &["--fault", "cancelled-answer-at-shutdown", "--fault", "big-late-answers"],
+        &["--only", "C1,C2,C3", "--timeout", "1", "--max-frame-mib", "1"],
+    );
+    expect(&r, "C1", "error");
+    let r = run(
+        &["--fault", "defer-until-next", "--fault", "answer-probes-at-shutdown", "--fault", "big-late-answers"],
+        &["--only", "C1,C2,C3", "--timeout", "1", "--max-frame-mib", "1"],
+    );
+    expect(&r, "C2", "error");
 }
 
 #[test]
@@ -2082,14 +2100,15 @@ fn a_frame_skipped_before_the_cancelled_request_doesnt_excuse_its_absence() {
 }
 
 #[test]
-fn a_frame_skipped_after_a_cancelled_request_went_unanswered_doesnt_excuse_it() {
-    // The oversized frame comes only after lspcheck stopped waiting for the
-    // cancelled request, so it can't have been its answer.
+fn a_frame_skipped_after_a_cancelled_request_went_unanswered_leaves_c1_inconclusive() {
+    // The oversized frame comes after lspcheck stopped waiting for the
+    // cancelled request, but an answer read before exit still counts, so it
+    // could have been one.
     let r = run(
         &["--fault", "cancelled-no-reply", "--fault", "big-frame-after-drop"],
         &["--max-frame-mib", "1", "--timeout", "3"],
     );
-    expect(&r, "C1", "fail");
+    expect(&r, "C1", "error");
     // It is read before C2's cancels, so C2 is still judged.
     expect(&r, "C2", "pass");
 }

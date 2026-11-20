@@ -178,6 +178,10 @@ const FAULTS: &[(&str, &str)] = &[
         "answer-probes-at-shutdown",
         "after a $/cancelRequest for an id that isn't pending, hold probes and answer them only when shutdown arrives",
     ),
+    (
+        "big-late-answers",
+        "with cancelled-answer-at-shutdown or answer-probes-at-shutdown, make each late answer's result a 2 MiB string",
+    ),
     ("cancel-not-found-float", "answer every $/cancelRequest with a MethodNotFound whose id is null and code -32601.0"),
     ("cancelled-reply-twice", "answer a cancelled request with both -32800 and a result"),
     ("cancelled-other-error", "lawful: answer a cancelled request with InternalError (-32603)"),
@@ -765,7 +769,7 @@ fn main() {
                 if fault("cancelled-no-reply") {
                     dropped = true;
                 } else if fault("cancelled-answer-at-shutdown") {
-                    cancelled_again = Some(ok(&deferred_id, Value::Null));
+                    cancelled_again = Some(ok(&deferred_id, late_result(fault("big-late-answers"))));
                 } else if fault("cancelled-other-error") {
                     out.frame(&err(&deferred_id, -32603, "internal error"));
                 } else if fault("cancelled-no-outcome") {
@@ -1760,7 +1764,7 @@ fn main() {
         }
         if method == "shutdown" {
             for held in held_probes.drain(..) {
-                out.frame(&ok(&held, Value::Null));
+                out.frame(&ok(&held, late_result(fault("big-late-answers"))));
             }
         }
         if method == "shutdown"
@@ -2943,6 +2947,12 @@ fn config_filling(size: usize) -> Value {
     let n = (1..).take_while(|&n| framed(n) <= size).last().unwrap_or(1);
     let items = vec![json!({}); n];
     json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": items}})
+}
+
+/// The result of an answer held until shutdown: null, or a 2 MiB string
+/// when `big` (big-late-answers).
+fn late_result(big: bool) -> Value {
+    if big { Value::String("x".repeat(2 * 1024 * 1024)) } else { Value::Null }
 }
 
 /// A response to a cancel notification: JSON-RPC has no id to give back.
