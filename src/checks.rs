@@ -1210,6 +1210,7 @@ async fn run_session(
         k1_pending: None,
         mutation: None,
         isolate,
+        offered: Vec::new(),
     };
     // The workspace, so a transcript of this scenario can be replayed in a
     // recreated one (files written later are recorded when they are written),
@@ -1360,6 +1361,12 @@ struct Ctx<'a> {
     mutation: Option<MutationSummary>,
     /// Set when the mutation scenario runs one case alone.
     isolate: Option<Isolate>,
+    /// The `positionEncodings` of the last initialize
+    /// [`Ctx::initialize_prepared`] sent and got a result for, which L2 and
+    /// the negotiated encoding judge its reply against. L3's second
+    /// initialize, whose reply is judged only for being an error, doesn't
+    /// change it.
+    offered: Vec<String>,
 }
 
 /// Why initialization didn't succeed.
@@ -1484,6 +1491,7 @@ impl Ctx<'_> {
 
     async fn initialize_prepared(&mut self, id: &Id, params: Value) -> Result<Message, InitFailure> {
         let t = self.cfg.startup_timeout;
+        let offered = offered_encodings(&params);
         let reply = match self.s.call_with_id(id, "initialize", Some(params), t).await {
             Ok(reply) => reply,
             Err(CallError::Wait(WaitError::Timeout)) => {
@@ -1511,6 +1519,7 @@ impl Ctx<'_> {
             }
             _ => unreachable!("wait_response returns responses"),
         }
+        self.offered = offered;
         if let Err(e) = self.s.notify("initialized", Some(json!({}))).await {
             return Err(InitFailure::Blocked(format!("initialized: {e}")));
         }
@@ -1534,7 +1543,8 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
         Err(InitFailure::Absent(why)) => return ctx.fail_absent("L2", since, why),
         Err(InitFailure::Blocked(why)) => return ctx.report("L2", Verdict::Error, why),
     };
-    judge_l2(ctx, &reply);
+    let (verdict, detail) = judge_l2(&reply, &ctx.offered);
+    ctx.report("L2", verdict, detail);
 
     let t = ctx.cfg.request_timeout;
     let mut problems = Vec::new();
@@ -2655,7 +2665,7 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
     let Some(caps) = initialize_capabilities(reply).filter(|c| c.is_object()).cloned() else {
         return K1Pending::Judged(Judgement::NotExercised("initialize had no capabilities object (see L2)".into()));
     };
-    let encoding = match negotiated_encoding(reply) {
+    let encoding = match negotiated_encoding(reply, &ctx.offered) {
         Ok(encoding) => encoding,
         Err(why) => return K1Pending::Judged(Judgement::Error(why)),
     };
@@ -3083,15 +3093,14 @@ fn documents_initialize_params(root: &Path) -> Value {
 }
 
 /// The encoding positions are counted in: the server's `positionEncoding`, or
-/// UTF-16 when it chose none. One lspcheck didn't offer is L2's failure, and
-/// leaves nothing D1 could count in.
-fn negotiated_encoding(reply: &Message) -> Result<Encoding, String> {
+/// UTF-16 when it chose none. One not in the `offered` list, other than
+/// UTF-16, is L2's failure, and leaves nothing D1 could count in.
+fn negotiated_encoding(reply: &Message, offered: &[String]) -> Result<Encoding, String> {
     let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { unreachable!() };
     match result.pointer("/capabilities/positionEncoding") {
         None => Ok(Encoding::Utf16),
-        Some(Value::String(name)) if OFFERED_ENCODINGS.contains(&name.as_str()) => {
-            Ok(Encoding::from_name(name).expect("every offered encoding has a name lspcheck knows"))
-        }
+        Some(Value::String(name)) if name == "utf-16" || offered.contains(name) => Encoding::from_name(name)
+            .ok_or_else(|| format!("not judged: lspcheck can't count positions in positionEncoding {name:?}")),
         Some(other) => {
             Err(format!("not judged: the server chose positionEncoding {other}, which lspcheck didn't offer (see L2)"))
         }
@@ -3295,7 +3304,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
         leave(ctx).await;
         return;
     }
-    let encoding = match negotiated_encoding(&reply) {
+    let encoding = match negotiated_encoding(&reply, &ctx.offered) {
         Ok(e) => e,
         Err(why) => {
             for id in ["D1", "D2", "D3", "D5", "D6"] {
@@ -5733,7 +5742,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         leave(ctx).await;
         return;
     }
-    let encoding = match negotiated_encoding(&reply) {
+    let encoding = match negotiated_encoding(&reply, &ctx.offered) {
         Ok(encoding) => encoding,
         Err(why) => {
             all(ctx, Verdict::Error, why.clone());
@@ -6585,22 +6594,38 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
     }
 }
 
+/// The position encodings lspcheck offers unless a profile changes them.
 const OFFERED_ENCODINGS: [&str; 3] = ["utf-8", "utf-32", "utf-16"];
 
-fn judge_l2(ctx: &mut Ctx<'_>, reply: &Message) {
+/// The `capabilities.general.positionEncodings` in these `initialize`
+/// params: none when it is absent or not an array of strings.
+fn offered_encodings(params: &Value) -> Vec<String> {
+    let offer = params.pointer("/capabilities/general/positionEncodings").and_then(Value::as_array);
+    let names = offer.and_then(|o| o.iter().map(|v| v.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>());
+    names.unwrap_or_default()
+}
+
+/// L2's verdict and detail on an initialize result, given the
+/// `positionEncodings` sent with it.
+fn judge_l2(reply: &Message, offered: &[String]) -> (Verdict, String) {
     let Kind::Response { outcome: Outcome::Result(result), .. } = &reply.kind else { unreachable!() };
     let Some(caps) = result.get("capabilities") else {
-        return ctx.fail("L2", "the result has no capabilities");
+        return (Verdict::Fail, "the result has no capabilities".into());
     };
     if !caps.is_object() {
-        return ctx.fail("L2", format!("capabilities is {caps}, not an object"));
+        return (Verdict::Fail, format!("capabilities is {caps}, not an object"));
     }
     match caps.get("positionEncoding") {
-        None => ctx.pass("L2"),
-        Some(Value::String(enc)) if OFFERED_ENCODINGS.contains(&enc.as_str()) => ctx.pass("L2"),
-        Some(other) => {
-            ctx.fail("L2", format!("positionEncoding {other} is not one of the offered {OFFERED_ENCODINGS:?}"))
-        }
+        None => (Verdict::Pass, String::new()),
+        Some(Value::String(enc)) if offered.contains(enc) => (Verdict::Pass, String::new()),
+        // The spec lets a server assume UTF-16 when the client leaves it out.
+        Some(Value::String(enc)) if enc == "utf-16" => (
+            Verdict::Pass,
+            format!(
+                "positionEncoding \"utf-16\" wasn't in the offer {offered:?}, but clients always support UTF-16 (LSP 3.17, general.positionEncodings)"
+            ),
+        ),
+        Some(other) => (Verdict::Fail, format!("positionEncoding {other} is not one of the offered {offered:?}")),
     }
 }
 
@@ -7338,6 +7363,55 @@ pub fn file_uri(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// An initialize result whose capabilities are `caps`.
+    fn initialize_reply(caps: Value) -> Message {
+        Message::classify(json!({"jsonrpc": "2.0", "id": 1, "result": {"capabilities": caps}}))
+    }
+
+    fn offer(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn l2_judges_against_the_offer_sent() {
+        let utf8 = initialize_reply(json!({"positionEncoding": "utf-8"}));
+        let (verdict, detail) = judge_l2(&utf8, &offer(&["utf-16"]));
+        assert_eq!(verdict, Verdict::Fail);
+        assert_eq!(detail, r#"positionEncoding "utf-8" is not one of the offered ["utf-16"]"#);
+        let default = offered_encodings(&initialize_params(Path::new("/workspace")));
+        assert_eq!(default, offer(&OFFERED_ENCODINGS));
+        assert_eq!(judge_l2(&utf8, &default), (Verdict::Pass, String::new()));
+        // An offer that isn't an array of strings offers nothing.
+        assert!(offered_encodings(&json!({"capabilities": {"general": {"positionEncodings": "utf-8"}}})).is_empty());
+        assert!(
+            offered_encodings(&json!({"capabilities": {"general": {"positionEncodings": ["utf-8", 7]}}})).is_empty()
+        );
+        assert_eq!(judge_l2(&utf8, &[]).0, Verdict::Fail);
+    }
+
+    #[test]
+    fn l2_accepts_utf16_left_out_of_the_offer() {
+        let utf16 = initialize_reply(json!({"positionEncoding": "utf-16"}));
+        let (verdict, detail) = judge_l2(&utf16, &offer(&["utf-8"]));
+        assert_eq!(verdict, Verdict::Pass);
+        assert!(detail.contains(r#"wasn't in the offer ["utf-8"]"#), "{detail}");
+        assert!(detail.contains("clients always support UTF-16"), "{detail}");
+        assert_eq!(judge_l2(&utf16, &offer(&OFFERED_ENCODINGS)), (Verdict::Pass, String::new()));
+    }
+
+    #[test]
+    fn negotiated_encoding_refuses_one_the_offer_lacks() {
+        let reply = |encoding: &str| initialize_reply(json!({"positionEncoding": encoding}));
+        let why = negotiated_encoding(&reply("utf-8"), &offer(&["utf-16"])).unwrap_err();
+        assert!(why.contains("which lspcheck didn't offer (see L2)"), "{why}");
+        assert_eq!(negotiated_encoding(&reply("utf-8"), &offer(&["utf-8"])), Ok(Encoding::Utf8));
+        assert_eq!(negotiated_encoding(&reply("utf-16"), &offer(&["utf-8"])), Ok(Encoding::Utf16));
+        assert_eq!(negotiated_encoding(&initialize_reply(json!({})), &[]), Ok(Encoding::Utf16));
+        // An offered name lspcheck can't count in isn't judged.
+        let why = negotiated_encoding(&reply("utf-7"), &offer(&["utf-7"])).unwrap_err();
+        assert!(why.starts_with("not judged"), "{why}");
+    }
+
     /// A failure about replies that never arrived, settled: it names only
     /// requests whose waits lspcheck read in full, the first and how many
     /// more (M2) or each (R4), since one whose wait it didn't may have been
@@ -7556,6 +7630,7 @@ mod tests {
             k1_pending: None,
             mutation: None,
             isolate: None,
+            offered: Vec::new(),
         }
     }
 
