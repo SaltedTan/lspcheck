@@ -1312,6 +1312,10 @@ impl Session {
         self.exit
     }
 
+    /// How long the exit wait idles before it looks at a server that seems
+    /// quiet, so the readers can take in anything already written.
+    const SETTLE: Duration = Duration::from_millis(20);
+
     /// L6 and L7's wait, after the `exit` lspcheck has just written. Like
     /// [`Session::serve_until_exit`], it reads what the server sends and
     /// answers its requests, but a server still running is looked at only
@@ -1359,8 +1363,21 @@ impl Session {
             let look = self.start + quiet + timeout;
             if Instant::now() >= look {
                 // Let the readers take in what the server has written, so a
-                // backlog isn't mistaken for quiet.
-                tokio::task::yield_now().await;
+                // backlog isn't mistaken for quiet. A yield isn't enough: on
+                // this runtime the waiting task can be polled before readers
+                // the I/O driver has just woken, as after lspcheck itself
+                // stalled across the look while the server was blocked
+                // writing to a full stderr pipe. An idle sleep parks the
+                // runtime on the driver, which runs every ready reader; one
+                // that itself overran was stalled too, so it is repeated
+                // (the 2 x timeout cap still ends the wait).
+                loop {
+                    let nap = Instant::now();
+                    sleep(Self::SETTLE).await;
+                    if nap.elapsed() < Self::SETTLE * 3 || Instant::now() >= self.start + due + timeout {
+                        break;
+                    }
+                }
                 if let Ok((at, inbound)) = self.rx.try_recv() {
                     if let Some(what) = self.take_after_exit(at, inbound, deadline).await {
                         (since, after) = (self.start.elapsed(), Some(what));

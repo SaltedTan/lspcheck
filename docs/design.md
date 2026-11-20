@@ -138,9 +138,13 @@ may hold its stdin without reading it), but not while it prepares one, which can
   lspcheck went back to waiting with nothing of the server's left to handle (after it wrote `exit`, after each message
   it took in, and so after each answer it wrote in full), with Q no later than the deadline. lspcheck looks once the
   server has been quiet that long, counting its reads of the server's stdout and stderr too; just before it looks, it
-  lets its readers catch up and takes in what they queued, and if there was anything it waits again. A server quiet
+  idles 20 ms so its readers can catch up (a bare yield could let it look before readers the I/O driver had just
+  woken, as after lspcheck itself stalled while the server was blocked writing to a full stderr pipe; a 20 ms idle
+  that overran three times over is repeated), takes in what they queued, and if there was anything it waits again. A server quiet
   since `exit` is looked at by the deadline. One that spoke after it, as lua-language-server does when it asks for
-  `workspace/configuration`, is looked at up to twice the timeout after `exit`. Once the session has ended, the
+  `workspace/configuration`, is looked at up to twice the timeout after `exit`. Building an answer to a server request isn't interrupted, so a
+  very large one (such as a big `[client].configuration`) can extend the wait by the time it takes; its write is
+  bounded as usual. Once the session has ended, the
   failure stands only if lspcheck read no byte of stdout after Q, up to the end of the session (whether or not it
   inspected it, and even as it stopped the server); every request the server sent in the session had its answer
   written in full by Q; and lspcheck lost nothing that could have held a request: no frame skipped or unreadable, no

@@ -303,7 +303,8 @@ lspcheck --profile go.toml --timeout 30 -- gopls
 
 - **Precedence.** A command after `--` overrides `[server].command`; with neither, lspcheck stops with a usage error.
   A timeout flag on the command line overrides the profile's, which overrides the default (30 s to initialize, 10 s per
-  request, 5 s to exit). Durations are strings: `"500ms"`, `"30s"`, `"2m"` or `"1h"`. `--only`, `--strict`, `--json`,
+  request, 5 s to exit). L6 and L7 may wait up to twice the exit timeout when the server writes or asks something
+  after `exit`, since they fail a server only once it has been quiet, with nothing owed to it, for a whole timeout. Durations are strings: `"500ms"`, `"30s"`, `"2m"` or `"1h"`. `--only`, `--strict`, `--json`,
   `--transcripts` and the size limits are command-line only.
 - **Paths** are relative to the profile file's directory: `[workspace].path`, and a `[server].command` program with a
   directory part (`bin/server`; a bare name is looked up on `PATH`). The fixture directory may hold only regular files
