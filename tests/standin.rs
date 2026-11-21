@@ -177,6 +177,20 @@ fn recorded_workspace(transcript: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn recorded_request_count(transcript: &std::path::Path) -> usize {
+    sent_messages(transcript).iter().filter(|message| matches!(message.kind, Kind::Request { .. })).count()
+}
+
+/// The params of each `initialize` lspcheck sent in `transcript`.
+fn sent_initializes(transcript: &std::path::Path) -> Vec<Value> {
+    sent_messages(transcript)
+        .into_iter()
+        .filter(|message| message.value["method"] == "initialize")
+        .map(|message| message.value["params"].clone())
+        .collect()
+}
+
+/// The messages lspcheck sent in `transcript`.
+fn sent_messages(transcript: &std::path::Path) -> Vec<Message> {
     let text = std::fs::read_to_string(transcript).unwrap();
     let mut reader = FrameReader::default();
     text.lines()
@@ -193,8 +207,7 @@ fn recorded_request_count(transcript: &std::path::Path) -> usize {
             Chunk::Frame { body, .. } => Message::parse(&body).ok(),
             _ => None,
         })
-        .filter(|message| matches!(message.kind, Kind::Request { .. }))
-        .count()
+        .collect()
 }
 
 fn fault(name: &str) -> Run {
@@ -1051,9 +1064,9 @@ fn requests_lspcheck_couldnt_send_are_errors_not_failures() {
     // The server stops reading while lspcheck answers its request, so
     // lspcheck can't deliver the requests J4 and L4 depend on.
     // Only run the three scenarios asserted below: waiting on this blocked
-    // server in every scenario can exceed the watchdog on Windows.
-    let r = run(&["--fault", "block-after-init"], &["--timeout", "1", "--only", "L2,J4,L4,L6,F3,F4,F5,F6,F7,L7"]);
-    expect(&r, "L2", "pass");
+    // server in every scenario can exceed the watchdog on Windows. L2 isn't
+    // selected, since it runs every scenario.
+    let r = run(&["--fault", "block-after-init"], &["--timeout", "1", "--only", "J4,L4,L6,F3,F4,F5,F6,F7,L7"]);
     for id in ["J4", "L4", "L6"] {
         expect(&r, id, "error");
     }
@@ -4885,4 +4898,408 @@ fn profile_readonly_fixture_override_starts_server_and_replays() {
         assert_eq!(std::fs::metadata(fixture.join(name)).unwrap().permissions().mode() & 0o777, 0o444);
     }
     replays_alike(&transcript, "needs-workspace-file");
+}
+
+// --- client capabilities ----------------------------------------------------
+
+/// A profile whose `[client.capabilities]` holds `table`.
+fn capabilities_profile(table: &str) -> (std::path::PathBuf, tempfile::TempDir) {
+    profile(&format!("[client.capabilities]\n{table}"))
+}
+
+const UTF16_ONLY: &str = "general.positionEncodings = [\"utf-16\"]\n";
+const SNIPPETS: &str = "textDocument.completion.completionItem.snippetSupport = true\n";
+
+#[test]
+fn profile_offer_fails_l2_for_an_unoffered_encoding() {
+    // UTF-8 is in lspcheck's own offer, so choosing it is lawful.
+    let r = fault("utf8-even-unoffered");
+    only_fails(&r, &[]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+
+    let (path, _keep) = capabilities_profile(UTF16_ONLY);
+    let r = with_profile(&["utf8-even-unoffered"], &path);
+    let unjudged = [("D1", "error"), ("D2", "error"), ("D3", "error"), ("D5", "error"), ("D6", "error")];
+    passes_except(&r, &[&[("L2", "fail"), ("K1", "error")][..], &unjudged].concat());
+    assert!(r.stdout.contains(r#"positionEncoding "utf-8" is not one of the offered ["utf-16"]"#), "{}", r.stdout);
+    assert!(r.stdout.contains("which lspcheck didn't offer (see L2)"), "{}", r.stdout);
+}
+
+#[test]
+fn profile_offer_changes_the_negotiated_encoding() {
+    // The stand-in miscounts only under UTF-8, which this offer leaves out.
+    let (path, _keep) = capabilities_profile(UTF16_ONLY);
+    let r = with_profile(&["utf16-positions-as-utf8"], &path);
+    only_fails(&r, &[]);
+    assert!(r.stdout.contains(r#"the profile offered ["utf-16"]"#), "{}", r.stdout);
+}
+
+#[test]
+fn profile_offer_without_utf16_is_lawful() {
+    // The stand-in chooses UTF-16 whatever is offered, and may.
+    let (path, _keep) = capabilities_profile("general.positionEncodings = [\"utf-8\"]\n");
+    let r = with_profile(&[], &path);
+    only_fails(&r, &[]);
+    assert!(r.stdout.contains(r#"wasn't in the offer ["utf-8"], but clients always support UTF-16"#), "{}", r.stdout);
+}
+
+#[test]
+fn profile_capabilities_reach_the_server_k1() {
+    let r = fault("snippet-completion-not-found");
+    only_fails(&r, &[]);
+    let (path, _keep) = capabilities_profile(SNIPPETS);
+    let r = with_profile(&["snippet-completion-not-found"], &path);
+    only_fails(&r, &["K1"]);
+    assert!(
+        r.stdout.contains("MethodNotFound (-32601) for 3 advertised request(s): textDocument/completion at"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn profile_capability_dependent_reply_is_lawful() {
+    let (path, _keep) = capabilities_profile(SNIPPETS);
+    let r = with_profile(&["snippet-completion"], &path);
+    only_fails(&r, &[]);
+    // K1 asked for completions, which only this profile's capabilities draw.
+    assert!(r.stdout.contains("13 request(s) for 7 advertised method(s) were answered"), "{}", r.stdout);
+}
+
+#[test]
+fn profile_progress_off_fails_nothing() {
+    let (path, _keep) = capabilities_profile("window.workDoneProgress = false\n");
+    let r = with_profile(&["progress-if-advertised"], &path);
+    // With no request from the server, J7 has nothing to judge.
+    passes_except(&r, &[("J7", "not-exercised")]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+}
+
+#[test]
+fn profile_capabilities_uncover_a_server_request_k2() {
+    let r = fault("show-document-if-advertised");
+    only_fails(&r, &[]);
+    let (path, _keep) = capabilities_profile("window.showDocument.support = true\n");
+    let r = with_profile(&["show-document-if-advertised"], &path);
+    only_fails(&r, &["K2"]);
+    assert!(r.stdout.contains("window/showDocument"), "{}", r.stdout);
+}
+
+#[test]
+fn profile_capabilities_reach_every_initialize() {
+    // The mutation profile, so the mutation scenario runs, and a fault that
+    // makes it isolate case 0, so its rerun does too.
+    let mutation = std::fs::read_to_string(mutation_profile()).unwrap();
+    let (path, _keep) = profile(&format!("{mutation}\n[client.capabilities]\n{SNIPPETS}"));
+    let dir = tempfile::tempdir().unwrap();
+    let t = dir.path().join("t");
+    let server = [STANDIN, "--fault", "exit-on-unbalanced"];
+    run_command_in(&["--profile", path.to_str().unwrap(), "--mutate"], &server, None, t.clone());
+    let mut seen = BTreeMap::new();
+    for entry in std::fs::read_dir(&t).unwrap() {
+        let file = entry.unwrap().path();
+        let scenario = file.file_stem().unwrap().to_str().unwrap().to_string();
+        let initializes = sent_initializes(&file);
+        for params in &initializes {
+            let caps = &params["capabilities"];
+            let snippets = &caps["textDocument"]["completion"]["completionItem"]["snippetSupport"];
+            assert_eq!(snippets, &Value::Bool(true), "{scenario}: {caps}");
+            // lspcheck's own capabilities stay, and each scenario's additions.
+            assert_eq!(caps["window"]["workDoneProgress"], true, "{scenario}: {caps}");
+            let k1 = scenario == "capabilities" || scenario.starts_with("mutation");
+            assert_eq!(caps["textDocument"].get("callHierarchy").is_some(), k1, "{scenario}: {caps}");
+            let documents = k1 || scenario == "documents";
+            assert_eq!(caps["textDocument"].get("inlayHint").is_some(), documents, "{scenario}: {caps}");
+        }
+        seen.insert(scenario, initializes.len());
+    }
+    // Each scenario's, L3's second and the isolated rerun's.
+    assert_eq!(seen.len(), lspcheck::checks::SCENARIOS.len() + 1, "{seen:?}");
+    assert!(seen.values().all(|&n| n >= 1), "{seen:?}");
+    assert_eq!((seen["after-initialize"], seen["pre-initialize"], seen["mutation-case-0"]), (2, 1, 1), "{seen:?}");
+}
+
+#[test]
+fn replay_resends_profile_capabilities() {
+    let (path, _keep) = capabilities_profile(SNIPPETS);
+    let (r, t, _keep_t) = run_with_transcripts(&[], &["--profile", path.to_str().unwrap(), "--only", "L2"]);
+    assert_eq!(r.status, 0, "{}", r.stdout);
+    let recorded = sent_initializes(&t.join("lifecycle.jsonl"));
+    assert_eq!(recorded[0]["capabilities"]["textDocument"]["completion"]["completionItem"]["snippetSupport"], true);
+    let out = replay(&t.join("lifecycle.jsonl"), &[], &[STANDIN]);
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(sent_initializes(&t.join("lifecycle.replay.jsonl")), recorded);
+}
+
+#[test]
+fn unknown_capability_key_warns_on_stderr_and_runs() {
+    let (path, _keep) = capabilities_profile("general.positionEncoding = \"utf-8\"\nexperimental.x = 1\n");
+    let (r, t, _keep_t) = run_with_transcripts(&[], &["--profile", path.to_str().unwrap()]);
+    only_fails(&r, &[]);
+    assert_eq!(
+        r.stderr,
+        "lspcheck: warning: client.capabilities.general.positionEncoding isn't an LSP 3.17 client capability \
+         (sent anyway)\n"
+    );
+    let sent = sent_initializes(&t.join("lifecycle.jsonl"));
+    assert_eq!(sent[0]["capabilities"]["general"]["positionEncoding"], "utf-8");
+}
+
+#[test]
+fn a_warning_lspcheck_cant_write_stops_nothing() {
+    let (path, _keep) = capabilities_profile("general.positionEncoding = \"utf-8\"\n");
+    // A pipe nothing reads, so writing the warning fails.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = Command::new(LSPCHECK)
+        .arg("--profile")
+        .arg(&path)
+        .args(["--only", "L6", "--", STANDIN])
+        .stderr(writer)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("PASS  L6"), "{stdout}");
+}
+
+/// Lets the server register foldingRange dynamically, so withdraw it.
+const DYNAMIC_FOLDING: &str = "textDocument.foldingRange.dynamicRegistration = true\n";
+
+/// What K1 says of a foldingRange MethodNotFound it doesn't judge, because
+/// of the server's registration activity for it.
+const FOLDING_EXCUSED: &str = "not judged, because the server had sent client/registerCapability or \
+                               client/unregisterCapability for the method before answering MethodNotFound, so it \
+                               may have withdrawn it: textDocument/foldingRange";
+
+#[test]
+fn k1_doesnt_judge_a_method_the_server_withdrew() {
+    let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
+    let r = with_profile(&["withdraw-folding"], &path);
+    only_fails(&r, &[]);
+    assert!(r.stdout.contains(FOLDING_EXCUSED), "{}", r.stdout);
+}
+
+#[test]
+fn k1_doesnt_judge_a_method_whose_replacement_registration_was_withdrawn_too() {
+    let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
+    let r = with_profile(&["withdraw-folding-cycle"], &path);
+    only_fails(&r, &[]);
+    assert!(r.stdout.contains(FOLDING_EXCUSED), "{}", r.stdout);
+}
+
+#[test]
+fn k1_doesnt_judge_a_method_registered_again_only_for_other_documents() {
+    let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
+    let r = with_profile(&["withdraw-folding-elsewhere"], &path);
+    only_fails(&r, &[]);
+    assert!(r.stdout.contains(FOLDING_EXCUSED), "{}", r.stdout);
+}
+
+#[test]
+fn k1_doesnt_judge_a_method_whose_withdrawal_may_be_in_a_skipped_frame() {
+    let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
+    let r = run(
+        &["--fault", "withdraw-folding-in-big-frame"],
+        &["--profile", path.to_str().unwrap(), "--only", "K1", "--max-frame-mib", "1"],
+    );
+    expect(&r, "K1", "not-exercised");
+    let detail = detail(&r, "K1");
+    assert!(
+        detail.contains(
+            "not judged, because the client lets the server register the method dynamically, and a withdrawal may \
+             have been in output lspcheck didn't see between the initialize answer and the MethodNotFound (a "
+        ) && detail.ends_with("wasn't checked): textDocument/foldingRange"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn k1_fails_a_method_with_an_id_in_its_options_and_no_registration() {
+    let (path, _keep) = capabilities_profile("textDocument.hover.dynamicRegistration = true\n");
+    let r = with_profile(&["hover-id-not-found"], &path);
+    only_fails(&r, &["K1"]);
+    let detail = detail(&r, "K1");
+    assert!(
+        detail.starts_with("MethodNotFound (-32601) for 3 advertised request(s): textDocument/hover at "),
+        "{detail}"
+    );
+    assert!(!detail.contains("not judged"), "{detail}");
+}
+
+#[test]
+fn k1_fails_a_method_withdrawn_only_after_its_method_not_found() {
+    let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
+    let r = with_profile(&["withdraw-folding-late"], &path);
+    only_fails(&r, &["K1"]);
+    assert!(
+        r.stdout.contains("MethodNotFound (-32601) for 1 advertised request(s): textDocument/foldingRange"),
+        "{}",
+        r.stdout
+    );
+}
+
+/// Lets the server register semantic tokens dynamically, with what every
+/// scenario's semanticTokens capability must hold.
+const DYNAMIC_TOKENS: &str = "textDocument.semanticTokens = { dynamicRegistration = true, requests = {}, \
+                              tokenTypes = [], tokenModifiers = [], formats = [\"relative\"] }\n";
+
+#[test]
+fn k1_doesnt_judge_semantic_tokens_withdrawn_under_their_registration_method() {
+    let (path, _keep) = capabilities_profile(DYNAMIC_TOKENS);
+    let r = with_profile(&["withdraw-semantic-tokens"], &path);
+    only_fails(&r, &[]);
+    expect(&r, "K1", "pass");
+    assert!(
+        r.stdout.contains(
+            "not judged, because the server had sent client/registerCapability or client/unregisterCapability for \
+             the method before answering MethodNotFound, so it may have withdrawn it: \
+             textDocument/semanticTokens/full, textDocument/semanticTokens/range"
+        ),
+        "{}",
+        r.stdout
+    );
+}
+
+/// The stand-in's mutation profile with [`DYNAMIC_FOLDING`].
+fn mutation_profile_with_dynamic_folding() -> (std::path::PathBuf, tempfile::TempDir) {
+    let base = std::fs::read_to_string(mutation_profile()).unwrap();
+    profile(&format!("{base}\n[client.capabilities]\n{DYNAMIC_FOLDING}"))
+}
+
+#[test]
+fn mutation_k1_doesnt_judge_a_method_the_server_withdrew() {
+    let (path, _keep) = mutation_profile_with_dynamic_folding();
+    let (r, _, _keep_t) = mutated_with(&path, &["withdraw-folding"], &[]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+    assert!(detail(&r, "K1").contains(&format!("N/E in the mutation scenario: {FOLDING_EXCUSED} (")), "{}", r.stdout);
+}
+
+#[test]
+fn mutation_k1_doesnt_judge_a_method_registered_again_only_for_other_documents() {
+    let (path, _keep) = mutation_profile_with_dynamic_folding();
+    let (r, _, _keep_t) = mutated_with(&path, &["withdraw-folding-elsewhere"], &[]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+    assert!(detail(&r, "K1").contains(&format!("N/E in the mutation scenario: {FOLDING_EXCUSED} (")), "{}", r.stdout);
+}
+
+#[test]
+fn mutation_k1_fails_a_method_withdrawn_only_after_its_method_not_found() {
+    let (path, _keep) = mutation_profile_with_dynamic_folding();
+    let (r, _, _keep_t) = mutated_with(&path, &["withdraw-folding-late"], &[]);
+    passes_except(&r, &[("K1", "fail"), ("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+    assert!(
+        r.stdout.contains(
+            "FAIL in the mutation scenario: MethodNotFound (-32601) for 1 advertised request(s) about the mutated \
+             documents: textDocument/foldingRange in the baseline"
+        ),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn mutation_k1_isnt_inconclusive_over_missed_output_when_every_method_not_found_was_excused() {
+    // foldingRange is all K1 asks, every MethodNotFound for it follows a
+    // withdrawal lspcheck read, and a frame lspcheck skips comes at shutdown:
+    // a MethodNotFound hidden there would be excused too.
+    let (path, _keep) = mutation_profile_with_dynamic_folding();
+    let (r, _, _keep_t) =
+        mutated_with(&path, &["withdraw-folding-then-big-log"], &["--max-frame-mib", "1", "--only", "K1"]);
+    expect(&r, "K1", "not-exercised");
+    assert!(detail(&r, "K1").contains(&format!("N/E in the mutation scenario: {FOLDING_EXCUSED} (")), "{}", r.stdout);
+}
+
+#[test]
+fn profile_without_workspace_folders_sends_none() {
+    let (path, _keep) = capabilities_profile("workspace.workspaceFolders = false\n");
+    let (r, t, _keep_t) = run_with_transcripts(&[], &["--profile", path.to_str().unwrap()]);
+    only_fails(&r, &[]);
+    let mut n = 0;
+    for entry in std::fs::read_dir(&t).unwrap() {
+        let file = entry.unwrap().path();
+        for params in sent_initializes(&file) {
+            assert_eq!(params["capabilities"]["workspace"]["workspaceFolders"], false, "{}", file.display());
+            assert!(params.get("workspaceFolders").is_none(), "{}: {params}", file.display());
+            assert!(params["rootUri"].is_string(), "{}: {params}", file.display());
+            n += 1;
+        }
+    }
+    // Every scenario's but mutation's, which needs --mutate, and L3's second.
+    assert_eq!(n, lspcheck::checks::SCENARIOS.len(), "{n}");
+    // lspcheck's own capabilities send the folder.
+    let (_, t, _keep_t) = run_with_transcripts(&[], &["--only", "L2"]);
+    assert!(sent_initializes(&t.join("lifecycle.jsonl"))[0]["workspaceFolders"].is_array());
+}
+
+#[test]
+fn profile_offer_fails_l2_for_an_unoffered_encoding_in_another_scenario() {
+    // UTF-8 is in lspcheck's own offer, so choosing it is lawful.
+    let r = fault("utf8-unoffered-with-inlay-hints");
+    only_fails(&r, &[]);
+
+    // The lifecycle scenario's initialize gets UTF-16, the others' UTF-8.
+    let (path, _keep) = capabilities_profile(UTF16_ONLY);
+    let unjudged = [("D1", "error"), ("D2", "error"), ("D3", "error"), ("D5", "error"), ("D6", "error")];
+    let expected = [&[("L2", "fail"), ("K1", "error")][..], &unjudged].concat();
+    let r = with_profile(&["utf8-unoffered-with-inlay-hints"], &path);
+    passes_except(&r, &expected);
+    let both =
+        r#"in the documents and capabilities scenarios, positionEncoding "utf-8" is not one of the offered ["utf-16"]"#;
+    assert!(r.stdout.contains(both), "{}", r.stdout);
+    // Wanted alone, L2 still sees every scenario's initialize, and links
+    // the transcript of the first scenario that saw the violation.
+    let (r, t, _keep_t) = run_with_transcripts(
+        &["--fault", "utf8-unoffered-with-inlay-hints"],
+        &["--profile", path.to_str().unwrap(), "--only", "L2"],
+    );
+    expect(&r, "L2", "fail");
+    assert!(r.stdout.contains(both), "{}", r.stdout);
+    let link = format!("transcript: {}", t.join("documents.jsonl").display());
+    assert!(r.stdout.contains(&link), "{}", r.stdout);
+    assert_eq!(r.report["results"][0]["scenario"], "documents", "{}", r.stdout);
+}
+
+#[test]
+fn l2_is_inconclusive_when_another_scenarios_initialize_answer_was_skipped() {
+    // The documents and capabilities scenarios' answers, with an unoffered
+    // utf-8, are over the inspection limit, so lspcheck never sees them.
+    let (path, _keep) = capabilities_profile(UTF16_ONLY);
+    let r = run(
+        &["--fault", "big-utf8-reply-with-inlay-hints"],
+        &["--profile", path.to_str().unwrap(), "--only", "L2", "--max-frame-mib", "1"],
+    );
+    expect(&r, "L2", "error");
+    let detail = detail(&r, "L2");
+    assert!(
+        detail.starts_with(
+            "inconclusive, because a first initialize got no result lspcheck saw, and it may have been in output \
+             lspcheck didn't see: in the documents scenario, a "
+        ) && detail.contains("; in the capabilities scenario, a "),
+        "{detail}"
+    );
+    assert_eq!(r.report["results"][0]["scenario"], "documents", "{}", r.stdout);
+}
+
+#[cfg(unix)]
+#[test]
+fn l2_fails_another_scenarios_initialize_answer_read_after_its_wait_ended() {
+    // The documents and capabilities scenarios' initialize is answered, with
+    // an unoffered utf-8, only once lspcheck stops the server; the answer is
+    // still read, and judged.
+    let (path, _keep) = capabilities_profile(UTF16_ONLY);
+    let r = run(
+        &["--fault", "utf8-answer-on-sigterm-with-inlay-hints"],
+        &["--profile", path.to_str().unwrap(), "--only", "L2", "--startup-timeout", "3"],
+    );
+    expect(&r, "L2", "fail");
+    let detail = detail(&r, "L2");
+    assert!(
+        detail.contains(
+            "positionEncoding \"utf-8\" is not one of the offered [\"utf-16\"], in an initialize result read after \
+             --startup-timeout ran out"
+        ),
+        "{detail}"
+    );
+    assert_eq!(r.report["results"][0]["scenario"], "documents", "{}", r.stdout);
 }

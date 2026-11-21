@@ -267,8 +267,7 @@ Many servers refuse to initialize, or check little, without a project or setting
 gives lspcheck what a server needs, and says what its maintainers accept. The sections and their top-level keys
 are optional, except that `[document]` needs `path` and `language_id`; each `allow.skip` entry requires both `id`
 and `reason`.
-The example below uses supported fields; [planned profile fields](docs/design.md#profiles-optional-toml) are not
-accepted yet.
+The example below shows the supported fields.
 
 ```toml
 [server]
@@ -284,6 +283,10 @@ files = { "go.mod" = "module example\n\ngo 1.22\n" }   # written after copying `
 [client]
 initialization_options = { hints = true }              # initializeParams.initializationOptions
 configuration = { gopls = { staticcheck = false } }    # answers to workspace/configuration
+
+[client.capabilities]          # merged over lspcheck's client capabilities in every initialize
+textDocument.completion.completionItem.snippetSupport = true
+window.workDoneProgress = false
 
 [allow]
 descendants = ["gopls-helper"]                         # process names allowed to outlive exit (L9)
@@ -324,6 +327,17 @@ lspcheck --profile go.toml --timeout 30 -- gopls
   its `section` as a dot-separated path in it (`"gopls.staticcheck"` gives `false`; a missing path gives `null`; an item
   without a section gets the whole table), and sends it once in `workspace/didChangeConfiguration` right after
   `initialized`, for servers that read settings only that way.
+- **`[client.capabilities]`** is converted the same way and merged over lspcheck's client capabilities in every
+  `initialize`: where both set a key, the profile wins (objects merge key by key, and arrays and scalars replace
+  lspcheck's), and lspcheck's own capabilities stay where the profile is silent. It can't remove a key. Two values are
+  refused because lspcheck couldn't judge under them: `textDocument.synchronization.dynamicRegistration = true`
+  (lspcheck doesn't follow sync registrations) and a `general.positionEncodings` entry other than `utf-8`, `utf-16` or
+  `utf-32`. A set that isn't of the LSP 3.17 `ClientCapabilities` type, once merged, is refused too, naming the key
+  and the scenarios affected. A key LSP 3.17 doesn't define is sent anyway, with a warning on stderr. With an offer of
+  its own, L2 judges the server's `positionEncoding` in every scenario's first initialize against it and names it.
+  With `workspace.workspaceFolders = false`, lspcheck sends no `workspaceFolders` param (`rootUri` still names the
+  workspace). The
+  [design reference](docs/design.md#profiles-optional-toml) has the details.
 - **`[allow]`.** L9 doesn't fail for a leftover process whose name, as lspcheck reports it, is in `descendants`; the
   `PASS` detail names what was allowed. (On Linux that name is the kernel's command name, at most 15 bytes.) A check in
   `skip` reports `SKIP` with the reason given, and doesn't affect the exit status. The

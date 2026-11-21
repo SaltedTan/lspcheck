@@ -45,6 +45,10 @@ pub struct Profile {
     pub initialization_options: Option<Value>,
     /// `[client].configuration`, as a JSON object.
     pub configuration: Option<Value>,
+    /// `[client.capabilities]`, as a JSON object.
+    pub client_capabilities: Option<Value>,
+    /// What lspcheck warns of on stderr before it runs.
+    pub warnings: Vec<String>,
     /// `[allow].descendants`: process names L9 accepts after exit.
     pub allowed_descendants: Vec<String>,
     /// `[allow].skip`.
@@ -133,6 +137,7 @@ struct RawWorkspace {
 struct RawClient {
     initialization_options: Option<toml::Value>,
     configuration: Option<toml::Table>,
+    capabilities: Option<toml::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -816,6 +821,16 @@ pub fn parse(text: &str, dir: &Path) -> Result<Profile, String> {
     if let Some(settings) = raw.client.configuration {
         profile.configuration = Some(to_json(&toml::Value::Table(settings), "client.configuration")?);
     }
+    if let Some(caps) = raw.client.capabilities {
+        let caps = client_capabilities(&caps)?;
+        let model = crate::metamodel::client_capabilities();
+        profile.warnings.extend(
+            crate::metamodel::unknown_keys(model, &caps, CAPABILITIES)
+                .into_iter()
+                .map(|key| format!("{key} isn't an LSP 3.17 client capability (sent anyway)")),
+        );
+        profile.client_capabilities = Some(caps);
+    }
     profile.allowed_descendants = raw.allow.descendants.unwrap_or_default();
     for skip in raw.allow.skip.unwrap_or_default() {
         let Some(check) = checks::CATALOGUE.iter().find(|c| c.id == skip.id) else {
@@ -836,6 +851,71 @@ pub fn parse(text: &str, dir: &Path) -> Result<Profile, String> {
         profile.mutation = Some(mutation_section(raw, &profile.workspace, profile.document.as_ref())?);
     }
     Ok(profile)
+}
+
+/// Where the paths in `[client.capabilities]`'s errors and warnings start.
+const CAPABILITIES: &str = "client.capabilities";
+
+/// The position encodings lspcheck can count positions in.
+const ENCODINGS: [&str; 3] = ["utf-8", "utf-16", "utf-32"];
+
+/// Validates `[client.capabilities]` and returns it as JSON. It must be a
+/// table, hold no value lspcheck couldn't judge under, and, merged over each
+/// set of capabilities lspcheck sends, leave it of the meta-model's
+/// `ClientCapabilities` type.
+fn client_capabilities(raw: &toml::Value) -> Result<Value, String> {
+    if !raw.is_table() {
+        return Err(format!(
+            "{CAPABILITIES} must be a table, such as\n  [client.capabilities]\n  \
+             textDocument.completion.completionItem.snippetSupport = true\nlspcheck's own capabilities are \
+             used where it is silent"
+        ));
+    }
+    let caps = to_json(raw, CAPABILITIES)?;
+    if caps.pointer("/textDocument/synchronization/dynamicRegistration") == Some(&Value::Bool(true)) {
+        return Err(format!(
+            "{CAPABILITIES}.textDocument.synchronization.dynamicRegistration can't be true: lspcheck doesn't \
+             follow sync registrations yet; D1, D3 and the mutation checks would judge text the server never had"
+        ));
+    }
+    if let Some(Value::Array(offer)) = caps.pointer("/general/positionEncodings") {
+        for (i, name) in offer.iter().enumerate() {
+            if let Some(name) = name.as_str().filter(|name| !ENCODINGS.contains(name)) {
+                return Err(format!(
+                    "{CAPABILITIES}.general.positionEncodings[{i}]: lspcheck can't count positions in {name:?}; \
+                     offer some of {ENCODINGS:?}"
+                ));
+            }
+        }
+    }
+    // Each problem, with the scenarios whose initialize would have it.
+    let mut problems: Vec<(String, Vec<&str>)> = Vec::new();
+    for (scenarios, mut merged) in checks::client_capability_sets() {
+        checks::merge_patch(&mut merged, &caps);
+        let found = crate::metamodel::on_validation_stack(|| {
+            crate::metamodel::validate(crate::metamodel::client_capabilities(), &merged, CAPABILITIES)
+                .map(|found| found.first.iter().map(ToString::to_string).collect::<Vec<_>>())
+        })
+        .map_err(|e| format!("{CAPABILITIES}: can't validate: {e}"))?
+        .map_err(|_| format!("{CAPABILITIES}: too large to validate"))?;
+        for problem in found {
+            match problems.iter_mut().find(|(p, _)| *p == problem) {
+                Some((_, names)) => names.extend(&scenarios),
+                None => problems.push((problem, scenarios.clone())),
+            }
+        }
+    }
+    match problems.first() {
+        None => Ok(caps),
+        Some((problem, scenarios)) => {
+            let which = match scenarios.len() {
+                n if n == checks::SCENARIOS.len() => "every scenario".to_string(),
+                1 => format!("the {} scenario", scenarios[0]),
+                _ => format!("the {} scenarios", scenarios.join(", ")),
+            };
+            Err(format!("{problem} (in the initialize of {which})"))
+        }
+    }
 }
 
 /// Validates `[document]`: `path` names a UTF-8 text file the workspace
@@ -1204,8 +1284,6 @@ mod tests {
         assert!(e.contains("why"), "{e}");
         let e = parse_here("[document]\npath = \"a\"\nlanguage = \"go\"\n").unwrap_err();
         assert!(e.contains("language") && e.contains("line 3"), "{e}");
-        // Client capabilities aren't accepted yet.
-        assert!(parse_here("[client]\ncapabilities = \"default\"\n").unwrap_err().contains("capabilities"));
     }
 
     #[test]
@@ -1588,6 +1666,104 @@ mod tests {
             parse_here("[client]\ninitialization_options = 7\n").unwrap().initialization_options,
             Some(7.into())
         );
+    }
+
+    fn caps(text: &str) -> Result<Profile, String> {
+        parse_here(&format!("[client.capabilities]\n{text}"))
+    }
+
+    #[test]
+    fn client_capabilities_table_is_converted_to_json() {
+        let p = caps(
+            "window.workDoneProgress = false\nworkspace.didChangeWatchedFiles = { dynamicRegistration = true }\n\
+             experimental.since = 1979-05-27\n",
+        )
+        .unwrap();
+        assert_eq!(
+            p.client_capabilities.unwrap(),
+            serde_json::json!({
+                "window": {"workDoneProgress": false},
+                "workspace": {"didChangeWatchedFiles": {"dynamicRegistration": true}},
+                "experimental": {"since": "1979-05-27"}
+            })
+        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(parse_here("").unwrap().client_capabilities, None);
+    }
+
+    #[test]
+    fn client_capabilities_string_is_refused_with_the_table_form() {
+        let e = parse_here("[client]\ncapabilities = \"default\"\n").unwrap_err();
+        assert!(e.starts_with("client.capabilities must be a table, such as"), "{e}");
+        assert!(e.contains("[client.capabilities]\n"), "{e}");
+    }
+
+    #[test]
+    fn client_capabilities_nan_is_refused_naming_its_path() {
+        let e = caps("experimental.x = nan\n").unwrap_err();
+        assert!(e.contains("client.capabilities.experimental.x"), "{e}");
+    }
+
+    #[test]
+    fn client_capabilities_wrong_type_is_refused_naming_its_path() {
+        let e = caps("general.positionEncodings = \"utf-8\"\n").unwrap_err();
+        assert!(e.starts_with("client.capabilities.general.positionEncodings is \"utf-8\"; required: "), "{e}");
+        let e = caps("window.workDoneProgress = 1\n").unwrap_err();
+        assert!(e.starts_with("client.capabilities.window.workDoneProgress is 1; required: boolean"), "{e}");
+        // Every scenario sends it, so every one is named.
+        assert!(e.ends_with(" (in the initialize of every scenario)"), "{e}");
+    }
+
+    #[test]
+    fn client_capabilities_unknown_encoding_is_refused() {
+        let e = caps("general.positionEncodings = [\"utf-16\", \"latin1\"]\n").unwrap_err();
+        assert!(e.contains("general.positionEncodings[1]: lspcheck can't count positions in \"latin1\""), "{e}");
+        for offer in ["[]", "[\"utf-16\"]", "[\"utf-32\", \"utf-8\"]"] {
+            let p = caps(&format!("general.positionEncodings = {offer}\n")).unwrap();
+            assert!(p.client_capabilities.unwrap()["general"]["positionEncodings"].is_array());
+        }
+    }
+
+    #[test]
+    fn client_capabilities_sync_dynamic_registration_is_refused() {
+        let e = caps("textDocument.synchronization.dynamicRegistration = true\n").unwrap_err();
+        assert!(e.contains("dynamicRegistration can't be true: lspcheck doesn't follow sync registrations"), "{e}");
+        caps("textDocument.synchronization.dynamicRegistration = false\n").unwrap();
+        // Other dynamic registrations only cost coverage.
+        caps("textDocument.hover.dynamicRegistration = true\n").unwrap();
+    }
+
+    #[test]
+    fn client_capabilities_partial_structure_is_refused_naming_scenarios() {
+        // Whole on top of K1's semantic tokens, missing its required fields elsewhere.
+        let e = caps("textDocument.semanticTokens.formats = [\"relative\"]\n").unwrap_err();
+        assert!(e.starts_with("client.capabilities.textDocument.semanticTokens.requests is missing; "), "{e}");
+        assert!(e.contains(" (in the initialize of the lifecycle, json-rpc,"), "{e}");
+        assert!(e.ends_with(", end-of-input, documents scenarios)"), "{e}");
+    }
+
+    #[test]
+    fn client_capabilities_unknown_keys_are_listed_not_refused() {
+        let p =
+            caps("general.positionEncoding = \"utf-8\"\nexperimental.x = { y = 1 }\nwindow.mystery = true\n").unwrap();
+        assert_eq!(
+            p.warnings,
+            [
+                "client.capabilities.general.positionEncoding isn't an LSP 3.17 client capability (sent anyway)",
+                "client.capabilities.window.mystery isn't an LSP 3.17 client capability (sent anyway)",
+            ]
+        );
+    }
+
+    #[test]
+    fn lspchecks_own_client_capabilities_are_valid() {
+        for (scenarios, set) in checks::client_capability_sets() {
+            let found = crate::metamodel::validate(crate::metamodel::client_capabilities(), &set, "c").unwrap();
+            assert!(found.is_empty(), "{scenarios:?}: {:?}", found.first);
+            assert!(crate::metamodel::unknown_keys(crate::metamodel::client_capabilities(), &set, "c").is_empty());
+        }
+        let named: Vec<&str> = checks::client_capability_sets().into_iter().flat_map(|(names, _)| names).collect();
+        assert_eq!(named.len(), checks::SCENARIOS.len());
     }
 
     #[test]

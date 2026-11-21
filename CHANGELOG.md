@@ -2,8 +2,38 @@
 
 ## Unreleased
 
+### Added
+
+- Profiles accept `[client.capabilities]`, a table merged over lspcheck's client capabilities in every `initialize`
+  it sends. The profile wins where both set a key (objects merge key by key; arrays and scalars replace lspcheck's),
+  and lspcheck's own capabilities stay where the profile is silent. Two values are refused because lspcheck couldn't
+  judge under them: `textDocument.synchronization.dynamicRegistration = true`, and a `general.positionEncodings`
+  entry other than `utf-8`, `utf-16` or `utf-32`. A set that isn't of the LSP 3.17 `ClientCapabilities` type once
+  merged is refused, naming the key and the scenarios affected. A key LSP 3.17 doesn't define is sent anyway, with a
+  warning on stderr. L2 judges the server's `positionEncoding` against the offer actually sent, and names a profile's
+  offer in its detail. When the capabilities set `workspace.workspaceFolders = false`, lspcheck sends no
+  `workspaceFolders` param; `rootUri` still names the workspace. The placeholder `capabilities = "default"` is refused
+  with a message showing the table form.
+
 ### Fixed
 
+- **L2** now judges the `positionEncoding` of every scenario's first initialize, each against the offer sent with
+  it, not only the lifecycle scenario's. A server that chose an encoding it wasn't offered in another scenario passed
+  L2, while D1 and the other position checks there said "not judged, see L2". The failure names the scenarios and the
+  offer, and a violation seen fails L2 even when the lifecycle scenario couldn't finish initializing. A first
+  initialize answered only after `--startup-timeout` ran out is judged from the result lspcheck read later. When no
+  violation was seen but a scenario's first initialize got no result lspcheck saw while it missed output (such as a
+  frame over `--max-frame-mib`), L2 is `ERROR`, naming the scenario, instead of passing. The report links the
+  transcript of the scenario L2's verdict came from. `--only L2` now runs every scenario.
+- **K1** no longer fails on a MethodNotFound for a request the server may have withdrawn with
+  `client/unregisterCapability`. Its answer isn't judged when, before it, lspcheck had read any
+  `client/registerCapability` or `client/unregisterCapability` for the request's registration method
+  (`textDocument/semanticTokens` for the semantic tokens requests, `textDocument/rename` for `prepareRename`),
+  whatever its id or document selector, or when the client capabilities let the server register the method
+  dynamically and lspcheck missed output between the initialize answer and the MethodNotFound. lspcheck doesn't track
+  which registrations are in force, so a server that sends a stray registration and then wrongly answers
+  MethodNotFound isn't failed. Such a request is still sent, and the detail names it and why. This applies in the
+  capabilities and mutation scenarios, and K1 with nothing else to judge is `N/E`.
 - **C1** and **R4** no longer pass when the server answers their request with a message carrying the id but no
   well-formed outcome, by J5's rules: exactly one of `result` and `error`, and the error an object with an integer
   `code` (signed 32-bit) and a string `message`. So neither, both, `error: null` and `error: {}` don't count. Such a message still

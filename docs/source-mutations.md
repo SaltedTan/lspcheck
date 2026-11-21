@@ -321,14 +321,18 @@ lspcheck keeps the last 64 text snapshots of each document. A position whose can
 and is counted, so retained text stays bounded and no position is judged against a text lspcheck no longer has.
 D2 judges every labelled publish against the versions sent before it was read; D6 every `selectionRange` reply; K1
 every MethodNotFound to an advertised request about a seed document (so not `workspace/symbol`), read at any time
-after the request was sent, including during cleanup's final stdout drain. lspcheck judges positions and selection
+after the request was sent, including during cleanup's final stdout drain, except one the server may have withdrawn
+before the first such answer was read: lspcheck had read a registration or unregistration for its registration
+method, or the client could register it dynamically and lspcheck missed output since the initialize answer (as in
+K1's own [scenario](design.md#capabilities-and-robustness)). lspcheck judges positions and selection
 ranges as it goes, before recording each version it sends,
 so a text is dropped only after everything read while it was kept has been judged against it; what may refer to a
 dropped text is counted in the detail (`that may refer to a version older than the 64 whose texts lspcheck keeps,
 not judged`). A request left unanswered or undelivered is M1's or M2's: it makes none of the four `ERROR`, though
 missed evidence in that window can make D1, D2 or D6 `ERROR`, as in their own scenarios. D1 and D2 are
-judged once a seed document was opened, D6 once a `selectionRange` was sent, and K1 only when it fails or missed
-output after its first request could have held a MethodNotFound; the scenario
+judged once a seed document was opened, D6 once a `selectionRange` was sent, and K1 only when it fails, missed
+output after its first request could have held a MethodNotFound, or it is `N/E` with a note naming the methods it
+didn't judge and why; the scenario
 contributes nothing to them when it stops before opening a document. In the combined detail, each scenario's part
 starts with its verdict and name (`FAIL in the mutation scenario: …; PASS in the documents scenario: …`), the
 winning one first, and each position, publish or reply the mutation scenario names says its case: a reply its

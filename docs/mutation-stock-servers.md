@@ -99,8 +99,8 @@ and are counted in its detail: gopls answers some requests with error code 0, cl
   stopped before the remaining cases' recovery was judged. Case 2 alone reproduces the crash. Same in all four runs.
 - **lemminx M1, M2, M3 and K1 `ERROR`** (a known server bug). lemminx never answers an `initialize` whose client
   capabilities include `textDocument.moniker: {}`, which K1's capabilities scenario and the mutation scenario both
-  send, so no case runs. This is the same bug as its stock `K1 error`. A profile can't change the client capabilities
-  (`[client].capabilities` is still planned).
+  send, so no case runs. This is the same bug as its stock `K1 error`. A profile can't remove a client capability:
+  `[client.capabilities]` only adds and replaces keys.
 - **D1 `FAIL` for rust-analyzer, lua-language-server and clangd** comes from the documents scenario, as in their stock
   baselines. In the mutation scenario D1 passes for all three: 8, 2 and 10 informative positions.
 - **zls D6 `FAIL`** comes from the documents scenario, as in its baseline (its `\n`-only line split). The mutation

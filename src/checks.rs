@@ -259,6 +259,11 @@ pub const CATALOGUE: &[CheckInfo] = &[
 /// Checks judged from every scenario's observations.
 pub const CROSS_CUTTING: &[&str] = &["F1", "F2", "F8", "J1", "J2", "J3", "J5", "J7", "L9", "K2"];
 
+/// Checks one scenario reports that every scenario's evidence can fail, so
+/// every scenario runs when one is wanted: L2 judges each scenario's first
+/// initialize (see [`settle_l2`]).
+const SETTLED_ACROSS: &[&str] = &["L2"];
+
 pub fn info(id: &str) -> &'static CheckInfo {
     CATALOGUE.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("unknown check {id}"))
 }
@@ -547,6 +552,9 @@ pub struct Config {
     pub workspace: profile::Workspace,
     /// Sent as `initializationOptions` in every `initialize`.
     pub initialization_options: Option<Value>,
+    /// The profile's client capabilities, merged over those of every
+    /// `initialize` (see [`merge_patch`]).
+    pub client_capabilities: Option<Value>,
     /// The settings `workspace/configuration` is answered from, also sent in
     /// a `workspace/didChangeConfiguration` after `initialized`.
     pub configuration: Option<Value>,
@@ -605,6 +613,12 @@ pub struct Observations {
     pub abandoned_at: Option<Duration>,
     /// How the json-rpc scenario's dedicated J3 exercise went, if it ran.
     pub j3_exercise: Option<(Verdict, String)>,
+    /// L2's encoding rule on the session's first initialize, if its result
+    /// had a capabilities object (see [`settle_l2`]).
+    pub l2_encoding: Option<(Verdict, String)>,
+    /// Why the session's first initialize may have had a result lspcheck
+    /// didn't see, if it got none and lspcheck missed output while it waited.
+    pub l2_unseen: Option<String>,
     /// Responses that matched no outstanding request, classified.
     pub unmatched: Vec<Unmatched>,
     /// Requests that were answered, with when their response was read.
@@ -901,7 +915,7 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
     // wanted and not skipped. It then runs whole, as it would without the
     // skips, so skipping a check changes no other check's verdict.
     let judges = |id: &str| wants(id) && !skipped(id);
-    let any_cross = CROSS_CUTTING.iter().any(|c| judges(c));
+    let any_cross = CROSS_CUTTING.iter().chain(SETTLED_ACROSS).any(|c| judges(c));
     let any_extended = EXTENDED.iter().any(|c| judges(c));
     let mut runs = Vec::new();
     for s in SCENARIOS {
@@ -939,6 +953,7 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
         }
     }
     combine_extended(&mut runs);
+    settle_l2(&mut runs);
     let cross: Vec<CheckResult> = [
         judge_f1(&runs),
         judge_f2(&runs),
@@ -1140,6 +1155,82 @@ fn rank(v: Verdict) -> u8 {
     }
 }
 
+/// Fails L2, which the lifecycle scenario reports, when another scenario's
+/// first initialize got a `positionEncoding` its own offer ruled out, naming
+/// each such scenario and its offer. Every scenario's offer is the profile's
+/// over its own capabilities, and a server may choose differently for each.
+/// The result then comes from the first scenario with a violation, so the
+/// report links its transcript. Without a violation, a pass is inconclusive
+/// when a scenario's first initialize got no result lspcheck saw and it
+/// missed output meanwhile.
+fn settle_l2(runs: &mut [ScenarioRun]) {
+    // Each failing detail once, with the scenarios that got it.
+    let mut failures: Vec<(&str, Vec<&'static str>)> = Vec::new();
+    for r in runs.iter() {
+        let Some((Verdict::Fail, detail)) = r.observed.as_ref().and_then(|o| o.l2_encoding.as_ref()) else { continue };
+        match failures.iter_mut().find(|(d, _)| d == detail) {
+            Some((_, names)) => names.push(r.name),
+            None => failures.push((detail, vec![r.name])),
+        }
+    }
+    if failures.is_empty() {
+        return unseen_l2(runs);
+    }
+    // A failure only the lifecycle scenario saw is L2's own detail.
+    let lifecycle_only = failures.iter().all(|(_, names)| names == &["lifecycle"]).then(|| failures[0].0.to_string());
+    let lifecycle_encoding = failures.iter().any(|(_, names)| names.contains(&"lifecycle"));
+    let first_failing = failures[0].1[0];
+    let parts: Vec<String> = failures
+        .iter()
+        .map(|(detail, names)| {
+            let s = if names.len() == 1 { "" } else { "s" };
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let [init @ .., last] = names.as_slice() else { unreachable!("a failure has a scenario") };
+            let names = if init.is_empty() { last.clone() } else { format!("{} and {last}", init.join(", ")) };
+            format!("in the {names} scenario{s}, {detail}")
+        })
+        .collect();
+    let Some(l2) = runs.iter_mut().flat_map(|r| &mut r.results).find(|r| r.id == "L2") else { return };
+    let (scenario, detail) = match lifecycle_only {
+        Some(_) if l2.verdict == Verdict::Fail => return,
+        // The violation was seen, so it outweighs an end lspcheck couldn't
+        // judge, such as an `initialized` it couldn't send.
+        Some(detail) => (l2.scenario, detail),
+        None => {
+            // A failure of the lifecycle scenario's other than the encoding's.
+            let own = (l2.verdict == Verdict::Fail && !lifecycle_encoding)
+                .then(|| format!("in the lifecycle scenario, {}", l2.detail));
+            let scenario = if own.is_some() { l2.scenario } else { first_failing };
+            (scenario, own.into_iter().chain(parts).collect::<Vec<_>>().join("; "))
+        }
+    };
+    *l2 = result(scenario, "L2", Verdict::Fail, detail);
+}
+
+/// Makes a passing L2 an error when a scenario's first initialize got no
+/// result lspcheck saw and lspcheck missed output while it waited: the
+/// result may have been there, with an encoding the offer ruled out. The
+/// result comes from the first such scenario.
+fn unseen_l2(runs: &mut [ScenarioRun]) {
+    let unseen: Vec<(&'static str, String)> =
+        runs.iter().filter_map(|r| Some((r.name, r.observed.as_ref()?.l2_unseen.clone()?))).collect();
+    let Some(&(first, _)) = unseen.first() else { return };
+    let Some(l2) = runs.iter_mut().flat_map(|r| &mut r.results).find(|r| r.id == "L2") else { return };
+    if l2.verdict != Verdict::Pass {
+        return;
+    }
+    let each: Vec<String> = unseen.iter().map(|(name, why)| format!("in the {name} scenario, {why}")).collect();
+    let mut detail = format!(
+        "inconclusive, because a first initialize got no result lspcheck saw, and it may have been in output \
+         lspcheck didn't see: {}",
+        each.join("; ")
+    );
+    if !l2.detail.is_empty() {
+        detail = format!("{detail} ({})", l2.detail);
+    }
+    *l2 = result(first, "L2", Verdict::Error, detail);
+}
+
 /// Folds the mutation scenario's verdict for each check it extends into the
 /// one the check's own scenario gives: the higher-ranked verdict wins (the
 /// own scenario's on a tie), with the scenario it came from, and the detail
@@ -1232,6 +1323,10 @@ async fn run_session(
         results: Vec::new(),
         scenario: name,
         j3_exercise: None,
+        l2_encoding: None,
+        initialize_tried: false,
+        l2_unseen: None,
+        withdrawable: Withdrawable::default(),
         k1_pending: None,
         mutation: None,
         isolate,
@@ -1277,7 +1372,7 @@ async fn run_session(
         MUTATION => mutation_scenario(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
-    let Ctx { s, mut results, j3_exercise, k1_pending, mut mutation, isolate, .. } = ctx;
+    let Ctx { s, mut results, j3_exercise, l2_encoding, l2_unseen, k1_pending, mut mutation, isolate, .. } = ctx;
     // A scenario that stopped without beginning a shutdown counts the
     // server's messages up to its cleanup, not during it.
     let stopping = s.elapsed();
@@ -1288,11 +1383,9 @@ async fn run_session(
     {
         m.messages = server_messages(&finish.messages, from..m.shutdown_at.unwrap_or(stopping), &m.case_times);
     }
-    if let (Some(K1Pending::Mutation { asked }), Some(m)) = (&k1_pending, &mut mutation) {
-        // The label is the method, then " in " and the case.
-        let troubles = k1_not_found(asked, &finish).into_iter().filter_map(|(_, _, label, case)| {
-            let method = label.split_once(" in ").map_or(label.as_str(), |(method, _)| method);
-            case.map(|case| Trouble::new(case, "K1", Verdict::Fail, method))
+    if let (Some(K1Pending::Mutation { asked, withdrawable }), Some(m)) = (&k1_pending, &mut mutation) {
+        let troubles = k1_not_found(asked, withdrawable, &finish).0.into_iter().filter_map(|(_, _, label, case)| {
+            case.map(|case| Trouble::new(case, "K1", Verdict::Fail, mutation_k1_method(label)))
         });
         m.troubles.extend(troubles);
     }
@@ -1331,10 +1424,28 @@ async fn run_session(
         None => (None, None),
     };
     drop(workspace);
-    (ScenarioRun { name, results, observed: Some(observations(finish, j3_exercise)), transcript, mutation }, unwritten)
+    (
+        ScenarioRun {
+            name,
+            results,
+            observed: Some(observations(finish, j3_exercise, l2_encoding, l2_unseen)),
+            transcript,
+            mutation,
+        },
+        unwritten,
+    )
 }
 
-fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observations {
+fn observations(
+    f: Finish,
+    j3_exercise: Option<(Verdict, String)>,
+    l2_encoding: Option<(Verdict, String)>,
+    l2_unseen: Option<L2Unseen>,
+) -> Observations {
+    let (l2_encoding, l2_unseen) = match l2_unseen {
+        Some(u) => late_l2(&f, u, l2_encoding),
+        None => (l2_encoding, None),
+    };
     Observations {
         problems: f.problems,
         cut_short: f.cut_short,
@@ -1354,6 +1465,8 @@ fn observations(f: Finish, j3_exercise: Option<(Verdict, String)>) -> Observatio
         j3_incomplete: f.j3_incomplete,
         abandoned_at: f.abandoned_at,
         j3_exercise,
+        l2_encoding,
+        l2_unseen,
         unmatched: f.unmatched,
         answered: f.answered,
         answered_methods: f.answered_methods,
@@ -1382,6 +1495,16 @@ struct Ctx<'a> {
     scenario: &'static str,
     /// How the json-rpc scenario's dedicated J3 exercise went.
     j3_exercise: Option<(Verdict, String)>,
+    /// L2's encoding rule on the first initialize, if it got a result.
+    l2_encoding: Option<(Verdict, String)>,
+    /// Whether [`Ctx::initialize_reply`] has sent an initialize.
+    initialize_tried: bool,
+    /// The first initialize, if its wait ended without a reply: a result
+    /// read later is judged, and output missed meanwhile may have held it.
+    l2_unseen: Option<L2Unseen>,
+    /// What may excuse a K1 MethodNotFound, from the last initialize that
+    /// got a result.
+    withdrawable: Withdrawable,
     k1_pending: Option<K1Pending>,
     /// What the mutation scenario ran.
     mutation: Option<MutationSummary>,
@@ -1415,10 +1538,22 @@ impl Ctx<'_> {
         );
     }
 
-    /// `initialize` params with the profile's `initializationOptions`, if any.
-    fn with_options(&self, mut params: Value) -> Value {
+    /// `initialize` params with the profile's `initializationOptions` and
+    /// client capabilities, if any, and without `workspaceFolders` when those
+    /// capabilities say the client has none.
+    fn with_profile(&self, mut params: Value) -> Value {
         if let Some(options) = &self.cfg.initialization_options {
             params["initializationOptions"] = options.clone();
+        }
+        if let Some(caps) = &self.cfg.client_capabilities {
+            merge_patch(&mut params["capabilities"], caps);
+        }
+        // A client without workspace folders sends none; `rootUri` still
+        // names the workspace.
+        if params.pointer("/capabilities/workspace/workspaceFolders") == Some(&Value::Bool(false))
+            && let Some(params) = params.as_object_mut()
+        {
+            params.remove("workspaceFolders");
         }
         params
     }
@@ -1542,7 +1677,7 @@ impl Ctx<'_> {
 
     /// Initializes the server with these params and sends `initialized`.
     async fn initialize_with(&mut self, params: Value) -> Result<Message, InitFailure> {
-        let params = self.with_options(params);
+        let params = self.with_profile(params);
         let id = self.s.fresh_id();
         self.initialize_prepared(&id, params).await
     }
@@ -1558,7 +1693,15 @@ impl Ctx<'_> {
     async fn initialize_reply(&mut self, id: &Id, params: Value) -> Result<Message, InitFailure> {
         let t = self.cfg.startup_timeout;
         let offered = offered_encodings(&params);
-        let reply = match self.s.call_with_id(id, "initialize", Some(params), t).await {
+        let dynamic = capabilities::dynamic_methods(&params["capabilities"]);
+        let first = !std::mem::replace(&mut self.initialize_tried, true);
+        let since = self.s.elapsed();
+        let reply = self.s.call_with_id(id, "initialize", Some(params), t).await;
+        if first && matches!(reply, Err(CallError::Wait(_))) {
+            self.l2_unseen =
+                Some(L2Unseen { id: id.clone(), offered: offered.clone(), since, until: self.s.elapsed() });
+        }
+        let reply = match reply {
             Ok(reply) => reply,
             Err(CallError::Wait(WaitError::Timeout)) => {
                 return Err(InitFailure::Blocked(format!(
@@ -1585,7 +1728,12 @@ impl Ctx<'_> {
             }
             _ => unreachable!("wait_response returns responses"),
         }
+        if first && let Some(caps) = initialize_capabilities(&reply).filter(|c| c.is_object()) {
+            self.l2_encoding = Some(judge_encoding(caps, &offered));
+        }
         self.offered = offered;
+        let since = self.s.answered_at(id).unwrap_or_else(|| self.s.elapsed());
+        self.withdrawable = Withdrawable { since, dynamic };
         Ok(reply)
     }
 
@@ -1609,7 +1757,7 @@ impl Ctx<'_> {
 /// Initialize, probe, shutdown, exit: the path every client takes.
 async fn lifecycle(ctx: &mut Ctx<'_>) {
     let since = ctx.s.elapsed();
-    let params = ctx.with_options(initialize_params(&ctx.root));
+    let params = ctx.with_profile(initialize_params(&ctx.root));
     let id = ctx.s.fresh_id();
     let reply = match ctx.initialize_reply(&id, params).await {
         Ok(reply) => reply,
@@ -2230,7 +2378,7 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
     // A reply to the notification can come after the request's answer, so
     // look at everything read until the answer to initialize, before
     // `initialized` and the profile's settings are sent.
-    let params = ctx.with_options(initialize_params(&ctx.root));
+    let params = ctx.with_profile(initialize_params(&ctx.root));
     let id = ctx.s.fresh_id();
     let init = ctx.initialize_reply(&id, params).await;
     // The window ends where the answer was in the stream, not when it was
@@ -2317,7 +2465,7 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
     // L3. Why the server can no longer be relied on, if it can't.
     let mut stopped: Option<&str> = None;
     let since = ctx.s.elapsed();
-    let params = ctx.with_options(initialize_params(&ctx.root));
+    let params = ctx.with_profile(initialize_params(&ctx.root));
     match ctx.s.call("initialize", Some(params), t).await {
         Ok(m) => match &m.kind {
             Kind::Response { outcome: Outcome::Error { code: Some(_), .. }, .. } => {
@@ -2705,6 +2853,7 @@ async fn with_exit(ctx: &mut Ctx<'_>, why: String) -> String {
 /// A request K1 sent, and the id whose response may still arrive during
 /// shutdown or the final stdout drain.
 struct K1Asked {
+    method: &'static str,
     label: String,
     /// The request's id, unless lspcheck couldn't send it.
     id: Option<Id>,
@@ -2713,16 +2862,21 @@ struct K1Asked {
 
 /// Evidence held until session cleanup drains the final stdout, so replies
 /// read after `leave` returns still count toward K1's verdict.
+/// Each also holds what may excuse a MethodNotFound (see [`k1_excuse`]).
 enum K1Pending {
     Judged(Judgement),
-    Sent {
-        asked: Vec<K1Asked>,
-        notes: Vec<String>,
-    },
-    /// Each request's id, when it was sent, its label and its case.
-    Mutation {
-        asked: Vec<(Id, Duration, String, Option<u64>)>,
-    },
+    Sent { asked: Vec<K1Asked>, notes: Vec<String>, withdrawable: Withdrawable },
+    Mutation { asked: Vec<MutationAsked>, withdrawable: Withdrawable },
+}
+
+/// What may excuse a K1 MethodNotFound besides the server's registration
+/// activity (see [`k1_excuse`]): when the scenario's initialize answer was
+/// read, and the methods whose capability the client let the server register
+/// dynamically.
+#[derive(Debug, Clone, Default)]
+struct Withdrawable {
+    since: Duration,
+    dynamic: HashSet<&'static str>,
 }
 
 /// K1: opens the profile's document (or lspcheck's own) and sends advertised
@@ -2743,7 +2897,7 @@ async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
 fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
     match pending {
         K1Pending::Judged(judgement) => Some(judgement),
-        K1Pending::Sent { mut asked, notes } => {
+        K1Pending::Sent { mut asked, notes, withdrawable } => {
             for a in &mut asked {
                 let Some(id) = &a.id else { continue };
                 if a.outcome == capabilities::Outcome::Unanswered
@@ -2754,15 +2908,14 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
                 // MethodNotFound for the request is seen evidence even when
                 // it isn't the first response with its id (J2 judges the
                 // duplicate); only responses read after the request was sent
-                // count.
+                // count. The first decides whether it is excused.
                 if let Some(&(sent, _)) = finish.sent.iter().find(|(_, s)| s == id)
-                    && finish.messages.iter().any(|(at, m)| {
-                        *at >= sent
-                            && m.response_id() == Some(id)
-                            && k1_outcome(m) == capabilities::Outcome::Error(codes::METHOD_NOT_FOUND)
-                    })
+                    && let Some(i) = first_not_found(&finish.messages, id, sent)
                 {
-                    a.outcome = capabilities::Outcome::Error(codes::METHOD_NOT_FOUND);
+                    a.outcome = match k1_excuse(a.method, i, &withdrawable, finish) {
+                        Some(excuse) => capabilities::Outcome::Excused(excuse),
+                        None => capabilities::Outcome::Error(codes::METHOD_NOT_FOUND),
+                    };
                 }
             }
             // Output lspcheck missed after the first request was sent may
@@ -2787,53 +2940,134 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
                 judgement => Some(judgement),
             }
         }
-        K1Pending::Mutation { asked } => {
+        K1Pending::Mutation { asked, withdrawable } => {
             // Only requests lspcheck wrote whole are K1's: a write that
             // failed part way asked the server nothing it must answer.
             let sent: HashSet<&Id> = finish.sent.iter().map(|(_, id)| id).collect();
             let asked: Vec<_> = asked.into_iter().filter(|(id, ..)| sent.contains(id)).collect();
-            let not_found = k1_not_found(&asked, finish);
+            let (not_found, excused) = k1_not_found(&asked, &withdrawable, finish);
+            // Each method excused, once, and how many requests it took.
+            let withdrawn = (!excused.is_empty()).then(|| {
+                let each: Vec<(&str, &capabilities::Excuse)> =
+                    excused.iter().map(|((_, _, label, _), excuse)| (mutation_k1_method(label), excuse)).collect();
+                format!("{} ({} request(s))", capabilities::excused_notes(&each).join("; "), excused.len())
+            });
             if not_found.is_empty() {
                 // As in the capabilities scenario, output missed after the
-                // first request was sent may have held a MethodNotFound.
+                // first request was sent may have held a MethodNotFound, for
+                // a request whose MethodNotFound wasn't already excused.
                 let first_sent = asked.iter().map(|(_, at, ..)| *at).min()?;
-                return finish.missed_output_within(first_sent, Duration::MAX).map(|why| {
-                    Judgement::Error(format!(
+                let open = excused.len() < asked.len();
+                let missed = open.then(|| finish.missed_output_within(first_sent, Duration::MAX)).flatten().map(|why| {
+                    let mut detail = format!(
                         "inconclusive, because {why}: a MethodNotFound for one of the {} advertised request(s) about \
                          the mutated documents may have been in output lspcheck didn't see",
                         asked.len()
-                    ))
+                    );
+                    if let Some(note) = &withdrawn {
+                        detail = format!("{detail}; {note}");
+                    }
+                    Judgement::Error(detail)
                 });
+                // An excused MethodNotFound judges nothing, but name it.
+                return missed.or(withdrawn.map(Judgement::NotExercised));
             }
             let n = not_found.len();
             let more = n.saturating_sub(K1_NAMED);
             let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
             let named: Vec<_> = not_found.iter().take(K1_NAMED).map(|(_, _, label, _)| label.as_str()).collect();
-            Some(Judgement::Fail(format!(
+            let mut detail = format!(
                 "MethodNotFound (-32601) for {n} advertised request(s) about the mutated documents: {}{tail}",
                 named.join(", ")
-            )))
+            );
+            if let Some(note) = withdrawn {
+                detail = format!("{detail}; {note}");
+            }
+            Some(Judgement::Fail(detail))
         }
     }
 }
 
+/// A mutation K1 request: its id, when it was sent, its label (the method,
+/// then " in " and where) and its case.
+type MutationAsked = (Id, Duration, String, Option<u64>);
+
+/// The method of a mutation K1 label: the method, then " in " and where.
+fn mutation_k1_method(label: &str) -> &str {
+    label.split_once(" in ").map_or(label, |(method, _)| method)
+}
+
 /// The mutation scenario's requests answered with MethodNotFound, read at
-/// any time after each was sent.
+/// any time after each was sent; then those whose first such answer is
+/// excused (see [`k1_excuse`]), each with why.
 fn k1_not_found<'a>(
-    asked: &'a [(Id, Duration, String, Option<u64>)],
+    asked: &'a [MutationAsked],
+    withdrawable: &Withdrawable,
     finish: &Finish,
-) -> Vec<&'a (Id, Duration, String, Option<u64>)> {
+) -> (Vec<&'a MutationAsked>, Vec<(&'a MutationAsked, capabilities::Excuse)>) {
     let by_id: HashMap<_, _> = asked.iter().enumerate().map(|(i, (id, ..))| (id, i)).collect();
-    let mut found = vec![false; asked.len()];
-    for (at, m) in &finish.messages {
+    let mut first: Vec<Option<usize>> = vec![None; asked.len()];
+    for (n, (at, m)) in finish.messages.iter().enumerate() {
         if let Some(&i) = m.response_id().and_then(|id| by_id.get(id))
             && *at >= asked[i].1
+            && first[i].is_none()
             && k1_outcome(m) == capabilities::Outcome::Error(codes::METHOD_NOT_FOUND)
         {
-            found[i] = true;
+            first[i] = Some(n);
         }
     }
-    asked.iter().zip(found).filter_map(|(a, found)| found.then_some(a)).collect()
+    let (mut not_found, mut excused) = (Vec::new(), Vec::new());
+    for (a, first) in asked.iter().zip(first) {
+        let Some(n) = first else { continue };
+        match k1_excuse(mutation_k1_method(&a.2), n, withdrawable, finish) {
+            Some(excuse) => excused.push((a, excuse)),
+            None => not_found.push(a),
+        }
+    }
+    (not_found, excused)
+}
+
+/// The index in `messages` of the first MethodNotFound answering `id` read
+/// at or after `sent`.
+fn first_not_found(messages: &[(Duration, Message)], id: &Id, sent: Duration) -> Option<usize> {
+    messages.iter().position(|(at, m)| {
+        *at >= sent
+            && m.response_id() == Some(id)
+            && k1_outcome(m) == capabilities::Outcome::Error(codes::METHOD_NOT_FOUND)
+    })
+}
+
+/// Why the MethodNotFound for `method` at index `at` in the session's
+/// messages isn't judged, if it isn't: the server may have withdrawn the
+/// method by then. lspcheck doesn't track which registrations are in force,
+/// since ids, document selectors and replacements can't be followed soundly,
+/// so it is excused when lspcheck had read any registration or unregistration
+/// for the method's registration method, or when the client let the server
+/// register the method dynamically and lspcheck missed output between the
+/// initialize answer and the MethodNotFound. A registration counts once
+/// read, whether or not lspcheck's acknowledgement got through.
+fn k1_excuse(method: &str, at: usize, withdrawable: &Withdrawable, finish: &Finish) -> Option<capabilities::Excuse> {
+    let registered = capabilities::registration_method(method);
+    if finish.messages[..at].iter().any(|(_, m)| registers(m, registered)) {
+        return Some(capabilities::Excuse::Registration);
+    }
+    if !withdrawable.dynamic.contains(method) {
+        return None;
+    }
+    finish.missed_output_within(withdrawable.since, finish.messages[at].0).map(capabilities::Excuse::Missed)
+}
+
+/// Whether `m` is a `client/registerCapability` or
+/// `client/unregisterCapability` request with an entry for `method`, whatever
+/// its id or options.
+fn registers(m: &Message, method: &str) -> bool {
+    // The spec keeps the misspelt `unregisterations` for compatibility.
+    let list = match &m.kind {
+        Kind::Request { method, .. } if method == "client/registerCapability" => "/params/registrations",
+        Kind::Request { method, .. } if method == "client/unregisterCapability" => "/params/unregisterations",
+        _ => return false,
+    };
+    m.value.pointer(list).and_then(Value::as_array).is_some_and(|each| each.iter().any(|e| e["method"] == method))
 }
 
 /// K1's requests, after a successful initialize. The caller leaves.
@@ -2898,14 +3132,26 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
         } else {
             ctx.s.request(r.method, Some(r.params.clone())).await.map(|id| (id, None))
         } {
-            Ok((id, Some(m))) => K1Asked { label: r.label.clone(), id: Some(id), outcome: k1_outcome(&m) },
+            Ok((id, Some(m))) => {
+                K1Asked { method: r.method, label: r.label.clone(), id: Some(id), outcome: k1_outcome(&m) }
+            }
             Ok((id, None)) => {
                 wait = false;
-                K1Asked { label: r.label.clone(), id: Some(id), outcome: capabilities::Outcome::Unanswered }
+                K1Asked {
+                    method: r.method,
+                    label: r.label.clone(),
+                    id: Some(id),
+                    outcome: capabilities::Outcome::Unanswered,
+                }
             }
             Err(e) => {
                 let why = if e == WriteError::Closed { with_exit(ctx, e.to_string()).await } else { e.to_string() };
-                K1Asked { label: r.label.clone(), id: None, outcome: capabilities::Outcome::Undelivered(why) }
+                K1Asked {
+                    method: r.method,
+                    label: r.label.clone(),
+                    id: None,
+                    outcome: capabilities::Outcome::Undelivered(why),
+                }
             }
         };
         let stop = matches!(sent.outcome, capabilities::Outcome::Undelivered(_));
@@ -2919,7 +3165,7 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
             break;
         }
     }
-    K1Pending::Sent { asked, notes }
+    K1Pending::Sent { asked, notes, withdrawable: ctx.withdrawable.clone() }
 }
 
 /// The index in `messages` of the first answer to `id` (see [`is_answer`])
@@ -4782,6 +5028,8 @@ struct Extended {
     published_cases: Vec<Option<u64>>,
     /// The cases whose replies or publishes D1 or D6 found at fault.
     troubles: Vec<Trouble>,
+    /// What may excuse a K1 MethodNotFound.
+    withdrawable: Withdrawable,
 }
 
 impl Extended {
@@ -4799,6 +5047,7 @@ impl Extended {
             selection: Vec::new(),
             published_cases: Vec::new(),
             troubles: Vec::new(),
+            withdrawable: Withdrawable::default(),
         }
     }
 
@@ -6137,7 +6386,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             ctx.report(id, verdict, detail.clone());
         }
     };
-    let params = ctx.with_options(capabilities_initialize_params(&ctx.root));
+    let params = ctx.with_profile(capabilities_initialize_params(&ctx.root));
     let id = ctx.s.fresh_id();
     let startup_bytes = mutation_startup_bytes(&id, &params, ctx.cfg.configuration.as_ref());
     if startup_bytes > MUTATION_BYTES {
@@ -6252,6 +6501,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         })
         .collect();
     let mut ext = Extended::new(encoding, docs.iter().map(|d| d.uri.clone()));
+    ext.withdrawable = ctx.withdrawable.clone();
     let opening_bytes = ctx.s.bytes_written()
         + SHUTDOWN_RESERVE
         + openings.iter().map(|params| notification_bytes("textDocument/didOpen", params)).sum::<u64>();
@@ -6768,6 +7018,7 @@ fn judge_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest], 
             })
             .map(|a| (a.id.clone(), a.at, format!("{} in {}", a.method, a.place()), a.case))
             .collect(),
+        withdrawable: ext.withdrawable.clone(),
     });
 }
 
@@ -7067,9 +7318,47 @@ fn judge_l2(reply: &Message, offered: &[String]) -> (Verdict, String) {
     if !caps.is_object() {
         return (Verdict::Fail, format!("capabilities is {caps}, not an object"));
     }
+    judge_encoding(caps, offered)
+}
+
+/// L2's rule on the `positionEncoding` in an initialize result's
+/// capabilities object, given the `positionEncodings` sent with it.
+/// A first initialize whose wait ended without a reply: its id, the offer
+/// it made, when it was sent and when the wait ended.
+struct L2Unseen {
+    id: Id,
+    offered: Vec<String>,
+    since: Duration,
+    until: Duration,
+}
+
+/// L2's encoding rule on a first initialize answered only after its wait
+/// ended (read later, even during cleanup), and why its result may have been
+/// missed instead, if no result was read and lspcheck missed output while it
+/// waited.
+fn late_l2(
+    f: &Finish,
+    u: L2Unseen,
+    l2_encoding: Option<(Verdict, String)>,
+) -> (Option<(Verdict, String)>, Option<String>) {
+    let late = f.messages.iter().find(|(at, m)| *at >= u.since && m.response_id() == Some(&u.id));
+    let Some((_, reply)) = late else {
+        return (l2_encoding, f.missed_output_within(u.since, u.until));
+    };
+    let judged = initialize_capabilities(reply).filter(|c| c.is_object()).map(|caps| {
+        let (verdict, detail) = judge_encoding(caps, &u.offered);
+        let when = "in an initialize result read after --startup-timeout ran out";
+        (verdict, if detail.is_empty() { detail } else { format!("{detail}, {when}") })
+    });
+    (judged.or(l2_encoding), None)
+}
+
+fn judge_encoding(caps: &Value, offered: &[String]) -> (Verdict, String) {
+    // Only a profile changes the offer; name it, since it isn't lspcheck's.
+    let note = if offered == OFFERED_ENCODINGS { String::new() } else { format!("the profile offered {offered:?}") };
     match caps.get("positionEncoding") {
-        None => (Verdict::Pass, String::new()),
-        Some(Value::String(enc)) if offered.contains(enc) => (Verdict::Pass, String::new()),
+        None => (Verdict::Pass, note),
+        Some(Value::String(enc)) if offered.contains(enc) => (Verdict::Pass, note),
         // The spec lets a server assume UTF-16 when the client leaves it out.
         Some(Value::String(enc)) if enc == "utf-16" => (
             Verdict::Pass,
@@ -7800,6 +8089,40 @@ pub fn initialize_params(root: &Path) -> Value {
     })
 }
 
+/// Merges `patch` into `target` as an RFC 7386 JSON Merge Patch: objects
+/// merge key by key, and anything else in `patch` replaces what `target` has.
+/// A profile's patch comes from TOML, which has no null, so nothing is deleted.
+pub fn merge_patch(target: &mut Value, patch: &Value) {
+    let Value::Object(entries) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = json!({});
+    }
+    let Value::Object(target) = target else { unreachable!() };
+    for (key, value) in entries {
+        merge_patch(target.entry(key.clone()).or_insert(Value::Null), value);
+    }
+}
+
+/// The client capabilities each scenario's initialize starts from, before a
+/// profile's are merged in, with the scenarios that send each set.
+pub fn client_capability_sets() -> Vec<(Vec<&'static str>, Value)> {
+    // The capabilities don't depend on the workspace, only the URIs do.
+    let root = Path::new("/workspace");
+    let own = |names: &[&str]| SCENARIOS.iter().map(|s| s.name).filter(|n| names.contains(n)).collect();
+    let others = SCENARIOS.iter().map(|s| s.name).filter(|n| !["documents", "capabilities", MUTATION].contains(n));
+    [
+        (others.collect(), initialize_params(root)),
+        (own(&["documents"]), documents_initialize_params(root)),
+        (own(&["capabilities", MUTATION]), capabilities_initialize_params(root)),
+    ]
+    .into_iter()
+    .map(|(names, params)| (names, params["capabilities"].clone()))
+    .collect()
+}
+
 /// The files in a workspace, as (relative name, bytes) pairs, for the
 /// workspace line of a transcript: those at its top, and the profile's
 /// `names` (relative, with `/` separators) wherever they are.
@@ -7899,6 +8222,64 @@ mod tests {
         // An offered name lspcheck can't count in isn't judged.
         let why = negotiated_encoding(&reply("utf-7"), &offer(&["utf-7"])).unwrap_err();
         assert!(why.starts_with("not judged"), "{why}");
+    }
+
+    #[test]
+    fn l2_names_an_offer_other_than_lspchecks() {
+        let utf16 = initialize_reply(json!({"positionEncoding": "utf-16"}));
+        assert_eq!(judge_l2(&utf16, &offer(&["utf-16"])), (Verdict::Pass, r#"the profile offered ["utf-16"]"#.into()));
+        let none = initialize_reply(json!({}));
+        assert_eq!(judge_l2(&none, &[]), (Verdict::Pass, "the profile offered []".into()));
+    }
+
+    /// The capabilities of `scenario`'s initialize under the profile's `patch`.
+    fn merged(scenario: &str, patch: Value) -> Value {
+        let (_, mut caps) = client_capability_sets().into_iter().find(|(names, _)| names.contains(&scenario)).unwrap();
+        merge_patch(&mut caps, &patch);
+        caps
+    }
+
+    #[test]
+    fn merge_patch_profile_scalar_replaces_base() {
+        let caps =
+            merged("lifecycle", json!({"textDocument": {"completion": {"completionItem": {"snippetSupport": true}}}}));
+        assert_eq!(caps["textDocument"]["completion"], json!({"completionItem": {"snippetSupport": true}}));
+        // A scalar replaces an object, and an object a scalar.
+        let mut target = json!({"a": {"b": 1}, "c": 2});
+        merge_patch(&mut target, &json!({"a": 3, "c": {"d": 4}}));
+        assert_eq!(target, json!({"a": 3, "c": {"d": 4}}));
+    }
+
+    #[test]
+    fn merge_patch_arrays_replace_whole() {
+        let caps = merged(
+            "capabilities",
+            json!({"general": {"positionEncodings": ["utf-16"]}, "textDocument": {"semanticTokens": {"tokenTypes": ["type"]}}}),
+        );
+        assert_eq!(caps["general"]["positionEncodings"], json!(["utf-16"]));
+        assert_eq!(caps["textDocument"]["semanticTokens"]["tokenTypes"], json!(["type"]));
+        assert_eq!(caps["textDocument"]["semanticTokens"]["formats"], json!(["relative"]));
+    }
+
+    #[test]
+    fn merge_patch_objects_keep_siblings() {
+        let caps = merged("lifecycle", json!({"window": {"workDoneProgress": false}}));
+        assert_eq!(
+            caps["window"],
+            json!({"workDoneProgress": false, "showMessage": {}, "showDocument": {"support": false}})
+        );
+    }
+
+    #[test]
+    fn scenario_additions_survive_where_profile_is_silent() {
+        let patch = json!({"textDocument": {"hover": {"contentFormat": ["plaintext"]}}});
+        for scenario in ["capabilities", MUTATION] {
+            let caps = merged(scenario, patch.clone());
+            assert_eq!(caps["textDocument"]["callHierarchy"], json!({}));
+            assert_eq!(caps["textDocument"]["hover"]["contentFormat"], json!(["plaintext"]));
+        }
+        assert_eq!(merged("documents", patch.clone())["textDocument"]["inlayHint"], json!({}));
+        assert!(merged("lifecycle", patch)["textDocument"].get("inlayHint").is_none());
     }
 
     /// A failure about replies that never arrived, settled: it names only
@@ -8094,6 +8475,7 @@ mod tests {
             transcripts: None,
             workspace: profile::Workspace::default(),
             initialization_options: None,
+            client_capabilities: None,
             configuration: None,
             allowed_descendants: Vec::new(),
             skip: Vec::new(),
@@ -8116,6 +8498,10 @@ mod tests {
             results: Vec::new(),
             scenario: MUTATION,
             j3_exercise: None,
+            l2_encoding: None,
+            initialize_tried: false,
+            l2_unseen: None,
+            withdrawable: Withdrawable::default(),
             k1_pending: None,
             mutation: None,
             isolate: None,
@@ -9020,6 +9406,7 @@ while header := sys.stdin.buffer.readline():
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn mutation_k1_matches_ids_times_and_reports_in_request_order() {
+        let unregistered = |asked| K1Pending::Mutation { asked, withdrawable: Withdrawable::default() };
         let cfg = mutation_test_config("exit 0");
         let ctx = mutation_test_ctx(&cfg, 1024).await;
         let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
@@ -9041,13 +9428,13 @@ while header := sys.stdin.buffer.readline():
         .into_iter()
         .map(|(at, value)| (Duration::from_millis(at), Message::classify(value)))
         .collect();
-        assert!(judge_k1(K1Pending::Mutation { asked: asked.clone() }, &finish).is_none());
+        assert!(judge_k1(unregistered(asked.clone()), &finish).is_none());
         // Output missed only before the first request was sent leaves that
         // alone; missed after it, nothing passes on that output's absence.
         finish.lost = vec![(Duration::from_millis(2), Duration::from_millis(9), "skipped".into())];
-        assert!(judge_k1(K1Pending::Mutation { asked: asked.clone() }, &finish).is_none());
+        assert!(judge_k1(unregistered(asked.clone()), &finish).is_none());
         finish.lost = vec![(Duration::from_millis(2), Duration::from_millis(11), "skipped".into())];
-        let Some(Judgement::Error(detail)) = judge_k1(K1Pending::Mutation { asked: asked.clone() }, &finish) else {
+        let Some(Judgement::Error(detail)) = judge_k1(unregistered(asked.clone()), &finish) else {
             panic!("output missed after mutation K1's requests must leave it inconclusive");
         };
         assert!(detail.starts_with("inconclusive, because skipped: a MethodNotFound for one of the 8"), "{detail}");
@@ -9055,9 +9442,9 @@ while header := sys.stdin.buffer.readline():
         // output after it leaves K1 alone, and isn't counted.
         let unsent = (Id::int(9), Duration::from_millis(1), "textDocument/hover in case 9".to_string(), Some(9));
         finish.lost = vec![(Duration::from_millis(2), Duration::from_millis(9), "skipped".into())];
-        assert!(judge_k1(K1Pending::Mutation { asked: vec![unsent.clone()] }, &finish).is_none());
+        assert!(judge_k1(unregistered(vec![unsent.clone()]), &finish).is_none());
         let with_unsent: Vec<_> = asked.iter().cloned().chain([unsent]).collect();
-        assert!(judge_k1(K1Pending::Mutation { asked: with_unsent }, &finish).is_none());
+        assert!(judge_k1(unregistered(with_unsent), &finish).is_none());
         finish.lost.clear();
         for (at, value) in [
             (20, json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32601, "message": "fourth"}})),
@@ -9069,7 +9456,7 @@ while header := sys.stdin.buffer.readline():
             finish.messages.push((Duration::from_millis(at), Message::classify(value)));
         }
         finish.messages.sort_by_key(|(at, _)| *at);
-        let Some(Judgement::Fail(detail)) = judge_k1(K1Pending::Mutation { asked }, &finish) else {
+        let Some(Judgement::Fail(detail)) = judge_k1(unregistered(asked), &finish) else {
             panic!("observed MethodNotFound responses must fail mutation K1");
         };
         assert_eq!(
@@ -9077,6 +9464,100 @@ while header := sys.stdin.buffer.readline():
             "MethodNotFound (-32601) for 4 advertised request(s) about the mutated documents: \
             textDocument/hover in case 1, textDocument/hover in case 2, textDocument/hover in case 3; and 1 more"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn k1_excuses_registration_activity_for_the_method_or_missed_output_and_judges_nothing_by_it() {
+        let cfg = mutation_test_config("exit 0");
+        let ctx = mutation_test_ctx(&cfg, 1024).await;
+        let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
+        let ms = Duration::from_millis;
+        let asked = vec![(Id::int(1), ms(10), "textDocument/semanticTokens/full in case 1".into(), Some(1))];
+        finish.sent = vec![(ms(10), Id::int(1))];
+        let request = |method: &str, list: &str, entry: Value| {
+            Message::classify(json!({"jsonrpc": "2.0", "id": "r", "method": method, "params": {list: [entry]}}))
+        };
+        let unregister = |id: &str, method: &str| {
+            request("client/unregisterCapability", "unregisterations", json!({"id": id, "method": method}))
+        };
+        let register = |options: Value| {
+            let entry = json!({"id": "x", "method": "textDocument/semanticTokens", "registerOptions": options});
+            request("client/registerCapability", "registrations", entry)
+        };
+        let not_found =
+            Message::classify(json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "no"}}));
+        let tokens = "textDocument/semanticTokens";
+        let dynamic = Withdrawable { since: ms(2), dynamic: HashSet::from(["textDocument/semanticTokens/full"]) };
+        let mut judged = |before: Vec<(u64, Message)>, lost: &[(u64, u64)], withdrawable: &Withdrawable| {
+            finish.messages = before.into_iter().map(|(at, m)| (ms(at), m)).collect();
+            finish.messages.push((ms(20), not_found.clone()));
+            finish.messages.sort_by_key(|(at, _)| *at);
+            finish.lost = lost.iter().map(|&(from, to)| (ms(from), ms(to), "a frame was skipped".into())).collect();
+            let pending = |asked| K1Pending::Mutation { asked, withdrawable: withdrawable.clone() };
+            judge_k1(pending(asked.clone()), &finish)
+        };
+        let none = Withdrawable::default();
+        // Any registration or unregistration for its registration method,
+        // whatever its id or selector, judges nothing.
+        for activity in [
+            unregister("stale", tokens),
+            register(json!({"documentSelector": [{"language": "rust"}]})),
+            register(json!({"documentSelector": null})),
+        ] {
+            let Some(Judgement::NotExercised(detail)) = judged(vec![(5, activity)], &[], &none) else {
+                panic!("an excused MethodNotFound alone judges nothing");
+            };
+            assert!(
+                detail.starts_with(
+                    "not judged, because the server had sent client/registerCapability or \
+                     client/unregisterCapability for the method before answering MethodNotFound, so it may have \
+                     withdrawn it: textDocument/semanticTokens/full (1 request(s))"
+                ),
+                "{detail}"
+            );
+        }
+        // Output missed between the initialize answer and the MethodNotFound
+        // judges nothing when the client let the server register it.
+        let Some(Judgement::NotExercised(detail)) = judged(vec![], &[(3, 4)], &dynamic) else {
+            panic!("a MethodNotFound after missed output judges nothing when the method could be registered");
+        };
+        assert!(
+            detail.contains("between the initialize answer and the MethodNotFound (a frame was skipped)"),
+            "{detail}"
+        );
+        // Otherwise it fails: activity for the request's own method or
+        // another, or read only after the answer; missed output when the
+        // client didn't let the server register it, or outside that window.
+        for (before, lost, withdrawable) in [
+            (vec![(5, unregister("t", "textDocument/semanticTokens/full"))], vec![], &dynamic),
+            (vec![(5, unregister("t", "textDocument/foldingRange"))], vec![], &dynamic),
+            (vec![(25, unregister("t", tokens))], vec![], &dynamic),
+            (vec![], vec![(3, 4)], &none),
+            (vec![], vec![(0, 1)], &dynamic),
+            (vec![], vec![(25, 30)], &dynamic),
+        ] {
+            let judgement = judged(before, &lost, withdrawable);
+            assert!(matches!(judgement, Some(Judgement::Fail(_))), "{lost:?} {withdrawable:?}: {judgement:?}");
+        }
+        // The capabilities scenario's K1 judges the same way.
+        let sent = |withdrawable: &Withdrawable| K1Pending::Sent {
+            asked: vec![K1Asked {
+                method: "textDocument/semanticTokens/full",
+                label: "textDocument/semanticTokens/full".into(),
+                id: Some(Id::int(1)),
+                outcome: capabilities::Outcome::Unanswered,
+            }],
+            notes: Vec::new(),
+            withdrawable: withdrawable.clone(),
+        };
+        finish.messages = vec![(ms(5), register(json!({}))), (ms(20), not_found.clone())];
+        finish.lost.clear();
+        assert!(matches!(judge_k1(sent(&none), &finish), Some(Judgement::NotExercised(_))));
+        finish.messages = vec![(ms(20), not_found)];
+        finish.lost = vec![(ms(3), ms(4), "a frame was skipped".into())];
+        assert!(matches!(judge_k1(sent(&dynamic), &finish), Some(Judgement::NotExercised(_))));
+        assert!(matches!(judge_k1(sent(&none), &finish), Some(Judgement::Fail(_))));
     }
 
     #[cfg(unix)]
@@ -9586,6 +10067,8 @@ while header := sys.stdin.buffer.readline():
                 j3_incomplete: None,
                 abandoned_at: None,
                 j3_exercise: None,
+                l2_encoding: None,
+                l2_unseen: None,
                 unmatched: Vec::new(),
                 answered: Vec::new(),
                 answered_methods: HashMap::new(),
@@ -10136,6 +10619,128 @@ while (message := read()) is not None:
         assert!(r.detail.contains("in documents at 3 ms, the result of workspace/symbol"), "{}", r.detail);
         assert!(r.detail.contains("in documents at 4 ms, the result of textDocument/documentSymbol"), "{}", r.detail);
         assert!(r.detail.ends_with("; 2 more, repeating these or not named"), "{}", r.detail);
+    }
+
+    #[test]
+    fn l2_fails_on_another_scenarios_unoffered_encoding() {
+        let with_encoding = |name: &'static str, l2: Option<(Verdict, &str)>| {
+            let mut run = observed_run(name, Vec::new(), None);
+            run.observed.as_mut().unwrap().l2_encoding = l2.map(|(v, d)| (v, d.to_string()));
+            run
+        };
+        let mut lifecycle = with_encoding("lifecycle", Some((Verdict::Pass, "")));
+        lifecycle.results.push(result("lifecycle", "L2", Verdict::Pass, "the profile offered [\"utf-16\"]"));
+        let mut runs = vec![
+            lifecycle,
+            with_encoding(
+                "documents",
+                Some((Verdict::Fail, "positionEncoding \"utf-8\" is not one of the offered []")),
+            ),
+            with_encoding("framing", None),
+            with_encoding("capabilities", Some((Verdict::Pass, "positionEncoding \"utf-16\" wasn't in the offer"))),
+        ];
+        settle_l2(&mut runs);
+        // It comes from the scenario that saw the violation, whose
+        // transcript the report links.
+        let l2 = &runs[0].results[0];
+        assert_eq!(
+            (l2.scenario, l2.verdict, l2.detail.as_str()),
+            (
+                "documents",
+                Verdict::Fail,
+                "in the documents scenario, positionEncoding \"utf-8\" is not one of the offered []"
+            )
+        );
+        // The lifecycle scenario's own failure comes first.
+        runs[0].results[0] = result("lifecycle", "L2", Verdict::Fail, "the result has no capabilities");
+        settle_l2(&mut runs);
+        assert!(
+            runs[0].results[0]
+                .detail
+                .starts_with("in the lifecycle scenario, the result has no capabilities; in the documents")
+        );
+        assert_eq!(runs[0].results[0].scenario, "lifecycle");
+        // The same failure in the lifecycle scenario is named with the others.
+        let utf8 = "positionEncoding \"utf-8\" is not one of the offered []";
+        runs[0].observed.as_mut().unwrap().l2_encoding = Some((Verdict::Fail, utf8.into()));
+        runs[0].results[0] = result("lifecycle", "L2", Verdict::Fail, utf8);
+        settle_l2(&mut runs);
+        assert_eq!(runs[0].results[0].detail, format!("in the lifecycle and documents scenarios, {utf8}"));
+        assert_eq!(runs[0].results[0].scenario, "lifecycle");
+        // Passes elsewhere change nothing.
+        runs.remove(1);
+        runs[0].results[0] = result("lifecycle", "L2", Verdict::Fail, utf8);
+        settle_l2(&mut runs);
+        assert_eq!(runs[0].results[0].detail, utf8);
+        runs[0].observed.as_mut().unwrap().l2_encoding = Some((Verdict::Pass, String::new()));
+        runs[0].results[0] = result("lifecycle", "L2", Verdict::Pass, "");
+        settle_l2(&mut runs);
+        assert_eq!((runs[0].results[0].verdict, runs[0].results[0].detail.as_str()), (Verdict::Pass, ""));
+    }
+
+    #[test]
+    fn l2_fails_on_a_seen_unoffered_encoding_even_when_the_lifecycle_scenario_ended_in_error() {
+        let utf8 = "positionEncoding \"utf-8\" is not one of the offered [\"utf-16\"]";
+        let blocked = "initialized: lspcheck couldn't write to the server's stdin";
+        let mut lifecycle = observed_run("lifecycle", Vec::new(), None);
+        lifecycle.observed.as_mut().unwrap().l2_encoding = Some((Verdict::Fail, utf8.into()));
+        lifecycle.results.push(result("lifecycle", "L2", Verdict::Error, blocked));
+        let mut runs = vec![lifecycle];
+        settle_l2(&mut runs);
+        let l2 = &runs[0].results[0];
+        assert_eq!((l2.scenario, l2.verdict, l2.detail.as_str()), ("lifecycle", Verdict::Fail, utf8));
+        // Another scenario's failure beats it too.
+        let mut documents = observed_run("documents", Vec::new(), None);
+        documents.observed.as_mut().unwrap().l2_encoding = Some((Verdict::Fail, utf8.into()));
+        runs[0].observed.as_mut().unwrap().l2_encoding = None;
+        runs[0].results[0] = result("lifecycle", "L2", Verdict::Error, blocked);
+        runs.push(documents);
+        settle_l2(&mut runs);
+        let l2 = &runs[0].results[0];
+        assert_eq!(
+            (l2.verdict, l2.detail.as_str()),
+            (Verdict::Fail, format!("in the documents scenario, {utf8}").as_str())
+        );
+    }
+
+    #[test]
+    fn l2_cant_pass_when_a_first_initialize_may_have_been_answered_in_missed_output() {
+        let with = |name: &'static str, unseen: Option<&str>| {
+            let mut run = observed_run(name, Vec::new(), None);
+            run.observed.as_mut().unwrap().l2_unseen = unseen.map(String::from);
+            run
+        };
+        let skipped = "a 1048661-byte frame is over lspcheck's 1048576-byte inspection limit (--max-frame-mib), so it \
+                       wasn't checked";
+        let mut lifecycle = with("lifecycle", None);
+        lifecycle.results.push(result("lifecycle", "L2", Verdict::Pass, "the profile offered [\"utf-16\"]"));
+        let mut runs = vec![lifecycle, with("framing", None), with("documents", Some(skipped))];
+        settle_l2(&mut runs);
+        let l2 = &runs[0].results[0];
+        assert_eq!(
+            (l2.scenario, l2.verdict, l2.detail.clone()),
+            (
+                "documents",
+                Verdict::Error,
+                format!(
+                    "inconclusive, because a first initialize got no result lspcheck saw, and it may have been in \
+                     output lspcheck didn't see: in the documents scenario, {skipped} (the profile offered \
+                     [\"utf-16\"])"
+                )
+            )
+        );
+        // A violation seen elsewhere still fails it.
+        let utf8 = "positionEncoding \"utf-8\" is not one of the offered [\"utf-16\"]";
+        runs[0].results[0] = result("lifecycle", "L2", Verdict::Pass, "");
+        runs[1].observed.as_mut().unwrap().l2_encoding = Some((Verdict::Fail, utf8.into()));
+        settle_l2(&mut runs);
+        let l2 = &runs[0].results[0];
+        assert_eq!((l2.scenario, l2.verdict), ("framing", Verdict::Fail));
+        // So does the lifecycle scenario's own failure.
+        runs[1].observed.as_mut().unwrap().l2_encoding = None;
+        runs[0].results[0] = result("lifecycle", "L2", Verdict::Fail, "the result has no capabilities");
+        settle_l2(&mut runs);
+        assert_eq!(runs[0].results[0].verdict, Verdict::Fail);
     }
 
     #[test]

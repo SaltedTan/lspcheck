@@ -191,6 +191,9 @@ pub struct Request {
     pub result: Type,
     pub params: Option<Type>,
     pub message_direction: Direction,
+    /// The method its capability is registered under, when that isn't its
+    /// own (`textDocument/semanticTokens` for the semantic tokens requests).
+    pub registration_method: Option<String>,
     #[serde(default)]
     pub proposed: bool,
 }
@@ -315,6 +318,42 @@ impl Model {
             (n.message_direction, n.proposed, n.params.as_ref())
         };
         (direction != Direction::ClientToServer && !proposed).then_some(params)?
+    }
+}
+
+/// The type of `initialize`'s `capabilities`.
+pub fn client_capabilities() -> &'static Type {
+    static TYPE: OnceLock<Type> = OnceLock::new();
+    TYPE.get_or_init(|| Type::Reference { name: "ClientCapabilities".into() })
+}
+
+/// The paths, from `root`, of the keys in `value` that the meta-model doesn't
+/// name where `ty` says what the object holds: in structures, structure
+/// literals and what type aliases name. An `or`, an array or a map (`LSPAny`,
+/// so `experimental`, among them) isn't looked into.
+pub fn unknown_keys(ty: &Type, value: &Value, root: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_unknown(model(), ty, value, root, &mut out);
+    out
+}
+
+fn collect_unknown(model: &Model, ty: &Type, value: &Value, path: &str, out: &mut Vec<String>) {
+    let properties = match ty {
+        Type::Literal { value: literal } => &literal.properties,
+        Type::Reference { name } => match (model.properties.get(name), model.aliases.get(name)) {
+            (Some(properties), _) => properties,
+            (None, Some(alias)) => return collect_unknown(model, &alias.ty, value, path, out),
+            (None, None) => return,
+        },
+        _ => return,
+    };
+    let Value::Object(entries) = value else { return };
+    for (key, item) in entries {
+        let at = format!("{path}.{key}");
+        match properties.iter().find(|p| &p.name == key) {
+            Some(p) => collect_unknown(model, &p.ty, item, &at, out),
+            None => out.push(at),
+        }
     }
 }
 
