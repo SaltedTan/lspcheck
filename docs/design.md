@@ -513,7 +513,9 @@ lspcheck acknowledges it and still sends the request. A MethodNotFound for the r
 first one for it was read after an unregistration that matches the registration exactly: its `method` is the
 request's registration method (the meta-model's `registrationMethod`, such as `textDocument/semanticTokens` for both
 semantic tokens requests, otherwise the request's own method) and its `id` is the one the capability advertised.
-An unregistration of another id, or of a capability advertised without one, withdraws nothing K1 asks. The detail
+An unregistration of another id, or of a capability advertised without one, withdraws nothing K1 asks, and a
+`client/registerCapability` for the same method read after the withdrawal and before the answer puts it back, so
+that answer is judged as usual. The detail
 names each such request with its registration id. The withdrawal counts once lspcheck has read it, whether or not
 its acknowledgement got through: it is the server's act, not lspcheck's. When no request is left to judge, K1 is
 `N/E`. The mutation scenario's K1 does the same, and is `N/E` there when withdrawn requests are all it has.

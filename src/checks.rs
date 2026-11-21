@@ -1701,7 +1701,7 @@ impl Ctx<'_> {
 /// Initialize, probe, shutdown, exit: the path every client takes.
 async fn lifecycle(ctx: &mut Ctx<'_>) {
     let since = ctx.s.elapsed();
-    let params = ctx.with_options(initialize_params(&ctx.root));
+    let params = ctx.with_profile(initialize_params(&ctx.root));
     let id = ctx.s.fresh_id();
     let reply = match ctx.initialize_reply(&id, params).await {
         Ok(reply) => reply,
@@ -2322,7 +2322,7 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
     // A reply to the notification can come after the request's answer, so
     // look at everything read until the answer to initialize, before
     // `initialized` and the profile's settings are sent.
-    let params = ctx.with_options(initialize_params(&ctx.root));
+    let params = ctx.with_profile(initialize_params(&ctx.root));
     let id = ctx.s.fresh_id();
     let init = ctx.initialize_reply(&id, params).await;
     // The window ends where the answer was in the stream, not when it was
@@ -2977,21 +2977,26 @@ fn first_not_found(messages: &[(Duration, Message)], id: &Id, sent: Duration) ->
     })
 }
 
-/// Each method the server withdrew with `client/unregisterCapability`, as
-/// (the request's index in `messages`, the method, the registration id).
-/// The withdrawal is the server's own act, so it counts once read, whether
-/// or not lspcheck's acknowledgement got through.
-fn withdrawals(messages: &[(Duration, Message)]) -> Vec<(usize, String, String)> {
+/// Each registration the server withdrew with `client/unregisterCapability`
+/// or made with `client/registerCapability`, as (the request's index in
+/// `messages`, whether it withdrew, the method, the registration id). The
+/// withdrawal is the server's own act, so it counts once read, whether or not
+/// lspcheck's acknowledgement got through.
+fn withdrawals(messages: &[(Duration, Message)]) -> Vec<(usize, bool, String, String)> {
     let mut found = Vec::new();
     for (i, (_, m)) in messages.iter().enumerate() {
-        if !matches!(&m.kind, Kind::Request { method, .. } if method == "client/unregisterCapability") {
-            continue;
-        }
         // The spec keeps the misspelt `unregisterations` for compatibility.
-        let Some(each) = m.value.pointer("/params/unregisterations").and_then(Value::as_array) else { continue };
+        let (withdraws, list) = match &m.kind {
+            Kind::Request { method, .. } if method == "client/unregisterCapability" => {
+                (true, "/params/unregisterations")
+            }
+            Kind::Request { method, .. } if method == "client/registerCapability" => (false, "/params/registrations"),
+            _ => continue,
+        };
+        let Some(each) = m.value.pointer(list).and_then(Value::as_array) else { continue };
         for u in each {
             if let (Some(method), Some(id)) = (u["method"].as_str(), u["id"].as_str()) {
-                found.push((i, method.to_string(), id.to_string()));
+                found.push((i, withdraws, method.to_string(), id.to_string()));
             }
         }
     }
@@ -2999,15 +3004,23 @@ fn withdrawals(messages: &[(Duration, Message)]) -> Vec<(usize, String, String)>
 }
 
 /// The id of `registration`, if the server withdrew it before the message at
-/// index `before` in `messages`: an unregistration matches only with both
-/// its method and its id.
+/// index `before` in `messages` and didn't register its method again in
+/// between: an unregistration matches only with both its method and its id.
 fn withdrawn_before<'a>(
-    withdrawals: &[(usize, String, String)],
+    withdrawals: &[(usize, bool, String, String)],
     registration: Option<&'a capabilities::Registration>,
     before: usize,
 ) -> Option<&'a str> {
     let r = registration?;
-    withdrawals.iter().any(|(i, method, id)| *i < before && method == r.method && *id == r.id).then_some(r.id.as_str())
+    let last = withdrawals
+        .iter()
+        .filter(|(i, withdraws, method, id)| *withdraws && *i < before && method == r.method && *id == r.id)
+        .map(|(i, ..)| *i)
+        .max()?;
+    let again = withdrawals
+        .iter()
+        .any(|(i, withdraws, method, _)| !*withdraws && *i > last && *i < before && method == r.method);
+    (!again).then_some(r.id.as_str())
 }
 
 /// K1's requests, after a successful initialize. The caller leaves.
@@ -9371,6 +9384,26 @@ while header := sys.stdin.buffer.readline():
             "MethodNotFound (-32601) for 4 advertised request(s) about the mutated documents: \
             textDocument/hover in case 1, textDocument/hover in case 2, textDocument/hover in case 3; and 1 more"
         );
+    }
+
+    #[test]
+    fn a_method_registered_again_after_its_withdrawal_isnt_excused() {
+        let request = |method: &str, list: &str, id: &str| {
+            let params = json!({list: [{"id": id, "method": "textDocument/foldingRange"}]});
+            (Duration::ZERO, Message::classify(json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})))
+        };
+        let withdraw = request("client/unregisterCapability", "unregisterations", "fold");
+        let register = request("client/registerCapability", "registrations", "fold-2");
+        let r = capabilities::Registration { method: "textDocument/foldingRange", id: "fold".into() };
+        let messages = vec![withdraw.clone(), register.clone()];
+        let events = withdrawals(&messages);
+        // Withdrawn and not registered again before the answer at index 1.
+        assert_eq!(withdrawn_before(&events, Some(&r), 1), Some("fold"));
+        // Registered again before the answer at index 2: judged as usual.
+        assert_eq!(withdrawn_before(&events, Some(&r), 2), None);
+        // Withdrawn again after that: excused again.
+        let messages = vec![withdraw.clone(), register, withdraw];
+        assert_eq!(withdrawn_before(&withdrawals(&messages), Some(&r), 3), Some("fold"));
     }
 
     #[cfg(unix)]

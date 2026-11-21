@@ -25,7 +25,8 @@
 - **K1** no longer fails on a MethodNotFound for a request whose static registration the server withdrew with
   `client/unregisterCapability` before answering it. The unregistration must name the request's registration method
   (`textDocument/semanticTokens` for the semantic tokens requests) and the `id` the server advertised for the
-  capability; an unregistration of any other id withdraws nothing. Such a request is still sent; its answer isn't
+  capability; an unregistration of any other id withdraws nothing, and registering the method again before
+  the answer puts it back. Such a request is still sent; its answer isn't
   judged, and the detail names it with its registration id. This applies in the capabilities and mutation scenarios,
   and a mutation scenario with nothing else to judge leaves K1 `N/E`.
 - **C1** and **R4** no longer pass when the server answers their request with a message carrying the id but no
