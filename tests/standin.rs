@@ -5066,37 +5066,71 @@ fn a_warning_lspcheck_cant_write_stops_nothing() {
 /// Lets the server register foldingRange dynamically, so withdraw it.
 const DYNAMIC_FOLDING: &str = "textDocument.foldingRange.dynamicRegistration = true\n";
 
+/// What K1 says of a foldingRange MethodNotFound it doesn't judge, because
+/// of the server's registration activity for it.
+const FOLDING_EXCUSED: &str = "not judged, because the server had sent client/registerCapability or \
+                               client/unregisterCapability for the method before answering MethodNotFound, so it \
+                               may have withdrawn it: textDocument/foldingRange";
+
 #[test]
 fn k1_doesnt_judge_a_method_the_server_withdrew() {
     let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
     let r = with_profile(&["withdraw-folding"], &path);
     only_fails(&r, &[]);
-    assert!(
-        r.stdout.contains(
-            "not judged, because the server had withdrawn the method with client/unregisterCapability before \
-             answering MethodNotFound: textDocument/foldingRange (registration fold)"
-        ),
-        "{}",
-        r.stdout
+    assert!(r.stdout.contains(FOLDING_EXCUSED), "{}", r.stdout);
+}
+
+#[test]
+fn k1_doesnt_judge_a_method_whose_replacement_registration_was_withdrawn_too() {
+    let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
+    let r = with_profile(&["withdraw-folding-cycle"], &path);
+    only_fails(&r, &[]);
+    assert!(r.stdout.contains(FOLDING_EXCUSED), "{}", r.stdout);
+}
+
+#[test]
+fn k1_doesnt_judge_a_method_registered_again_only_for_other_documents() {
+    let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
+    let r = with_profile(&["withdraw-folding-elsewhere"], &path);
+    only_fails(&r, &[]);
+    assert!(r.stdout.contains(FOLDING_EXCUSED), "{}", r.stdout);
+}
+
+#[test]
+fn k1_doesnt_judge_a_method_whose_withdrawal_may_be_in_a_skipped_frame() {
+    let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
+    let r = run(
+        &["--fault", "withdraw-folding-in-big-frame"],
+        &["--profile", path.to_str().unwrap(), "--only", "K1", "--max-frame-mib", "1"],
     );
+    expect(&r, "K1", "not-exercised");
+    let detail = detail(&r, "K1");
+    assert!(
+        detail.contains(
+            "not judged, because the client lets the server register the method dynamically, and a withdrawal may \
+             have been in output lspcheck didn't see between the initialize answer and the MethodNotFound (a "
+        ) && detail.ends_with("wasn't checked): textDocument/foldingRange"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn k1_fails_a_method_with_an_id_in_its_options_and_no_registration() {
+    let (path, _keep) = capabilities_profile("textDocument.hover.dynamicRegistration = true\n");
+    let r = with_profile(&["hover-id-not-found"], &path);
+    only_fails(&r, &["K1"]);
+    let detail = detail(&r, "K1");
+    assert!(
+        detail.starts_with("MethodNotFound (-32601) for 3 advertised request(s): textDocument/hover at "),
+        "{detail}"
+    );
+    assert!(!detail.contains("not judged"), "{detail}");
 }
 
 #[test]
 fn k1_fails_a_method_withdrawn_only_after_its_method_not_found() {
     let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
     let r = with_profile(&["withdraw-folding-late"], &path);
-    only_fails(&r, &["K1"]);
-    assert!(
-        r.stdout.contains("MethodNotFound (-32601) for 1 advertised request(s): textDocument/foldingRange"),
-        "{}",
-        r.stdout
-    );
-}
-
-#[test]
-fn k1_fails_a_method_whose_withdrawal_names_another_registration_id() {
-    let (path, _keep) = capabilities_profile(DYNAMIC_FOLDING);
-    let r = with_profile(&["withdraw-stale-folding-id"], &path);
     only_fails(&r, &["K1"]);
     assert!(
         r.stdout.contains("MethodNotFound (-32601) for 1 advertised request(s): textDocument/foldingRange"),
@@ -5118,9 +5152,9 @@ fn k1_doesnt_judge_semantic_tokens_withdrawn_under_their_registration_method() {
     expect(&r, "K1", "pass");
     assert!(
         r.stdout.contains(
-            "not judged, because the server had withdrawn the method with client/unregisterCapability before \
-             answering MethodNotFound: textDocument/semanticTokens/full (registration tokens), \
-             textDocument/semanticTokens/range (registration tokens)"
+            "not judged, because the server had sent client/registerCapability or client/unregisterCapability for \
+             the method before answering MethodNotFound, so it may have withdrawn it: \
+             textDocument/semanticTokens/full, textDocument/semanticTokens/range"
         ),
         "{}",
         r.stdout
@@ -5138,14 +5172,15 @@ fn mutation_k1_doesnt_judge_a_method_the_server_withdrew() {
     let (path, _keep) = mutation_profile_with_dynamic_folding();
     let (r, _, _keep_t) = mutated_with(&path, &["withdraw-folding"], &[]);
     passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
-    assert!(
-        r.stdout.contains(
-            "N/E in the mutation scenario: not judged, because the server had withdrawn the method with \
-             client/unregisterCapability before answering MethodNotFound: textDocument/foldingRange (registration fold)"
-        ),
-        "{}",
-        r.stdout
-    );
+    assert!(detail(&r, "K1").contains(&format!("N/E in the mutation scenario: {FOLDING_EXCUSED} (")), "{}", r.stdout);
+}
+
+#[test]
+fn mutation_k1_doesnt_judge_a_method_registered_again_only_for_other_documents() {
+    let (path, _keep) = mutation_profile_with_dynamic_folding();
+    let (r, _, _keep_t) = mutated_with(&path, &["withdraw-folding-elsewhere"], &[]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+    assert!(detail(&r, "K1").contains(&format!("N/E in the mutation scenario: {FOLDING_EXCUSED} (")), "{}", r.stdout);
 }
 
 #[test]
@@ -5161,16 +5196,6 @@ fn mutation_k1_fails_a_method_withdrawn_only_after_its_method_not_found() {
         "{}",
         r.stdout
     );
-}
-
-#[test]
-fn mutation_k1_fails_a_method_whose_withdrawal_names_another_registration_id() {
-    let (path, _keep) = mutation_profile_with_dynamic_folding();
-    let (r, _, _keep_t) = mutated_with(&path, &["withdraw-stale-folding-id"], &[]);
-    passes_except(&r, &[("K1", "fail"), ("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
-    let detail = detail(&r, "K1");
-    assert!(detail.contains("FAIL in the mutation scenario: MethodNotFound (-32601) for "), "{detail}");
-    assert!(detail.contains("textDocument/foldingRange in the baseline") && !detail.contains("not judged"), "{detail}");
 }
 
 #[test]
@@ -5210,9 +5235,36 @@ fn profile_offer_fails_l2_for_an_unoffered_encoding_in_another_scenario() {
     let both =
         r#"in the documents and capabilities scenarios, positionEncoding "utf-8" is not one of the offered ["utf-16"]"#;
     assert!(r.stdout.contains(both), "{}", r.stdout);
-    // Wanted alone, L2 still sees every scenario's initialize.
-    let r =
-        run(&["--fault", "utf8-unoffered-with-inlay-hints"], &["--profile", path.to_str().unwrap(), "--only", "L2"]);
+    // Wanted alone, L2 still sees every scenario's initialize, and links
+    // the transcript of the first scenario that saw the violation.
+    let (r, t, _keep_t) = run_with_transcripts(
+        &["--fault", "utf8-unoffered-with-inlay-hints"],
+        &["--profile", path.to_str().unwrap(), "--only", "L2"],
+    );
     expect(&r, "L2", "fail");
     assert!(r.stdout.contains(both), "{}", r.stdout);
+    let link = format!("transcript: {}", t.join("documents.jsonl").display());
+    assert!(r.stdout.contains(&link), "{}", r.stdout);
+    assert_eq!(r.report["results"][0]["scenario"], "documents", "{}", r.stdout);
+}
+
+#[test]
+fn l2_is_inconclusive_when_another_scenarios_initialize_answer_was_skipped() {
+    // The documents and capabilities scenarios' answers, with an unoffered
+    // utf-8, are over the inspection limit, so lspcheck never sees them.
+    let (path, _keep) = capabilities_profile(UTF16_ONLY);
+    let r = run(
+        &["--fault", "big-utf8-reply-with-inlay-hints"],
+        &["--profile", path.to_str().unwrap(), "--only", "L2", "--max-frame-mib", "1"],
+    );
+    expect(&r, "L2", "error");
+    let detail = detail(&r, "L2");
+    assert!(
+        detail.starts_with(
+            "inconclusive, because a first initialize got no result lspcheck saw, and it may have been in output \
+             lspcheck didn't see: in the documents scenario, a "
+        ) && detail.contains("; in the capabilities scenario, a "),
+        "{detail}"
+    );
+    assert_eq!(r.report["results"][0]["scenario"], "documents", "{}", r.stdout);
 }

@@ -11,7 +11,7 @@ use crate::message::codes;
 use crate::metamodel;
 use crate::text::{self, Encoding, Position};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 /// How many positions a profile's `[document]` may give.
 pub const MAX_POSITIONS: usize = 5;
@@ -179,33 +179,63 @@ pub fn methods() -> Vec<&'static str> {
     table().into_iter().map(|(_, _, method, _)| method).collect()
 }
 
-/// A static registration the server can withdraw with
-/// `client/unregisterCapability`: the method it is registered under and the
-/// `id` the server advertised it with.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Registration {
-    pub method: &'static str,
-    pub id: String,
-}
-
-/// The static registration of each method K1 can ask whose capability the
-/// initialize result gave an `id` (`StaticRegistrationOptions`). Only an
-/// unregistration of that method and id withdraws it; a capability without
-/// an `id` can't be withdrawn.
-pub fn registrations(caps: &Value) -> HashMap<&'static str, Registration> {
-    let mut found = HashMap::new();
-    for (capability, _, method, _) in table() {
-        if let Some(id) = caps.get(capability).and_then(|c| c.get("id")).and_then(Value::as_str) {
-            found.insert(method, Registration { method: registration_method(method), id: id.to_string() });
-        }
-    }
-    found
-}
-
 /// The method `method`'s capability is registered under: the meta-model's
-/// `registrationMethod` for it, else its own.
-fn registration_method(method: &'static str) -> &'static str {
+/// `registrationMethod` for it, else its own. `textDocument/prepareRename`
+/// has neither; its capability is rename's `prepareProvider`, so it is
+/// registered with rename.
+pub fn registration_method(method: &str) -> &str {
+    if method == "textDocument/prepareRename" {
+        return "textDocument/rename";
+    }
     metamodel::model().requests.get(method).and_then(|r| r.registration_method.as_deref()).unwrap_or(method)
+}
+
+/// Where in `ClientCapabilities` the capability of the K1 method `method` is,
+/// as a JSON pointer: the object that says whether the client lets the server
+/// register it dynamically.
+fn client_capability(method: &str) -> Option<&'static str> {
+    Some(match method {
+        "textDocument/hover" => "/textDocument/hover",
+        "textDocument/definition" => "/textDocument/definition",
+        "textDocument/declaration" => "/textDocument/declaration",
+        "textDocument/typeDefinition" => "/textDocument/typeDefinition",
+        "textDocument/implementation" => "/textDocument/implementation",
+        "textDocument/references" => "/textDocument/references",
+        "textDocument/documentHighlight" => "/textDocument/documentHighlight",
+        "textDocument/signatureHelp" => "/textDocument/signatureHelp",
+        "textDocument/completion" => "/textDocument/completion",
+        "textDocument/prepareRename" | "textDocument/rename" => "/textDocument/rename",
+        "textDocument/linkedEditingRange" => "/textDocument/linkedEditingRange",
+        "textDocument/prepareCallHierarchy" => "/textDocument/callHierarchy",
+        "textDocument/prepareTypeHierarchy" => "/textDocument/typeHierarchy",
+        "textDocument/moniker" => "/textDocument/moniker",
+        "textDocument/selectionRange" => "/textDocument/selectionRange",
+        "textDocument/documentSymbol" => "/textDocument/documentSymbol",
+        "textDocument/foldingRange" => "/textDocument/foldingRange",
+        "textDocument/codeLens" => "/textDocument/codeLens",
+        "textDocument/documentLink" => "/textDocument/documentLink",
+        "textDocument/documentColor" => "/textDocument/colorProvider",
+        "textDocument/diagnostic" => "/textDocument/diagnostic",
+        "textDocument/formatting" => "/textDocument/formatting",
+        "textDocument/rangeFormatting" => "/textDocument/rangeFormatting",
+        "textDocument/codeAction" => "/textDocument/codeAction",
+        "textDocument/inlayHint" => "/textDocument/inlayHint",
+        "textDocument/semanticTokens/full" | "textDocument/semanticTokens/range" => "/textDocument/semanticTokens",
+        "workspace/symbol" => "/workspace/symbol",
+        _ => return None,
+    })
+}
+
+/// The methods K1 can ask whose capability the client capabilities `sent`
+/// let the server register dynamically (`dynamicRegistration: true`).
+pub fn dynamic_methods(sent: &Value) -> HashSet<&'static str> {
+    methods()
+        .into_iter()
+        .filter(|method| {
+            client_capability(method).and_then(|at| sent.pointer(&format!("{at}/dynamicRegistration")))
+                == Some(&Value::Bool(true))
+        })
+        .collect()
 }
 
 /// Whether a capability's value advertises support: `true`, or an options
@@ -337,10 +367,25 @@ pub enum Outcome {
     Unanswered,
     /// lspcheck couldn't deliver it.
     Undelivered(String),
-    /// Answered with MethodNotFound after the server withdrew the method
-    /// with `client/unregisterCapability`, named here (its registration id).
-    /// Not judged: the server no longer offered it.
-    Withdrawn(String),
+    /// Answered with MethodNotFound when the server may have withdrawn the
+    /// method by then. Not judged.
+    Excused(Excuse),
+}
+
+/// Why a MethodNotFound for one of K1's requests isn't judged: the server may
+/// have withdrawn the method with `client/unregisterCapability` by then.
+/// lspcheck doesn't track which registrations are in force (ids, selectors,
+/// replacements), so any registration activity for the method excuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Excuse {
+    /// lspcheck had read a `client/registerCapability` or
+    /// `client/unregisterCapability` entry for the method's registration
+    /// method.
+    Registration,
+    /// The client let the server register the method dynamically, and
+    /// lspcheck missed output (for this reason) between the initialize
+    /// answer and the MethodNotFound.
+    Missed(String),
 }
 
 /// What K1 reports.
@@ -404,19 +449,17 @@ fn other_errors(asked: &[(String, Outcome)]) -> Option<String> {
 /// request with no response by the end of the session is inconclusive rather
 /// than a failure; one lspcheck couldn't deliver is an error too.
 pub fn judge(asked: &[(String, Outcome)], notes: &[String]) -> Judgement {
-    let withdrawn: Vec<String> = asked
+    let excused: Vec<(&str, &Excuse)> = asked
         .iter()
         .filter_map(|(label, o)| match o {
-            Outcome::Withdrawn(id) => Some(format!("{label} (registration {id})")),
+            Outcome::Excused(excuse) => Some((label.as_str(), excuse)),
             _ => None,
         })
         .collect();
     let with_notes = |detail: String| {
         let mut parts = vec![detail];
         parts.extend(other_errors(asked));
-        if !withdrawn.is_empty() {
-            parts.push(withdrawn_note(&withdrawn));
-        }
+        parts.extend(excused_notes(&excused));
         parts.extend(notes.iter().cloned());
         parts.join("; ")
     };
@@ -452,7 +495,7 @@ pub fn judge(asked: &[(String, Outcome)], notes: &[String]) -> Judgement {
     if !unjudged.is_empty() {
         return Judgement::Error(with_notes(unjudged.join("; ")));
     }
-    if !asked.is_empty() && withdrawn.len() == asked.len() {
+    if !asked.is_empty() && excused.len() == asked.len() {
         return Judgement::NotExercised(with_notes("no request K1 sent was judged".into()));
     }
     if asked.is_empty() {
@@ -463,7 +506,7 @@ pub fn judge(asked: &[(String, Outcome)], notes: &[String]) -> Judgement {
         return Judgement::NotExercised(detail);
     }
     let judged: Vec<&str> =
-        asked.iter().filter(|(_, o)| !matches!(o, Outcome::Withdrawn(_))).map(|(label, _)| label.as_str()).collect();
+        asked.iter().filter(|(_, o)| !matches!(o, Outcome::Excused(_))).map(|(label, _)| label.as_str()).collect();
     let mut methods: Vec<&str> = judged.iter().map(|label| label.split(' ').next().unwrap_or(label)).collect();
     methods.dedup();
     Judgement::Pass(with_notes(format!(
@@ -473,14 +516,33 @@ pub fn judge(asked: &[(String, Outcome)], notes: &[String]) -> Judgement {
     )))
 }
 
-/// The note naming requests answered with MethodNotFound after the server
-/// withdrew their method, each with its registration id.
-pub fn withdrawn_note(withdrawn: &[String]) -> String {
-    format!(
-        "not judged, because the server had withdrawn the method with client/unregisterCapability before answering \
-         MethodNotFound: {}",
-        withdrawn.join(", ")
-    )
+/// The notes naming the requests whose MethodNotFound wasn't judged, one for
+/// each reason, each request once.
+pub fn excused_notes(excused: &[(&str, &Excuse)]) -> Vec<String> {
+    let mut by_reason: Vec<(&Excuse, Vec<&str>)> = Vec::new();
+    for &(label, excuse) in excused {
+        match by_reason.iter_mut().find(|(e, _)| *e == excuse) {
+            Some((_, labels)) if labels.contains(&label) => {}
+            Some((_, labels)) => labels.push(label),
+            None => by_reason.push((excuse, vec![label])),
+        }
+    }
+    by_reason
+        .into_iter()
+        .map(|(excuse, labels)| match excuse {
+            Excuse::Registration => format!(
+                "not judged, because the server had sent client/registerCapability or client/unregisterCapability \
+                 for the method before answering MethodNotFound, so it may have withdrawn it: {}",
+                labels.join(", ")
+            ),
+            Excuse::Missed(why) => format!(
+                "not judged, because the client lets the server register the method dynamically, and a withdrawal \
+                 may have been in output lspcheck didn't see between the initialize answer and the MethodNotFound \
+                 ({why}): {}",
+                labels.join(", ")
+            ),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -701,41 +763,78 @@ mod tests {
     }
 
     #[test]
-    fn registrations_are_under_the_registration_method_with_the_advertised_id() {
-        let caps = json!({
-            "semanticTokensProvider": {"legend": {"tokenTypes": [], "tokenModifiers": []}, "full": true, "id": "t"},
-            "foldingRangeProvider": {"id": "f"},
-            "hoverProvider": true,
-            "colorProvider": {"documentSelector": null},
-        });
-        let r = registrations(&caps);
-        let named = |method, id: &str| Some(Registration { method, id: id.into() });
-        assert_eq!(r.get("textDocument/semanticTokens/full").cloned(), named("textDocument/semanticTokens", "t"));
-        assert_eq!(r.get("textDocument/semanticTokens/range").cloned(), named("textDocument/semanticTokens", "t"));
-        assert_eq!(r.get("textDocument/foldingRange").cloned(), named("textDocument/foldingRange", "f"));
-        // Without an id, nothing can withdraw it.
-        assert_eq!(r.len(), 3, "{r:?}");
+    fn each_method_has_a_registration_method_and_a_dynamic_registration_capability() {
+        assert_eq!(registration_method("textDocument/semanticTokens/range"), "textDocument/semanticTokens");
+        assert_eq!(registration_method("textDocument/prepareRename"), "textDocument/rename");
+        assert_eq!(registration_method("textDocument/hover"), "textDocument/hover");
+        // Every method's capability is where the meta-model has one with a
+        // dynamicRegistration.
+        let mut every = json!({});
+        for method in methods() {
+            let at = client_capability(method).unwrap_or_else(|| panic!("{method} has no client capability"));
+            let mut value = json!({"dynamicRegistration": true});
+            for key in at.rsplit('/').filter(|k| !k.is_empty()) {
+                value = json!({key: value});
+            }
+            crate::checks::merge_patch(&mut every, &value);
+        }
+        assert_eq!(
+            metamodel::unknown_keys(metamodel::client_capabilities(), &every, "capabilities"),
+            Vec::<String>::new()
+        );
+        assert_eq!(dynamic_methods(&every).len(), methods().len());
+        let some = json!({"textDocument": {
+            "foldingRange": {"dynamicRegistration": true},
+            "hover": {"dynamicRegistration": false},
+            "semanticTokens": {"dynamicRegistration": true},
+            "definition": {}
+        }});
+        let mut dynamic: Vec<_> = dynamic_methods(&some).into_iter().collect();
+        dynamic.sort();
+        assert_eq!(
+            dynamic,
+            ["textDocument/foldingRange", "textDocument/semanticTokens/full", "textDocument/semanticTokens/range"]
+        );
     }
 
     #[test]
-    fn a_withdrawn_method_is_noted_not_judged() {
-        let withdrawn = answered("textDocument/foldingRange", Outcome::Withdrawn("fold".into()));
-        let note = "not judged, because the server had withdrawn the method with client/unregisterCapability before \
-                    answering MethodNotFound: textDocument/foldingRange (registration fold)";
-        let asked = [answered("textDocument/hover at 1:1", Outcome::Answered), withdrawn.clone()];
-        let Judgement::Pass(detail) = judge(&asked, &[]) else { panic!("a withdrawn method's MethodNotFound passes") };
+    fn an_excused_method_is_noted_not_judged() {
+        let excused = answered("textDocument/foldingRange", Outcome::Excused(Excuse::Registration));
+        let note = "not judged, because the server had sent client/registerCapability or \
+                    client/unregisterCapability for the method before answering MethodNotFound, so it may have \
+                    withdrawn it: textDocument/foldingRange";
+        let asked = [answered("textDocument/hover at 1:1", Outcome::Answered), excused.clone()];
+        let Judgement::Pass(detail) = judge(&asked, &[]) else { panic!("an excused method's MethodNotFound passes") };
         assert_eq!(
             detail,
             format!("1 request(s) for 1 advertised method(s) were answered, none with MethodNotFound; {note}")
         );
         // With nothing else asked, nothing was judged.
         assert_eq!(
-            judge(std::slice::from_ref(&withdrawn), &[]),
+            judge(std::slice::from_ref(&excused), &[]),
             Judgement::NotExercised(format!("no request K1 sent was judged; {note}"))
         );
         // A MethodNotFound for another method still fails.
-        let asked = [answered("workspace/symbol", Outcome::Error(-32601)), withdrawn];
+        let asked = [answered("workspace/symbol", Outcome::Error(-32601)), excused.clone()];
         let Judgement::Fail(detail) = judge(&asked, &[]) else { panic!("MethodNotFound elsewhere fails") };
         assert!(detail.ends_with(note), "{detail}");
+        // Each reason has its note, naming each request once.
+        let missed = Excuse::Missed("a frame was skipped".into());
+        let notes = excused_notes(&[
+            ("textDocument/foldingRange", &Excuse::Registration),
+            ("textDocument/hover", &missed),
+            ("textDocument/foldingRange", &Excuse::Registration),
+            ("textDocument/codeLens", &missed),
+        ]);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].ends_with("withdrawn it: textDocument/foldingRange"), "{}", notes[0]);
+        assert!(
+            notes[1].ends_with(
+                "between the initialize answer and the MethodNotFound (a frame was skipped): textDocument/hover, \
+                 textDocument/codeLens"
+            ),
+            "{}",
+            notes[1]
+        );
     }
 }

@@ -12,8 +12,8 @@ during mutation in the [reports](#report), makes F1 `ERROR`, not `FAIL`, on a fr
 cut short, and keeps K1 from passing on output it didn't see.
 Unreleased: a profile's [`[client.capabilities]`](#profiles-optional-toml) is merged over every initialize's client
 capabilities, and L2 judges the encoding offer actually sent, in every scenario's first initialize. K1 no longer
-judges a MethodNotFound for a request whose static registration the server withdrew with
-`client/unregisterCapability`.
+judges a MethodNotFound for a request the server may have withdrawn: one whose method it had registered or
+unregistered dynamically, or one it could register dynamically when lspcheck missed output before the answer.
 See the [changelog](../CHANGELOG.md) for changes by release.
 
 ## Purpose
@@ -121,7 +121,7 @@ the server sent no requests or lspcheck sent none after completing an answer.
 | ID | Basis | Check |
 |---|---|---|
 | L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification sent before it (`workspace/didChangeConfiguration`) is dropped without a reply: no response other than those two answers may arrive before the answer to `initialize`. If lspcheck may have missed output in that time (a frame it skipped or couldn't read), L1 is `error` instead of passing. The time ends where the answer to `initialize` was in the stream (when it was read, not when lspcheck took it in), before `initialized` and the profile's settings are sent. A frame lspcheck skipped that arrived in the same read as that answer has the same time and still makes L1 `error`. |
-| L2 | MUST | `initialize` returns an object with `capabilities`; a chosen `positionEncoding` is one the client offered (lspcheck's default offer is `utf-8` first, `utf-16` last; a profile can [change it](#profiles-optional-toml), and the detail then names it). UTF-16 passes even when left out of the offer, with a note, since clients always support it. The encoding rule is judged on the first successful initialize of every scenario, each against the offer sent with it, since a server may choose differently for each; a failure names the scenarios and the offer. A violation seen there fails L2 even when the lifecycle scenario's L2 ended in `ERROR`, for example because lspcheck couldn't send `initialized`. L2 is reported by the lifecycle scenario, and wanting it runs every scenario. The result is judged even if lspcheck can't send `initialized` after it; the lifecycle checks that need the server initialized are then `error`. |
+| L2 | MUST | `initialize` returns an object with `capabilities`; a chosen `positionEncoding` is one the client offered (lspcheck's default offer is `utf-8` first, `utf-16` last; a profile can [change it](#profiles-optional-toml), and the detail then names it). UTF-16 passes even when left out of the offer, with a note, since clients always support it. The encoding rule is judged on the first successful initialize of every scenario, each against the offer sent with it, since a server may choose differently for each; a failure names the scenarios and the offer. A violation seen there fails L2 even when the lifecycle scenario's L2 ended in `ERROR`, for example because lspcheck couldn't send `initialized`. Without a violation seen, L2 is `ERROR`, naming the scenario, when a scenario's first initialize got no result lspcheck saw and lspcheck missed output while it waited (a skipped or unreadable frame, or inspection that stopped), since the result may have been there. L2 is reported by the lifecycle scenario, and wanting it runs every scenario; a verdict settled from another scenario's initialize comes from the first such scenario, so the report links its transcript. The result is judged even if lspcheck can't send `initialized` after it; the lifecycle checks that need the server initialized are then `error`. |
 | L3 | POLICY | A second `initialize` gets an error and the server keeps serving: a plain request answered before it is answered after it too. |
 | L4 | MUST | `shutdown` returns `null` and the process keeps running until `exit`. An error, which LSP allows for an exception during shutdown, passes too if the process keeps running; the detail names it. The error must be well formed by J5's rules (an integer `code` in the signed 32-bit range and a string `message`), and not MethodNotFound (`-32601`), since every server must implement `shutdown`. Any other result or error fails. The process must still be running when lspcheck looks just before it writes `exit`. |
 | L5 | SHOULD | Requests after `shutdown` get error `-32600` InvalidRequest (tested with `workspace/symbol`, after L3 in the same scenario; if the server stopped answering at L3, L5 is `error`). |
@@ -506,19 +506,27 @@ request by its matched response, including replies read during shutdown or the f
 counts when its id equals the request's exactly and it was read at or after the request was sent, even after another
 response with that id (the duplicate is J2's).
 
-A server may withdraw a capability it advertised with a registration `id` (`StaticRegistrationOptions.id` in the
-capability's options in the initialize result) by sending `client/unregisterCapability` for it (the client must
-have declared that feature's `dynamicRegistration`, which lspcheck's own capabilities don't, but a profile's may).
-lspcheck acknowledges it and still sends the request. A MethodNotFound for the request is then not judged, when the
-first one for it was read after an unregistration that matches the registration exactly: its `method` is the
-request's registration method (the meta-model's `registrationMethod`, such as `textDocument/semanticTokens` for both
-semantic tokens requests, otherwise the request's own method) and its `id` is the one the capability advertised.
-An unregistration of another id, or of a capability advertised without one, withdraws nothing K1 asks, and a
-`client/registerCapability` for the same method read after the withdrawal and before the answer puts it back, so
-that answer is judged as usual. The detail
-names each such request with its registration id. The withdrawal counts once lspcheck has read it, whether or not
-its acknowledgement got through: it is the server's act, not lspcheck's. When no request is left to judge, K1 is
-`N/E`. The mutation scenario's K1 does the same, and is `N/E` there when withdrawn requests are all it has.
+A server may withdraw a capability with `client/unregisterCapability`, and register it again, perhaps for other
+documents, with `client/registerCapability`, when the client declared that feature's `dynamicRegistration` (which
+lspcheck's own capabilities don't, but a profile's may). lspcheck acknowledges these requests and still sends K1's.
+It doesn't track which registrations are in force: ids, document selectors, replacements and withdrawals in output it
+didn't see can't be followed soundly one case at a time. So the first MethodNotFound for a request is not judged
+when, before it was read, either:
+
+- lspcheck had read a `client/registerCapability` or `client/unregisterCapability` entry whose `method` is the
+  request's registration method (the meta-model's `registrationMethod`, such as `textDocument/semanticTokens` for both
+  semantic tokens requests; rename's for `textDocument/prepareRename`, whose capability is rename's
+  `prepareProvider`; otherwise the request's own method), whatever its id or options; or
+- the client capabilities sent declared `dynamicRegistration: true` for the request's capability, and lspcheck
+  missed output (a frame it skipped or couldn't read, or inspection that stopped) between the scenario's initialize
+  answer and the MethodNotFound.
+
+An `id` in a capability's options in the initialize result plays no part. The detail names each such request and why.
+A registration counts once lspcheck has read it, whether or not its acknowledgement got through: it is the server's
+act, not lspcheck's. When no request is left to judge, K1 is `N/E`; otherwise it is judged on the rest as usual. The
+mutation scenario's K1 does the same, and is `N/E` there when excused requests are all it has. This accepts a
+residual: a server that sends a stray registration or unregistration for a method, then wrongly answers it with
+MethodNotFound, isn't failed.
 
 For either a failure or an error, the detail names every unanswered request. It gives the delivery failure's cause
 (including the server's exit status when observed) once, on the request lspcheck couldn't send, then lists the

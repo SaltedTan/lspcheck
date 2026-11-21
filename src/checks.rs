@@ -613,9 +613,12 @@ pub struct Observations {
     pub abandoned_at: Option<Duration>,
     /// How the json-rpc scenario's dedicated J3 exercise went, if it ran.
     pub j3_exercise: Option<(Verdict, String)>,
-    /// L2's encoding rule on the session's first successful initialize, if
-    /// its result had a capabilities object (see [`settle_l2`]).
+    /// L2's encoding rule on the session's first initialize, if its result
+    /// had a capabilities object (see [`settle_l2`]).
     pub l2_encoding: Option<(Verdict, String)>,
+    /// Why the session's first initialize may have had a result lspcheck
+    /// didn't see, if it got none and lspcheck missed output while it waited.
+    pub l2_unseen: Option<String>,
     /// Responses that matched no outstanding request, classified.
     pub unmatched: Vec<Unmatched>,
     /// Requests that were answered, with when their response was read.
@@ -1156,9 +1159,13 @@ fn rank(v: Verdict) -> u8 {
 /// first initialize got a `positionEncoding` its own offer ruled out, naming
 /// each such scenario and its offer. Every scenario's offer is the profile's
 /// over its own capabilities, and a server may choose differently for each.
+/// The result then comes from the first scenario with a violation, so the
+/// report links its transcript. Without a violation, a pass is inconclusive
+/// when a scenario's first initialize got no result lspcheck saw and it
+/// missed output meanwhile.
 fn settle_l2(runs: &mut [ScenarioRun]) {
     // Each failing detail once, with the scenarios that got it.
-    let mut failures: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut failures: Vec<(&str, Vec<&'static str>)> = Vec::new();
     for r in runs.iter() {
         let Some((Verdict::Fail, detail)) = r.observed.as_ref().and_then(|o| o.l2_encoding.as_ref()) else { continue };
         match failures.iter_mut().find(|(d, _)| d == detail) {
@@ -1167,11 +1174,12 @@ fn settle_l2(runs: &mut [ScenarioRun]) {
         }
     }
     if failures.is_empty() {
-        return;
+        return unseen_l2(runs);
     }
     // A failure only the lifecycle scenario saw is L2's own detail.
     let lifecycle_only = failures.iter().all(|(_, names)| names == &["lifecycle"]).then(|| failures[0].0.to_string());
     let lifecycle_encoding = failures.iter().any(|(_, names)| names.contains(&"lifecycle"));
+    let first_failing = failures[0].1[0];
     let parts: Vec<String> = failures
         .iter()
         .map(|(detail, names)| {
@@ -1183,19 +1191,44 @@ fn settle_l2(runs: &mut [ScenarioRun]) {
         })
         .collect();
     let Some(l2) = runs.iter_mut().flat_map(|r| &mut r.results).find(|r| r.id == "L2") else { return };
-    let detail = match lifecycle_only {
+    let (scenario, detail) = match lifecycle_only {
         Some(_) if l2.verdict == Verdict::Fail => return,
         // The violation was seen, so it outweighs an end lspcheck couldn't
         // judge, such as an `initialized` it couldn't send.
-        Some(detail) => detail,
+        Some(detail) => (l2.scenario, detail),
         None => {
             // A failure of the lifecycle scenario's other than the encoding's.
             let own = (l2.verdict == Verdict::Fail && !lifecycle_encoding)
                 .then(|| format!("in the lifecycle scenario, {}", l2.detail));
-            own.into_iter().chain(parts).collect::<Vec<_>>().join("; ")
+            let scenario = if own.is_some() { l2.scenario } else { first_failing };
+            (scenario, own.into_iter().chain(parts).collect::<Vec<_>>().join("; "))
         }
     };
-    *l2 = result(l2.scenario, "L2", Verdict::Fail, detail);
+    *l2 = result(scenario, "L2", Verdict::Fail, detail);
+}
+
+/// Makes a passing L2 an error when a scenario's first initialize got no
+/// result lspcheck saw and lspcheck missed output while it waited: the
+/// result may have been there, with an encoding the offer ruled out. The
+/// result comes from the first such scenario.
+fn unseen_l2(runs: &mut [ScenarioRun]) {
+    let unseen: Vec<(&'static str, String)> =
+        runs.iter().filter_map(|r| Some((r.name, r.observed.as_ref()?.l2_unseen.clone()?))).collect();
+    let Some(&(first, _)) = unseen.first() else { return };
+    let Some(l2) = runs.iter_mut().flat_map(|r| &mut r.results).find(|r| r.id == "L2") else { return };
+    if l2.verdict != Verdict::Pass {
+        return;
+    }
+    let each: Vec<String> = unseen.iter().map(|(name, why)| format!("in the {name} scenario, {why}")).collect();
+    let mut detail = format!(
+        "inconclusive, because a first initialize got no result lspcheck saw, and it may have been in output \
+         lspcheck didn't see: {}",
+        each.join("; ")
+    );
+    if !l2.detail.is_empty() {
+        detail = format!("{detail} ({})", l2.detail);
+    }
+    *l2 = result(first, "L2", Verdict::Error, detail);
 }
 
 /// Folds the mutation scenario's verdict for each check it extends into the
@@ -1291,6 +1324,9 @@ async fn run_session(
         scenario: name,
         j3_exercise: None,
         l2_encoding: None,
+        initialize_tried: false,
+        l2_unseen: None,
+        withdrawable: Withdrawable::default(),
         k1_pending: None,
         mutation: None,
         isolate,
@@ -1336,7 +1372,7 @@ async fn run_session(
         MUTATION => mutation_scenario(&mut ctx).await,
         _ => unreachable!("unknown scenario {name}"),
     }
-    let Ctx { s, mut results, j3_exercise, l2_encoding, k1_pending, mut mutation, isolate, .. } = ctx;
+    let Ctx { s, mut results, j3_exercise, l2_encoding, l2_unseen, k1_pending, mut mutation, isolate, .. } = ctx;
     // A scenario that stopped without beginning a shutdown counts the
     // server's messages up to its cleanup, not during it.
     let stopping = s.elapsed();
@@ -1347,11 +1383,9 @@ async fn run_session(
     {
         m.messages = server_messages(&finish.messages, from..m.shutdown_at.unwrap_or(stopping), &m.case_times);
     }
-    if let (Some(K1Pending::Mutation { asked, registrations }), Some(m)) = (&k1_pending, &mut mutation) {
-        // The label is the method, then " in " and the case.
-        let troubles = k1_not_found(asked, registrations, &finish).0.into_iter().filter_map(|(_, _, label, case)| {
-            let method = label.split_once(" in ").map_or(label.as_str(), |(method, _)| method);
-            case.map(|case| Trouble::new(case, "K1", Verdict::Fail, method))
+    if let (Some(K1Pending::Mutation { asked, withdrawable }), Some(m)) = (&k1_pending, &mut mutation) {
+        let troubles = k1_not_found(asked, withdrawable, &finish).0.into_iter().filter_map(|(_, _, label, case)| {
+            case.map(|case| Trouble::new(case, "K1", Verdict::Fail, mutation_k1_method(label)))
         });
         m.troubles.extend(troubles);
     }
@@ -1394,7 +1428,7 @@ async fn run_session(
         ScenarioRun {
             name,
             results,
-            observed: Some(observations(finish, j3_exercise, l2_encoding)),
+            observed: Some(observations(finish, j3_exercise, l2_encoding, l2_unseen)),
             transcript,
             mutation,
         },
@@ -1406,7 +1440,9 @@ fn observations(
     f: Finish,
     j3_exercise: Option<(Verdict, String)>,
     l2_encoding: Option<(Verdict, String)>,
+    l2_unseen: Option<(Duration, Duration)>,
 ) -> Observations {
+    let l2_unseen = l2_unseen.and_then(|(from, to)| f.missed_output_within(from, to));
     Observations {
         problems: f.problems,
         cut_short: f.cut_short,
@@ -1427,6 +1463,7 @@ fn observations(
         abandoned_at: f.abandoned_at,
         j3_exercise,
         l2_encoding,
+        l2_unseen,
         unmatched: f.unmatched,
         answered: f.answered,
         answered_methods: f.answered_methods,
@@ -1455,8 +1492,16 @@ struct Ctx<'a> {
     scenario: &'static str,
     /// How the json-rpc scenario's dedicated J3 exercise went.
     j3_exercise: Option<(Verdict, String)>,
-    /// L2's encoding rule on the first initialize that got a result.
+    /// L2's encoding rule on the first initialize, if it got a result.
     l2_encoding: Option<(Verdict, String)>,
+    /// Whether [`Ctx::initialize_reply`] has sent an initialize.
+    initialize_tried: bool,
+    /// When the first initialize was sent and when its wait ended, if no
+    /// reply came: output lspcheck missed then may have held its result.
+    l2_unseen: Option<(Duration, Duration)>,
+    /// What may excuse a K1 MethodNotFound, from the last initialize that
+    /// got a result.
+    withdrawable: Withdrawable,
     k1_pending: Option<K1Pending>,
     /// What the mutation scenario ran.
     mutation: Option<MutationSummary>,
@@ -1645,7 +1690,14 @@ impl Ctx<'_> {
     async fn initialize_reply(&mut self, id: &Id, params: Value) -> Result<Message, InitFailure> {
         let t = self.cfg.startup_timeout;
         let offered = offered_encodings(&params);
-        let reply = match self.s.call_with_id(id, "initialize", Some(params), t).await {
+        let dynamic = capabilities::dynamic_methods(&params["capabilities"]);
+        let first = !std::mem::replace(&mut self.initialize_tried, true);
+        let since = self.s.elapsed();
+        let reply = self.s.call_with_id(id, "initialize", Some(params), t).await;
+        if first && matches!(reply, Err(CallError::Wait(_))) {
+            self.l2_unseen = Some((since, self.s.elapsed()));
+        }
+        let reply = match reply {
             Ok(reply) => reply,
             Err(CallError::Wait(WaitError::Timeout)) => {
                 return Err(InitFailure::Blocked(format!(
@@ -1672,12 +1724,12 @@ impl Ctx<'_> {
             }
             _ => unreachable!("wait_response returns responses"),
         }
-        if self.l2_encoding.is_none()
-            && let Some(caps) = initialize_capabilities(&reply).filter(|c| c.is_object())
-        {
+        if first && let Some(caps) = initialize_capabilities(&reply).filter(|c| c.is_object()) {
             self.l2_encoding = Some(judge_encoding(caps, &offered));
         }
         self.offered = offered;
+        let since = self.s.answered_at(id).unwrap_or_else(|| self.s.elapsed());
+        self.withdrawable = Withdrawable { since, dynamic };
         Ok(reply)
     }
 
@@ -2806,16 +2858,22 @@ struct K1Asked {
 
 /// Evidence held until session cleanup drains the final stdout, so replies
 /// read after `leave` returns still count toward K1's verdict.
-/// Each also holds the static registrations the server could withdraw (see
-/// [`capabilities::registrations`]).
+/// Each also holds what may excuse a MethodNotFound (see [`k1_excuse`]).
 enum K1Pending {
     Judged(Judgement),
-    Sent { asked: Vec<K1Asked>, notes: Vec<String>, registrations: Registrations },
-    Mutation { asked: Vec<MutationAsked>, registrations: Registrations },
+    Sent { asked: Vec<K1Asked>, notes: Vec<String>, withdrawable: Withdrawable },
+    Mutation { asked: Vec<MutationAsked>, withdrawable: Withdrawable },
 }
 
-/// The static registration of each method K1 can ask, by method.
-type Registrations = HashMap<&'static str, capabilities::Registration>;
+/// What may excuse a K1 MethodNotFound besides the server's registration
+/// activity (see [`k1_excuse`]): when the scenario's initialize answer was
+/// read, and the methods whose capability the client let the server register
+/// dynamically.
+#[derive(Debug, Clone, Default)]
+struct Withdrawable {
+    since: Duration,
+    dynamic: HashSet<&'static str>,
+}
 
 /// K1: opens the profile's document (or lspcheck's own) and sends advertised
 /// requests. Ends with a graceful shutdown when initialize succeeded;
@@ -2835,8 +2893,7 @@ async fn capabilities_scenario(ctx: &mut Ctx<'_>) {
 fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
     match pending {
         K1Pending::Judged(judgement) => Some(judgement),
-        K1Pending::Sent { mut asked, notes, registrations } => {
-            let withdrawals = withdrawals(&finish.messages);
+        K1Pending::Sent { mut asked, notes, withdrawable } => {
             for a in &mut asked {
                 let Some(id) = &a.id else { continue };
                 if a.outcome == capabilities::Outcome::Unanswered
@@ -2847,12 +2904,12 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
                 // MethodNotFound for the request is seen evidence even when
                 // it isn't the first response with its id (J2 judges the
                 // duplicate); only responses read after the request was sent
-                // count. The first decides whether the method was withdrawn.
+                // count. The first decides whether it is excused.
                 if let Some(&(sent, _)) = finish.sent.iter().find(|(_, s)| s == id)
                     && let Some(i) = first_not_found(&finish.messages, id, sent)
                 {
-                    a.outcome = match withdrawn_before(&withdrawals, registrations.get(a.method), i) {
-                        Some(registration) => capabilities::Outcome::Withdrawn(registration.to_string()),
+                    a.outcome = match k1_excuse(a.method, i, &withdrawable, finish) {
+                        Some(excuse) => capabilities::Outcome::Excused(excuse),
                         None => capabilities::Outcome::Error(codes::METHOD_NOT_FOUND),
                     };
                 }
@@ -2879,23 +2936,17 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
                 judgement => Some(judgement),
             }
         }
-        K1Pending::Mutation { asked, registrations } => {
+        K1Pending::Mutation { asked, withdrawable } => {
             // Only requests lspcheck wrote whole are K1's: a write that
             // failed part way asked the server nothing it must answer.
             let sent: HashSet<&Id> = finish.sent.iter().map(|(_, id)| id).collect();
             let asked: Vec<_> = asked.into_iter().filter(|(id, ..)| sent.contains(id)).collect();
-            let (not_found, withdrawn) = k1_not_found(&asked, &registrations, finish);
-            // Each method withdrawn, once, and how many requests it took.
-            let withdrawn = (!withdrawn.is_empty()).then(|| {
-                let mut each: Vec<String> = Vec::new();
-                for ((_, _, label, _), registration) in &withdrawn {
-                    let method = label.split_once(" in ").map_or(label.as_str(), |(method, _)| method);
-                    let named = format!("{method} (registration {registration})");
-                    if !each.contains(&named) {
-                        each.push(named);
-                    }
-                }
-                format!("{} ({} request(s))", capabilities::withdrawn_note(&each), withdrawn.len())
+            let (not_found, excused) = k1_not_found(&asked, &withdrawable, finish);
+            // Each method excused, once, and how many requests it took.
+            let withdrawn = (!excused.is_empty()).then(|| {
+                let each: Vec<(&str, &capabilities::Excuse)> =
+                    excused.iter().map(|((_, _, label, _), excuse)| (mutation_k1_method(label), excuse)).collect();
+                format!("{} ({} request(s))", capabilities::excused_notes(&each).join("; "), excused.len())
             });
             if not_found.is_empty() {
                 // As in the capabilities scenario, output missed after the
@@ -2912,7 +2963,7 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
                     }
                     Judgement::Error(detail)
                 });
-                // A withdrawn method's MethodNotFound judges nothing, but name it.
+                // An excused MethodNotFound judges nothing, but name it.
                 return missed.or(withdrawn.map(Judgement::NotExercised));
             }
             let n = not_found.len();
@@ -2935,14 +2986,19 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
 /// then " in " and where) and its case.
 type MutationAsked = (Id, Duration, String, Option<u64>);
 
+/// The method of a mutation K1 label: the method, then " in " and where.
+fn mutation_k1_method(label: &str) -> &str {
+    label.split_once(" in ").map_or(label, |(method, _)| method)
+}
+
 /// The mutation scenario's requests answered with MethodNotFound, read at
-/// any time after each was sent; then those whose first such answer came
-/// after the server withdrew the method, each with the registration id.
+/// any time after each was sent; then those whose first such answer is
+/// excused (see [`k1_excuse`]), each with why.
 fn k1_not_found<'a>(
     asked: &'a [MutationAsked],
-    registrations: &Registrations,
+    withdrawable: &Withdrawable,
     finish: &Finish,
-) -> (Vec<&'a MutationAsked>, Vec<(&'a MutationAsked, String)>) {
+) -> (Vec<&'a MutationAsked>, Vec<(&'a MutationAsked, capabilities::Excuse)>) {
     let by_id: HashMap<_, _> = asked.iter().enumerate().map(|(i, (id, ..))| (id, i)).collect();
     let mut first: Vec<Option<usize>> = vec![None; asked.len()];
     for (n, (at, m)) in finish.messages.iter().enumerate() {
@@ -2954,17 +3010,15 @@ fn k1_not_found<'a>(
             first[i] = Some(n);
         }
     }
-    let withdrawals = withdrawals(&finish.messages);
-    let (mut not_found, mut withdrawn) = (Vec::new(), Vec::new());
+    let (mut not_found, mut excused) = (Vec::new(), Vec::new());
     for (a, first) in asked.iter().zip(first) {
         let Some(n) = first else { continue };
-        let method = a.2.split_once(" in ").map_or(a.2.as_str(), |(method, _)| method);
-        match withdrawn_before(&withdrawals, registrations.get(method), n) {
-            Some(registration) => withdrawn.push((a, registration.to_string())),
+        match k1_excuse(mutation_k1_method(&a.2), n, withdrawable, finish) {
+            Some(excuse) => excused.push((a, excuse)),
             None => not_found.push(a),
         }
     }
-    (not_found, withdrawn)
+    (not_found, excused)
 }
 
 /// The index in `messages` of the first MethodNotFound answering `id` read
@@ -2977,50 +3031,37 @@ fn first_not_found(messages: &[(Duration, Message)], id: &Id, sent: Duration) ->
     })
 }
 
-/// Each registration the server withdrew with `client/unregisterCapability`
-/// or made with `client/registerCapability`, as (the request's index in
-/// `messages`, whether it withdrew, the method, the registration id). The
-/// withdrawal is the server's own act, so it counts once read, whether or not
-/// lspcheck's acknowledgement got through.
-fn withdrawals(messages: &[(Duration, Message)]) -> Vec<(usize, bool, String, String)> {
-    let mut found = Vec::new();
-    for (i, (_, m)) in messages.iter().enumerate() {
-        // The spec keeps the misspelt `unregisterations` for compatibility.
-        let (withdraws, list) = match &m.kind {
-            Kind::Request { method, .. } if method == "client/unregisterCapability" => {
-                (true, "/params/unregisterations")
-            }
-            Kind::Request { method, .. } if method == "client/registerCapability" => (false, "/params/registrations"),
-            _ => continue,
-        };
-        let Some(each) = m.value.pointer(list).and_then(Value::as_array) else { continue };
-        for u in each {
-            if let (Some(method), Some(id)) = (u["method"].as_str(), u["id"].as_str()) {
-                found.push((i, withdraws, method.to_string(), id.to_string()));
-            }
-        }
+/// Why the MethodNotFound for `method` at index `at` in the session's
+/// messages isn't judged, if it isn't: the server may have withdrawn the
+/// method by then. lspcheck doesn't track which registrations are in force,
+/// since ids, document selectors and replacements can't be followed soundly,
+/// so it is excused when lspcheck had read any registration or unregistration
+/// for the method's registration method, or when the client let the server
+/// register the method dynamically and lspcheck missed output between the
+/// initialize answer and the MethodNotFound. A registration counts once
+/// read, whether or not lspcheck's acknowledgement got through.
+fn k1_excuse(method: &str, at: usize, withdrawable: &Withdrawable, finish: &Finish) -> Option<capabilities::Excuse> {
+    let registered = capabilities::registration_method(method);
+    if finish.messages[..at].iter().any(|(_, m)| registers(m, registered)) {
+        return Some(capabilities::Excuse::Registration);
     }
-    found
+    if !withdrawable.dynamic.contains(method) {
+        return None;
+    }
+    finish.missed_output_within(withdrawable.since, finish.messages[at].0).map(capabilities::Excuse::Missed)
 }
 
-/// The id of `registration`, if the server withdrew it before the message at
-/// index `before` in `messages` and didn't register its method again in
-/// between: an unregistration matches only with both its method and its id.
-fn withdrawn_before<'a>(
-    withdrawals: &[(usize, bool, String, String)],
-    registration: Option<&'a capabilities::Registration>,
-    before: usize,
-) -> Option<&'a str> {
-    let r = registration?;
-    let last = withdrawals
-        .iter()
-        .filter(|(i, withdraws, method, id)| *withdraws && *i < before && method == r.method && *id == r.id)
-        .map(|(i, ..)| *i)
-        .max()?;
-    let again = withdrawals
-        .iter()
-        .any(|(i, withdraws, method, _)| !*withdraws && *i > last && *i < before && method == r.method);
-    (!again).then_some(r.id.as_str())
+/// Whether `m` is a `client/registerCapability` or
+/// `client/unregisterCapability` request with an entry for `method`, whatever
+/// its id or options.
+fn registers(m: &Message, method: &str) -> bool {
+    // The spec keeps the misspelt `unregisterations` for compatibility.
+    let list = match &m.kind {
+        Kind::Request { method, .. } if method == "client/registerCapability" => "/params/registrations",
+        Kind::Request { method, .. } if method == "client/unregisterCapability" => "/params/unregisterations",
+        _ => return false,
+    };
+    m.value.pointer(list).and_then(Value::as_array).is_some_and(|each| each.iter().any(|e| e["method"] == method))
 }
 
 /// K1's requests, after a successful initialize. The caller leaves.
@@ -3118,7 +3159,7 @@ async fn k1(ctx: &mut Ctx<'_>, reply: &Message) -> K1Pending {
             break;
         }
     }
-    K1Pending::Sent { asked, notes, registrations: capabilities::registrations(&caps) }
+    K1Pending::Sent { asked, notes, withdrawable: ctx.withdrawable.clone() }
 }
 
 /// The index in `messages` of the first answer to `id` (see [`is_answer`])
@@ -4981,8 +5022,8 @@ struct Extended {
     published_cases: Vec<Option<u64>>,
     /// The cases whose replies or publishes D1 or D6 found at fault.
     troubles: Vec<Trouble>,
-    /// The static registrations the server could withdraw, for K1.
-    registrations: Registrations,
+    /// What may excuse a K1 MethodNotFound.
+    withdrawable: Withdrawable,
 }
 
 impl Extended {
@@ -5000,7 +5041,7 @@ impl Extended {
             selection: Vec::new(),
             published_cases: Vec::new(),
             troubles: Vec::new(),
-            registrations: HashMap::new(),
+            withdrawable: Withdrawable::default(),
         }
     }
 
@@ -6454,7 +6495,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
         })
         .collect();
     let mut ext = Extended::new(encoding, docs.iter().map(|d| d.uri.clone()));
-    ext.registrations = capabilities::registrations(&caps);
+    ext.withdrawable = ctx.withdrawable.clone();
     let opening_bytes = ctx.s.bytes_written()
         + SHUTDOWN_RESERVE
         + openings.iter().map(|params| notification_bytes("textDocument/didOpen", params)).sum::<u64>();
@@ -6971,7 +7012,7 @@ fn judge_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest], 
             })
             .map(|a| (a.id.clone(), a.at, format!("{} in {}", a.method, a.place()), a.case))
             .collect(),
-        registrations: ext.registrations.clone(),
+        withdrawable: ext.withdrawable.clone(),
     });
 }
 
@@ -8422,6 +8463,9 @@ mod tests {
             scenario: MUTATION,
             j3_exercise: None,
             l2_encoding: None,
+            initialize_tried: false,
+            l2_unseen: None,
+            withdrawable: Withdrawable::default(),
             k1_pending: None,
             mutation: None,
             isolate: None,
@@ -9326,7 +9370,7 @@ while header := sys.stdin.buffer.readline():
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn mutation_k1_matches_ids_times_and_reports_in_request_order() {
-        let unregistered = |asked| K1Pending::Mutation { asked, registrations: HashMap::new() };
+        let unregistered = |asked| K1Pending::Mutation { asked, withdrawable: Withdrawable::default() };
         let cfg = mutation_test_config("exit 0");
         let ctx = mutation_test_ctx(&cfg, 1024).await;
         let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
@@ -9386,66 +9430,98 @@ while header := sys.stdin.buffer.readline():
         );
     }
 
-    #[test]
-    fn a_method_registered_again_after_its_withdrawal_isnt_excused() {
-        let request = |method: &str, list: &str, id: &str| {
-            let params = json!({list: [{"id": id, "method": "textDocument/foldingRange"}]});
-            (Duration::ZERO, Message::classify(json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})))
-        };
-        let withdraw = request("client/unregisterCapability", "unregisterations", "fold");
-        let register = request("client/registerCapability", "registrations", "fold-2");
-        let r = capabilities::Registration { method: "textDocument/foldingRange", id: "fold".into() };
-        let messages = vec![withdraw.clone(), register.clone()];
-        let events = withdrawals(&messages);
-        // Withdrawn and not registered again before the answer at index 1.
-        assert_eq!(withdrawn_before(&events, Some(&r), 1), Some("fold"));
-        // Registered again before the answer at index 2: judged as usual.
-        assert_eq!(withdrawn_before(&events, Some(&r), 2), None);
-        // Withdrawn again after that: excused again.
-        let messages = vec![withdraw.clone(), register, withdraw];
-        assert_eq!(withdrawn_before(&withdrawals(&messages), Some(&r), 3), Some("fold"));
-    }
-
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn mutation_k1_excuses_only_a_withdrawal_of_the_registration_and_judges_nothing_by_it() {
+    async fn k1_excuses_registration_activity_for_the_method_or_missed_output_and_judges_nothing_by_it() {
         let cfg = mutation_test_config("exit 0");
         let ctx = mutation_test_ctx(&cfg, 1024).await;
         let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
-        let asked =
-            vec![(Id::int(1), Duration::from_millis(10), "textDocument/semanticTokens/full in case 1".into(), Some(1))];
-        finish.sent = vec![(Duration::from_millis(10), Id::int(1))];
-        let caps = json!({"semanticTokensProvider": {"legend": {"tokenTypes": [], "tokenModifiers": []}, "full": true, "id": "t"}});
-        let mut judged = |registrations: &Registrations, id: &str, method: &str| {
-            let unregistration = json!({"id": id, "method": method});
-            let request = json!({
-                "jsonrpc": "2.0",
-                "id": "u",
-                "method": "client/unregisterCapability",
-                "params": {"unregisterations": [unregistration]}
-            });
-            let not_found = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "withdrawn"}});
-            finish.messages = vec![
-                (Duration::from_millis(5), Message::classify(request)),
-                (Duration::from_millis(20), Message::classify(not_found)),
-            ];
-            judge_k1(K1Pending::Mutation { asked: asked.clone(), registrations: registrations.clone() }, &finish)
+        let ms = Duration::from_millis;
+        let asked = vec![(Id::int(1), ms(10), "textDocument/semanticTokens/full in case 1".into(), Some(1))];
+        finish.sent = vec![(ms(10), Id::int(1))];
+        let request = |method: &str, list: &str, entry: Value| {
+            Message::classify(json!({"jsonrpc": "2.0", "id": "r", "method": method, "params": {list: [entry]}}))
         };
-        let registrations = capabilities::registrations(&caps);
-        // Withdrawn under its registration method and id, it judges nothing.
-        let Some(Judgement::NotExercised(detail)) = judged(&registrations, "t", "textDocument/semanticTokens") else {
-            panic!("a withdrawn method's MethodNotFound alone judges nothing");
+        let unregister = |id: &str, method: &str| {
+            request("client/unregisterCapability", "unregisterations", json!({"id": id, "method": method}))
         };
-        assert!(detail.starts_with("not judged, because the server had withdrawn"), "{detail}");
-        // Another id, the request's own method, or a capability advertised
-        // without an id isn't withdrawn.
-        for (registrations, id, method) in [
-            (&registrations, "stale", "textDocument/semanticTokens"),
-            (&registrations, "t", "textDocument/semanticTokens/full"),
-            (&HashMap::new(), "t", "textDocument/semanticTokens"),
+        let register = |options: Value| {
+            let entry = json!({"id": "x", "method": "textDocument/semanticTokens", "registerOptions": options});
+            request("client/registerCapability", "registrations", entry)
+        };
+        let not_found =
+            Message::classify(json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "no"}}));
+        let tokens = "textDocument/semanticTokens";
+        let dynamic = Withdrawable { since: ms(2), dynamic: HashSet::from(["textDocument/semanticTokens/full"]) };
+        let mut judged = |before: Vec<(u64, Message)>, lost: &[(u64, u64)], withdrawable: &Withdrawable| {
+            finish.messages = before.into_iter().map(|(at, m)| (ms(at), m)).collect();
+            finish.messages.push((ms(20), not_found.clone()));
+            finish.messages.sort_by_key(|(at, _)| *at);
+            finish.lost = lost.iter().map(|&(from, to)| (ms(from), ms(to), "a frame was skipped".into())).collect();
+            let pending = |asked| K1Pending::Mutation { asked, withdrawable: withdrawable.clone() };
+            judge_k1(pending(asked.clone()), &finish)
+        };
+        let none = Withdrawable::default();
+        // Any registration or unregistration for its registration method,
+        // whatever its id or selector, judges nothing.
+        for activity in [
+            unregister("stale", tokens),
+            register(json!({"documentSelector": [{"language": "rust"}]})),
+            register(json!({"documentSelector": null})),
         ] {
-            assert!(matches!(judged(registrations, id, method), Some(Judgement::Fail(_))), "{id} {method}");
+            let Some(Judgement::NotExercised(detail)) = judged(vec![(5, activity)], &[], &none) else {
+                panic!("an excused MethodNotFound alone judges nothing");
+            };
+            assert!(
+                detail.starts_with(
+                    "not judged, because the server had sent client/registerCapability or \
+                     client/unregisterCapability for the method before answering MethodNotFound, so it may have \
+                     withdrawn it: textDocument/semanticTokens/full (1 request(s))"
+                ),
+                "{detail}"
+            );
         }
+        // Output missed between the initialize answer and the MethodNotFound
+        // judges nothing when the client let the server register it.
+        let Some(Judgement::NotExercised(detail)) = judged(vec![], &[(3, 4)], &dynamic) else {
+            panic!("a MethodNotFound after missed output judges nothing when the method could be registered");
+        };
+        assert!(
+            detail.contains("between the initialize answer and the MethodNotFound (a frame was skipped)"),
+            "{detail}"
+        );
+        // Otherwise it fails: activity for the request's own method or
+        // another, or read only after the answer; missed output when the
+        // client didn't let the server register it, or outside that window.
+        for (before, lost, withdrawable) in [
+            (vec![(5, unregister("t", "textDocument/semanticTokens/full"))], vec![], &dynamic),
+            (vec![(5, unregister("t", "textDocument/foldingRange"))], vec![], &dynamic),
+            (vec![(25, unregister("t", tokens))], vec![], &dynamic),
+            (vec![], vec![(3, 4)], &none),
+            (vec![], vec![(0, 1)], &dynamic),
+            (vec![], vec![(25, 30)], &dynamic),
+        ] {
+            let judgement = judged(before, &lost, withdrawable);
+            assert!(matches!(judgement, Some(Judgement::Fail(_))), "{lost:?} {withdrawable:?}: {judgement:?}");
+        }
+        // The capabilities scenario's K1 judges the same way.
+        let sent = |withdrawable: &Withdrawable| K1Pending::Sent {
+            asked: vec![K1Asked {
+                method: "textDocument/semanticTokens/full",
+                label: "textDocument/semanticTokens/full".into(),
+                id: Some(Id::int(1)),
+                outcome: capabilities::Outcome::Unanswered,
+            }],
+            notes: Vec::new(),
+            withdrawable: withdrawable.clone(),
+        };
+        finish.messages = vec![(ms(5), register(json!({}))), (ms(20), not_found.clone())];
+        finish.lost.clear();
+        assert!(matches!(judge_k1(sent(&none), &finish), Some(Judgement::NotExercised(_))));
+        finish.messages = vec![(ms(20), not_found)];
+        finish.lost = vec![(ms(3), ms(4), "a frame was skipped".into())];
+        assert!(matches!(judge_k1(sent(&dynamic), &finish), Some(Judgement::NotExercised(_))));
+        assert!(matches!(judge_k1(sent(&none), &finish), Some(Judgement::Fail(_))));
     }
 
     #[cfg(unix)]
@@ -9956,6 +10032,7 @@ while header := sys.stdin.buffer.readline():
                 abandoned_at: None,
                 j3_exercise: None,
                 l2_encoding: None,
+                l2_unseen: None,
                 unmatched: Vec::new(),
                 answered: Vec::new(),
                 answered_methods: HashMap::new(),
@@ -10527,11 +10604,13 @@ while (message := read()) is not None:
             with_encoding("capabilities", Some((Verdict::Pass, "positionEncoding \"utf-16\" wasn't in the offer"))),
         ];
         settle_l2(&mut runs);
+        // It comes from the scenario that saw the violation, whose
+        // transcript the report links.
         let l2 = &runs[0].results[0];
         assert_eq!(
             (l2.scenario, l2.verdict, l2.detail.as_str()),
             (
-                "lifecycle",
+                "documents",
                 Verdict::Fail,
                 "in the documents scenario, positionEncoding \"utf-8\" is not one of the offered []"
             )
@@ -10544,12 +10623,14 @@ while (message := read()) is not None:
                 .detail
                 .starts_with("in the lifecycle scenario, the result has no capabilities; in the documents")
         );
+        assert_eq!(runs[0].results[0].scenario, "lifecycle");
         // The same failure in the lifecycle scenario is named with the others.
         let utf8 = "positionEncoding \"utf-8\" is not one of the offered []";
         runs[0].observed.as_mut().unwrap().l2_encoding = Some((Verdict::Fail, utf8.into()));
         runs[0].results[0] = result("lifecycle", "L2", Verdict::Fail, utf8);
         settle_l2(&mut runs);
         assert_eq!(runs[0].results[0].detail, format!("in the lifecycle and documents scenarios, {utf8}"));
+        assert_eq!(runs[0].results[0].scenario, "lifecycle");
         // Passes elsewhere change nothing.
         runs.remove(1);
         runs[0].results[0] = result("lifecycle", "L2", Verdict::Fail, utf8);
@@ -10584,6 +10665,46 @@ while (message := read()) is not None:
             (l2.verdict, l2.detail.as_str()),
             (Verdict::Fail, format!("in the documents scenario, {utf8}").as_str())
         );
+    }
+
+    #[test]
+    fn l2_cant_pass_when_a_first_initialize_may_have_been_answered_in_missed_output() {
+        let with = |name: &'static str, unseen: Option<&str>| {
+            let mut run = observed_run(name, Vec::new(), None);
+            run.observed.as_mut().unwrap().l2_unseen = unseen.map(String::from);
+            run
+        };
+        let skipped = "a 1048661-byte frame is over lspcheck's 1048576-byte inspection limit (--max-frame-mib), so it \
+                       wasn't checked";
+        let mut lifecycle = with("lifecycle", None);
+        lifecycle.results.push(result("lifecycle", "L2", Verdict::Pass, "the profile offered [\"utf-16\"]"));
+        let mut runs = vec![lifecycle, with("framing", None), with("documents", Some(skipped))];
+        settle_l2(&mut runs);
+        let l2 = &runs[0].results[0];
+        assert_eq!(
+            (l2.scenario, l2.verdict, l2.detail.clone()),
+            (
+                "documents",
+                Verdict::Error,
+                format!(
+                    "inconclusive, because a first initialize got no result lspcheck saw, and it may have been in \
+                     output lspcheck didn't see: in the documents scenario, {skipped} (the profile offered \
+                     [\"utf-16\"])"
+                )
+            )
+        );
+        // A violation seen elsewhere still fails it.
+        let utf8 = "positionEncoding \"utf-8\" is not one of the offered [\"utf-16\"]";
+        runs[0].results[0] = result("lifecycle", "L2", Verdict::Pass, "");
+        runs[1].observed.as_mut().unwrap().l2_encoding = Some((Verdict::Fail, utf8.into()));
+        settle_l2(&mut runs);
+        let l2 = &runs[0].results[0];
+        assert_eq!((l2.scenario, l2.verdict), ("framing", Verdict::Fail));
+        // So does the lifecycle scenario's own failure.
+        runs[1].observed.as_mut().unwrap().l2_encoding = None;
+        runs[0].results[0] = result("lifecycle", "L2", Verdict::Fail, "the result has no capabilities");
+        settle_l2(&mut runs);
+        assert_eq!(runs[0].results[0].verdict, Verdict::Fail);
     }
 
     #[test]

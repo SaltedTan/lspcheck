@@ -321,6 +321,11 @@ const FAULTS: &[(&str, &str)] = &[
          utf-8 and count positions in bytes, whatever it offered",
     ),
     (
+        "big-utf8-reply-with-inlay-hints",
+        "to a client with textDocument.inlayHint, choose utf-8 whatever it offered, in an initialize answer padded \
+         past 1 MiB, then exit",
+    ),
+    (
         "snippet-completion-not-found",
         "advertise completion only to a client with snippetSupport, then answer it with MethodNotFound",
     ),
@@ -337,9 +342,27 @@ const FAULTS: &[(&str, &str)] = &[
          with MethodNotFound, and only then withdraw it with client/unregisterCapability",
     ),
     (
-        "withdraw-stale-folding-id",
-        "to a client with foldingRange.dynamicRegistration, advertise foldingRange with the registration id \"fold\", \
-         withdraw the id \"stale\" for foldingRange on initialized, then answer foldingRange with MethodNotFound",
+        "withdraw-folding-cycle",
+        "lawful: to a client with foldingRange.dynamicRegistration, advertise foldingRange with a registration id, \
+         and on initialized withdraw it, register a replacement and withdraw that, then answer foldingRange with \
+         MethodNotFound",
+    ),
+    (
+        "withdraw-folding-elsewhere",
+        "lawful: to a client with foldingRange.dynamicRegistration, advertise foldingRange with a registration id, \
+         and on initialized withdraw it and register a replacement only for Rust documents, then answer foldingRange \
+         with MethodNotFound",
+    ),
+    (
+        "withdraw-folding-in-big-frame",
+        "lawful: to a client with foldingRange.dynamicRegistration, advertise foldingRange with a registration id, \
+         advertise nothing else K1 asks, withdraw it on initialized in a frame padded past 1 MiB, then answer \
+         foldingRange with MethodNotFound",
+    ),
+    (
+        "hover-id-not-found",
+        "to a client with hover.dynamicRegistration, advertise hover with an id in its options, which register \
+         nothing, then answer hover with MethodNotFound",
     ),
     (
         "withdraw-semantic-tokens",
@@ -634,8 +657,15 @@ fn main() {
     let fault = |name: &str| faults.iter().any(|f| f == name);
     // The faults that advertise foldingRange with a registration id and
     // answer it with MethodNotFound.
-    let folding_faults =
-        ["withdraw-folding", "withdraw-folding-late", "withdraw-stale-folding-id"].iter().any(|f| fault(f));
+    let folding_faults = [
+        "withdraw-folding",
+        "withdraw-folding-late",
+        "withdraw-folding-cycle",
+        "withdraw-folding-elsewhere",
+        "withdraw-folding-in-big-frame",
+    ]
+    .iter()
+    .any(|f| fault(f));
     // How the stand-in splits lines, per the line-splitting faults.
     let split = line_split(&faults);
     // Whether a workspace/symbol reply waits to see whether it is cancelled.
@@ -1303,8 +1333,37 @@ fn main() {
             if method == "initialized" && fault("withdraw-folding") && withdraws_folding(&client_caps) {
                 out.frame(&unregister("fold", "textDocument/foldingRange"));
             }
-            if method == "initialized" && fault("withdraw-stale-folding-id") && withdraws_folding(&client_caps) {
-                out.frame(&unregister("stale", "textDocument/foldingRange"));
+            if method == "initialized"
+                && (fault("withdraw-folding-cycle") || fault("withdraw-folding-elsewhere"))
+                && withdraws_folding(&client_caps)
+            {
+                out.frame(&unregister("fold", "textDocument/foldingRange"));
+                // A replacement for no document lspcheck opens, or one
+                // withdrawn in turn.
+                let selector =
+                    if fault("withdraw-folding-elsewhere") { json!([{"language": "rust"}]) } else { Value::Null };
+                let registration = json!({
+                    "id": "fold-2",
+                    "method": "textDocument/foldingRange",
+                    "registerOptions": {"documentSelector": selector}
+                });
+                out.frame(&json!({
+                    "jsonrpc": "2.0",
+                    "id": "register-fold-2",
+                    "method": "client/registerCapability",
+                    "params": {"registrations": [registration]}
+                }));
+                if fault("withdraw-folding-cycle") {
+                    out.frame(&unregister("fold-2", "textDocument/foldingRange"));
+                }
+            }
+            if method == "initialized" && fault("withdraw-folding-in-big-frame") && withdraws_folding(&client_caps) {
+                // JSON may end in whitespace; this pads the body past 1 MiB.
+                let mut body = serde_json::to_vec(&unregister("fold", "textDocument/foldingRange")).unwrap();
+                body.resize(body.len() + (1 << 20), b' ');
+                let mut bytes = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+                bytes.extend(body);
+                out.raw(&bytes);
             }
             if method == "initialized" && fault("withdraw-semantic-tokens") && withdraws_tokens(&client_caps) {
                 out.frame(&unregister("tokens", "textDocument/semanticTokens"));
@@ -1701,7 +1760,8 @@ fn main() {
             (encoding, units) = if fault("bad-encoding") {
                 ("utf-7", Units::Utf16)
             } else if fault("utf8-even-unoffered")
-                || fault("utf8-unoffered-with-inlay-hints") && client_caps.pointer("/textDocument/inlayHint").is_some()
+                || (fault("utf8-unoffered-with-inlay-hints") || fault("big-utf8-reply-with-inlay-hints"))
+                    && client_caps.pointer("/textDocument/inlayHint").is_some()
             {
                 ("utf-8", Units::Bytes)
             } else if fault("utf32-encoding") && offered("utf-32") {
@@ -1764,6 +1824,20 @@ fn main() {
             if folding_faults && withdraws_folding(&client_caps) {
                 result["capabilities"]["foldingRangeProvider"] = json!({"documentSelector": null, "id": "fold"});
             }
+            if fault("withdraw-folding-in-big-frame") && withdraws_folding(&client_caps) {
+                // Only foldingRange, so it is all K1 asks.
+                let caps = &result["capabilities"];
+                result["capabilities"] = json!({
+                    "textDocumentSync": caps["textDocumentSync"],
+                    "foldingRangeProvider": caps["foldingRangeProvider"]
+                });
+            }
+            if fault("hover-id-not-found")
+                && client_caps.pointer("/textDocument/hover/dynamicRegistration") == Some(&json!(true))
+            {
+                // HoverOptions has no id; it registers nothing to withdraw.
+                result["capabilities"]["hoverProvider"] = json!({"id": "hover"});
+            }
             if fault("withdraw-semantic-tokens") && withdraws_tokens(&client_caps) {
                 result["capabilities"]["semanticTokensProvider"] = json!({
                     "documentSelector": null,
@@ -1781,6 +1855,15 @@ fn main() {
                 // to the server once it has read the result.
                 close_stdin(input);
                 out.frame(&ok(&id, result));
+                std::process::exit(0);
+            }
+            if fault("big-utf8-reply-with-inlay-hints") && client_caps.pointer("/textDocument/inlayHint").is_some() {
+                // JSON may end in whitespace; this pads the body past 1 MiB.
+                let mut body = serde_json::to_vec(&ok(&id, result)).unwrap();
+                body.resize(body.len() + (1 << 20), b' ');
+                let mut bytes = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+                bytes.extend(body);
+                out.raw(&bytes);
                 std::process::exit(0);
             }
             if fault("exit-before-initialize-reply") {
@@ -2193,6 +2276,12 @@ fn main() {
                 out.frame(&ok(&id, json!([item])));
             }
             "textDocument/hover" if fault("hover-contents-number") => out.frame(&ok(&id, json!({"contents": 3}))),
+            "textDocument/hover"
+                if fault("hover-id-not-found")
+                    && client_caps.pointer("/textDocument/hover/dynamicRegistration") == Some(&json!(true)) =>
+            {
+                out.frame(&err(&id, -32601, "hover isn't registered"));
+            }
             "workspace/symbol" if fault("symbol-missing-name") => {
                 // Otherwise a whole SymbolInformation, in a document lspcheck never opens.
                 let symbol = json!({"kind": 13, "location": {"uri": ELSEWHERE, "range": range(0, 0, 0, 1)}});

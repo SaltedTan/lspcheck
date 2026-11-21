@@ -20,15 +20,19 @@
 - **L2** now judges the `positionEncoding` of every scenario's first initialize, each against the offer sent with
   it, not only the lifecycle scenario's. A server that chose an encoding it wasn't offered in another scenario passed
   L2, while D1 and the other position checks there said "not judged, see L2". The failure names the scenarios and the
-  offer, and a violation seen fails L2 even when the lifecycle scenario couldn't finish initializing. `--only L2` now
-  runs every scenario.
-- **K1** no longer fails on a MethodNotFound for a request whose static registration the server withdrew with
-  `client/unregisterCapability` before answering it. The unregistration must name the request's registration method
-  (`textDocument/semanticTokens` for the semantic tokens requests) and the `id` the server advertised for the
-  capability; an unregistration of any other id withdraws nothing, and registering the method again before
-  the answer puts it back. Such a request is still sent; its answer isn't
-  judged, and the detail names it with its registration id. This applies in the capabilities and mutation scenarios,
-  and a mutation scenario with nothing else to judge leaves K1 `N/E`.
+  offer, and a violation seen fails L2 even when the lifecycle scenario couldn't finish initializing. When no
+  violation was seen but a scenario's first initialize got no result lspcheck saw while it missed output (such as a
+  frame over `--max-frame-mib`), L2 is `ERROR`, naming the scenario, instead of passing. The report links the
+  transcript of the scenario L2's verdict came from. `--only L2` now runs every scenario.
+- **K1** no longer fails on a MethodNotFound for a request the server may have withdrawn with
+  `client/unregisterCapability`. Its answer isn't judged when, before it, lspcheck had read any
+  `client/registerCapability` or `client/unregisterCapability` for the request's registration method
+  (`textDocument/semanticTokens` for the semantic tokens requests, `textDocument/rename` for `prepareRename`),
+  whatever its id or document selector, or when the client capabilities let the server register the method
+  dynamically and lspcheck missed output between the initialize answer and the MethodNotFound. lspcheck doesn't track
+  which registrations are in force, so a server that sends a stray registration and then wrongly answers
+  MethodNotFound isn't failed. Such a request is still sent, and the detail names it and why. This applies in the
+  capabilities and mutation scenarios, and K1 with nothing else to judge is `N/E`.
 - **C1** and **R4** no longer pass when the server answers their request with a message carrying the id but no
   well-formed outcome, by J5's rules: exactly one of `result` and `error`, and the error an object with an integer
   `code` (signed 32-bit) and a string `message`. So neither, both, `error: null` and `error: {}` don't count. Such a message still
