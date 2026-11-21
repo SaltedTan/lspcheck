@@ -2,7 +2,7 @@
 
 Drafted 2026-11-04. Licence: Apache-2.0. Language: Rust.
 
-**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client].capabilities` is still planned. v0.3.0 adds [K2](#capabilities-and-robustness). v0.4.0 expands the [example profile catalogue](../examples/profiles/README.md) to 18 servers and the [stock-server CI matrix](../ci/stock-servers/README.md) to 11, accepts unknown values of the tag and kind enumerations clients must tolerate in K2, refines [K2's failure detail](#capabilities-and-robustness), and [isolates Content-Type probes](#framing-and-output). M4 is done (see the [integration milestone](#milestones)). v0.5.0 adds experimental [seeded source mutation](source-mutations.md), steps 1 to 7 of its plan: under `--mutate`, M1 to M3 are judged, D1, D2, D6 and K1 also judge the mutated texts, and the first three failing or erroring cases are run again alone; the stock example profiles have `[mutation]` sections, [measured on the pinned servers](mutation-stock-servers.md), and the stock matrix runs a mutation job per server against its recorded `.mutation.verdicts`. See the
+**Status:** milestones M0 and M1 are done: the transport, process, and session layers, the stand-in server, and checks F1 to F8, J4, and L1 to L9. M2 is done: J1 to J3, J5 to J7, C1 to C3, D1 to D6 and [`replay`](#report). F1, F2, F8, J1, J2, J5, J7 and L9 are judged across every scenario, and J3 follows its [scenario coverage rules](#json-rpc-correlation). M3 is under way: v0.1.0 is released with prebuilt binaries for five platforms (each checked against the stand-in on its own platform, with SHA-256 checksums and build provenance), after a manual run against gopls, rust-analyzer, lua-language-server and basedpyright. v0.2.0 adds [profiles](#profiles-optional-toml) (`[server]`, `[workspace]`, `[client].initialization_options` and `configuration`, `[document]`, `[allow]`) with example profiles for those four servers, [K1 and R1 to R4](#capabilities-and-robustness), and [JUnit and Markdown reports](#report); the [stock-server CI matrix](../ci/stock-servers/README.md) is implemented; `[client.capabilities]` came later (see below). v0.3.0 adds [K2](#capabilities-and-robustness). v0.4.0 expands the [example profile catalogue](../examples/profiles/README.md) to 18 servers and the [stock-server CI matrix](../ci/stock-servers/README.md) to 11, accepts unknown values of the tag and kind enumerations clients must tolerate in K2, refines [K2's failure detail](#capabilities-and-robustness), and [isolates Content-Type probes](#framing-and-output). M4 is done (see the [integration milestone](#milestones)). v0.5.0 adds experimental [seeded source mutation](source-mutations.md), steps 1 to 7 of its plan: under `--mutate`, M1 to M3 are judged, D1, D2, D6 and K1 also judge the mutated texts, and the first three failing or erroring cases are run again alone; the stock example profiles have `[mutation]` sections, [measured on the pinned servers](mutation-stock-servers.md), and the stock matrix runs a mutation job per server against its recorded `.mutation.verdicts`. See the
 [mutation implementation status](source-mutations.md) for current behavior and the
 [implementation plan](source-mutations.md#implementation-plan) for the remaining step,
 minimisation, which waits until isolation shows it is wanted.
@@ -10,6 +10,10 @@ D6's [candidate rules](#documents-and-positions) apply in the documents and muta
 v0.6.0 warns on stderr about a short mutation case start window, summarizes the server's Error and Warning messages
 during mutation in the [reports](#report), makes F1 `ERROR`, not `FAIL`, on a frame lspcheck's own cleanup may have
 cut short, and keeps K1 from passing on output it didn't see.
+Unreleased: a profile's [`[client.capabilities]`](#profiles-optional-toml) is merged over every initialize's client
+capabilities, and L2 judges the encoding offer actually sent, in every scenario's first initialize. K1 no longer
+judges a MethodNotFound for a request whose static registration the server withdrew with
+`client/unregisterCapability`.
 See the [changelog](../CHANGELOG.md) for changes by release.
 
 ## Purpose
@@ -117,7 +121,7 @@ the server sent no requests or lspcheck sent none after completing an answer.
 | ID | Basis | Check |
 |---|---|---|
 | L1 | SHOULD | A request before `initialize` gets error `-32002`; a notification sent before it (`workspace/didChangeConfiguration`) is dropped without a reply: no response other than those two answers may arrive before the answer to `initialize`. If lspcheck may have missed output in that time (a frame it skipped or couldn't read), L1 is `error` instead of passing. The time ends where the answer to `initialize` was in the stream (when it was read, not when lspcheck took it in), before `initialized` and the profile's settings are sent. A frame lspcheck skipped that arrived in the same read as that answer has the same time and still makes L1 `error`. |
-| L2 | MUST | `initialize` returns an object with `capabilities`; a chosen `positionEncoding` is one the client offered (offer `utf-8` first, `utf-16` last). The result is judged even if lspcheck can't send `initialized` after it; the lifecycle checks that need the server initialized are then `error`. |
+| L2 | MUST | `initialize` returns an object with `capabilities`; a chosen `positionEncoding` is one the client offered (lspcheck's default offer is `utf-8` first, `utf-16` last; a profile can [change it](#profiles-optional-toml), and the detail then names it). UTF-16 passes even when left out of the offer, with a note, since clients always support it. The encoding rule is judged on the first successful initialize of every scenario, each against the offer sent with it, since a server may choose differently for each; a failure names the scenarios and the offer. A violation seen there fails L2 even when the lifecycle scenario's L2 ended in `ERROR`, for example because lspcheck couldn't send `initialized`. L2 is reported by the lifecycle scenario, and wanting it runs every scenario. The result is judged even if lspcheck can't send `initialized` after it; the lifecycle checks that need the server initialized are then `error`. |
 | L3 | POLICY | A second `initialize` gets an error and the server keeps serving: a plain request answered before it is answered after it too. |
 | L4 | MUST | `shutdown` returns `null` and the process keeps running until `exit`. An error, which LSP allows for an exception during shutdown, passes too if the process keeps running; the detail names it. The error must be well formed by J5's rules (an integer `code` in the signed 32-bit range and a string `message`), and not MethodNotFound (`-32601`), since every server must implement `shutdown`. Any other result or error fails. The process must still be running when lspcheck looks just before it writes `exit`. |
 | L5 | SHOULD | Requests after `shutdown` get error `-32600` InvalidRequest (tested with `workspace/symbol`, after L3 in the same scenario; if the server stopped answering at L3, L5 is `error`). |
@@ -256,9 +260,9 @@ D1 to D6 are done.
 
 The checks share one scenario, `documents`. lspcheck initializes with client capabilities for folding ranges,
 selection ranges, highlights, links, code lenses, pull diagnostics, inlay hints and formatting, and offers the usual
-encodings (`utf-8`, `utf-32`, `utf-16`). The negotiated encoding is the server's `positionEncoding`, or UTF-16 when it
-chose none. If the server doesn't ask for `didOpen`, D1 is `SKIP`. Otherwise lspcheck saves document A as `doc.txt` in
-the workspace and opens it as `plaintext` at version 41. A's first line is six emoji, ` word `, six emoji: the start
+encodings (`utf-8`, `utf-32`, `utf-16`) unless the profile's [capabilities](#profiles-optional-toml) set others. The
+negotiated encoding is the server's `positionEncoding`, or UTF-16 when it chose none. If the server doesn't ask for
+`didOpen`, D1 is `SKIP`. Otherwise lspcheck saves document A as `doc.txt` in the workspace and opens it as `plaintext` at version 41. A's first line is six emoji, ` word `, six emoji: the start
 and end of `word` land inside a character whichever way a server confuses UTF-8 bytes, UTF-16 units and code points.
 Its other lines hold a combining mark, CJK characters, a ZWJ sequence, a flag and an ASCII line. lspcheck then sends
 each request the server advertises (document symbols, folding ranges, links, code lenses, inlay hints, formatting,
@@ -318,7 +322,7 @@ diagnostics, may refer to version 41, so a position in them that is invalid is D
   `didChange` is sent.
 - **error:** the server registered `textDocument/didChange` or `didOpen` dynamically before the change (a
   `client/registerCapability` request whose `params.registrations` array has an entry whose `method` is one of
-  those; lspcheck declares no dynamic registration but answers registrations with success, so the server may
+  those; lspcheck declares none, and a profile can't make it declare one, but it answers registrations with success, so the server may
   expect another sync kind); the `didChange` couldn't be sent; or nothing failed but lspcheck missed evidence the
   server sent from the change on.
 - **fail:** a position read after the change is inside a character of version 42 in the negotiated encoding, on no
@@ -428,7 +432,8 @@ it, and the detail names the scenario and case.
 K1 runs in its own `capabilities` scenario. Advertising a capability declares that the server handles its request,
 so answering that request with MethodNotFound contradicts the server's own initialize result. Any other error
 (RequestFailed, ContentModified, InvalidParams for a position the server dislikes, or a code of its own) is lawful and
-only noted in the detail. lspcheck initializes with client capabilities for every request below, then takes the
+only noted in the detail. lspcheck initializes with client capabilities for every request below, merged under the
+profile's [capabilities](#profiles-optional-toml), then takes the
 document from the profile's [`[document]`](#profiles-optional-toml), or else writes its own, `lspcheck-k1.txt`, as
 `plaintext`: identifier-like words on four lines. It reads the document's text from the workspace (a profile's
 positions are checked again against it, in case the fixture changed since the profile was read; a mismatch is
@@ -500,6 +505,18 @@ answering the server's requests on the way. Once session cleanup has drained the
 request by its matched response, including replies read during shutdown or the final drain. A MethodNotFound reply
 counts when its id equals the request's exactly and it was read at or after the request was sent, even after another
 response with that id (the duplicate is J2's).
+
+A server may withdraw a capability it advertised with a registration `id` (`StaticRegistrationOptions.id` in the
+capability's options in the initialize result) by sending `client/unregisterCapability` for it (the client must
+have declared that feature's `dynamicRegistration`, which lspcheck's own capabilities don't, but a profile's may).
+lspcheck acknowledges it and still sends the request. A MethodNotFound for the request is then not judged, when the
+first one for it was read after an unregistration that matches the registration exactly: its `method` is the
+request's registration method (the meta-model's `registrationMethod`, such as `textDocument/semanticTokens` for both
+semantic tokens requests, otherwise the request's own method) and its `id` is the one the capability advertised.
+An unregistration of another id, or of a capability advertised without one, withdraws nothing K1 asks. The detail
+names each such request with its registration id. The withdrawal counts once lspcheck has read it, whether or not
+its acknowledgement got through: it is the server's act, not lspcheck's. When no request is left to judge, K1 is
+`N/E`. The mutation scenario's K1 does the same, and is `N/E` there when withdrawn requests are all it has.
 
 For either a failure or an error, the detail names every unanswered request. It gives the delivery failure's cause
 (including the server's exit status when observed) once, on the request lspcheck couldn't send, then lists the
@@ -666,18 +683,10 @@ verdict rules, scenario selection and implementation status. See the [README](..
 
 ## Profiles (optional TOML)
 Profiles are implemented in `src/profile.rs`; the [README](../README.md#profiles) owns the supported profile example,
-command and timeout precedence, path rules, and common usage. This section records implementation details and
-planned extensions. The documents scenario still uses its [plain-text probe documents](#documents-and-positions);
+command and timeout precedence, path rules, and common usage. This section records implementation details. The documents scenario still uses its [plain-text probe documents](#documents-and-positions);
 mutation seed selection is defined in the [mutation schema](source-mutations.md#profile-schema).
 The [example profile catalogue](../examples/profiles/README.md) lists the available
 servers and their prerequisites; the [stock-server matrix](../ci/stock-servers/README.md) documents which it runs.
-
-This field is planned, and refused for now:
-
-```toml
-[client]
-capabilities = "default"       # planned: or a path to a capabilities JSON
-```
 
 - **Parsing.** Serde's `deny_unknown_fields` enforces the accepted keys. TOML parsing errors include a line, column
   and the offending line; validation errors name the relevant key. Duration quantities must be non-negative whole
@@ -695,6 +704,32 @@ capabilities = "default"       # planned: or a path to a capabilities JSON
 - **`initialization_options`** is any TOML value, converted to JSON (a date or time becomes its TOML spelling; NaN or
   an infinite float is an error), and sent as `initializationOptions` in every initialize lspcheck sends: each
   scenario's, L3's second one and the pre-initialize scenario's. Absent, the field is omitted as before.
+- **`[client.capabilities]`** (a table) is converted to JSON by the same rules as `initialization_options`, and
+  merged into the client capabilities of every initialize lspcheck sends (each scenario's, L3's second one, the
+  pre-initialize scenario's, and the mutation scenario's, isolated reruns included) as an RFC 7386 JSON Merge Patch
+  applied last: objects merge key by key, and arrays and scalars replace lspcheck's. TOML has no null, so nothing is
+  deleted: lspcheck's own capabilities, and the documents and capabilities scenarios' additions, stay where the
+  profile is silent. The merge happens in `Ctx::with_profile`, where `initializationOptions` is added. A string,
+  such as the placeholder `"default"` once documented here, is refused with a message showing the table form. Before
+  any scenario runs, lspcheck refuses:
+  - `textDocument.synchronization.dynamicRegistration = true`: lspcheck doesn't follow sync registrations, so a
+    server that registered another sync kind would get changes it doesn't expect, and D1, D3 and the mutation checks
+    would judge text the server never had.
+  - a `general.positionEncodings` entry other than `utf-8`, `utf-16` or `utf-32`, which lspcheck can't count
+    positions in. An empty array is allowed: only UTF-16 is then lawful.
+  - a merged set that isn't of the meta-model's `ClientCapabilities` type, for each distinct set (the base, the
+    documents scenario's, and the one the capabilities and mutation scenarios share). The error names the path, what
+    is required there, and the scenarios whose initialize it affects. A partial structure can be whole on top of one
+    set and missing required fields on another (`textDocument.semanticTokens.formats` alone, for instance).
+
+  A key the 3.17 meta-model doesn't name is sent anyway, and lspcheck warns once per key on stderr; real editors send
+  3.18 and proposed keys. The search follows structures, structure literals and type aliases, not `or` types, arrays
+  or `LSPAny` (so not `experimental`). Other dynamic registrations are allowed: a server may then register a feature
+  instead of advertising it, which costs K1 and D coverage, never a verdict. With `workspace.workspaceFolders =
+  false`, lspcheck sends no `workspaceFolders` param, so the initialize doesn't contradict itself; `rootUri` and
+  `rootPath` still name the workspace. It answers server requests the same way whatever was advertised; every such
+  answer stays lawful. Transcripts record the merged `initialize`, so a replay
+  sends it again unchanged.
 - **`configuration`** (a table). Each `workspace/configuration` item is answered by looking up its `section` as a
   dot-separated path into the table (`"gopls"` gives the `gopls` table, `"gopls.staticcheck"` gives `false`); an item
   without a section, or with a null or empty one, gets the whole table; a path that leads nowhere, or another
@@ -717,7 +752,7 @@ capabilities = "default"       # planned: or a path to a capabilities JSON
   leftover not on the list fails as before, and the detail of that failure names the allowed ones too.
 - **`allow.skip`.** Each entry needs an `id` in the catalogue and a non-empty `reason`; an id listed twice is an
   error. A skipped check reports `SKIP` with `skipped by the profile: <reason>` and doesn't affect the exit status. A
-  scenario other than [mutation](#mutation) runs when one of its checks, or a cross-cutting check, is wanted (by
+  scenario other than [mutation](#mutation) runs when one of its checks, a cross-cutting check, or L2 is wanted (by
   `--only`) and not skipped, and then runs whole, as without the skips, so no other verdict changes; a skipped
   check's verdict is replaced at the end. A
   scenario whose checks are all skipped or unselected doesn't run (when no cross-cutting check needs it), and its

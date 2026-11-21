@@ -2,8 +2,32 @@
 
 ## Unreleased
 
+### Added
+
+- Profiles accept `[client.capabilities]`, a table merged over lspcheck's client capabilities in every `initialize`
+  it sends. The profile wins where both set a key (objects merge key by key; arrays and scalars replace lspcheck's),
+  and lspcheck's own capabilities stay where the profile is silent. Two values are refused because lspcheck couldn't
+  judge under them: `textDocument.synchronization.dynamicRegistration = true`, and a `general.positionEncodings`
+  entry other than `utf-8`, `utf-16` or `utf-32`. A set that isn't of the LSP 3.17 `ClientCapabilities` type once
+  merged is refused, naming the key and the scenarios affected. A key LSP 3.17 doesn't define is sent anyway, with a
+  warning on stderr. L2 judges the server's `positionEncoding` against the offer actually sent, and names a profile's
+  offer in its detail. When the capabilities set `workspace.workspaceFolders = false`, lspcheck sends no
+  `workspaceFolders` param; `rootUri` still names the workspace. The placeholder `capabilities = "default"` is refused
+  with a message showing the table form.
+
 ### Fixed
 
+- **L2** now judges the `positionEncoding` of every scenario's first initialize, each against the offer sent with
+  it, not only the lifecycle scenario's. A server that chose an encoding it wasn't offered in another scenario passed
+  L2, while D1 and the other position checks there said "not judged, see L2". The failure names the scenarios and the
+  offer, and a violation seen fails L2 even when the lifecycle scenario couldn't finish initializing. `--only L2` now
+  runs every scenario.
+- **K1** no longer fails on a MethodNotFound for a request whose static registration the server withdrew with
+  `client/unregisterCapability` before answering it. The unregistration must name the request's registration method
+  (`textDocument/semanticTokens` for the semantic tokens requests) and the `id` the server advertised for the
+  capability; an unregistration of any other id withdraws nothing. Such a request is still sent; its answer isn't
+  judged, and the detail names it with its registration id. This applies in the capabilities and mutation scenarios,
+  and a mutation scenario with nothing else to judge leaves K1 `N/E`.
 - **C1** and **R4** no longer pass when the server answers their request with a message carrying the id but no
   well-formed outcome, by J5's rules: exactly one of `result` and `error`, and the error an object with an integer
   `code` (signed 32-bit) and a string `message`. So neither, both, `error: null` and `error: {}` don't count. Such a message still

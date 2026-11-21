@@ -314,6 +314,43 @@ const FAULTS: &[(&str, &str)] = &[
     ("utf16-positions-as-utf8", "choose utf-8 when offered, but count positions in UTF-16 code units"),
     ("utf8-encoding", "lawful: choose utf-8 when offered, and count positions in bytes"),
     ("utf32-encoding", "lawful: choose utf-32 when offered, and count positions in code points"),
+    ("utf8-even-unoffered", "choose utf-8 and count positions in bytes, whatever the client offered"),
+    (
+        "utf8-unoffered-with-inlay-hints",
+        "to a client with textDocument.inlayHint (lspcheck's documents, capabilities and mutation scenarios), choose \
+         utf-8 and count positions in bytes, whatever it offered",
+    ),
+    (
+        "snippet-completion-not-found",
+        "advertise completion only to a client with snippetSupport, then answer it with MethodNotFound",
+    ),
+    ("snippet-completion", "lawful: advertise completion only to a client with snippetSupport, and offer a snippet"),
+    ("progress-if-advertised", "lawful: ask for a progress token only if the client has window.workDoneProgress"),
+    (
+        "withdraw-folding",
+        "lawful: to a client with foldingRange.dynamicRegistration, advertise foldingRange with a registration id, \
+         withdraw it with client/unregisterCapability on initialized, then answer it with MethodNotFound",
+    ),
+    (
+        "withdraw-folding-late",
+        "to a client with foldingRange.dynamicRegistration, advertise foldingRange with a registration id, answer it \
+         with MethodNotFound, and only then withdraw it with client/unregisterCapability",
+    ),
+    (
+        "withdraw-stale-folding-id",
+        "to a client with foldingRange.dynamicRegistration, advertise foldingRange with the registration id \"fold\", \
+         withdraw the id \"stale\" for foldingRange on initialized, then answer foldingRange with MethodNotFound",
+    ),
+    (
+        "withdraw-semantic-tokens",
+        "lawful: to a client with semanticTokens.dynamicRegistration, advertise full and range semantic tokens with a \
+         registration id, withdraw it under textDocument/semanticTokens on initialized, then answer both with \
+         MethodNotFound",
+    ),
+    (
+        "show-document-if-advertised",
+        "send window/showDocument with a number for its uri to a client with window.showDocument.support",
+    ),
     ("past-line-end", "lawful: add diagnostics ending past the end of a line and past the end of the document"),
     ("grapheme-split", "lawful: add a diagnostic starting between a letter and its combining mark"),
     (
@@ -595,6 +632,10 @@ fn main() {
         }
     }
     let fault = |name: &str| faults.iter().any(|f| f == name);
+    // The faults that advertise foldingRange with a registration id and
+    // answer it with MethodNotFound.
+    let folding_faults =
+        ["withdraw-folding", "withdraw-folding-late", "withdraw-stale-folding-id"].iter().any(|f| fault(f));
     // How the stand-in splits lines, per the line-splitting faults.
     let split = line_split(&faults);
     // Whether a workspace/symbol reply waits to see whether it is cancelled.
@@ -691,6 +732,10 @@ fn main() {
     // The URIs closed with didClose, for closed-from-disk.
     let mut closed: HashSet<String> = HashSet::new();
     let mut units = Units::Utf16;
+    // The capabilities of the first initialize.
+    let mut client_caps = Value::Null;
+    // Whether withdraw-folding-late has withdrawn foldingRange yet.
+    let mut folding_withdrawn = false;
     // The unit of the encoding the stand-in declared, used to apply changes;
     // a position-counting fault changes `units`, not this.
     let mut negotiated_units = Units::Utf16;
@@ -1224,7 +1269,8 @@ fn main() {
                     "params": {"registrations": [{"id": "1", "method": "textDocument/didChange", "registerOptions": {"documentSelector": null, "syncKind": 2}}]}
                 }));
             }
-            if method == "initialized" {
+            let progress = client_caps.pointer("/window/workDoneProgress") == Some(&json!(true));
+            if method == "initialized" && (progress || !fault("progress-if-advertised")) {
                 // Like many servers, ask for a progress token. reused-request-id
                 // asks again with the same id in the same write, before the
                 // answer to the first can have arrived.
@@ -1253,6 +1299,22 @@ fn main() {
                 out.frame(
                     &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
                 );
+            }
+            if method == "initialized" && fault("withdraw-folding") && withdraws_folding(&client_caps) {
+                out.frame(&unregister("fold", "textDocument/foldingRange"));
+            }
+            if method == "initialized" && fault("withdraw-stale-folding-id") && withdraws_folding(&client_caps) {
+                out.frame(&unregister("stale", "textDocument/foldingRange"));
+            }
+            if method == "initialized" && fault("withdraw-semantic-tokens") && withdraws_tokens(&client_caps) {
+                out.frame(&unregister("tokens", "textDocument/semanticTokens"));
+            }
+            if method == "initialized"
+                && fault("show-document-if-advertised")
+                && client_caps.pointer("/window/showDocument/support") == Some(&json!(true))
+            {
+                let params = json!({"uri": 5});
+                out.frame(&json!({"jsonrpc": "2.0", "id": "show", "method": "window/showDocument", "params": params}));
             }
             if method == "initialized" && fault("needs-configuration") {
                 // Like a server that reads its settings before doing
@@ -1629,6 +1691,7 @@ fn main() {
                 continue;
             }
             initialized = true;
+            client_caps = msg.pointer("/params/capabilities").cloned().unwrap_or(Value::Null);
             let offered = |name: &str| {
                 msg.pointer("/params/capabilities/general/positionEncodings")
                     .and_then(Value::as_array)
@@ -1637,6 +1700,10 @@ fn main() {
             let encoding;
             (encoding, units) = if fault("bad-encoding") {
                 ("utf-7", Units::Utf16)
+            } else if fault("utf8-even-unoffered")
+                || fault("utf8-unoffered-with-inlay-hints") && client_caps.pointer("/textDocument/inlayHint").is_some()
+            {
+                ("utf-8", Units::Bytes)
             } else if fault("utf32-encoding") && offered("utf-32") {
                 ("utf-32", Units::CodePoints)
             } else if fault("utf8-encoding") && offered("utf-8") {
@@ -1688,6 +1755,23 @@ fn main() {
             .any(|f| fault(f))
             {
                 result["capabilities"]["colorProvider"] = json!(true);
+            }
+            let snippets = client_caps.pointer("/textDocument/completion/completionItem/snippetSupport");
+            if (fault("snippet-completion-not-found") || fault("snippet-completion")) && snippets == Some(&json!(true))
+            {
+                result["capabilities"]["completionProvider"] = json!({});
+            }
+            if folding_faults && withdraws_folding(&client_caps) {
+                result["capabilities"]["foldingRangeProvider"] = json!({"documentSelector": null, "id": "fold"});
+            }
+            if fault("withdraw-semantic-tokens") && withdraws_tokens(&client_caps) {
+                result["capabilities"]["semanticTokensProvider"] = json!({
+                    "documentSelector": null,
+                    "legend": {"tokenTypes": [], "tokenModifiers": []},
+                    "full": true,
+                    "range": true,
+                    "id": "tokens"
+                });
             }
             if fault("no-capabilities") {
                 result = json!({"serverInfo": {"name": "lspcheck-standin"}});
@@ -2104,6 +2188,10 @@ fn main() {
                 bytes.extend(out.encode(&ok(&id, json!(3))));
                 out.raw(&bytes);
             }
+            "textDocument/completion" if fault("snippet-completion") => {
+                let item = json!({"label": "f", "insertText": "f(${1:x})", "insertTextFormat": 2});
+                out.frame(&ok(&id, json!([item])));
+            }
             "textDocument/hover" if fault("hover-contents-number") => out.frame(&ok(&id, json!({"contents": 3}))),
             "workspace/symbol" if fault("symbol-missing-name") => {
                 // Otherwise a whole SymbolInformation, in a document lspcheck never opens.
@@ -2111,6 +2199,18 @@ fn main() {
                 out.frame(&ok(&id, json!([symbol])));
             }
             "textDocument/hover" | "workspace/symbol" => out.frame(&ok(&id, Value::Null)),
+            "textDocument/foldingRange" if folding_faults && withdraws_folding(&client_caps) => {
+                out.frame(&err(&id, -32601, "foldingRange isn't registered"));
+                if fault("withdraw-folding-late") && !folding_withdrawn {
+                    folding_withdrawn = true;
+                    out.frame(&unregister("fold", "textDocument/foldingRange"));
+                }
+            }
+            "textDocument/semanticTokens/full" | "textDocument/semanticTokens/range"
+                if fault("withdraw-semantic-tokens") && withdraws_tokens(&client_caps) =>
+            {
+                out.frame(&err(&id, -32601, "semanticTokens isn't registered"));
+            }
             "textDocument/documentSymbol"
             | "textDocument/foldingRange"
             | "textDocument/documentHighlight"
@@ -3103,6 +3203,28 @@ fn ok(id: &Value, result: Value) -> Value {
 
 fn err(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+/// Whether the client lets the server register foldingRange dynamically, and
+/// so withdraw the static registration it gave an id.
+fn withdraws_folding(client_caps: &Value) -> bool {
+    client_caps.pointer("/textDocument/foldingRange/dynamicRegistration") == Some(&json!(true))
+}
+
+/// Whether the client lets the server register semantic tokens dynamically.
+fn withdraws_tokens(client_caps: &Value) -> bool {
+    client_caps.pointer("/textDocument/semanticTokens/dynamicRegistration") == Some(&json!(true))
+}
+
+/// Withdraws the registration `id` of `method`.
+fn unregister(id: &str, method: &str) -> Value {
+    let unregistration = json!({"id": id, "method": method});
+    json!({
+        "jsonrpc": "2.0",
+        "id": format!("unregister-{id}"),
+        "method": "client/unregisterCapability",
+        "params": {"unregisterations": [unregistration]}
+    })
 }
 
 fn wrong_param_types(method: &str, params: &Value) -> bool {

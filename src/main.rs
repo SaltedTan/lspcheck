@@ -8,6 +8,7 @@ use lspcheck::profile;
 use lspcheck::replay;
 use lspcheck::report;
 use std::ffi::OsString;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -207,6 +208,10 @@ fn main() {
         }
     }
     let p = loaded.unwrap_or_default();
+    for warning in &p.warnings {
+        // Advisory: a stderr that can't be written stops nothing.
+        let _ = writeln!(std::io::stderr().lock(), "lspcheck: warning: {warning}");
+    }
     let request_timeout = profile::timeout(cli.timeout, p.request_timeout, 10);
     let mutation = if cli.mutate {
         match profile::mutation_settings(&p, cli.mutation_seed, cli.mutation_cases, request_timeout) {
@@ -242,6 +247,7 @@ fn main() {
         transcripts: cli.transcripts.clone(),
         workspace: p.workspace,
         initialization_options: p.initialization_options,
+        client_capabilities: p.client_capabilities,
         configuration: p.configuration,
         allowed_descendants: p.allowed_descendants,
         skip: p.skip,
