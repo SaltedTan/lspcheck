@@ -1440,9 +1440,12 @@ fn observations(
     f: Finish,
     j3_exercise: Option<(Verdict, String)>,
     l2_encoding: Option<(Verdict, String)>,
-    l2_unseen: Option<(Duration, Duration)>,
+    l2_unseen: Option<L2Unseen>,
 ) -> Observations {
-    let l2_unseen = l2_unseen.and_then(|(from, to)| f.missed_output_within(from, to));
+    let (l2_encoding, l2_unseen) = match l2_unseen {
+        Some(u) => late_l2(&f, u, l2_encoding),
+        None => (l2_encoding, None),
+    };
     Observations {
         problems: f.problems,
         cut_short: f.cut_short,
@@ -1496,9 +1499,9 @@ struct Ctx<'a> {
     l2_encoding: Option<(Verdict, String)>,
     /// Whether [`Ctx::initialize_reply`] has sent an initialize.
     initialize_tried: bool,
-    /// When the first initialize was sent and when its wait ended, if no
-    /// reply came: output lspcheck missed then may have held its result.
-    l2_unseen: Option<(Duration, Duration)>,
+    /// The first initialize, if its wait ended without a reply: a result
+    /// read later is judged, and output missed meanwhile may have held it.
+    l2_unseen: Option<L2Unseen>,
     /// What may excuse a K1 MethodNotFound, from the last initialize that
     /// got a result.
     withdrawable: Withdrawable,
@@ -1695,7 +1698,8 @@ impl Ctx<'_> {
         let since = self.s.elapsed();
         let reply = self.s.call_with_id(id, "initialize", Some(params), t).await;
         if first && matches!(reply, Err(CallError::Wait(_))) {
-            self.l2_unseen = Some((since, self.s.elapsed()));
+            self.l2_unseen =
+                Some(L2Unseen { id: id.clone(), offered: offered.clone(), since, until: self.s.elapsed() });
         }
         let reply = match reply {
             Ok(reply) => reply,
@@ -2950,9 +2954,11 @@ fn judge_k1(pending: K1Pending, finish: &Finish) -> Option<Judgement> {
             });
             if not_found.is_empty() {
                 // As in the capabilities scenario, output missed after the
-                // first request was sent may have held a MethodNotFound.
+                // first request was sent may have held a MethodNotFound, for
+                // a request whose MethodNotFound wasn't already excused.
                 let first_sent = asked.iter().map(|(_, at, ..)| *at).min()?;
-                let missed = finish.missed_output_within(first_sent, Duration::MAX).map(|why| {
+                let open = excused.len() < asked.len();
+                let missed = open.then(|| finish.missed_output_within(first_sent, Duration::MAX)).flatten().map(|why| {
                     let mut detail = format!(
                         "inconclusive, because {why}: a MethodNotFound for one of the {} advertised request(s) about \
                          the mutated documents may have been in output lspcheck didn't see",
@@ -7317,6 +7323,36 @@ fn judge_l2(reply: &Message, offered: &[String]) -> (Verdict, String) {
 
 /// L2's rule on the `positionEncoding` in an initialize result's
 /// capabilities object, given the `positionEncodings` sent with it.
+/// A first initialize whose wait ended without a reply: its id, the offer
+/// it made, when it was sent and when the wait ended.
+struct L2Unseen {
+    id: Id,
+    offered: Vec<String>,
+    since: Duration,
+    until: Duration,
+}
+
+/// L2's encoding rule on a first initialize answered only after its wait
+/// ended (read later, even during cleanup), and why its result may have been
+/// missed instead, if no result was read and lspcheck missed output while it
+/// waited.
+fn late_l2(
+    f: &Finish,
+    u: L2Unseen,
+    l2_encoding: Option<(Verdict, String)>,
+) -> (Option<(Verdict, String)>, Option<String>) {
+    let late = f.messages.iter().find(|(at, m)| *at >= u.since && m.response_id() == Some(&u.id));
+    let Some((_, reply)) = late else {
+        return (l2_encoding, f.missed_output_within(u.since, u.until));
+    };
+    let judged = initialize_capabilities(reply).filter(|c| c.is_object()).map(|caps| {
+        let (verdict, detail) = judge_encoding(caps, &u.offered);
+        let when = "in an initialize result read after --startup-timeout ran out";
+        (verdict, if detail.is_empty() { detail } else { format!("{detail}, {when}") })
+    });
+    (judged.or(l2_encoding), None)
+}
+
 fn judge_encoding(caps: &Value, offered: &[String]) -> (Verdict, String) {
     // Only a profile changes the offer; name it, since it isn't lspcheck's.
     let note = if offered == OFFERED_ENCODINGS { String::new() } else { format!("the profile offered {offered:?}") };

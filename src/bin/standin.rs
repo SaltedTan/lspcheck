@@ -326,6 +326,11 @@ const FAULTS: &[(&str, &str)] = &[
          past 1 MiB, then exit",
     ),
     (
+        "utf8-answer-on-sigterm-with-inlay-hints",
+        "to a client with textDocument.inlayHint, answer initialize only when SIGTERM arrives, choosing utf-8 \
+         whatever it offered (Unix only)",
+    ),
+    (
         "snippet-completion-not-found",
         "advertise completion only to a client with snippetSupport, then answer it with MethodNotFound",
     ),
@@ -358,6 +363,12 @@ const FAULTS: &[(&str, &str)] = &[
         "lawful: to a client with foldingRange.dynamicRegistration, advertise foldingRange with a registration id, \
          advertise nothing else K1 asks, withdraw it on initialized in a frame padded past 1 MiB, then answer \
          foldingRange with MethodNotFound",
+    ),
+    (
+        "withdraw-folding-then-big-log",
+        "lawful: to a client with foldingRange.dynamicRegistration, advertise foldingRange with a registration id, \
+         advertise nothing else K1 asks, withdraw it on initialized, answer foldingRange with MethodNotFound, and at \
+         shutdown send a log message padded past 1 MiB",
     ),
     (
         "hover-id-not-found",
@@ -663,6 +674,7 @@ fn main() {
         "withdraw-folding-cycle",
         "withdraw-folding-elsewhere",
         "withdraw-folding-in-big-frame",
+        "withdraw-folding-then-big-log",
     ]
     .iter()
     .any(|f| fault(f));
@@ -1330,7 +1342,10 @@ fn main() {
                     &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
                 );
             }
-            if method == "initialized" && fault("withdraw-folding") && withdraws_folding(&client_caps) {
+            if method == "initialized"
+                && (fault("withdraw-folding") || fault("withdraw-folding-then-big-log"))
+                && withdraws_folding(&client_caps)
+            {
                 out.frame(&unregister("fold", "textDocument/foldingRange"));
             }
             if method == "initialized"
@@ -1733,6 +1748,14 @@ fn main() {
                 out.frame(&json!({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": items}}));
                 std::thread::sleep(std::time::Duration::from_secs(60));
             }
+            #[cfg(unix)]
+            if fault("utf8-answer-on-sigterm-with-inlay-hints")
+                && msg.pointer("/params/capabilities/textDocument/inlayHint").is_some()
+            {
+                let reply =
+                    json!({"jsonrpc": "2.0", "id": id, "result": {"capabilities": {"positionEncoding": "utf-8"}}});
+                answer_on_sigterm(&reply);
+            }
             if fault("init-error") {
                 out.frame(&json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32001, "message": "Required SDK is unavailable", "data": {"retry": false}}}));
                 continue;
@@ -1824,7 +1847,9 @@ fn main() {
             if folding_faults && withdraws_folding(&client_caps) {
                 result["capabilities"]["foldingRangeProvider"] = json!({"documentSelector": null, "id": "fold"});
             }
-            if fault("withdraw-folding-in-big-frame") && withdraws_folding(&client_caps) {
+            if (fault("withdraw-folding-in-big-frame") || fault("withdraw-folding-then-big-log"))
+                && withdraws_folding(&client_caps)
+            {
                 // Only foldingRange, so it is all K1 asks.
                 let caps = &result["capabilities"];
                 result["capabilities"] = json!({
@@ -2088,6 +2113,12 @@ fn main() {
             && let Some(reply) = reply_at_shutdown.take()
         {
             out.frame(&reply);
+        }
+        if method == "shutdown" && fault("withdraw-folding-then-big-log") && withdraws_folding(&client_caps) {
+            let text = "x".repeat(2 * 1024 * 1024);
+            out.frame(
+                &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
+            );
         }
         if method == "shutdown" && fault("null-id-error-at-shutdown") {
             out.frame(&err(&Value::Null, -32603, "unrelated failure while shutting down"));
@@ -3190,6 +3221,33 @@ fn spawn_child(arg: &str, stdin: Stdio) -> Child {
     child.stdout.take().unwrap().read_exact(&mut line).unwrap();
     assert_eq!(&line, b"ready\n");
     child
+}
+
+/// The frame [`answer_on_sigterm`] writes.
+#[cfg(unix)]
+static ON_SIGTERM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Waits, reading nothing more, until SIGTERM arrives, then writes `reply`
+/// as a frame and exits.
+#[cfg(unix)]
+fn answer_on_sigterm(reply: &Value) -> ! {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    extern "C" fn on_sigterm(_: nix::libc::c_int) {
+        // Only async-signal-safe calls: one write, small enough to be whole.
+        if let Some(bytes) = ON_SIGTERM.get() {
+            let _ = nix::unistd::write(std::io::stdout(), bytes);
+        }
+        // SAFETY: _exit is async-signal-safe and ends the process at once.
+        unsafe { nix::libc::_exit(0) }
+    }
+    let body = reply.to_string();
+    let _ = ON_SIGTERM.set(format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes());
+    let action = SigAction::new(SigHandler::Handler(on_sigterm), SaFlags::empty(), SigSet::empty());
+    // SAFETY: the handler makes only async-signal-safe calls.
+    unsafe { sigaction(Signal::SIGTERM, &action) }.unwrap();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
 }
 
 struct Writer<W: Write> {

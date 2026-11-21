@@ -20,7 +20,8 @@
 - **L2** now judges the `positionEncoding` of every scenario's first initialize, each against the offer sent with
   it, not only the lifecycle scenario's. A server that chose an encoding it wasn't offered in another scenario passed
   L2, while D1 and the other position checks there said "not judged, see L2". The failure names the scenarios and the
-  offer, and a violation seen fails L2 even when the lifecycle scenario couldn't finish initializing. When no
+  offer, and a violation seen fails L2 even when the lifecycle scenario couldn't finish initializing. A first
+  initialize answered only after `--startup-timeout` ran out is judged from the result lspcheck read later. When no
   violation was seen but a scenario's first initialize got no result lspcheck saw while it missed output (such as a
   frame over `--max-frame-mib`), L2 is `ERROR`, naming the scenario, instead of passing. The report links the
   transcript of the scenario L2's verdict came from. `--only L2` now runs every scenario.

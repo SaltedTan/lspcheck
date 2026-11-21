@@ -5199,6 +5199,18 @@ fn mutation_k1_fails_a_method_withdrawn_only_after_its_method_not_found() {
 }
 
 #[test]
+fn mutation_k1_isnt_inconclusive_over_missed_output_when_every_method_not_found_was_excused() {
+    // foldingRange is all K1 asks, every MethodNotFound for it follows a
+    // withdrawal lspcheck read, and a frame lspcheck skips comes at shutdown:
+    // a MethodNotFound hidden there would be excused too.
+    let (path, _keep) = mutation_profile_with_dynamic_folding();
+    let (r, _, _keep_t) =
+        mutated_with(&path, &["withdraw-folding-then-big-log"], &["--max-frame-mib", "1", "--only", "K1"]);
+    expect(&r, "K1", "not-exercised");
+    assert!(detail(&r, "K1").contains(&format!("N/E in the mutation scenario: {FOLDING_EXCUSED} (")), "{}", r.stdout);
+}
+
+#[test]
 fn profile_without_workspace_folders_sends_none() {
     let (path, _keep) = capabilities_profile("workspace.workspaceFolders = false\n");
     let (r, t, _keep_t) = run_with_transcripts(&[], &["--profile", path.to_str().unwrap()]);
@@ -5264,6 +5276,29 @@ fn l2_is_inconclusive_when_another_scenarios_initialize_answer_was_skipped() {
             "inconclusive, because a first initialize got no result lspcheck saw, and it may have been in output \
              lspcheck didn't see: in the documents scenario, a "
         ) && detail.contains("; in the capabilities scenario, a "),
+        "{detail}"
+    );
+    assert_eq!(r.report["results"][0]["scenario"], "documents", "{}", r.stdout);
+}
+
+#[cfg(unix)]
+#[test]
+fn l2_fails_another_scenarios_initialize_answer_read_after_its_wait_ended() {
+    // The documents and capabilities scenarios' initialize is answered, with
+    // an unoffered utf-8, only once lspcheck stops the server; the answer is
+    // still read, and judged.
+    let (path, _keep) = capabilities_profile(UTF16_ONLY);
+    let r = run(
+        &["--fault", "utf8-answer-on-sigterm-with-inlay-hints"],
+        &["--profile", path.to_str().unwrap(), "--only", "L2", "--startup-timeout", "3"],
+    );
+    expect(&r, "L2", "fail");
+    let detail = detail(&r, "L2");
+    assert!(
+        detail.contains(
+            "positionEncoding \"utf-8\" is not one of the offered [\"utf-16\"], in an initialize result read after \
+             --startup-timeout ran out"
+        ),
         "{detail}"
     );
     assert_eq!(r.report["results"][0]["scenario"], "documents", "{}", r.stdout);
