@@ -10,7 +10,7 @@ D6's [candidate rules](#documents-and-positions) apply in the documents and muta
 v0.6.0 warns on stderr about a short mutation case start window, summarizes the server's Error and Warning messages
 during mutation in the [reports](#report), makes F1 `ERROR`, not `FAIL`, on a frame lspcheck's own cleanup may have
 cut short, and keeps K1 from passing on output it didn't see.
-Unreleased: a profile's [`[client.capabilities]`](#profiles-optional-toml) is merged over every initialize's client
+v0.7.0: a profile's [`[client.capabilities]`](#profiles-optional-toml) is merged over every initialize's client
 capabilities, and L2 judges the encoding offer actually sent, in every scenario's first initialize. K1 no longer
 judges a MethodNotFound for a request the server may have withdrawn: one whose method it had registered or
 unregistered dynamically, or one it could register dynamically when lspcheck missed output before the answer.

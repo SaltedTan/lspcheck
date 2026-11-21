@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.7.0 (2026-11-21)
+
+This release lets a profile set the client capabilities lspcheck sends, and fixes verdicts that didn't match what
+lspcheck observed, mostly in the cancellation and lifecycle checks. Some verdicts change from 0.6.0, each to what
+lspcheck actually saw: C1, C2, C3, K1, L4, L6, L7 and L9 can go from `fail` to `pass`, `error` or `N/E`; C1, C2, L1,
+L2, L9, R1 and R4 from `pass` to `fail` or `error`; and L2 and R3 from `error` to `pass` or `fail`. The entries
+below say when.
+
 ### Added
 
 - Profiles accept `[client.capabilities]`, a table merged over lspcheck's client capabilities in every `initialize`
