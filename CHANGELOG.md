@@ -38,7 +38,9 @@
   another (imports and the like): a mutation of one file lawfully changes the other's diagnostics at its unchanged
   version 1. A publish labelled with version 1 is now held to the pushed-diagnostics baseline only if it was read
   before lspcheck began writing a change to another seed file. Such a server can now pass M3, and with
-  `expect = "baseline"`, fail it when it doesn't recover.
+  `expect = "baseline"`, fail it when it doesn't recover. For the same reason, an unmutated seed file's publish read
+  before the restoration no longer shows it recovered at once: it decides only if it is still the last read by the end
+  of `recovery_timeout`, so each case of a multi-file profile may take the whole bound.
 
 ## 0.7.0 (2026-11-21)
 

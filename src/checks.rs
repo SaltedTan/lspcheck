@@ -6239,12 +6239,18 @@ async fn recover(
     let mut watches = vec![PushWatch::default(); n];
     // What was read before the restoration began gives only each
     // document's latest word about its current version: an unmutated
-    // document's, which the server needn't publish again.
+    // document's, which the server needn't publish again. It doesn't show
+    // the probe recovered, since a change to another seed document may
+    // change its diagnostics at the same version: it decides only if it is
+    // still the last publish read by the end of the bound.
     rec.pushes.scan(&ctx.s.messages, docs, began);
     for s in rec.stable.iter().filter(|s| s.params.is_none()) {
         if let Some(&index) = rec.pushes.latest[s.doc].get(&docs[s.doc].version) {
             rec.push_read(&mut watches, &ctx.s.messages, docs, s.doc, docs[s.doc].version, index);
         }
+    }
+    for w in &mut watches {
+        w.matched = None;
     }
     let (mut polls, mut last, mut spent) = (0u32, restored, false);
     let mut end = BatchEnd::default();
@@ -6434,6 +6440,9 @@ async fn recover(
                             terminal: false,
                         },
                         (false, Some(m)) => ProbeEnd::Recovered { after: m.saturating_sub(restored), terminal: false },
+                        (false, None) if rec.recovered(i, &projected) => {
+                            ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: false }
+                        }
                         _ => rec.differs(i, k, &deciding, &projected, (at, bound), interrupted.clone(), &read),
                     }
                 }

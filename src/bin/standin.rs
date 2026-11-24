@@ -552,6 +552,11 @@ const FAULTS: &[(&str, &str)] = &[
         "as cross-file-diagnostics, but keep that Error once another open document's brackets were unbalanced",
     ),
     (
+        "cross-file-publishes-when-restored",
+        "with a cross-file fault, publish the other open documents' diagnostics again only on a didChange that \
+         leaves every open document at its opened text, as a server that waits for edits to settle might",
+    ),
+    (
         "warning-after-unbalanced",
         "lawful: once a document's brackets were unbalanced, add a Warning to every publish about it",
     ),
@@ -1381,6 +1386,8 @@ fn main() {
             // labelled with that document's own, unchanged version.
             if method == "textDocument/didChange"
                 && (fault("cross-file-diagnostics") || fault("cross-file-errors-after-unbalanced"))
+                && (!fault("cross-file-publishes-when-restored")
+                    || docs.iter().all(|(uri, (text, _))| opened.get(uri) == Some(text)))
                 && let Some(changed) = msg.pointer("/params/textDocument/uri").and_then(Value::as_str)
             {
                 let mut others: Vec<(&String, &(String, i64))> = docs.iter().filter(|(u, _)| *u != changed).collect();

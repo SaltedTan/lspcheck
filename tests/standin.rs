@@ -4199,6 +4199,46 @@ fn cross_file_diagnostics_that_never_recover_fail_m3() {
 }
 
 #[test]
+fn cross_file_errors_published_only_after_the_restoration_fail_m3() {
+    // As above, but the stand-in publishes the other seed's diagnostics
+    // again only once every document is back at its opened text: its Error
+    // is read after the restoration began. The clean publish read before
+    // the first mutation is older than the change to main.lua, so it
+    // doesn't show other.lua recovered.
+    let (path, _keep) = cross_file_profile("expect = \"baseline\"\nrecovery_timeout = \"2s\"");
+    let faults = ["cross-file-errors-after-unbalanced", "cross-file-publishes-when-restored"];
+    let (r, _, _keep) = mutated_with(&path, &faults, &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+    expect(&r, "M3", "fail");
+    assert!(
+        detail(&r, "M3").contains(
+            "case 0: publishDiagnostics of other.lua didn't return to its baseline within 2 s of the restoration"
+        ),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn a_seed_whose_diagnostics_are_never_published_again_passes_m3() {
+    // The clean stand-in never publishes other.lua again after its didOpen.
+    // That publish, read before the first mutation, is still its last word
+    // by the end of recovery_timeout and equals its baseline, so it
+    // recovers.
+    let (path, _keep) = cross_file_profile("expect = \"baseline\"\nrecovery_timeout = \"2s\"");
+    let (r, _, _keep) = mutated_with(&path, &[], &["--mutation-cases", "2", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+    expect(&r, "M3", "pass");
+    assert!(
+        detail(&r, "M3").contains("probes: publishDiagnostics of main.lua, publishDiagnostics of other.lua;"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
 fn a_late_selection_reply_with_the_wrong_count_fails_d6() {
     // The stand-in answers one selectionRange with no entries, after it has
     // read 65 later versions of the document. The text the reply may describe
