@@ -4394,9 +4394,6 @@ async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: O
     let missing = file_uri(&ctx.root.join(MISSING_FILE));
     let closed_label = if closed { "the closed document" } else { "the document on disk (never opened)" };
     let mut outcomes = Vec::new();
-    // What of D4's own the server had been sent, if anything: an exit seen
-    // after it is a server that didn't keep serving.
-    let mut delivered = closed.then_some("didClose".to_string());
     for (label, doc_uri) in
         [(closed_label, Some(uri)), ("the never-opened document", Some(missing.as_str())), ("the plain request", None)]
     {
@@ -4410,7 +4407,6 @@ async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: O
                 outcomes.push(format!("{label} got {}", describe_d4_outcome(&reply)));
                 // It is answering again, whatever happened before.
                 stalled = None;
-                delivered = Some(format!("answering {label}"));
             }
             Ok((_, Err(e))) => {
                 let waited = ctx.s.elapsed();
@@ -4436,14 +4432,14 @@ async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: O
             }
             Err(e) => {
                 let unsent = format!("{label}: lspcheck couldn't send it");
-                let (verdict, detail) = match (stalled, &delivered) {
+                let (verdict, detail) = match (stalled, closed) {
                     (Some(why), _) => (
                         Verdict::Error,
                         format!("not judged: {unsent} ({e}), but the server had already stopped answering ({why})"),
                     ),
-                    (None, None) => (Verdict::Error, format!("{unsent} ({e})")),
-                    (None, Some(after)) => match lost_after_write(ctx, &format!("{m} ({label})"), &e).await {
-                        Lost::Gone(why) => (Verdict::Fail, format!("{unsent}: {why} after {after}")),
+                    (None, false) => (Verdict::Error, format!("{unsent} ({e})")),
+                    (None, true) => match lost_after_write(ctx, &format!("{m} ({label})"), &e).await {
+                        Lost::Gone(why) => (Verdict::Fail, format!("{unsent}: {why} after didClose")),
                         Lost::Uninspected(why) => (
                             Verdict::Error,
                             format!(

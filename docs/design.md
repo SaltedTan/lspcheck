@@ -358,9 +358,9 @@ have changed it), so neither D4's replies nor later diagnostics are judged by th
 - **fail:** any of the three requests goes unanswered within `--timeout`, unless missed evidence in that wait could
   have held the answer (then `error`, as for any windowed recheck). When the server's output ended instead, lspcheck
   waits up to `--exit-timeout` for its exit, and the detail names the exit status. A request lspcheck couldn't write
-  fails too when it was written after something of D4's reached the server (the `didClose` written in full, or an
-  earlier D4 request answered): lspcheck waits up to `--exit-timeout`, as M1 does after a failed write, and an exit
-  or closed output seen then is a server that didn't keep serving; the detail names it.
+  fails too when it was written after the `didClose` reached the server in full: lspcheck waits up to
+  `--exit-timeout`, as M1 does after a failed write, and an exit or closed output seen then is a server that didn't
+  keep serving; the detail names it. With the document never opened, such a request is an `error`.
 - **error:** the `didClose` couldn't be sent in full, or an earlier step left the session unable to send; a request
   couldn't be written and the server neither exited nor closed its output, lspcheck stopped reading its output, or
   lspcheck had withheld an answer at the written-bytes cap; or a D4 request went unanswered or couldn't be written
