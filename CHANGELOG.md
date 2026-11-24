@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Fixed
+
+- **J4** now fails instead of reporting `error` when `lspcheck/unknownRequest` was delivered and went unanswered (for
+  example because the server crashed on it) and the follow-up `$/lspcheck/unknownRequest` could then not be written.
+  Each of J4's two waits is now tracked separately, so output missed during only one wait no longer excuses the other
+  fully-read unanswered request (naming only the fully-read request and noting the other may have been answered
+  unseen, as R4 and M2 do).
+- **J4**, **L1**, **L3** and **L5** no longer pass on malformed error objects (such as an error without a string
+  `message`, or for L3 an error code outside LSP's signed 32-bit integer range), matching L4 and R2.
+- **L5** now waits briefly (300 ms, as L4 does) for a server that exits right after replying to `shutdown` before
+  sending its post-shutdown request, so such a server leaves L5 `not-exercised` instead of falsely failing it.
+- **J6** now counts and lists every delivered concurrent request that went unanswered when the server closes stdout,
+  rather than stopping at the first missing id.
+- **J1**, **J2**, **J5** and **J7** now report `error` rather than `not-exercised` when a frame couldn't be read or
+  was cut short and no readable evidence was seen, matching K2.
+- When the `documents` scenario fails to initialize or send `didOpen`, every document check (`D1`–`D6`) now reports
+  that reason instead of `D4`, `D5` or `D6` falling through to the generic `"the scenario ended before reaching this
+  check"` detail.
+
 ## 0.7.0 (2026-11-21)
 
 This release lets a profile set the client capabilities lspcheck sends, and fixes verdicts that didn't match what
