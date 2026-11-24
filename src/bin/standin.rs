@@ -421,6 +421,11 @@ const FAULTS: &[(&str, &str)] = &[
     ("no-diagnostics", "lawful: never publish diagnostics"),
     ("unversioned-diagnostics", "lawful: publish diagnostics without a version"),
     (
+        "workspace-scan-diagnostics",
+        "lawful: on initialized, before reading any didOpen, publish empty diagnostics labelled with version 0 for \
+         every file in the workspace root and for doc.txt and crlf.txt, as a server that checks the workspace",
+    ),
+    (
         "diagnostics-own-version",
         "label publishDiagnostics with the stand-in's own counter instead of the document's version",
     ),
@@ -536,6 +541,15 @@ const FAULTS: &[(&str, &str)] = &[
     (
         "errors-after-unbalanced",
         "once a document's brackets were unbalanced, add an Error diagnostic to every publish about it",
+    ),
+    (
+        "cross-file-diagnostics",
+        "lawful: while another open document's brackets are unbalanced, add an Error to a document's diagnostics, \
+         and on each didChange publish every other open document's diagnostics again, labelled with its version",
+    ),
+    (
+        "cross-file-errors-after-unbalanced",
+        "as cross-file-diagnostics, but keep that Error once another open document's brackets were unbalanced",
     ),
     (
         "warning-after-unbalanced",
@@ -836,6 +850,10 @@ fn main() {
     let mut folds_since_restored: HashMap<String, usize> = HashMap::new();
     let mut late: HashSet<String> = HashSet::new();
     let mut broken: HashSet<String> = HashSet::new();
+    // For the cross-file faults: the open documents whose brackets are unbalanced now.
+    let mut unbalanced_now: HashSet<String> = HashSet::new();
+    // For workspace-scan-diagnostics: the rootUri of the first initialize.
+    let mut root_uri: Option<String> = None;
     let (mut symbol_answers, mut publishes) = (0usize, 0u64);
     loop {
         if queued.is_empty() && !input.ready() {
@@ -1124,6 +1142,7 @@ fn main() {
                         late: late.contains(uri),
                         padded: false,
                         publishes,
+                        elsewhere: false,
                     };
                     publish_diagnostics(&mut out, &faults, units, uri, text, label.clone(), lingering);
                     if fault("late-warning-in-skipped-frame") || fault("second-baseline-warning") {
@@ -1189,6 +1208,8 @@ fn main() {
                 let version = msg.pointer("/params/textDocument/version").and_then(Value::as_i64).unwrap_or(0);
                 let previous_version = *old_version;
                 let old_text = text.clone();
+                // Other documents' brackets, which this change leaves as they are.
+                let elsewhere = cross_file_error(&faults, uri, &unbalanced_now, &broken);
                 // Version 1's analysis finishing late: lspcheck reads this
                 // only after it has written the first mutation.
                 let jumped = fault("late-baseline-on-version-jump") && version > previous_version + 1;
@@ -1201,7 +1222,13 @@ fn main() {
                 {
                     publishes += 1;
                     let padded = fault("late-baseline-in-skipped-frame");
-                    let lingering = Lingering { broken_once: broken.contains(uri), late: true, padded, publishes };
+                    let lingering = Lingering {
+                        broken_once: broken.contains(uri),
+                        late: true,
+                        padded,
+                        publishes,
+                        elsewhere: false,
+                    };
                     publish_diagnostics(&mut out, &faults, units, uri, text, Some(json!(1)), lingering);
                 }
                 if fault("codepoint-positions-after-change") {
@@ -1225,6 +1252,9 @@ fn main() {
                 let unbalanced = !unmatched_brackets(text, units, split).is_empty();
                 if unbalanced {
                     broken.insert(uri.to_string());
+                    unbalanced_now.insert(uri.to_string());
+                } else {
+                    unbalanced_now.remove(uri);
                 }
                 if opened.get(uri) != Some(text) {
                     since_restored.remove(uri);
@@ -1269,6 +1299,7 @@ fn main() {
                             late: late.contains(uri),
                             padded: false,
                             publishes,
+                            elsewhere,
                         };
                         publish_diagnostics(&mut out, &faults, units, uri, &old_text, stale, lingering);
                     }
@@ -1285,6 +1316,7 @@ fn main() {
                         late: late.contains(uri),
                         padded: false,
                         publishes,
+                        elsewhere,
                     };
                     publish_diagnostics(&mut out, &faults, units, uri, publish_text, label, lingering);
                 }
@@ -1338,9 +1370,55 @@ fn main() {
                             late: late.contains(uri),
                             padded: false,
                             publishes,
+                            elsewhere: false,
                         };
                         publish_diagnostics(&mut out, &faults, units, uri, first_text, Some(json!(*first)), lingering);
                     }
+                }
+            }
+            // The cross-file faults: every other open document's diagnostics
+            // depend on the one changed, so they are published again, each
+            // labelled with that document's own, unchanged version.
+            if method == "textDocument/didChange"
+                && (fault("cross-file-diagnostics") || fault("cross-file-errors-after-unbalanced"))
+                && let Some(changed) = msg.pointer("/params/textDocument/uri").and_then(Value::as_str)
+            {
+                let mut others: Vec<(&String, &(String, i64))> = docs.iter().filter(|(u, _)| *u != changed).collect();
+                others.sort();
+                for (uri, (text, version)) in others {
+                    publishes += 1;
+                    let lingering = Lingering {
+                        broken_once: broken.contains(uri),
+                        late: late.contains(uri),
+                        padded: false,
+                        publishes,
+                        elsewhere: cross_file_error(&faults, uri, &unbalanced_now, &broken),
+                    };
+                    publish_diagnostics(&mut out, &faults, units, uri, text, Some(json!(version)), lingering);
+                }
+            }
+            if method == "initialized"
+                && fault("workspace-scan-diagnostics")
+                && let Some(root) = &root_uri
+            {
+                // The files on disk, and the two the documents scenario
+                // writes later, none of them opened yet.
+                let mut names: Vec<String> = uri_path(root)
+                    .and_then(|dir| std::fs::read_dir(dir).ok())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .chain(["doc.txt".to_string(), "crlf.txt".to_string()])
+                    .collect();
+                names.sort();
+                names.dedup();
+                for name in names {
+                    let params = json!({"uri": format!("{}/{name}", root.trim_end_matches('/')), "version": 0, "diagnostics": []});
+                    out.frame(
+                        &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
+                    );
                 }
             }
             if method == "initialized" && fault("register-sync") {
@@ -1823,6 +1901,7 @@ fn main() {
             }
             initialized = true;
             client_caps = msg.pointer("/params/capabilities").cloned().unwrap_or(Value::Null);
+            root_uri = msg.pointer("/params/rootUri").and_then(Value::as_str).map(str::to_string);
             let offered = |name: &str| {
                 msg.pointer("/params/capabilities/general/positionEncodings")
                     .and_then(Value::as_array)
@@ -3000,6 +3079,18 @@ struct Lingering {
     padded: bool,
     /// Which publish of the session this is.
     publishes: u64,
+    /// Another open document's brackets are unbalanced, or were, for the
+    /// cross-file faults.
+    elsewhere: bool,
+}
+
+/// Whether a cross-file fault adds its Error to the diagnostics of `uri`:
+/// another open document's brackets are unbalanced, or with
+/// cross-file-errors-after-unbalanced, ever were.
+fn cross_file_error(faults: &[String], uri: &str, now: &HashSet<String>, ever: &HashSet<String>) -> bool {
+    let fault = |name: &str| faults.iter().any(|f| f == name);
+    let other = |set: &HashSet<String>| set.iter().any(|u| u != uri);
+    (fault("cross-file-diagnostics") && other(now)) || (fault("cross-file-errors-after-unbalanced") && other(ever))
 }
 
 /// A URI the stand-in publishes about without it ever being opened.
@@ -3062,6 +3153,9 @@ fn publish_diagnostics<W: Write>(
     if lingering.broken_once && fault("errors-after-unbalanced") {
         diagnostics
             .push(json!({"range": range(0, 0, 0, 0), "severity": 1, "source": "standin", "message": "still broken"}));
+    }
+    if lingering.elsewhere {
+        diagnostics.push(json!({"range": range(0, 0, 0, 0), "severity": 1, "source": "standin", "message": "a document this one depends on is broken"}));
     }
     if lingering.broken_once && fault("warning-after-unbalanced") {
         diagnostics

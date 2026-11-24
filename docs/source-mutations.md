@@ -101,11 +101,16 @@ extends is selected and not skipped by the profile.
    The evidence window from each document's `didOpen` to the first mutation's write is rechecked when judging M3
    and at session end. A skipped frame that spans the first mutation can invalidate that baseline later; dependent
    verdicts become `ERROR`, with the inspection loss named, while independent observed failures still stand.
-   Publishes labelled with version 1 read after the first mutation still describe the opened text, so they are held
-   to the baseline too, when judging M3 and at session end: if one differs after projection, or lspcheck may have
-   missed one because it missed some of the server's output after the document's `didOpen`, that probe's outcomes
-   become `ERROR` (an Error in it, under `no_errors`, contradicts the profile at baseline), and independent observed
-   failures still stand.
+   A publish labelled with version 1 read after the first mutation still describes the document's opened text, so it
+   is held to the baseline too, when judging M3 and at session end, while the other seed documents have their opened
+   texts as well: one read once lspcheck has begun writing a change to another seed document isn't held. A document's
+   diagnostics may depend on the others (imports and the like), but its label names only its own text, and the
+   server may still publish what it worked out from another document's changed text after that document's
+   restoration was delivered, even after reading it, so no later window is known to be clean. With one seed
+   document, or for a document whose fellow seeds are never changed, every such publish is held. If a held one
+   differs after projection, or lspcheck may have missed one because it missed some of the server's output from the
+   document's `didOpen` to the end of that window, that probe's outcomes become `ERROR` (an Error in it, under
+   `no_errors`, contradicts the profile at baseline), and independent observed failures still stand.
 5. **Cases**, in order, while the run's budget lasts. Case *k* has its own RNG streams, so it doesn't depend on the
    cases before it or on the server's timing. Each step applies one to three mutations to one document, sends them in
    one `didChange`, then sends the step's requests (default four) without waiting between them, and waits for each
@@ -246,9 +251,9 @@ the mutations. It also needs complete evidence: the terminal probe delivered and
 diagnostics, the whole bound read), and nothing missed in lspcheck's reading of the server's output (a skipped or
 cut-short frame) between the deciding answer and its end (for a pull, from the terminal probe's write to its answer;
 for a push, from that publish to the end of the bound). A pushed-diagnostics verdict also needs every publish labelled
-with version 1 since the document's `didOpen` to match the baseline after projection (held only to `no_errors`, to
-have no Error; see [step 5](#step-5)), and nothing missed in the server's output from that `didOpen` to the session's
-end. Anything less, including polling stopped early by lspcheck's
+with version 1 since the document's `didOpen`, up to the first change to another seed document (step 4), to match the
+baseline after projection (held only to `no_errors`, to have no Error; see [step 5](#step-5)), and nothing missed in
+the server's output from that `didOpen` to the session's end, or to that change. Anything less, including polling stopped early by lspcheck's
 poll budget or a terminal probe left unanswered, makes M3 `ERROR` for that case, with what was missing named. That is
 seen evidence, which is what `FAIL` needs. Without a stated expectation, the same
 observation is reported as `ERROR` with the difference shown, and the profile's author decides.
@@ -305,9 +310,9 @@ A fully evidenced failure takes precedence over errors in other cases or probes.
   ("not seen to recover within 20 s; lspcheck's bound, not a protocol rule: set `[mutation.recovery].expect` if the
   answers are fixed"); with a stable probe, a stop during a case (an exit, closed output, an undeliverable write or
   the written-bytes cap) left its recovery unjudged; a stated expectation was contradicted at baseline; malformed
-  diagnostic evidence arrived during recovery; a publish labelled with version 1 since `didOpen` differed from a pushed
-  baseline (held only to `no_errors`, had an Error), or lspcheck missed some of the server's output from `didOpen`
-  to the session's end, which makes that probe's outcomes `ERROR` whether they failed or recovered; or nothing failed
+  diagnostic evidence arrived during recovery; a publish labelled with version 1 since `didOpen`, and before a change
+  to another seed document, differed from a pushed baseline (held only to `no_errors`, had an Error), or lspcheck
+  missed some of the server's output in that window, which makes that probe's outcomes `ERROR` whether they failed or recovered; or nothing failed
   but evidence was missed in a recovery window.
   Stop state is refreshed after draining recovery output and after the terminal probes, including when no terminal
   request was needed. Earlier completed cases' observed failures still stand.
@@ -319,7 +324,8 @@ until lspcheck stops waiting for `shutdown`'s reply (or its write fails), with
 [D1's candidate rule](design.md#documents-and-positions).
 lspcheck keeps the last 64 text snapshots of each document. A position whose candidate texts reach further back isn't judged
 and is counted, so retained text stays bounded and no position is judged against a text lspcheck no longer has.
-D2 judges every labelled publish against the versions sent before it was read; D6 every `selectionRange` reply; K1
+D2 judges every labelled publish against the versions sent before it was read, once lspcheck knows the server had
+read the document's `didOpen` ([D2's rule](design.md#documents-and-positions)); D6 every `selectionRange` reply; K1
 every MethodNotFound to an advertised request about a seed document (so not `workspace/symbol`), read at any time
 after the request was sent, including during cleanup's final stdout drain, except one the server may have withdrawn
 before the first such answer was read: lspcheck had read a registration or unregistration for its registration
@@ -538,6 +544,9 @@ runner stalled for 3 s) tests something else, and is repeated.
 | `late-baseline-in-skipped-frame` | lawful: as `late-baseline-warning`, with the late publish in a frame larger than `--max-frame-mib` | with `expect = "baseline"`, pushed diagnostics as the only probe and that frame skipped, M3 `ERROR`, never `FAIL`, naming the publish lspcheck may have missed |
 | `late-baseline-on-version-jump` | lawful: as `late-baseline-warning`, on a `didChange` more than one version on, which only an isolated case sends | with `warning-after-unbalanced`, `expect = "baseline"` and pushed diagnostics, M3 fails; case 0 alone reproduces, and case 1 alone has no stable baseline, so `reproduced` is `null`, not `false` |
 | `errors-after-unbalanced` | once unbalanced, publish an Error diagnostic forever | M3 fails with `no_errors = true` |
+| `cross-file-diagnostics` | lawful: while another open document is unbalanced, add an Error to a document's diagnostics, and on each `didChange` publish every other open document again at its own version | with a second seed file, `expect = "baseline"` and pushed diagnostics as the only probe, M3 passes: the other file's publishes at version 1 during a case aren't held to its baseline |
+| `cross-file-errors-after-unbalanced` | as `cross-file-diagnostics`, but keep the Error once another document was unbalanced | in the same setup, M3 fails: the other file doesn't return to its baseline |
+| `workspace-scan-diagnostics` | lawful: on `initialized`, before reading any `didOpen`, publish diagnostics labelled with version 0 for the workspace's files and the documents scenario's | nothing fails; D2 passes in both scenarios, counting those publishes as ones that may predate the `didOpen` |
 | `warning-after-unbalanced` | once unbalanced, publish an extra Warning forever | M3 fails with `expect = "baseline"` and pushed diagnostics as the only probe; passes with `no_errors = true` alone |
 | `malformed-recovery-diagnostics` | once unbalanced, publish `null` instead of a diagnostics array | M3 `ERROR`, including with `no_errors = true` |
 | `malformed-baseline-diagnostics` | publish `null` instead of a diagnostics array at version 1 | pushed diagnostics unused; M3 `N/E` when they are the only probe |
