@@ -2090,12 +2090,21 @@ fn exiting_on_shutdown_fails_l4_and_skips_l6() {
 
 #[test]
 fn exiting_right_after_the_shutdown_reply_leaves_l5_not_exercised() {
-    // The reply is written directly before exit (no relay helper), exercising
-    // L4 and L5's 300 ms post-shutdown exit wait so lspcheck sees the server
-    // gone: L4 fails, and L5 isn't failed by a request the server can no
-    // longer answer.
+    // The reply is written directly before exit (no relay helper), so whether
+    // lspcheck sees the server gone within L4's 300 ms wait depends on
+    // scheduling: L4 and L6 are not pinned here (`exit-on-shutdown` covers
+    // L4's fail). L5 isn't failed either way, whether the server is seen gone
+    // before the post-shutdown request or only after it goes unanswered.
     let r = fault("exit-after-shutdown-reply");
-    passes_except(&r, &[("L4", "fail"), ("L5", "not-exercised"), ("L6", "not-exercised")]);
+    let l6 = match r.verdicts.get("L4").map(String::as_str) {
+        Some("fail") => "not-exercised",
+        Some("pass") => {
+            assert_ne!(r.verdicts.get("L6").map(String::as_str), Some("fail"), "{}", r.stdout);
+            r.verdicts.get("L6").map_or("", String::as_str)
+        }
+        other => panic!("L4 is {other:?}\n{}", r.stdout),
+    };
+    passes_except(&r, &[("L4", r.verdicts["L4"].as_str()), ("L5", "not-exercised"), ("L6", l6)]);
 }
 
 /// The status comes from before exit was sent, so it says nothing about how

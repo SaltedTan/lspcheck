@@ -885,7 +885,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "content-type", checks: &["F6", "F7"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
-    Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5", "D6"] },
+    Scenario { name: "documents", checks: &DOCUMENTS },
     Scenario { name: "wrong-params", checks: &["R2"] },
     Scenario { name: "large-document", checks: &["R3"] },
     Scenario { name: "capabilities", checks: &["K1"] },
@@ -2580,12 +2580,23 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
                 }
             }
         }
-        Err(e) => ctx.fail_call(
-            "L5",
-            since,
-            format!("a request after shutdown went unanswered ({})", describe_call_error(&e, t)),
-            &e,
-        ),
+        Err(e) => {
+            ctx.s.wait_exit(Instant::now() + Duration::from_millis(300)).await;
+            if ctx.s.is_alive() {
+                ctx.fail_call(
+                    "L5",
+                    since,
+                    format!("a request after shutdown went unanswered ({})", describe_call_error(&e, t)),
+                    &e,
+                );
+            } else {
+                return ctx.report(
+                    "L5",
+                    Verdict::NotExercised,
+                    "the server exited after shutdown, before exit (see L4)",
+                );
+            }
+        }
     }
     if ctx.s.notify("exit", None).await.is_ok() {
         let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
@@ -10270,6 +10281,8 @@ while header := sys.stdin.buffer.readline():
         ] {
             let results = documents_unjudged(detail);
             let ids: Vec<&str> = results.iter().map(|r| r.id).collect();
+            let scenario = SCENARIOS.iter().find(|s| s.name == "documents").expect("the documents scenario");
+            assert_eq!(ids, scenario.checks);
             assert_eq!(ids, ["D1", "D2", "D3", "D4", "D5", "D6"]);
             assert!(results.iter().all(|r| r.verdict == Verdict::Error && r.detail == detail));
         }

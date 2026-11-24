@@ -11,8 +11,9 @@
   unseen, as R4 and M2 do).
 - **J4**, **L1**, **L3** and **L5** no longer pass on malformed error objects (such as an error without a string
   `message`, or for L3 an error code outside LSP's signed 32-bit integer range), matching L4 and R2.
-- **L5** now waits briefly (300 ms, as L4 does) for a server that exits right after replying to `shutdown` before
-  sending its post-shutdown request, so such a server leaves L5 `not-exercised` instead of falsely failing it.
+- **L5** no longer fails a server that exits after replying to `shutdown`, before `exit`: that is L4's rule, and an
+  exited server can't answer the post-shutdown request. L5 now waits briefly (300 ms, as L4 does) for the server to
+  be seen gone, both before sending that request and if it goes unanswered, and is `not-exercised` if it is gone.
 - **J6** now counts and lists every delivered concurrent request that went unanswered when the server closes stdout,
   rather than stopping at the first missing id.
 - **J1**, **J2**, **J5** and **J7** now report `error` rather than `not-exercised` when a frame couldn't be read or
