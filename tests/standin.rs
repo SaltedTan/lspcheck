@@ -1268,6 +1268,17 @@ fn answering_before_initialize_fails_l1() {
 }
 
 #[test]
+fn an_error_before_initialize_without_a_message_fails_l1() {
+    // ServerNotInitialized without the string `message` it needs is neither
+    // the error L1 expects nor well formed, so L1 fails rather than matching
+    // the code. J5 fails the envelope too.
+    let r = fault("pre-init-error-no-message");
+    only_fails(&r, &["J5", "L1"]);
+    assert!(r.stdout.contains("an error whose message isn't a string"), "{}", r.stdout);
+    assert!(r.stdout.contains("instead of ServerNotInitialized"), "{}", r.stdout);
+}
+
+#[test]
 fn output_skipped_after_a_missed_answer_doesnt_excuse_it() {
     // The request before initialize goes unanswered; the frame too big to
     // inspect comes only with the answer to initialize, after lspcheck
@@ -1354,6 +1365,49 @@ fn replies_sent_before_their_requests_dont_count() {
 fn wrong_unknown_method_errors_fail_j4() {
     only_fails(&fault("wrong-unknown-error"), &["J4"]);
     only_fails(&fault("ignore-dollar-request"), &["J4"]);
+}
+
+#[test]
+fn an_unanswered_request_that_couldnt_be_delivered_after_it_still_fails_j4() {
+    // The server exits on the first unknown request: it goes unanswered, and
+    // the second can't be written. The failure seen stands rather than
+    // becoming an error because lspcheck couldn't send the second.
+    let r = run(&["--fault", "exit-on-unknown-request"], &["--only", "J4"]);
+    expect(&r, "J4", "fail");
+    assert!(r.stdout.contains("the server closed its stdout without responding"), "{}", r.stdout);
+    assert!(r.stdout.contains("the server's stdin is closed"), "{}", r.stdout);
+}
+
+#[test]
+fn j4_names_only_the_waits_it_read_in_full() {
+    // Both unknown requests go unanswered, but an oversized frame arrives
+    // during one wait only. That wait could have hidden a reply, so J4 names
+    // the other as unanswered and says the first may have been answered
+    // unseen, rather than calling the failure inconclusive.
+    for (name, unseen, read) in [
+        ("big-frame-on-first-unknown-request", "lspcheck/unknownRequest", "$/lspcheck/unknownRequest"),
+        ("big-frame-on-dollar-unknown-request", "$/lspcheck/unknownRequest", "lspcheck/unknownRequest"),
+    ] {
+        let r = run(&["--fault", name], &["--only", "J4", "--max-frame-mib", "1"]);
+        expect(&r, "J4", "fail");
+        assert!(
+            r.stdout.contains(&format!(
+                "no response came to request {read}; request {unseen} may have been answered unseen"
+            )),
+            "{name}\n{}",
+            r.stdout
+        );
+        assert!(!r.stdout.contains("inconclusive"), "{name}\n{}", r.stdout);
+    }
+}
+
+#[test]
+fn method_not_found_without_a_message_fails_j4() {
+    let r = run(&["--fault", "unknown-request-error-no-message"], &["--only", "J4,J5"]);
+    expect(&r, "J4", "fail");
+    expect(&r, "J5", "fail");
+    assert!(r.stdout.contains("an error whose message isn't a string"), "{}", r.stdout);
+    assert!(r.stdout.contains("instead of MethodNotFound"), "{}", r.stdout);
 }
 
 #[test]
@@ -1910,6 +1964,17 @@ fn dropping_a_concurrent_request_fails_j6() {
 }
 
 #[test]
+fn every_unanswered_concurrent_request_is_counted_after_the_stream_closes() {
+    // The two numeric ids are answered, then the server reads both string-id
+    // requests and exits without answering either. The stream closing mustn't
+    // hide the second string id, which is just as unanswered.
+    let r = run(&["--fault", "exit-after-concurrent-batch"], &["--only", "J6"]);
+    expect(&r, "J6", "fail");
+    assert!(r.stdout.contains("2 of 4"), "{}", r.stdout);
+    assert!(r.stdout.contains("(the server closed its stdout)"), "{}", r.stdout);
+}
+
+#[test]
 fn replying_to_a_notification_before_initialize_fails_l1() {
     for name in ["reply-to-pre-init-notification", "late-reply-to-pre-init-notification"] {
         let r = fault(name);
@@ -1956,6 +2021,27 @@ fn a_second_initialize_must_get_an_error_and_leave_the_server_serving() {
 }
 
 #[test]
+fn a_malformed_error_for_the_second_initialize_fails_l3() {
+    for (name, why) in [
+        ("reinitialize-error-no-message", "an error whose message isn't a string"),
+        ("reinitialize-error-wide-code", "an error code 2147483648, outside LSP's integer range"),
+    ] {
+        let r = fault(name);
+        only_fails(&r, &["J5", "L3"]);
+        assert!(r.stdout.contains(why), "{name}\n{}", r.stdout);
+        assert!(r.stdout.contains("instead of a well-formed error"), "{name}\n{}", r.stdout);
+    }
+}
+
+#[test]
+fn an_invalid_request_without_a_message_fails_l5() {
+    let r = fault("post-shutdown-error-no-message");
+    only_fails(&r, &["J5", "L5"]);
+    assert!(r.stdout.contains("an error whose message isn't a string"), "{}", r.stdout);
+    assert!(r.stdout.contains("instead of InvalidRequest"), "{}", r.stdout);
+}
+
+#[test]
 fn answering_requests_after_shutdown_fails_l5() {
     let r = fault("post-shutdown-results");
     only_fails(&r, &["L5"]);
@@ -1995,11 +2081,21 @@ fn method_not_found_for_shutdown_fails_l4() {
 fn exiting_on_shutdown_fails_l4_and_skips_l6() {
     let r = fault("exit-on-shutdown");
     expect(&r, "L4", "fail");
+    expect(&r, "L5", "not-exercised");
     expect(&r, "L6", "not-exercised");
     // An error LSP allows for shutdown doesn't excuse exiting before exit.
     let r = run(&["--fault", "exit-on-shutdown", "--fault", "shutdown-exception"], &["--only", "L4,L6"]);
     expect(&r, "L4", "fail");
     assert!(r.stdout.contains("after replying to shutdown, before exit"), "{}", r.stdout);
+}
+
+#[test]
+fn crashing_on_a_request_after_shutdown_fails_l5() {
+    // The server is still running after L5's wait, so the request is
+    // delivered, and it exits without answering it.
+    let r = fault("crash-after-shutdown");
+    only_fails(&r, &["L5"]);
+    assert!(r.stdout.contains("a request after shutdown went unanswered"), "{}", r.stdout);
 }
 
 /// The status comes from before exit was sent, so it says nothing about how
@@ -2441,6 +2537,20 @@ fn unreadable_frames_make_other_failures_inconclusive() {
         if id != "F1" {
             assert_ne!(v, "fail", "{id}\n{}", r.stdout);
         }
+    }
+}
+
+#[test]
+fn a_documents_scenario_that_cant_initialize_errors_every_document_check() {
+    let r = run(&["--fault", "init-error"], &["--only", "D4,D5,D6"]);
+    for id in ["D4", "D5", "D6"] {
+        expect(&r, id, "error");
+        let detail = r.report["results"].as_array().unwrap().iter().find(|v| v["id"] == id).unwrap()["detail"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(detail.starts_with("initialize didn't succeed: "), "{id}: {detail}");
+        assert!(!detail.contains("the scenario ended before reaching this check"), "{id}: {detail}");
     }
 }
 

@@ -52,14 +52,21 @@ const FAULTS: &[(&str, &str)] = &[
     ("block-after-init", "after initialize, send a huge configuration request and stop reading"),
     ("block-on-config", "on initialize, send a huge configuration request and stop reading"),
     ("no-pre-init-error", "answer requests before initialize normally"),
+    ("pre-init-error-no-message", "answer a request before initialize with ServerNotInitialized and no message"),
     ("ignore-pre-init-requests", "never answer requests before initialize"),
     ("reply-to-pre-init-notification", "answer a notification before initialize with an error whose id is null"),
     ("late-reply-to-pre-init-notification", "like reply-to-pre-init-notification, after the next request's answer"),
     ("big-reply-to-pre-init-notification", "like reply-to-pre-init-notification, with 2 MiB of error data"),
     ("replay-gate", "ask a client request and answer it only after the client answers workspace/configuration"),
     ("reinitialize", "answer a second initialize as if it were the first"),
+    ("reinitialize-error-no-message", "answer a second initialize with an error that has a code but no message"),
+    (
+        "reinitialize-error-wide-code",
+        "answer a second initialize with an error whose code, 2147483648, is outside LSP's integers",
+    ),
     ("exit-on-reinitialize", "exit on a second initialize"),
     ("post-shutdown-results", "answer requests after shutdown normally"),
+    ("post-shutdown-error-no-message", "answer a request after shutdown with InvalidRequest and no message"),
     ("ignore-eof", "keep running when stdin ends"),
     ("bad-encoding", "choose a position encoding the client didn't offer"),
     ("no-capabilities", "leave capabilities out of the initialize result"),
@@ -112,7 +119,21 @@ const FAULTS: &[(&str, &str)] = &[
         "drop-concurrent",
         "on a request with an all-digit string id, wait for the next frame and drop the earlier request",
     ),
+    (
+        "exit-after-concurrent-batch",
+        "on a request with an all-digit string id, read the next frame and exit without answering either",
+    ),
     ("ignore-dollar-request", "never answer an unknown $/ request"),
+    ("exit-on-unknown-request", "exit when lspcheck/unknownRequest arrives, without answering it"),
+    (
+        "big-frame-on-first-unknown-request",
+        "drop both unknown requests, sending a 2 MiB log message during the first request's wait",
+    ),
+    (
+        "big-frame-on-dollar-unknown-request",
+        "drop both unknown requests, sending a 2 MiB log message during the second request's wait",
+    ),
+    ("unknown-request-error-no-message", "answer both unknown requests with MethodNotFound and no message"),
     ("big-dollar-reply", "lawful: answer an unknown $/ request with MethodNotFound carrying 2 MiB of data"),
     (
         "big-frame-before-unknown-reply",
@@ -153,6 +174,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("shutdown-error-wide-code", "answer shutdown with an error whose code, 2147483648, is outside LSP's integers"),
     ("shutdown-method-not-found", "answer shutdown with MethodNotFound (-32601)"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
+    ("crash-after-shutdown", "answer shutdown, then exit without replying to the next request"),
     (
         "close-stdin-before-initialize-reply",
         "on initialize, close stdin, then send the result and exit, so initialized can't be sent",
@@ -848,6 +870,12 @@ fn main() {
             let Some(next) = input.next() else { break };
             eprintln!("standin: drop-concurrent dropped a request");
             (headers, body) = next;
+        }
+        if fault("exit-after-concurrent-batch") && is_digit_string_request(&body) {
+            // Read the fourth concurrent request before exiting so all four
+            // are delivered before stdout closes.
+            let _ = input.next();
+            std::process::exit(0);
         }
         if fault("answers-reordered") && input.ready() {
             out.holding = true;
@@ -1673,7 +1701,14 @@ fn main() {
             if fault("exit-on-reinitialize") {
                 std::process::exit(3);
             }
-            out.frame(&err(&id, -32600, "already initialized"));
+            let mut reply = err(&id, -32600, "already initialized");
+            if fault("reinitialize-error-no-message") {
+                reply["error"].as_object_mut().unwrap().remove("message");
+            }
+            if fault("reinitialize-error-wide-code") {
+                reply["error"]["code"] = json!(1i64 << 31);
+            }
+            out.frame(&reply);
             continue;
         }
         if method == "initialize" {
@@ -1967,7 +2002,11 @@ fn main() {
                 out.raw(b"pre-init server log\n");
             }
             // Both in one write, so the reply is read in the same go as the answer.
-            let mut bytes = out.encode(&err(&id, -32002, "not initialized"));
+            let mut reply = err(&id, -32002, "not initialized");
+            if fault("pre-init-error-no-message") {
+                reply["error"].as_object_mut().unwrap().remove("message");
+            }
+            let mut bytes = out.encode(&reply);
             if let Some(reply) = late_reply.take() {
                 bytes.extend(out.encode(&reply));
             }
@@ -1978,8 +2017,16 @@ fn main() {
             out.frame(&err(&id, -32603, "the stand-in isn't configured: setting standin.mode isn't \"ready\""));
             continue;
         }
+        if shut_down && fault("crash-after-shutdown") {
+            eprintln!("standin: crash-after-shutdown");
+            std::process::exit(1);
+        }
         if shut_down && !fault("post-shutdown-results") {
-            out.frame(&err(&id, -32600, "shutting down"));
+            let mut reply = err(&id, -32600, "shutting down");
+            if fault("post-shutdown-error-no-message") {
+                reply["error"].as_object_mut().unwrap().remove("message");
+            }
+            out.frame(&reply);
             continue;
         }
         if method == "workspace/symbol" && holds {
@@ -2463,6 +2510,32 @@ fn main() {
                 reply.push(bytes[0]);
                 out.raw(&reply);
                 unfinished = Some(bytes[1..].to_vec());
+            }
+            "lspcheck/unknownRequest" if fault("exit-on-unknown-request") => {
+                eprintln!("standin: exit-on-unknown-request");
+                close_stdin(input);
+                std::process::exit(0);
+            }
+            "lspcheck/unknownRequest" if fault("big-frame-on-first-unknown-request") => {
+                let text = "x".repeat(2 * 1024 * 1024);
+                out.frame(
+                    &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
+                );
+            }
+            "$/lspcheck/unknownRequest" if fault("big-frame-on-dollar-unknown-request") => {
+                let text = "x".repeat(2 * 1024 * 1024);
+                out.frame(
+                    &json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 4, "message": text}}),
+                );
+            }
+            m if (m == "lspcheck/unknownRequest" || m == "$/lspcheck/unknownRequest")
+                && (fault("big-frame-on-first-unknown-request") || fault("big-frame-on-dollar-unknown-request")) => {}
+            m if (m == "lspcheck/unknownRequest" || m == "$/lspcheck/unknownRequest")
+                && fault("unknown-request-error-no-message") =>
+            {
+                let mut reply = err(&id, -32601, "method not found");
+                reply["error"].as_object_mut().unwrap().remove("message");
+                out.frame(&reply);
             }
             _ if fault("ignore-unknown-requests") => {}
             _ if fault("wrong-unknown-error") => out.frame(&err(&id, -32600, "unknown")),

@@ -885,7 +885,7 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario { name: "content-type", checks: &["F6", "F7"] },
     Scenario { name: "after-initialize", checks: &["L3", "L5"] },
     Scenario { name: "cancellation", checks: &["C1", "C2", "C3"] },
-    Scenario { name: "documents", checks: &["D1", "D2", "D3", "D4", "D5", "D6"] },
+    Scenario { name: "documents", checks: &DOCUMENTS },
     Scenario { name: "wrong-params", checks: &["R2"] },
     Scenario { name: "large-document", checks: &["R3"] },
     Scenario { name: "capabilities", checks: &["K1"] },
@@ -958,11 +958,11 @@ pub async fn run(cfg: &Config, selected: &[String]) -> Result<Vec<ScenarioRun>, 
         judge_f1(&runs),
         judge_f2(&runs),
         judge_f8(&runs),
-        unless_unreadable(&runs, judge_j1(&runs)),
-        unless_unreadable(&runs, judge_j2(&runs)),
+        judge_j1(&runs),
+        judge_j2(&runs),
         judge_j3(&runs),
-        unless_unreadable(&runs, judge_j5(&runs)),
-        unless_unreadable(&runs, judge_j7(&runs)),
+        judge_j5(&runs),
+        judge_j7(&runs),
         judge_l9(&runs, &cfg.allowed_descendants),
     ]
     .into_iter()
@@ -1776,37 +1776,66 @@ async fn lifecycle(ctx: &mut Ctx<'_>) {
     }
 
     let t = ctx.cfg.request_timeout;
-    let mut problems = Vec::new();
-    let (mut seen_wrong, mut unsent) = (false, false);
-    // When the first request that went unanswered was sent.
-    let mut since = None;
+    let mut wrong = Vec::new();
+    // Each delivered request that went unanswered: its method, what became of
+    // the wait, and the wait's window.
+    let mut missing: Vec<(&str, String)> = Vec::new();
+    let mut missing_windows = Vec::new();
+    let mut unsent = Vec::new();
     for method in ["lspcheck/unknownRequest", "$/lspcheck/unknownRequest"] {
         let sent = ctx.s.elapsed();
-        match ctx.s.call(method, Some(json!({})), t).await {
-            Ok(m) => match &m.kind {
-                Kind::Response { outcome: Outcome::Error { code: Some(codes::METHOD_NOT_FOUND), .. }, .. } => {}
-                Kind::Response { outcome, .. } => {
-                    seen_wrong = true;
-                    problems.push(format!("{method}: {} instead of MethodNotFound", describe_outcome(outcome)))
+        let reply = ctx.s.call(method, Some(json!({})), t).await;
+        let waited = ctx.s.elapsed();
+        match reply {
+            Ok(m) => {
+                if let Some(why) = answer_problem(&m) {
+                    wrong.push(format!("{method}: {why} instead of MethodNotFound"));
+                    continue;
                 }
-                _ => unreachable!(),
-            },
-            Err(e) => {
-                unsent |= matches!(e, CallError::Write(_));
-                since.get_or_insert(sent);
-                problems.push(format!("{method}: {}", describe_call_error(&e, t)))
+                match &m.kind {
+                    Kind::Response { outcome: Outcome::Error { code: Some(codes::METHOD_NOT_FOUND), .. }, .. } => {}
+                    Kind::Response { outcome, .. } => {
+                        wrong.push(format!("{method}: {} instead of MethodNotFound", describe_outcome(outcome)))
+                    }
+                    _ => unreachable!(),
+                }
             }
+            Err(e @ CallError::Wait(_)) => {
+                missing.push((method, format!("{method}: {}", describe_call_error(&e, t))));
+                missing_windows.push((sent, waited));
+            }
+            Err(e @ CallError::Write(_)) => unsent.push(format!("{method}: {}", describe_call_error(&e, t))),
         }
     }
-    if problems.is_empty() {
-        ctx.pass("J4");
-    } else if seen_wrong {
+    if !wrong.is_empty() {
+        // A reply seen directly stands; the rest can't explain it away.
+        let problems: Vec<&str> = wrong
+            .iter()
+            .map(String::as_str)
+            .chain(missing.iter().map(|(_, detail)| detail.as_str()))
+            .chain(unsent.iter().map(String::as_str))
+            .collect();
         ctx.fail("J4", problems.join("; "));
-    } else if unsent {
-        ctx.report("J4", Verdict::Error, problems.join("; "));
+    } else if !missing.is_empty() {
+        let mut detail: Vec<&str> = missing.iter().map(|(_, detail)| detail.as_str()).collect();
+        detail.extend(unsent.iter().map(String::as_str));
+        ctx.fail("J4", detail.join("; "));
+        let r = ctx.results.last_mut().expect("just reported");
+        r.absent_at = missing_windows;
+        // Settling names only the requests whose waits lspcheck read in full
+        // if another's may have hidden a reply (which happens only when both
+        // requests were delivered, so `unsent` is empty then).
+        r.absent_detail = Some(AbsentDetail::all(
+            missing.iter().map(|(method, _)| (*method).to_string()).collect(),
+            "no response came to request ".into(),
+            String::new(),
+            "request ".into(),
+            String::new(),
+        ));
+    } else if !unsent.is_empty() {
+        ctx.report("J4", Verdict::Error, unsent.join("; "));
     } else {
-        let since = since.expect("a request went unanswered");
-        ctx.fail_absent("J4", since, problems.join("; "));
+        ctx.pass("J4");
     }
 
     let since = ctx.s.elapsed();
@@ -2219,9 +2248,11 @@ async fn check_j6(ctx: &mut Ctx<'_>, t: Duration) {
             Ok(_) => {}
             Err(WaitError::Timeout) => missing.push(id.clone()),
             Err(WaitError::Closed) => {
+                // `wait_response` answers from `self.answers` first, so it
+                // still finds replies already read; the rest are checked
+                // too, since the closed stream can't have carried them.
                 missing.push(id.clone());
                 closed = true;
-                break;
             }
         }
     }
@@ -2402,14 +2433,19 @@ async fn pre_initialize(ctx: &mut Ctx<'_>) {
     match &request {
         Ok(m) => {
             let mut problems = Vec::new();
-            match &m.kind {
-                Kind::Response {
-                    outcome: Outcome::Error { code: Some(codes::SERVER_NOT_INITIALIZED), .. }, ..
-                } => {}
-                Kind::Response { outcome, .. } => {
-                    problems.push(format!("got {} instead of ServerNotInitialized", describe_outcome(outcome)))
+            if let Some(why) = answer_problem(m) {
+                problems.push(format!("got {why} instead of ServerNotInitialized"));
+            } else {
+                match &m.kind {
+                    Kind::Response {
+                        outcome: Outcome::Error { code: Some(codes::SERVER_NOT_INITIALIZED), .. },
+                        ..
+                    } => {}
+                    Kind::Response { outcome, .. } => {
+                        problems.push(format!("got {} instead of ServerNotInitialized", describe_outcome(outcome)))
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             }
             problems.extend(replied);
             if problems.is_empty() {
@@ -2467,33 +2503,40 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
     let since = ctx.s.elapsed();
     let params = ctx.with_profile(initialize_params(&ctx.root));
     match ctx.s.call("initialize", Some(params), t).await {
-        Ok(m) => match &m.kind {
-            Kind::Response { outcome: Outcome::Error { code: Some(_), .. }, .. } => {
-                if !answers {
-                    ctx.pass_with(
-                        "L3",
-                        "whether it keeps serving wasn't checked: it didn't answer a plain request before either",
-                    );
-                } else {
-                    let since = ctx.s.elapsed();
-                    match ctx.s.call(PROBE, Some(json!({})), t).await {
-                        Ok(_) => ctx.pass("L3"),
-                        Err(e) => {
-                            stopped = Some("the server stopped answering after the second initialize (see L3)");
-                            let why = format!(
-                                "after the error for the second initialize, a plain request went unanswered ({})",
-                                describe_call_error(&e, t)
+        Ok(m) => {
+            if let Some(why) = answer_problem(&m) {
+                ctx.fail("L3", format!("a second initialize got {why} instead of a well-formed error"));
+            } else {
+                match &m.kind {
+                    Kind::Response { outcome: Outcome::Error { code: Some(_), .. }, .. } => {
+                        if !answers {
+                            ctx.pass_with(
+                                "L3",
+                                "whether it keeps serving wasn't checked: it didn't answer a plain request before either",
                             );
-                            ctx.fail_call("L3", since, why, &e);
+                        } else {
+                            let since = ctx.s.elapsed();
+                            match ctx.s.call(PROBE, Some(json!({})), t).await {
+                                Ok(_) => ctx.pass("L3"),
+                                Err(e) => {
+                                    stopped = Some("the server stopped answering after the second initialize (see L3)");
+                                    let why = format!(
+                                        "after the error for the second initialize, a plain request went unanswered ({})",
+                                        describe_call_error(&e, t)
+                                    );
+                                    ctx.fail_call("L3", since, why, &e);
+                                }
+                            }
                         }
                     }
+                    Kind::Response { outcome, .. } => ctx.fail(
+                        "L3",
+                        format!("a second initialize got {} instead of an error", describe_outcome(outcome)),
+                    ),
+                    _ => unreachable!(),
                 }
             }
-            Kind::Response { outcome, .. } => {
-                ctx.fail("L3", format!("a second initialize got {} instead of an error", describe_outcome(outcome)))
-            }
-            _ => unreachable!(),
-        },
+        }
         Err(e) => {
             stopped = Some("the second initialize went unanswered (see L3)");
             ctx.fail_call(
@@ -2512,19 +2555,31 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
     if let Err(e) = ctx.s.call("shutdown", None, t).await {
         return ctx.report("L5", Verdict::Error, format!("shutdown: {}", describe_call_error(&e, t)));
     }
+    // Time for a server that exits as it answers `shutdown` to be seen doing
+    // so: L5 is then not exercised, not failed by a request it can no longer
+    // answer.
+    ctx.s.wait_exit(Instant::now() + Duration::from_millis(300)).await;
     if !ctx.s.is_alive() {
         return ctx.report("L5", Verdict::NotExercised, "the server exited after shutdown, before exit (see L4)");
     }
     let since = ctx.s.elapsed();
     match ctx.s.call("workspace/symbol", Some(json!({"query": ""})), t).await {
-        Ok(m) => match &m.kind {
-            Kind::Response { outcome: Outcome::Error { code: Some(codes::INVALID_REQUEST), .. }, .. } => ctx.pass("L5"),
-            Kind::Response { outcome, .. } => ctx.fail(
-                "L5",
-                format!("a request after shutdown got {} instead of InvalidRequest", describe_outcome(outcome)),
-            ),
-            _ => unreachable!(),
-        },
+        Ok(m) => {
+            if let Some(why) = answer_problem(&m) {
+                ctx.fail("L5", format!("a request after shutdown got {why} instead of InvalidRequest"));
+            } else {
+                match &m.kind {
+                    Kind::Response { outcome: Outcome::Error { code: Some(codes::INVALID_REQUEST), .. }, .. } => {
+                        ctx.pass("L5")
+                    }
+                    Kind::Response { outcome, .. } => ctx.fail(
+                        "L5",
+                        format!("a request after shutdown got {} instead of InvalidRequest", describe_outcome(outcome)),
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+        }
         Err(e) => ctx.fail_call(
             "L5",
             since,
@@ -3852,6 +3907,16 @@ const DOC_A2_VERSION: i64 = 42;
 /// Document B's version, sent in its `didOpen`.
 const DOC_B_VERSION: i64 = 7;
 
+/// The checks the documents scenario judges: a failure before its evidence is
+/// gathered leaves every one of them unjudged.
+const DOCUMENTS: [&str; 6] = ["D1", "D2", "D3", "D4", "D5", "D6"];
+
+/// An error for every documents check, `detail` saying why none could be
+/// judged.
+fn documents_unjudged(detail: &str) -> Vec<CheckResult> {
+    DOCUMENTS.into_iter().map(|id| result("documents", id, Verdict::Error, detail)).collect()
+}
+
 /// Documents: lspcheck opens document A, asks the server's advertised
 /// requests about it one at a time, and waits a while for diagnostics. Every
 /// position the server sends about it must fall on a character boundary of
@@ -3869,10 +3934,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let reply = match ctx.initialize_with(params).await {
         Ok(reply) => reply,
         Err(InitFailure::Violation(why) | InitFailure::Absent(why) | InitFailure::Blocked(why)) => {
-            let detail = format!("initialize didn't succeed: {why}");
-            for id in ["D1", "D2", "D3", "D4"] {
-                ctx.report(id, Verdict::Error, detail.clone());
-            }
+            ctx.results.extend(documents_unjudged(&format!("initialize didn't succeed: {why}")));
             return;
         }
     };
@@ -3923,10 +3985,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let opened_at = ctx.s.elapsed();
     let doc = json!({"uri": uri, "languageId": "plaintext", "version": DOC_A_VERSION, "text": text});
     if let Err(e) = ctx.s.notify("textDocument/didOpen", Some(json!({"textDocument": doc}))).await {
-        let detail = format!("lspcheck couldn't send didOpen: {e}");
-        for id in ["D1", "D2", "D3", "D5", "D6"] {
-            ctx.report(id, Verdict::Error, detail.clone());
-        }
+        ctx.results.extend(documents_unjudged(&format!("lspcheck couldn't send didOpen: {e}")));
         leave(ctx).await;
         return;
     }
@@ -7492,7 +7551,7 @@ fn judge_j1(runs: &[ScenarioRun]) -> CheckResult {
             ))
         })
         .collect();
-    let r = cross("J1", runs, failures, "", true);
+    let r = unless_unreadable(runs, cross("J1", runs, failures, "", true));
     if r.verdict != Verdict::Pass {
         return r;
     }
@@ -7538,8 +7597,11 @@ fn judge_j2(runs: &[ScenarioRun]) -> CheckResult {
             Some(format!("in {name} at {} ms: {}{tail}", first.at.as_millis(), describe_unmatched(first)))
         })
         .collect();
-    let r = cross("J2", runs, failures, "", true);
-    if r.verdict == Verdict::Pass && observed(runs).all(|(_, o)| o.answered.is_empty() && o.unmatched.is_empty()) {
+    let r = unless_unreadable(runs, cross("J2", runs, failures, "", true));
+    if r.verdict != Verdict::Pass {
+        return r;
+    }
+    if observed(runs).all(|(_, o)| o.answered.is_empty() && o.unmatched.is_empty()) {
         return result("all", "J2", Verdict::NotExercised, "the server sent no response lspcheck could judge");
     }
     r
@@ -7699,8 +7761,11 @@ fn judge_j5(runs: &[ScenarioRun]) -> CheckResult {
             Some(format!("in {name} at {} ms: {why}{tail}", at.as_millis()))
         })
         .collect();
-    let r = cross("J5", runs, failures, "", true);
-    if r.verdict == Verdict::Pass && observed(runs).all(|(_, o)| o.messages.is_empty()) {
+    let r = unless_unreadable(runs, cross("J5", runs, failures, "", true));
+    if r.verdict != Verdict::Pass {
+        return r;
+    }
+    if observed(runs).all(|(_, o)| o.messages.is_empty()) {
         return result("all", "J5", Verdict::NotExercised, "the server sent no readable message");
     }
     r
@@ -7756,7 +7821,7 @@ fn judge_j7(runs: &[ScenarioRun]) -> CheckResult {
             ))
         })
         .collect();
-    let r = cross("J7", runs, failures, "", true);
+    let r = unless_unreadable(runs, cross("J7", runs, failures, "", true));
     if r.verdict != Verdict::Pass {
         return r;
     }
@@ -10171,6 +10236,45 @@ while header := sys.stdin.buffer.readline():
         let mut runs = j7_run(vec![server_request(10, "1", Some(20))], true);
         runs[0].observed.as_mut().unwrap().limit = Some((Duration::from_millis(5), "skipped a frame".into()));
         assert_eq!(judge_j7(&runs).verdict, Verdict::Error);
+    }
+
+    #[test]
+    fn an_unreadable_frame_makes_j1_j2_j5_and_j7_errors_not_unexercised() {
+        // With no readable message, response or server request, each check
+        // would otherwise say it wasn't exercised. A frame lspcheck couldn't
+        // read might have held what it judges, so each is an error instead.
+        for cut_short in [false, true] {
+            let run = || {
+                let mut run = observed_run("lifecycle", vec![], None);
+                let o = run.observed.as_mut().unwrap();
+                let at = Duration::from_millis(5);
+                if cut_short {
+                    o.cut_short = Some((at, "the stream ended inside a frame".into()));
+                } else {
+                    o.problems.push((at, Problem::NotJson { body: b"?".to_vec(), error: "expected value".into() }));
+                }
+                [run]
+            };
+            for r in [judge_j1(&run()), judge_j2(&run()), judge_j5(&run()), judge_j7(&run())] {
+                assert_eq!(r.verdict, Verdict::Error, "{}: {}", r.id, r.detail);
+                assert!(r.detail.contains("a frame couldn't be read"), "{}: {}", r.id, r.detail);
+            }
+        }
+    }
+
+    #[test]
+    fn a_documents_failure_before_its_evidence_errors_every_check() {
+        for detail in [
+            "initialize didn't succeed: the server closed its stdout without replying to initialize",
+            "lspcheck couldn't send didOpen: the server's stdin is closed",
+        ] {
+            let results = documents_unjudged(detail);
+            let ids: Vec<&str> = results.iter().map(|r| r.id).collect();
+            let scenario = SCENARIOS.iter().find(|s| s.name == "documents").expect("the documents scenario");
+            assert_eq!(ids, scenario.checks);
+            assert_eq!(ids, ["D1", "D2", "D3", "D4", "D5", "D6"]);
+            assert!(results.iter().all(|r| r.verdict == Verdict::Error && r.detail == detail));
+        }
     }
 
     #[test]
