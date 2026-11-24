@@ -6462,7 +6462,17 @@ async fn recover(
                         (false, None) if rec.recovered(i, &projected) => {
                             ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: false, since }
                         }
-                        _ => rec.differs(i, k, &deciding, &projected, (at, bound), interrupted.clone(), &read),
+                        _ => {
+                            let whole = interrupted.clone().and_then(|()| match version {
+                                1 => Err(format!(
+                                    "{deciding} describes the opened text but was read after lspcheck began changing \
+                                     another seed document, so it may be version 1's analysis finishing late or \
+                                     diagnostics that depend on that document"
+                                )),
+                                _ => Ok(()),
+                            });
+                            rec.differs(i, k, &deciding, &projected, (at, bound), whole, &read)
+                        }
                     }
                 }
             }

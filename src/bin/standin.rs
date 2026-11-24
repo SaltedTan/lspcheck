@@ -552,6 +552,11 @@ const FAULTS: &[(&str, &str)] = &[
         "as cross-file-diagnostics, but keep that Error once another open document's brackets were unbalanced",
     ),
     (
+        "late-baseline-warning-elsewhere",
+        "lawful: on reading a didChange, publish each other open document still at version 1 once more, labelled \
+         with version 1 with a Warning added, and add that Warning to every later publish about it",
+    ),
+    (
         "cross-file-publishes-when-restored",
         "with a cross-file fault, publish the other open documents' diagnostics again only on a didChange that \
          leaves every open document at its opened text, as a server that waits for edits to settle might",
@@ -1402,6 +1407,31 @@ fn main() {
                         elsewhere: cross_file_error(&faults, uri, &unbalanced_now, &broken),
                     };
                     publish_diagnostics(&mut out, &faults, units, uri, text, Some(json!(version)), lingering);
+                }
+            }
+            // Another document's version 1 analysis finishing late: lspcheck
+            // reads it only after it has written a change to this one.
+            if method == "textDocument/didChange"
+                && fault("late-baseline-warning-elsewhere")
+                && let Some(changed) = msg.pointer("/params/textDocument/uri").and_then(Value::as_str)
+            {
+                let mut others: Vec<(String, String)> = docs
+                    .iter()
+                    .filter(|(u, (_, version))| *u != changed && *version == 1 && !late.contains(*u))
+                    .map(|(u, (text, _))| (u.clone(), text.clone()))
+                    .collect();
+                others.sort();
+                for (uri, text) in others {
+                    late.insert(uri.clone());
+                    publishes += 1;
+                    let lingering = Lingering {
+                        broken_once: broken.contains(&uri),
+                        late: true,
+                        padded: false,
+                        publishes,
+                        elsewhere: cross_file_error(&faults, &uri, &unbalanced_now, &broken),
+                    };
+                    publish_diagnostics(&mut out, &faults, units, &uri, &text, Some(json!(1)), lingering);
                 }
             }
             if method == "initialized"

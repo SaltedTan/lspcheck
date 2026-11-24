@@ -4182,7 +4182,10 @@ fn cross_file_diagnostics_that_recover_pass_m3() {
 #[test]
 fn cross_file_diagnostics_that_never_recover_fail_m3() {
     // As above, but once a seed was unbalanced, the other keeps its Error
-    // after the restoration: with `expect = "baseline"`, that fails M3.
+    // after the restoration. In case 0, other.lua's text never changed, so
+    // its Error, labelled with version 1, may be a late baseline (ERROR).
+    // Case 1 changes other.lua too, and main.lua's Error is labelled with
+    // its restored version: with `expect = "baseline"`, that fails M3.
     let (path, _keep) = cross_file_profile("expect = \"baseline\"\nrecovery_timeout = \"2s\"");
     let (r, _, _keep) =
         mutated_with(&path, &["cross-file-errors-after-unbalanced"], &["--mutation-cases", "2", "--only", "M1,M2,M3"]);
@@ -4191,7 +4194,7 @@ fn cross_file_diagnostics_that_never_recover_fail_m3() {
     expect(&r, "M3", "fail");
     assert!(
         detail(&r, "M3").contains(
-            "case 0: publishDiagnostics of other.lua didn't return to its baseline within 2 s of the restoration"
+            "case 1: publishDiagnostics of main.lua didn't return to its baseline within 2 s of the restoration"
         ),
         "{}",
         r.stdout
@@ -4199,26 +4202,44 @@ fn cross_file_diagnostics_that_never_recover_fail_m3() {
 }
 
 #[test]
-fn cross_file_errors_published_only_after_the_restoration_fail_m3() {
+fn cross_file_errors_published_only_after_the_restoration_leave_m3_an_error() {
     // As above, but the stand-in publishes the other seed's diagnostics
     // again only once every document is back at its opened text: its Error
     // is read after the restoration began. The clean publish read before
     // the first mutation is older than the change to main.lua, so it
-    // doesn't show other.lua recovered.
+    // doesn't show other.lua recovered. other.lua's text is still the
+    // opened one, so the Error, labelled with version 1, may be a late
+    // baseline: M3 is ERROR, not PASS.
     let (path, _keep) = cross_file_profile("expect = \"baseline\"\nrecovery_timeout = \"2s\"");
     let faults = ["cross-file-errors-after-unbalanced", "cross-file-publishes-when-restored"];
     let (r, _, _keep) = mutated_with(&path, &faults, &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
     expect(&r, "M1", "pass");
     expect(&r, "M2", "pass");
-    expect(&r, "M3", "fail");
-    assert!(
-        detail(&r, "M3").contains(
-            "case 0: publishDiagnostics of other.lua didn't return to its baseline within 2 s of the restoration"
-        ),
-        "{}",
-        r.stdout
-    );
+    expect(&r, "M3", "error");
+    assert!(detail(&r, "M3").contains(UNMUTATED_SEED_DIFFERS), "{}", r.stdout);
 }
+
+#[test]
+fn a_late_baseline_of_an_unmutated_seed_leaves_m3_an_error() {
+    // Once main.lua changes, the stand-in publishes other.lua, still at
+    // version 1, with a Warning its baseline lacks, and keeps it: version
+    // 1's analysis finishing late, which is lawful. It can't be told from
+    // diagnostics that depend on main.lua and never recovered, so with
+    // `expect = "baseline"` M3 is ERROR, not FAIL.
+    let (path, _keep) = cross_file_profile("expect = \"baseline\"\nrecovery_timeout = \"2s\"");
+    let (r, _, _keep) =
+        mutated_with(&path, &["late-baseline-warning-elsewhere"], &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+    expect(&r, "M3", "error");
+    assert!(detail(&r, "M3").contains(UNMUTATED_SEED_DIFFERS), "{}", r.stdout);
+}
+
+/// What M3 says of a seed document whose text never changed when its last
+/// publish differs from its baseline.
+const UNMUTATED_SEED_DIFFERS: &str = "case 0: publishDiagnostics of other.lua: the last publishDiagnostics labelled with \
+                                      version 1 read within 2 s of the restoration describes the opened text but was \
+                                      read after lspcheck began changing another seed document";
 
 #[test]
 fn a_seed_whose_diagnostics_are_never_published_again_passes_m3() {

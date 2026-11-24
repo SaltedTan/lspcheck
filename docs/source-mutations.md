@@ -545,7 +545,9 @@ runner stalled for 3 s) tests something else, and is repeated.
 | `late-baseline-on-version-jump` | lawful: as `late-baseline-warning`, on a `didChange` more than one version on, which only an isolated case sends | with `warning-after-unbalanced`, `expect = "baseline"` and pushed diagnostics, M3 fails; case 0 alone reproduces, and case 1 alone has no stable baseline, so `reproduced` is `null`, not `false` |
 | `errors-after-unbalanced` | once unbalanced, publish an Error diagnostic forever | M3 fails with `no_errors = true` |
 | `cross-file-diagnostics` | lawful: while another open document is unbalanced, add an Error to a document's diagnostics, and on each `didChange` publish every other open document again at its own version | with a second seed file, `expect = "baseline"` and pushed diagnostics as the only probe, M3 passes: the other file's publishes at version 1 during a case aren't held to its baseline |
-| `cross-file-errors-after-unbalanced` | as `cross-file-diagnostics`, but keep the Error once another document was unbalanced | in the same setup, M3 fails: the other file doesn't return to its baseline |
+| `cross-file-errors-after-unbalanced` | as `cross-file-diagnostics`, but keep the Error once another document was unbalanced | in the same setup with two cases, M3 fails: in case 1, which changes both files, `main.lua` doesn't return to its baseline at its restored version. In case 0, `other.lua`'s text never changed, so its Error, labelled with version 1, is `ERROR` |
+| `cross-file-publishes-when-restored` | with a cross-file fault, publish the other documents again only on a `didChange` that leaves every document at its opened text | with `cross-file-errors-after-unbalanced` and one case, M3 `ERROR`, not `PASS`: the clean publish of `other.lua` read before the restoration doesn't show it recovered, and its later Error is labelled with version 1 |
+| `late-baseline-warning-elsewhere` | lawful: on reading a `didChange`, publish each other document still at version 1 again with a Warning added, and keep the Warning | with a second seed file, `expect = "baseline"`, pushed diagnostics as the only probe and one case, M3 `ERROR`, never `FAIL`: a late baseline of `other.lua` can't be told from diagnostics that depend on `main.lua` |
 | `workspace-scan-diagnostics` | lawful: on `initialized`, before reading any `didOpen`, publish diagnostics labelled with version 0 for the workspace's files and the documents scenario's | nothing fails; D2 passes in both scenarios, counting those publishes as ones that may predate the `didOpen` |
 | `warning-after-unbalanced` | once unbalanced, publish an extra Warning forever | M3 fails with `expect = "baseline"` and pushed diagnostics as the only probe; passes with `no_errors = true` alone |
 | `malformed-recovery-diagnostics` | once unbalanced, publish `null` instead of a diagnostics array | M3 `ERROR`, including with `no_errors = true` |
@@ -699,6 +701,11 @@ Step 5 builds [Recovery](#recovery) and M3 as above. Where the rules leave a cho
   same version, so a profile with several seed documents may take the whole bound. With `no_errors`, its publishes are
   read to the end of `recovery_timeout`, and the last decides, so each case takes the whole bound. A recovery decided
   by a publish read before the restoration is `ERROR` if lspcheck may have missed output from that read on.
+- A seed document whose text has never changed is still at version 1, and its publishes read after lspcheck began
+  changing another seed document aren't held to its baseline. When the last of them differs from the baseline, M3 is
+  `ERROR`, not `FAIL`: version 1's analysis finishing late is lawful, and lspcheck can't tell it from diagnostics that
+  depend on the other document and never recovered. So in a profile with several seed files, a cross-file Error that
+  never goes away fails M3 only in a document that was changed and restored, at its restored version.
 - Generated edits that leave all documents at their clean text establish the restoration boundary too; recovery
   is timed from that delivery even when no extra restoration write is needed.
 - Terminal probes are sent with or without an expectation; an answer equal to the baseline counts as recovered. An
