@@ -253,10 +253,11 @@ cut-short frame) between the deciding answer and its end (for a pull, from the t
 for a push, from that publish to the end of the bound). A pushed-diagnostics verdict also needs every publish labelled
 with version 1 since the document's `didOpen`, up to the first change to another seed document (step 4), to match the
 baseline after projection (held only to `no_errors`, to have no Error; see [step 5](#step-5)), and nothing missed in
-the server's output from that `didOpen` to the session's end, or to that change. Anything less, including polling stopped early by lspcheck's
-poll budget or a terminal probe left unanswered, makes M3 `ERROR` for that case, with what was missing named. That is
-seen evidence, which is what `FAIL` needs. Without a stated expectation, the same
-observation is reported as `ERROR` with the difference shown, and the profile's author decides.
+the server's output from that `didOpen` to the session's end, or to that change. Anything less, including polling
+stopped early by lspcheck's poll budget or a terminal probe left unanswered, makes M3 `ERROR` for that case, with what
+was missing named. That is seen evidence, which is what `FAIL` needs. Without a stated expectation, the same
+observation is reported as `ERROR` with the difference shown, and the profile's author decides. A differing deciding
+publish labelled with version 1, for a document whose text never changed, is `ERROR` too ([step 5](#step-5)).
 
 ### Verdict rules
 

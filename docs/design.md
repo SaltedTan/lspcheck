@@ -324,8 +324,8 @@ labelled with a version lspcheck had sent for it (which the server could only ha
 later `didChange`), or the answer to a request lspcheck began writing after the `didOpen`. A publish with a version
 lspcheck had sent passes whenever it is read. One with another version read earlier is counted as one "that may
 predate the server's reading of the document's didOpen", not judged; if every versioned publish is such a one, D2 is
-`N/E`. So a server that labels its first publish after `didOpen` wrongly fails only on a later publish. Every early exit that skips or voids D1 skips or voids D2 too, and a pass over missed evidence
-is `ERROR` for D2 as it is for D1.
+`N/E`. So a server that labels its first publish after `didOpen` wrongly fails only on a later publish. Every early
+exit that skips or voids D1 skips or voids D2 too, and a pass over missed evidence is `ERROR` for D2 as it is for D1.
 
 D3 judges the positions that can only refer to the changed text, against version 42's text: replies to requests sent
 after the change, and diagnostics labelled 42. A late reply to a request sent before the change, or unlabelled
