@@ -252,7 +252,7 @@ D1 to D6 are done.
 | ID | Basis | Check |
 |---|---|---|
 | D1 | MUST | Every judged position in a reply or notification about an open document is at a character boundary of the text it refers to, in the negotiated encoding: never inside a UTF-16 surrogate pair or a UTF-8 multi-byte sequence. Positions past the end of a line or of the document aren't judged, since the spec lets clients clamp them. Splitting a grapheme cluster is lawful. |
-| D2 | MUST | A `version` in `textDocument/publishDiagnostics` for an open document is one lspcheck sent for that URI before the notification was read: the version `didOpen` sent, and a later `didChange`'s. An older version is lawful, and so is none at all; `null` or a non-integer one is a type error for K2, not D2's finding. |
+| D2 | MUST | A `version` in `textDocument/publishDiagnostics` for an open document is one lspcheck sent for that URI before the notification was read: the version `didOpen` sent, and a later `didChange`'s. An older version is lawful, and so is none at all; `null` or a non-integer one is a type error for K2, not D2's finding. A publish the server may have written before it read the `didOpen` isn't judged. |
 | D3 | MUST | After a `didChange`, positions refer to the changed text. lspcheck sends the change the advertised way: an incremental edit replaces a 4-byte character and adds a line, or the full text when the server asked for Full. |
 | D4 | POLICY | A request about a closed document, and one about a URI that was never opened and doesn't exist, each get a response (any result or error), and the server keeps serving. |
 | D5 | MUST | Lines are split at `\n`, `\r\n` and `\r`: positions in a document with CR LF and lone CR line endings fall on character boundaries of the lines the spec defines. |
@@ -313,8 +313,19 @@ that carries an integer `version` must name one lspcheck sent for it before the 
 that labels with its own counter, or with one past the document's, fails; the detail gives the version read and the
 versions sent before it. An older version is lawful. A notification without a version leaves D2 `N/E` with the
 unversioned ones counted, and `null` or a non-integer `version` isn't judged here (K2's type check), nor is any URI
-lspcheck didn't open. Every early exit that skips or voids D1 skips or voids D2 too, and a pass over missed evidence
-is `ERROR` for D2 as it is for D1.
+lspcheck didn't open.
+
+D2 judges a publish only once lspcheck knows the server had read the document's `didOpen`. LSP sets no rule for the
+version of a document the client hasn't opened, and a server that checks the workspace on startup may label a file's
+diagnostics with a version of its own and write them before it reads the `didOpen`, though lspcheck reads them only
+after it has begun writing it. The server reads its input in order, and lspcheck reads its output in order, so
+lspcheck knows the `didOpen` was read once it has read, before the publish, either a publish about the document
+labelled with a version lspcheck had sent for it (which the server could only have learnt from the `didOpen` or a
+later `didChange`), or the answer to a request lspcheck began writing after the `didOpen`. A publish with a version
+lspcheck had sent passes whenever it is read. One with another version read earlier is counted as one "that may
+predate the server's reading of the document's didOpen", not judged; if every versioned publish is such a one, D2 is
+`N/E`. So a server that labels its first publish after `didOpen` wrongly fails only on a later publish. Every early
+exit that skips or voids D1 skips or voids D2 too, and a pass over missed evidence is `ERROR` for D2 as it is for D1.
 
 D3 judges the positions that can only refer to the changed text, against version 42's text: replies to requests sent
 after the change, and diagnostics labelled 42. A late reply to a request sent before the change, or unlabelled

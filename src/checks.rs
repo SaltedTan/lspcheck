@@ -4136,7 +4136,9 @@ async fn documents(ctx: &mut Ctx<'_>) {
     let msgs = &ctx.s.messages;
     let mut sources = Vec::new();
     let mut published = Vec::new();
+    let mut answered = None;
     for (at, m) in msgs.iter().filter(|(at, _)| *at < end) {
+        answered = answered.max(answer_registered(&ctx.s, *at, m));
         if m.method() == Some(PUBLISH_DIAGNOSTICS) && matches!(m.kind, Kind::Notification { .. }) {
             let params = m.value.get("params").cloned().unwrap_or(Value::Null);
             if let Some(uri) = params.get("uri").and_then(Value::as_str) {
@@ -4146,6 +4148,7 @@ async fn documents(ctx: &mut Ctx<'_>) {
                     uri: uri.into(),
                     version: params.get("version").cloned(),
                     read_at: *at,
+                    answered,
                     place: None,
                 });
             }
@@ -5084,6 +5087,13 @@ fn answers_capped(s: &Session, next: u64, place: &str) -> Option<String> {
     ))
 }
 
+/// When lspcheck registered the request `m`, read at `at`, answers, if it
+/// is a response to one registered before it was read: the server had read
+/// everything lspcheck wrote before that request ([`Published::answered`]).
+fn answer_registered(s: &Session, at: Duration, m: &Message) -> Option<Duration> {
+    s.registered_at(m.response_id()?).filter(|registered| *registered <= at)
+}
+
 /// What the mutation scenario gathers for the checks it extends, D1, D2, D6
 /// and K1 ([design](../docs/source-mutations.md#verdict-rules)): the
 /// versions it sent, and the evidence judged so far.
@@ -5111,6 +5121,8 @@ struct Extended {
     positions: documents::Judged,
     /// D2's evidence: the diagnostics notifications read.
     published: Vec<Published>,
+    /// When lspcheck registered the latest request answered so far.
+    answered: Option<Duration>,
     /// D6's judgements so far.
     selection: Vec<documents::SelectionReply>,
     /// The case each of [`Extended::published`] was read in.
@@ -5133,6 +5145,7 @@ impl Extended {
             indexed: 0,
             positions: documents::Judged::default(),
             published: Vec::new(),
+            answered: None,
             selection: Vec::new(),
             published_cases: Vec::new(),
             troubles: Vec::new(),
@@ -5146,7 +5159,7 @@ impl Extended {
     /// still counts as sent, since the server may have read it, and a
     /// version counted as sent can't make a check fail.
     fn record(&mut self, s: &Session, asked: &[StepRequest], d: usize, at: Duration, number: i64, text: String) {
-        self.judge(&s.messages, asked, None);
+        self.judge(s, asked, None);
         self.opened_at.get_or_insert(at);
         self.docs[d].push(Version { at, number, text }, documents::KEPT_TEXTS);
     }
@@ -5176,7 +5189,8 @@ impl Extended {
     /// Judges the messages read since the last call. Positions and selection
     /// ranges use D1's candidate rule; only what was read before `end` (when
     /// given) counts for D1, D2 and D6.
-    fn judge(&mut self, msgs: &[(Duration, Message)], asked: &[StepRequest], end: Option<Duration>) {
+    fn judge(&mut self, s: &Session, asked: &[StepRequest], end: Option<Duration>) {
+        let msgs = &s.messages;
         for (i, a) in asked.iter().enumerate().skip(self.indexed) {
             self.by_id.insert(a.id.clone(), i);
         }
@@ -5184,6 +5198,7 @@ impl Extended {
         let before_end = |at: Duration| end.is_none_or(|end| at < end);
         for (at, m) in &msgs[self.judged_to..] {
             let at = *at;
+            self.answered = self.answered.max(answer_registered(s, at, m));
             if m.method() == Some(PUBLISH_DIAGNOSTICS) && matches!(m.kind, Kind::Notification { .. }) && before_end(at)
             {
                 let params = m.value.get("params").cloned().unwrap_or(Value::Null);
@@ -5191,7 +5206,13 @@ impl Extended {
                 let case = self.case_number_at(at);
                 if let Some(uri) = params.get("uri").and_then(Value::as_str) {
                     let version = params.get("version").cloned();
-                    self.published.push(Published { uri: uri.into(), version, read_at: at, place: place.clone() });
+                    self.published.push(Published {
+                        uri: uri.into(),
+                        version,
+                        read_at: at,
+                        answered: self.answered,
+                        place: place.clone(),
+                    });
                     self.published_cases.push(case);
                 }
                 let source = Source {
@@ -5681,12 +5702,18 @@ fn publish_label(m: &Message) -> Option<(&str, i64)> {
     Some((params.get("uri")?.as_str()?, params.get("version").and_then(documents::version_number)?))
 }
 
-/// A pushed-diagnostics baseline, as M3 holds every publish labelled with
-/// version 1 to it. Those read after the first mutation still describe the
-/// opened text, so one that differs shows the baseline wasn't stable,
-/// however late it was read, and one lspcheck missed may have differed.
-/// Held only to `no_errors`, M3 judges whether a text has an Error, so a
-/// publish that differs without one says nothing against it.
+/// A pushed-diagnostics baseline, as M3 holds the publishes labelled with
+/// version 1 to it. One read after the first mutation still describes the
+/// opened text, so if it differs the baseline wasn't stable, however late it
+/// was read, and one lspcheck missed may have differed. That holds only while
+/// the other seed documents had their opened texts too: a document's
+/// diagnostics may depend on the others (imports and the like), and the
+/// version label names only its own text. So a publish is held only if it
+/// was read before lspcheck began writing a change to another seed document.
+/// After that, even once the texts are restored, the server may lawfully
+/// still publish what it worked out from a changed text. Held only to
+/// `no_errors`, M3 judges whether a text has an Error, so a publish that
+/// differs without one says nothing against it.
 #[derive(Debug, Clone)]
 pub struct PushBaseline {
     label: String,
@@ -5696,6 +5723,9 @@ pub struct PushBaseline {
     /// When the baseline was taken, at the first mutation: the publishes
     /// read before it were judged then.
     taken_at: Duration,
+    /// When lspcheck began writing the first change to another seed
+    /// document, if it did: the publishes read from then on aren't held.
+    held_until: Option<Duration>,
     baseline: Value,
     no_errors: bool,
     /// Whether the profile expects the baseline back (`expect = "baseline"`).
@@ -5704,20 +5734,22 @@ pub struct PushBaseline {
 
 impl PushBaseline {
     /// Why the publishes labelled with version 1 in `msgs` read after the
-    /// baseline was taken don't all show it, or may not have, given what
-    /// lspcheck missed of the server's output since the document was opened
-    /// (`missed_output_within`). Those read before were judged when it was
-    /// taken: held only to `no_errors` they may differ, and an Error in one
-    /// is already the disagreement before any mutation.
+    /// baseline was taken, and before `held_until`, don't all show it, or may
+    /// not have, given what lspcheck missed of the server's output from when
+    /// the document was opened to then (`missed_output_within`). Those read
+    /// before were judged when it was taken: held only to `no_errors` they
+    /// may differ, and an Error in one is already the disagreement before
+    /// any mutation.
     fn unstable(
         &self,
         msgs: &[(Duration, Message)],
         missed_output_within: impl Fn(Duration, Duration) -> Option<String>,
     ) -> Option<String> {
         let late = "a publishDiagnostics labelled with version 1 read after the first mutation";
+        let held = |at: Duration| at >= self.taken_at && self.held_until.is_none_or(|until| at < until);
         msgs.iter()
             .filter(|(at, m)| {
-                *at >= self.taken_at
+                held(*at)
                     && publish_label(m).is_some_and(|(uri, label)| label == 1 && documents::same_uri(&self.uri, uri))
             })
             .find_map(|(_, m)| {
@@ -5751,7 +5783,7 @@ impl PushBaseline {
                 Some(format!("{}: {late} differed from the baseline{shown}", self.label))
             })
             .or_else(|| {
-                missed_output_within(self.opened_at, Duration::MAX).map(|why| {
+                missed_output_within(self.opened_at, self.held_until.unwrap_or(Duration::MAX)).map(|why| {
                     format!(
                         "{}: lspcheck may have missed a publishDiagnostics labelled with version 1 since the \
                          document was opened, because {why}",
@@ -5820,8 +5852,10 @@ struct PushWatch {
 #[derive(Debug, Clone, PartialEq)]
 enum ProbeEnd {
     /// Seen to satisfy the recovery comparison this long after the restoration was
-    /// delivered; by its terminal probe if `terminal`.
-    Recovered { after: Duration, terminal: bool },
+    /// delivered; by its terminal probe if `terminal`. `since` is when the
+    /// publish that decided it was read, if before the restoration was
+    /// delivered: output lspcheck missed from then on may have superseded it.
+    Recovered { after: Duration, terminal: bool, since: Option<Duration> },
     /// Seen not to: a failure, unless lspcheck missed something between
     /// `from` and `to`.
     Failed { detail: String, from: Duration, to: Duration },
@@ -5836,6 +5870,19 @@ struct CaseRecovery {
     window: (Duration, Duration),
     /// Each stable probe's outcome, in the order of [`Recovery::stable`].
     outcomes: Vec<ProbeEnd>,
+}
+
+impl CaseRecovery {
+    /// The windows in which output lspcheck missed may have changed outcome
+    /// `i`: the recovery window, and before it, from when a deciding publish
+    /// read before the restoration was read.
+    fn windows(&self, i: usize) -> impl Iterator<Item = (Duration, Duration)> {
+        let before = match self.outcomes[i] {
+            ProbeEnd::Recovered { since: Some(at), .. } => Some((at, self.window.0)),
+            _ => None,
+        };
+        std::iter::once(self.window).chain(before)
+    }
 }
 
 /// What M3 judges: the probes with stable baselines and how each case's
@@ -5861,6 +5908,9 @@ struct Recovery {
     pushes: PushLog,
     /// The seed documents' URIs, once pushed baselines have been taken.
     uris: Vec<String>,
+    /// When lspcheck began writing the first change to each seed document,
+    /// by its index, for those it changed.
+    changed: Vec<Option<Duration>>,
 }
 
 impl Recovery {
@@ -5945,13 +5995,23 @@ impl Recovery {
         }
     }
 
+    /// Notes that lspcheck is about to write a change to seed document `d`, at `at`.
+    fn changing(&mut self, d: usize, at: Duration) {
+        if self.changed.len() <= d {
+            self.changed.resize(d + 1, None);
+        }
+        self.changed[d].get_or_insert(at);
+    }
+
     /// What M3 holds later publishes to, if `s` is pushed diagnostics.
     fn push_baseline(&self, s: &Stable) -> Option<PushBaseline> {
+        let others = self.changed.iter().enumerate().filter(|&(d, _)| d != s.doc);
         Some(PushBaseline {
             label: s.label.clone(),
             uri: self.uris.get(s.doc)?.clone(),
             opened_at: s.baseline_window?.0,
             taken_at: s.baseline_window?.1,
+            held_until: others.filter_map(|(_, at)| *at).min(),
             baseline: s.baseline.clone(),
             no_errors: self.no_errors,
             expected: self.expect == Expect::Baseline,
@@ -6194,12 +6254,18 @@ async fn recover(
     let mut watches = vec![PushWatch::default(); n];
     // What was read before the restoration began gives only each
     // document's latest word about its current version: an unmutated
-    // document's, which the server needn't publish again.
+    // document's, which the server needn't publish again. It doesn't show
+    // the probe recovered, since a change to another seed document may
+    // change its diagnostics at the same version: it decides only if it is
+    // still the last publish read by the end of the bound.
     rec.pushes.scan(&ctx.s.messages, docs, began);
     for s in rec.stable.iter().filter(|s| s.params.is_none()) {
         if let Some(&index) = rec.pushes.latest[s.doc].get(&docs[s.doc].version) {
             rec.push_read(&mut watches, &ctx.s.messages, docs, s.doc, docs[s.doc].version, index);
         }
+    }
+    for w in &mut watches {
+        w.matched = None;
     }
     let (mut polls, mut last, mut spent) = (0u32, restored, false);
     let mut end = BatchEnd::default();
@@ -6314,7 +6380,7 @@ async fn recover(
             ProbeEnd::Unseen(format!("case {k}: {} had malformed diagnostics during recovery", s.label))
         } else if s.params.is_some() {
             match (seen[i], &stopped, terminal[i]) {
-                (Some((after, terminal)), ..) => ProbeEnd::Recovered { after, terminal },
+                (Some((after, terminal)), ..) => ProbeEnd::Recovered { after, terminal, since: None },
                 (None, Some(why), _) => {
                     ProbeEnd::Unseen(format!("case {k}: {} wasn't seen to recover: {why}", s.label))
                 }
@@ -6327,7 +6393,7 @@ async fn recover(
                     match probe_answer(&ctx.s, request, s.probe, timeout) {
                         Ok(projected) if rec.recovered(i, &projected) => {
                             let at = ctx.s.answered_at(&request.id).unwrap_or(request.deadline_at);
-                            ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: true }
+                            ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: true, since: None }
                         }
                         Ok(projected) => {
                             let to = ctx.s.answered_at(&request.id).unwrap_or(request.deadline_at);
@@ -6361,7 +6427,7 @@ async fn recover(
             let version = docs[s.doc].version;
             match (w.matched, &stopped, w.latest) {
                 (Some(at), ..) if !rec.no_errors => {
-                    ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: false }
+                    ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: false, since: None }
                 }
                 (_, Some(why), _) => ProbeEnd::Unseen(format!("case {k}: {} wasn't seen to recover: {why}", s.label)),
                 _ if !drained => ProbeEnd::Unseen(format!(
@@ -6383,13 +6449,30 @@ async fn recover(
                     );
                     let error = rec.no_errors && recovery::first_error(&projected).is_some();
                     let read = format!("lspcheck read all the server sent in those {t} s, and polled {polls} time(s)");
+                    let since = (at < restored).then_some(at);
                     match (error, matched) {
                         (false, _) if rec.no_errors && rec.expect == Expect::Observe => ProbeEnd::Recovered {
                             after: w.clean_since.unwrap_or(at).saturating_sub(restored),
                             terminal: false,
+                            since,
                         },
-                        (false, Some(m)) => ProbeEnd::Recovered { after: m.saturating_sub(restored), terminal: false },
-                        _ => rec.differs(i, k, &deciding, &projected, (at, bound), interrupted.clone(), &read),
+                        (false, Some(m)) => {
+                            ProbeEnd::Recovered { after: m.saturating_sub(restored), terminal: false, since }
+                        }
+                        (false, None) if rec.recovered(i, &projected) => {
+                            ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: false, since }
+                        }
+                        _ => {
+                            let whole = interrupted.clone().and_then(|()| match version {
+                                1 => Err(format!(
+                                    "{deciding} describes the opened text but was read after lspcheck began changing \
+                                     another seed document, so it may be version 1's analysis finishing late or \
+                                     diagnostics that depend on that document"
+                                )),
+                                _ => Ok(()),
+                            });
+                            rec.differs(i, k, &deciding, &projected, (at, bound), whole, &read)
+                        }
                     }
                 }
             }
@@ -6815,6 +6898,7 @@ async fn mutation_scenario(ctx: &mut Ctx<'_>) {
             if summary.first_change.is_none() {
                 rec.before_first_mutation(&ctx.s, &docs, change_at);
             }
+            rec.changing(d, change_at);
             ext.record(&ctx.s, &asked, d, change_at, *version, after.clone());
             if let Err(e) = ctx.s.notify("textDocument/didChange", Some(params.clone())).await {
                 lost = Some((lost_after_write(ctx, "a didChange", &e).await, place));
@@ -7078,7 +7162,7 @@ async fn leave_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequ
 /// the verdicts the checks' own scenarios give.
 fn judge_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest], end: Duration) {
     let Some(opened_at) = ext.opened_at else { return };
-    ext.judge(&ctx.s.messages, asked, Some(end));
+    ext.judge(&ctx.s, asked, Some(end));
     let encoding = ext.encoding;
     let ext = &*ext;
     ctx.report_judged("D1", opened_at, end, |why| documents::judge_d1(encoding, &ext.positions, why));
@@ -7086,9 +7170,10 @@ fn judge_extended(ctx: &mut Ctx<'_>, ext: &mut Extended, asked: &[StepRequest], 
     if asked.iter().any(|a| a.method == SELECTION_RANGE) {
         ctx.report_judged("D6", opened_at, end, |why| documents::judge_d6(&ext.selection, why));
     }
-    // Each publish D2 would fail on its own, by the case it was read in.
-    let d2 = ext.published.iter().zip(&ext.published_cases).filter_map(|(p, case)| {
-        let failed = documents::judge_d2(&ext.docs, std::slice::from_ref(p), None).0 == Verdict::Fail;
+    // Each publish D2 fails, by the case it was read in.
+    let seen = documents::d2_each(&ext.docs, &ext.published);
+    let d2 = seen.iter().zip(&ext.published_cases).filter_map(|(seen, case)| {
+        let failed = matches!(seen, documents::D2Seen::Unsent(_));
         case.filter(|_| failed).map(|case| Trouble::new(case, "D2", Verdict::Fail, PUBLISH_DIAGNOSTICS))
     });
     let troubles: Vec<Trouble> = ext.troubles.iter().cloned().chain(d2).collect();
@@ -7258,10 +7343,10 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
     let mut troubles = Vec::new();
     let mut recovered = Vec::new();
     let mut slowest: Option<(Duration, u64, usize, bool)> = None;
-    // A publish labelled with version 1 read after the first mutation that
-    // differs (held only to no_errors, has an Error), or one lspcheck may
-    // have missed, leaves the probe without a stable baseline, as if read
-    // before.
+    // A publish labelled with version 1 read after the first mutation, and
+    // before a change to another seed document, that differs (held only to
+    // no_errors, has an Error), or one lspcheck may have missed, leaves the
+    // probe without a stable baseline, as if read before.
     let pushed: Vec<Option<PushBaseline>> = rec.stable.iter().map(|s| rec.push_baseline(s)).collect();
     let unstable: Vec<Option<String>> = pushed
         .iter()
@@ -7282,12 +7367,12 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
                 continue;
             }
             match outcome {
-                ProbeEnd::Recovered { after, terminal } => {
+                ProbeEnd::Recovered { after, terminal, .. } => {
                     if slowest.is_none_or(|(t, ..)| *after > t) {
                         slowest = Some((*after, c.case, i, *terminal));
                     }
                     // As M3's pass: only with nothing missed in its windows.
-                    let windows: Vec<_> = std::iter::once(c.window).chain(stable.baseline_window).collect();
+                    let windows: Vec<_> = c.windows(i).chain(stable.baseline_window).collect();
                     if windows.iter().all(|&(from, to)| ctx.s.incomplete_within(from, to).is_none()) {
                         let mut t = Trouble::new(c.case, "M3", Verdict::Pass, &stable.label);
                         t.result.unless_missed = Some(Recheck::Recovered {
@@ -7366,8 +7451,12 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
             "nothing failed, but lspcheck may have missed evidence in a recovery window or pushed baseline, because {why}: {pass}"
         )
     };
-    let windows: Vec<_> =
-        rec.cases.iter().map(|c| c.window).chain(rec.stable.iter().filter_map(|s| s.baseline_window)).collect();
+    let windows: Vec<_> = rec
+        .cases
+        .iter()
+        .flat_map(|c| (0..c.outcomes.len()).flat_map(|i| c.windows(i)))
+        .chain(rec.stable.iter().filter_map(|s| s.baseline_window))
+        .collect();
     match windows.iter().find_map(|&(from, to)| ctx.s.incomplete_within(from, to)) {
         Some(why) => ctx.report("M3", Verdict::Error, unless(&why)),
         None => {
@@ -8893,6 +8982,52 @@ while header := sys.stdin.buffer.readline():
         }
     }
 
+    #[test]
+    fn a_pushed_baseline_holds_version_1_only_until_another_seed_changes() {
+        let uri = "file:///w/a.lua";
+        let publish = |at: u64, diagnostics: Value| {
+            let n = message::notification(
+                PUBLISH_DIAGNOSTICS,
+                Some(json!({"uri": uri, "version": 1, "diagnostics": diagnostics})),
+            );
+            (Duration::from_secs(at), Message::parse(&serde_json::to_vec(&n).unwrap()).unwrap())
+        };
+        let error = json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "severity": 1, "message": "b.lua is broken"}]);
+        let stable = Stable {
+            doc: 0,
+            probe: profile::Probe::PublishDiagnostics,
+            label: "publishDiagnostics of a.lua".into(),
+            params: None,
+            baseline: recovery::project(profile::Probe::PublishDiagnostics, &json!({"uri": uri, "diagnostics": []}))
+                .unwrap(),
+            baseline_window: Some((Duration::ZERO, Duration::from_secs(1))),
+        };
+        let mut rec = Recovery {
+            expect: Expect::Baseline,
+            uris: vec![uri.into(), "file:///w/b.lua".into()],
+            ..Recovery::default()
+        };
+        // a.lua's own changes don't end its hold; b.lua's first does.
+        rec.changing(0, Duration::from_secs(1));
+        rec.changing(1, Duration::from_secs(3));
+        rec.changing(1, Duration::from_secs(5));
+        let push = rec.push_baseline(&stable).unwrap();
+        assert_eq!(push.held_until, Some(Duration::from_secs(3)));
+        // Read after b.lua's change began, a publish with b.lua's Error
+        // isn't held to the baseline, nor is output missed then.
+        let missed =
+            |_: Duration, to: Duration| (to > Duration::from_secs(3)).then(|| "a frame was skipped".to_string());
+        assert_eq!(push.unstable(&[publish(4, error.clone())], missed), None);
+        // Read before, it is.
+        let why = push.unstable(&[publish(2, error.clone())], |_, _| None).unwrap();
+        assert!(why.contains("read after the first mutation differed from the baseline"), "{why}");
+        // With no other seed changed, every later publish is held.
+        rec.changed = vec![Some(Duration::from_secs(1))];
+        let push = rec.push_baseline(&stable).unwrap();
+        assert_eq!(push.held_until, None);
+        assert!(push.unstable(&[publish(40, error)], |_, _| None).is_some());
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn recovery_pushed_baseline_is_rechecked_after_judgment() {
@@ -8921,7 +9056,7 @@ while header := sys.stdin.buffer.readline():
             for case in 0..2 {
                 let window = (Duration::from_secs(4 + case * 2), Duration::from_secs(5 + case * 2));
                 let mut outcomes = vec![if recovered {
-                    ProbeEnd::Recovered { after: Duration::ZERO, terminal: false }
+                    ProbeEnd::Recovered { after: Duration::ZERO, terminal: false, since: None }
                 } else {
                     rec.differs(0, case, "the last publish", &json!([{"severity": 2}]), window, Ok(()), "read in full")
                 }];
@@ -8964,6 +9099,45 @@ while header := sys.stdin.buffer.readline():
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
+    async fn a_recovery_decided_by_a_publish_read_before_the_restoration_needs_nothing_missed_since() {
+        // Another seed's change at 3 s ends the baseline's hold, so output
+        // missed from 4 s to 4.5 s, before the restoration at 5 s, is outside
+        // the baseline's windows and the recovery window. A recovery decided
+        // by a publish read at 3.5 s rests on it: the missed output may have
+        // been a later publish. One decided after the restoration doesn't.
+        for since in [None, Some(Duration::from_millis(3500))] {
+            let cfg = mutation_test_config("exit 0");
+            let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+            let docs = recovery_test_docs();
+            let publish = message::notification(
+                PUBLISH_DIAGNOSTICS,
+                Some(json!({"uri": docs[0].uri, "version": 1, "diagnostics": []})),
+            );
+            ctx.s.messages.push((Duration::ZERO, Message::parse(&serde_json::to_vec(&publish).unwrap()).unwrap()));
+            let mut rec = Recovery { expect: Expect::Baseline, pushes_pending: true, ..Recovery::default() };
+            rec.before_first_mutation(&ctx.s, &docs, Duration::from_secs(2));
+            assert_eq!(rec.stable.len(), 1);
+            rec.changed = vec![None, Some(Duration::from_secs(3))];
+            let window = (Duration::from_secs(5), Duration::from_secs(6));
+            let outcomes = vec![ProbeEnd::Recovered { after: Duration::ZERO, terminal: false, since }];
+            rec.cases.push(CaseRecovery { case: 0, window, outcomes });
+            judge_m3(&mut ctx, &rec, None, None);
+            let mut m3 = ctx.results.pop().unwrap();
+            assert_eq!(m3.verdict, Verdict::Pass, "{since:?}");
+            let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
+            finish.lost = vec![(Duration::from_secs(4), Duration::from_millis(4500), "a frame was skipped".into())];
+            m3.recheck(&finish);
+            if since.is_some() {
+                assert_eq!(m3.verdict, Verdict::Error);
+                assert!(m3.detail.contains("a frame was skipped"), "{}", m3.detail);
+            } else {
+                assert_eq!(m3.verdict, Verdict::Pass, "{}", m3.detail);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
     async fn recovery_pushed_baseline_is_held_to_publishes_read_after_judgment() {
         // A publish labelled with version 1 read only after M3 was judged,
         // with a Warning the baseline lacks, turns what rested on that
@@ -8995,7 +9169,7 @@ while header := sys.stdin.buffer.readline():
             }
             let window = (Duration::from_secs(4), Duration::from_secs(5));
             let mut outcomes = vec![if recovered {
-                ProbeEnd::Recovered { after: Duration::ZERO, terminal: false }
+                ProbeEnd::Recovered { after: Duration::ZERO, terminal: false, since: None }
             } else {
                 rec.differs(0, 0, "the last publish", &json!([{"severity": 2}]), window, Ok(()), "read in full")
             }];

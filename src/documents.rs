@@ -414,6 +414,12 @@ pub struct Published {
     pub version: Option<Value>,
     /// When the notification was read.
     pub read_at: Duration,
+    /// When lspcheck began writing the latest request answered before the
+    /// notification was read, if any. The server reads its input in order,
+    /// so a request written after a `didOpen` is answered only once the
+    /// server has read that `didOpen`, and what it writes after the answer
+    /// is read after it.
+    pub answered: Option<Duration>,
     /// Where in its scenario it was read, as [`Source::place`].
     pub place: Option<String>,
 }
@@ -1276,8 +1282,14 @@ fn version_list(numbers: &[i64]) -> String {
 }
 
 /// The lawful publishes a D2 detail counts, after its main clause.
-fn unjudged_counts(unversioned: usize, unjudged: usize) -> String {
+fn unjudged_counts(unversioned: usize, unjudged: usize, early: usize) -> String {
     let mut out = String::new();
+    if early > 0 {
+        out.push_str(&format!(
+            "; {early} with a version lspcheck hadn't sent that may predate the server's reading of the \
+             document's didOpen, which D2 doesn't judge"
+        ));
+    }
     if unversioned > 0 {
         out.push_str(&format!("; {unversioned} without a version, which is lawful"));
     }
@@ -1287,39 +1299,94 @@ fn unjudged_counts(unversioned: usize, unjudged: usize) -> String {
     out
 }
 
+/// How D2 takes one `textDocument/publishDiagnostics`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum D2Seen {
+    /// About a URI lspcheck didn't open.
+    Elsewhere,
+    Unversioned,
+    /// `null` or a non-integer version: a type error for K2.
+    NotInteger,
+    /// A version lspcheck had sent for the document when it was read.
+    Sent,
+    /// Another version, read before lspcheck knew the server had read the
+    /// document's `didOpen`: the server may have written it before then,
+    /// about a document the client hadn't opened, whose version LSP
+    /// doesn't govern.
+    Early,
+    /// Another version, read after: the failure, as its detail names it.
+    Unsent(String),
+}
+
+/// How D2 takes each of `published`, given in the order they were read.
+///
+/// Only a publish read once lspcheck knew the server had read the
+/// document's `didOpen` can fail. lspcheck knows that from what it read
+/// before the publish: a publish about the document labelled with a version
+/// lspcheck had sent for it, which the server could only have learnt from
+/// the `didOpen` or a later `didChange`, or the answer to a request lspcheck
+/// began writing after the `didOpen` ([`Published::answered`]).
+pub fn d2_each(docs: &[OpenDoc], published: &[Published]) -> Vec<D2Seen> {
+    // For each document, whether the server is known to have read its `didOpen`.
+    let mut known = vec![false; docs.len()];
+    published
+        .iter()
+        .map(|p| {
+            let Some(d) = docs.iter().position(|doc| same_uri(&doc.uri, &p.uri)) else { return D2Seen::Elsewhere };
+            let doc = &docs[d];
+            let opened = doc.sent().next().map(|(at, _)| at);
+            if opened.zip(p.answered).is_some_and(|(opened, asked)| asked > opened) {
+                known[d] = true;
+            }
+            let Some(n) = p.version.as_ref().and_then(version_number) else {
+                return match p.version {
+                    None => D2Seen::Unversioned,
+                    Some(_) => D2Seen::NotInteger,
+                };
+            };
+            // The same "sent" test as `candidates`: what lspcheck had written
+            // for this URI by the time the notification was read, including
+            // versions whose texts it no longer keeps.
+            let sent: Vec<i64> = doc.sent().filter(|(at, _)| *at <= p.read_at).map(|(_, n)| n).collect();
+            if sent.contains(&n) {
+                known[d] = true;
+                return D2Seen::Sent;
+            }
+            if !known[d] {
+                return D2Seen::Early;
+            }
+            // Known to follow the `didOpen`, so at least its version was sent.
+            let place = p.place.as_ref().map(|place| format!("{place}: ")).unwrap_or_default();
+            D2Seen::Unsent(format!(
+                "{place}{} carries version {}, and lspcheck had sent {} for it before the notification was read",
+                p.uri,
+                n,
+                version_list(&sent)
+            ))
+        })
+        .collect()
+}
+
 /// D2's verdict: an integer `version` in `textDocument/publishDiagnostics`
 /// for a document lspcheck opened is one lspcheck sent for that URI (in
 /// `didOpen`, later `didChange`) before the notification was read. An older
 /// version is lawful, and so is none at all; `null` or a non-integer one
 /// isn't judged here (a type error for K2), nor is any URI lspcheck didn't
-/// open. `incomplete` says why lspcheck may have missed a notification the
-/// server sent from the `didOpen` on.
+/// open, nor a publish the server may have written before it read the
+/// document's `didOpen` ([`d2_each`]). `incomplete` says why lspcheck may
+/// have missed a notification the server sent from the `didOpen` on.
 pub fn judge_d2(docs: &[OpenDoc], published: &[Published], incomplete: Option<&str>) -> (Verdict, String) {
     let mut fails: Vec<String> = Vec::new();
-    let (mut checked, mut unversioned, mut unjudged) = (0usize, 0usize, 0usize);
-    for p in published {
-        let Some(doc) = docs.iter().find(|d| same_uri(&d.uri, &p.uri)) else { continue };
-        let Some(n) = p.version.as_ref().and_then(version_number) else {
-            match p.version {
-                None => unversioned += 1,
-                Some(_) => unjudged += 1,
-            }
-            continue;
-        };
-        // The same "sent" test as `candidates`: what lspcheck had written
-        // for this URI by the time the notification was read, including
-        // versions whose texts it no longer keeps.
-        let sent: Vec<i64> = doc.sent().filter(|(at, _)| *at <= p.read_at).map(|(_, n)| n).collect();
-        if sent.contains(&n) {
-            checked += 1;
-            continue;
+    let (mut checked, mut unversioned, mut unjudged, mut early) = (0usize, 0usize, 0usize, 0usize);
+    for seen in d2_each(docs, published) {
+        match seen {
+            D2Seen::Elsewhere => {}
+            D2Seen::Unversioned => unversioned += 1,
+            D2Seen::NotInteger => unjudged += 1,
+            D2Seen::Sent => checked += 1,
+            D2Seen::Early => early += 1,
+            D2Seen::Unsent(why) => fails.push(why),
         }
-        let had = if sent.is_empty() { "none".to_string() } else { version_list(&sent) };
-        let place = p.place.as_ref().map(|place| format!("{place}: ")).unwrap_or_default();
-        fails.push(format!(
-            "{place}{} carries version {}, and lspcheck had sent {had} for it before the notification was read",
-            p.uri, n
-        ));
     }
     if !fails.is_empty() {
         // A failure that was seen stands, whatever else was missed.
@@ -1335,13 +1402,24 @@ pub fn judge_d2(docs: &[OpenDoc], published: &[Published], incomplete: Option<&s
             ),
         );
     }
-    let extras = unjudged_counts(unversioned, unjudged);
+    let extras = unjudged_counts(unversioned, unjudged, early);
     if let Some(why) = incomplete {
         return (
             Verdict::Error,
             format!(
                 "inconclusive, because {why}: a versioned diagnostics notification may have been missed; \
                  {checked} versioned diagnostics notification(s) arrived{extras}"
+            ),
+        );
+    }
+    if checked == 0 && early > 0 {
+        let extras = unjudged_counts(unversioned, unjudged, 0);
+        return (
+            Verdict::NotExercised,
+            format!(
+                "every versioned diagnostics notification for an opened document may predate the server's reading \
+                 of its didOpen: {early} with a version lspcheck hadn't sent, read before anything showed the server \
+                 had read the didOpen{extras}"
             ),
         );
     }
@@ -1595,12 +1673,15 @@ mod tests {
         assert!(detail.contains("p0; p1; p2; and 2 more"), "{detail}");
     }
 
+    /// A publish read at `read` ms, just after the answer to a request
+    /// lspcheck began writing then.
     fn publish(uri: &str, version: Value, read: u64) -> Published {
-        Published { uri: uri.into(), version: Some(version), read_at: Duration::from_millis(read), place: None }
+        let at = Duration::from_millis(read);
+        Published { uri: uri.into(), version: Some(version), read_at: at, answered: Some(at), place: None }
     }
 
     fn unversioned(uri: &str, read: u64) -> Published {
-        Published { uri: uri.into(), version: None, read_at: Duration::from_millis(read), place: None }
+        Published { version: None, ..publish(uri, Value::Null, read) }
     }
 
     #[test]
@@ -1627,10 +1708,56 @@ mod tests {
             detail.contains("carries version 42, and lspcheck had sent 41 for it before the notification was read"),
             "{detail}"
         );
-        // Read before any version was sent, it names that too.
-        let (v, detail) = judge_d2(&d, &[publish(URI, serde_json::json!(41), 5)], None);
-        assert_eq!(v, Verdict::Fail);
-        assert!(detail.contains("and lspcheck had sent none for it"), "{detail}");
+    }
+
+    #[test]
+    fn d2_judges_a_publish_only_once_the_server_is_known_to_have_read_the_didopen() {
+        let d = [doc(&[(10, 41, "a"), (100, 42, "b")])];
+        let before = |version: i64, read: u64, answered: Option<u64>| Published {
+            answered: answered.map(Duration::from_millis),
+            ..publish(URI, serde_json::json!(version), read)
+        };
+        // A workspace scan labelled 0, read before anything showed the
+        // server had read the didOpen: it may predate it. Read before
+        // lspcheck began writing the didOpen, or after the answer to a
+        // request written before it, it is no different.
+        for early in [before(0, 5, None), before(0, 50, None), before(0, 50, Some(5)), before(0, 50, Some(10))] {
+            assert_eq!(d2_each(&d, std::slice::from_ref(&early)), [D2Seen::Early]);
+        }
+        let (v, detail) = judge_d2(&d, &[before(0, 20, None), before(0, 30, None)], None);
+        assert_eq!(v, Verdict::NotExercised);
+        assert_eq!(
+            detail,
+            "every versioned diagnostics notification for an opened document may predate the server's reading of its \
+             didOpen: 2 with a version lspcheck hadn't sent, read before anything showed the server had read the didOpen"
+        );
+        // A publish labelled with a version lspcheck sent shows it, for that
+        // document only: a later wrong one fails, one about another
+        // document doesn't.
+        let other = "file:///w/other.txt";
+        let docs = [d[0].clone(), OpenDoc { uri: other.into(), ..doc(&[(12, 1, "x")]) }];
+        let published = [
+            before(0, 20, None),
+            before(41, 30, None),
+            Published { uri: other.into(), ..before(0, 40, None) },
+            before(0, 50, None),
+        ];
+        let seen = d2_each(&docs, &published);
+        assert_eq!(seen[..3], [D2Seen::Early, D2Seen::Sent, D2Seen::Early]);
+        assert!(matches!(&seen[3], D2Seen::Unsent(why) if why.contains("carries version 0, and lspcheck had sent 41")));
+        assert_eq!(judge_d2(&docs, &published, None).0, Verdict::Fail);
+        // The answer to a request written after the didOpen shows it too.
+        assert!(matches!(d2_each(&d, &[before(0, 50, Some(11))])[..], [D2Seen::Unsent(_)]));
+        // Beside a judged publish, the early ones are counted.
+        let (v, detail) = judge_d2(&d, &[before(0, 20, None), before(41, 30, None)], None);
+        assert_eq!(v, Verdict::Pass);
+        assert!(
+            detail.ends_with(
+                "named a version lspcheck had sent; 1 with a version lspcheck hadn't sent that may predate the \
+                 server's reading of the document's didOpen, which D2 doesn't judge"
+            ),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -1902,15 +2029,23 @@ mod tests {
                 uri: b.into(),
                 version: Some(serde_json::json!(7)),
                 read_at: Duration::from_millis(150),
+                answered: None,
                 place: None,
             },
             Published {
                 uri: b.into(),
                 version: Some(serde_json::json!(7)),
                 read_at: Duration::from_millis(50),
+                answered: None,
                 place: None,
             },
-            Published { uri: URI.into(), version: None, read_at: Duration::from_millis(150), place: None },
+            Published {
+                uri: URI.into(),
+                version: None,
+                read_at: Duration::from_millis(150),
+                answered: None,
+                place: None,
+            },
         ];
         forget_after_close(&mut sources, &mut published, b, at);
         assert_eq!(sources[0].found.len(), 1);

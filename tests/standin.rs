@@ -2825,22 +2825,27 @@ fn a_frame_skipped_after_didopen_makes_a_d1_pass_inconclusive() {
 fn diagnostics_versions_the_document_never_had_fail_d2() {
     // The stand-in labels diagnostics with its own counter instead of the
     // document's version; D1 still judges the positions against version 41,
-    // since an unknown label makes every version sent a candidate.
+    // since an unknown label makes every version sent a candidate. The
+    // publish on didOpen, labelled 1, may predate the server's reading of
+    // the didOpen, so isn't judged; the one on the change, labelled 2, is
+    // read after answers to requests sent after the didOpen.
     let r = fault("diagnostics-own-version");
     only_fails(&r, &["D2"]);
     assert_eq!(r.status, 1, "D2 is a MUST check");
-    assert!(r.stdout.contains("carries version 1,"), "{}", r.stdout);
-    assert!(r.stdout.contains("lspcheck had sent 41"), "{}", r.stdout);
+    assert!(r.stdout.contains("carries version 2, and lspcheck had sent 41 and 42"), "{}", r.stdout);
 }
 
 #[test]
 fn a_diagnostics_version_beyond_the_document_fails_d2() {
     // One past the version lspcheck sent is not a version it had either.
+    // The publish on didOpen, labelled 42, is read before anything shows
+    // the server had read the didOpen, so it isn't judged; the one on the
+    // change to 42, labelled 43, is read after the answers to requests sent
+    // after the didOpen.
     let r = fault("future-diagnostics-version");
     only_fails(&r, &["D2"]);
     assert_eq!(r.status, 1, "D2 is a MUST check");
-    assert!(r.stdout.contains("carries version 42,"), "{}", r.stdout);
-    assert!(r.stdout.contains("lspcheck had sent 41"), "{}", r.stdout);
+    assert!(r.stdout.contains("carries version 43, and lspcheck had sent 41 and 42"), "{}", r.stdout);
 }
 
 #[test]
@@ -4102,8 +4107,11 @@ fn a_position_inside_a_character_of_a_mutated_text_fails_d1() {
 fn a_diagnostics_version_never_sent_in_the_mutation_scenario_fails_d2() {
     // The stand-in labels diagnostics with its own counter. With one seed
     // document it would match the versions sent; with two, it runs ahead of
-    // each. The documents scenario fails D2 too; the detail shows the
-    // mutation scenario's failure. Its publishes never return to their
+    // each. other.lua's publish on didOpen, labelled 2, may predate the
+    // server's reading of that didOpen, so isn't judged; main.lua's on each
+    // change are read after a publish labelled with a version lspcheck sent.
+    // The documents scenario fails D2 too; the detail shows the mutation
+    // scenario's failure. Its publishes never return to their
     // baseline, so pushed diagnostics aren't a recovery probe here: each
     // case, and each case run again alone, would wait out recovery_timeout.
     let (path, _keep) = mutation_variant(&[
@@ -4118,8 +4126,137 @@ fn a_diagnostics_version_never_sent_in_the_mutation_scenario_fails_d2() {
     expect(&r, "D2", "fail");
     let d2 = detail(&r, "D2");
     let mutation = &d2[d2.find("FAIL in the mutation scenario: ").expect(&d2)..];
-    assert!(mutation.contains("other.lua carries version 2, and lspcheck had sent 1 for it"), "{d2}");
-    assert!(mutation.contains("main.lua carries version"), "{d2}");
+    assert!(mutation.contains("case 0: file:///"), "{d2}");
+    assert!(mutation.contains("main.lua carries version 3, and lspcheck had sent 1 and 2 for it"), "{d2}");
+}
+
+#[test]
+fn diagnostics_published_before_the_didopen_was_read_are_lawful() {
+    // On initialized, the stand-in publishes diagnostics labelled 0 for the
+    // workspace's files and the documents scenario's, before it reads any
+    // didOpen. LSP sets no rule for the version of a document the client
+    // hasn't opened, and lspcheck may read them after it began writing the
+    // didOpen, so D2 counts them without judging them, in both scenarios.
+    let (r, _, _keep) = mutated(&["workspace-scan-diagnostics"], &[]);
+    passes_except(&r, &[("M1", "pass"), ("M2", "pass"), ("M3", "pass")]);
+    let d2 = detail(&r, "D2");
+    let early = "with a version lspcheck hadn't sent that may predate the server's reading of the document's didOpen";
+    assert!(d2.starts_with("PASS in the documents scenario: "), "{d2}");
+    assert!(d2.contains(&format!("named a version lspcheck had sent; 2 {early}")), "{d2}");
+    let mutation = &d2[d2.find("PASS in the mutation scenario: ").expect(&d2)..];
+    assert!(mutation.contains(&format!("named a version lspcheck had sent; 1 {early}")), "{d2}");
+}
+
+/// The stand-in's mutation profile with a second seed document, other.lua,
+/// and pushed diagnostics as its only recovery probe, held to `recovery`.
+fn cross_file_profile(recovery: &str) -> (std::path::PathBuf, tempfile::TempDir) {
+    mutation_variant(&[
+        ("files = { \"main.lua\" = \"\"\"", "files = { \"other.lua\" = \"local x = (1)\\n\", \"main.lua\" = \"\"\""),
+        ("[mutation]\n", "[mutation]\nfiles = [\"main.lua\", \"other.lua\"]\n"),
+        (
+            "[mutation.lexicon]",
+            &format!("[mutation.recovery]\nprobes = [\"publishDiagnostics\"]\n{recovery}\n\n[mutation.lexicon]"),
+        ),
+    ])
+}
+
+#[test]
+fn cross_file_diagnostics_that_recover_pass_m3() {
+    // A mutation of one seed adds an Error to the other's diagnostics,
+    // published again at its unchanged version 1, and the restoration
+    // removes it. That publish describes the other seed's opened text but
+    // not the changed one's, so it doesn't show the baseline unstable.
+    let (path, _keep) = cross_file_profile("expect = \"baseline\"\nrecovery_timeout = \"10s\"");
+    let (r, _, _keep) =
+        mutated_with(&path, &["cross-file-diagnostics"], &["--mutation-cases", "2", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+    expect(&r, "M3", "pass");
+    assert!(
+        detail(&r, "M3").contains("probes: publishDiagnostics of main.lua, publishDiagnostics of other.lua;"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn cross_file_diagnostics_that_never_recover_fail_m3() {
+    // As above, but once a seed was unbalanced, the other keeps its Error
+    // after the restoration. In case 0, other.lua's text never changed, so
+    // its Error, labelled with version 1, may be a late baseline (ERROR).
+    // Case 1 changes other.lua too, and main.lua's Error is labelled with
+    // its restored version: with `expect = "baseline"`, that fails M3.
+    let (path, _keep) = cross_file_profile("expect = \"baseline\"\nrecovery_timeout = \"2s\"");
+    let (r, _, _keep) =
+        mutated_with(&path, &["cross-file-errors-after-unbalanced"], &["--mutation-cases", "2", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+    expect(&r, "M3", "fail");
+    assert!(
+        detail(&r, "M3").contains(
+            "case 1: publishDiagnostics of main.lua didn't return to its baseline within 2 s of the restoration"
+        ),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn cross_file_errors_published_only_after_the_restoration_leave_m3_an_error() {
+    // As above, but the stand-in publishes the other seed's diagnostics
+    // again only once every document is back at its opened text: its Error
+    // is read after the restoration began. The clean publish read before
+    // the first mutation is older than the change to main.lua, so it
+    // doesn't show other.lua recovered. other.lua's text is still the
+    // opened one, so the Error, labelled with version 1, may be a late
+    // baseline: M3 is ERROR, not PASS.
+    let (path, _keep) = cross_file_profile("expect = \"baseline\"\nrecovery_timeout = \"2s\"");
+    let faults = ["cross-file-errors-after-unbalanced", "cross-file-publishes-when-restored"];
+    let (r, _, _keep) = mutated_with(&path, &faults, &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+    expect(&r, "M3", "error");
+    assert!(detail(&r, "M3").contains(UNMUTATED_SEED_DIFFERS), "{}", r.stdout);
+}
+
+#[test]
+fn a_late_baseline_of_an_unmutated_seed_leaves_m3_an_error() {
+    // Once main.lua changes, the stand-in publishes other.lua, still at
+    // version 1, with a Warning its baseline lacks, and keeps it: version
+    // 1's analysis finishing late, which is lawful. It can't be told from
+    // diagnostics that depend on main.lua and never recovered, so with
+    // `expect = "baseline"` M3 is ERROR, not FAIL.
+    let (path, _keep) = cross_file_profile("expect = \"baseline\"\nrecovery_timeout = \"2s\"");
+    let (r, _, _keep) =
+        mutated_with(&path, &["late-baseline-warning-elsewhere"], &["--mutation-cases", "1", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+    expect(&r, "M3", "error");
+    assert!(detail(&r, "M3").contains(UNMUTATED_SEED_DIFFERS), "{}", r.stdout);
+}
+
+/// What M3 says of a seed document whose text never changed when its last
+/// publish differs from its baseline.
+const UNMUTATED_SEED_DIFFERS: &str = "case 0: publishDiagnostics of other.lua: the last publishDiagnostics labelled with \
+                                      version 1 read within 2 s of the restoration describes the opened text but was \
+                                      read after lspcheck began changing another seed document";
+
+#[test]
+fn a_seed_whose_diagnostics_are_never_published_again_passes_m3() {
+    // The clean stand-in never publishes other.lua again after its didOpen.
+    // That publish, read before the first mutation, is still its last word
+    // by the end of recovery_timeout and equals its baseline, so it
+    // recovers.
+    let (path, _keep) = cross_file_profile("expect = \"baseline\"\nrecovery_timeout = \"2s\"");
+    let (r, _, _keep) = mutated_with(&path, &[], &["--mutation-cases", "2", "--only", "M1,M2,M3"]);
+    expect(&r, "M1", "pass");
+    expect(&r, "M2", "pass");
+    expect(&r, "M3", "pass");
+    assert!(
+        detail(&r, "M3").contains("probes: publishDiagnostics of main.lua, publishDiagnostics of other.lua;"),
+        "{}",
+        r.stdout
+    );
 }
 
 #[test]

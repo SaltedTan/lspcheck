@@ -27,6 +27,22 @@
 - When the `documents` scenario fails to initialize or send `didOpen`, every document check (`D1`–`D6`) now reports
   that reason instead of `D4`, `D5` or `D6` falling through to the generic `"the scenario ended before reaching this
   check"` detail.
+- **D2** no longer fails a server that checks the workspace on startup and publishes diagnostics for a file, labelled
+  with a version of its own, before it has read that file's `didOpen`. LSP sets no rule for the version of a document
+  the client hasn't opened. A publish with a version lspcheck hadn't sent is now judged only once lspcheck has read
+  evidence that the server had read the `didOpen`: a publish about the document labelled with a version lspcheck
+  sent, or the answer to a request sent after the `didOpen`. Earlier ones are counted in the detail, and D2 is `N/E`
+  when every versioned publish is one. A server that labels its first publish after `didOpen` wrongly now fails D2
+  only on a later publish.
+- **M3** no longer reports `error` for a multi-file profile whose server's diagnostics for one seed file depend on
+  another (imports and the like): a mutation of one file lawfully changes the other's diagnostics at its unchanged
+  version 1. A publish labelled with version 1 is now held to the pushed-diagnostics baseline only if it was read
+  before lspcheck began writing a change to another seed file. Such a server can now pass M3, and with
+  `expect = "baseline"`, fail it when a changed and restored file doesn't recover. A file whose text never changed
+  that ends a case differing from its baseline at version 1 is `error`, not `fail`: lspcheck can't tell a late
+  baseline from diagnostics that depend on another file and never recovered. For the same reason, an unmutated seed
+  file's publish read before the restoration no longer shows it recovered at once: it decides only if it is still the
+  last read by the end of `recovery_timeout`, so each case of a multi-file profile may take the whole bound.
 
 ## 0.7.0 (2026-11-21)
 
