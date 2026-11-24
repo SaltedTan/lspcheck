@@ -284,7 +284,9 @@ plain `lspcheck/probe`, each sent alone and awaited by `--timeout`. If the serve
 D3 skip and D4 still runs, with the document never opened. Then it leaves.
 
 Positions are found by a fixed table of where each reply and `publishDiagnostics` carries them, never by searching
-for `line` and `character` (so a diagnostic's `data`, for instance, is never read). A position counts only when its URI
+for `line` and `character` (so a diagnostic's `data`, for instance, is never read). A `line` or `character` is read as
+K2 reads a `uinteger`: a whole-valued JSON number from 0 to 2^31-1 in any spelling (`1`, `1.0`, `1e0`); anything else
+isn't a position. D3, D5 and D6 read positions the same way. A position counts only when its URI
 names the opened document, compared as written and then after percent-decoding and folding a drive letter's case. It
 is judged when its line exists and its character is at most the line's length. It is *informative* when its line has
 non-ASCII text before it, since only those can show encodings confused. A reply refers to the version current when its
@@ -353,12 +355,18 @@ have changed it), so neither D4's replies nor later diagnostics are judged by th
 
 - **skip:** the server advertises none of `hoverProvider`, `documentSymbolProvider`, `foldingRangeProvider`,
   `documentHighlightProvider` or `selectionRangeProvider`.
-- **fail:** any of the three requests goes unanswered within `--timeout`. It goes through `fail_call`, so it is
-  `error` when lspcheck couldn't deliver the request, or when missed evidence could have held the answer.
-- **error:** the `didClose` couldn't be sent, or an earlier step left the session unable to send; or a D4 request
-  went unanswered when the server's latest requests before it had gone unanswered too (it had stopped answering
-  before any document was closed, which says nothing about documents that aren't open). A server that answers again
-  in between has recovered, and is judged as usual.
+- **fail:** any of the three requests goes unanswered within `--timeout`, unless missed evidence in that wait could
+  have held the answer (then `error`, as for any windowed recheck). When the server's output ended instead, lspcheck
+  waits up to `--exit-timeout` for its exit, and the detail names the exit status. A request lspcheck couldn't write
+  fails too when it was written after the `didClose` reached the server in full: lspcheck waits up to
+  `--exit-timeout`, as M1 does after a failed write, and an exit or closed output seen then is a server that didn't
+  keep serving; the detail names it. With the document never opened, such a request is an `error`.
+- **error:** the `didClose` couldn't be sent in full, or an earlier step left the session unable to send; a request
+  couldn't be written and the server neither exited nor closed its output, lspcheck stopped reading its output, or
+  lspcheck had withheld an answer at the written-bytes cap; or a D4 request went unanswered or couldn't be written
+  when the server's latest requests before it had gone unanswered too (it had stopped answering before any document
+  was closed, which says nothing about documents that aren't open). A server that answers again in between has
+  recovered, and is judged as usual.
 - **pass:** all three are answered. The detail records each outcome: result (null, empty, or non-empty) or the
   error code, for the closed document, the never-opened one, and the probe.
 
@@ -407,7 +415,8 @@ request's own `positions`:
 - **pass:** otherwise; the detail says how many replies and entries were judged.
 
 A range on a line the text doesn't have is not judged (counted in the detail); a malformed entry (no `range`, not an
-object, a `parent` that isn't an object) is not judged here — it is a type error for
+object, a `parent` that isn't an object, or a `line` or `character` that isn't a `uinteger` as D1 reads it) is not
+judged here — it is a type error for
 [K2](#capabilities-and-robustness) — but is counted.
 The parent chain walk is bounded (1000 levels), and a chain cut short is counted.
 

@@ -218,8 +218,9 @@ and D1 carries the failure. A server that takes no changes leaves D3 `SKIP`.
 The same scenario also checks documents that aren't open (D4): after the change, lspcheck closes document A with a
 `didClose`, then sends one advertised document request about the closed document, the same request about a file in
 the workspace that was never opened and doesn't exist, and a plain request, each awaited alone. Each must get a
-response — any result or error is lawful, including one read from disk — and the server must keep serving. A server
-that advertises none of the document requests leaves D4 `SKIP`.
+response — any result or error is lawful, including one read from disk — and the server must keep serving: one that
+exits after the `didClose` fails D4, whether or not lspcheck could still write the next request. A server that
+advertises none of the document requests leaves D4 `SKIP`.
 
 The same scenario also checks line endings (D5): before closing A, lspcheck opens a second document, B, whose lines end
 in a lone `\r`, `\r\n` and `\n`, with a word on two lines that a wrong split moves onto a line of emoji. A position

@@ -4409,8 +4409,8 @@ async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: O
                 stalled = None;
             }
             Ok((_, Err(e))) => {
-                let e = CallError::Wait(e);
-                let what = format!("{label} went unanswered ({})", describe_call_error(&e, t));
+                let waited = ctx.s.elapsed();
+                let mut what = format!("{label} went unanswered ({})", describe_call_error(&CallError::Wait(e), t));
                 if let Some(why) = stalled {
                     ctx.report(
                         "D4",
@@ -4419,11 +4419,41 @@ async fn d4(ctx: &mut Ctx<'_>, caps: &Value, closed: bool, uri: &str, stalled: O
                     );
                     return closed_at;
                 }
-                ctx.fail_call("D4", since, what, &e);
+                // Its output ended: say how the server went, as when the
+                // request couldn't be written. Only what lspcheck missed
+                // while it waited for the response could have held it.
+                if matches!(e, WaitError::Closed)
+                    && let Some(status) = ctx.s.wait_exit(Instant::now() + ctx.cfg.exit_timeout).await
+                {
+                    what = format!("{what}; the server exited with {}", session::describe_status(status));
+                }
+                ctx.fail_absent_between("D4", since, waited, what);
                 return closed_at;
             }
             Err(e) => {
-                ctx.report("D4", Verdict::Error, format!("{label}: lspcheck couldn't send it ({e})"));
+                let unsent = format!("{label}: lspcheck couldn't send it");
+                let (verdict, detail) = match (stalled, closed) {
+                    (Some(why), _) => (
+                        Verdict::Error,
+                        format!("not judged: {unsent} ({e}), but the server had already stopped answering ({why})"),
+                    ),
+                    (None, false) => (Verdict::Error, format!("{unsent} ({e})")),
+                    (None, true) => match lost_after_write(ctx, &format!("{m} ({label})"), &e).await {
+                        Lost::Gone(why) => (Verdict::Fail, format!("{unsent}: {why} after didClose")),
+                        Lost::Uninspected(why) => (
+                            Verdict::Error,
+                            format!(
+                                "{unsent} ({e}), and lspcheck stopped reading the server's output, so it can't tell \
+                                 whether the server survived: {why}"
+                            ),
+                        ),
+                        Lost::Undelivered(why) => (Verdict::Error, format!("{why}, and the server didn't exit")),
+                        Lost::AfterWithheld(why) => {
+                            (Verdict::Error, format!("{unsent}: {why}, so it isn't held against the server"))
+                        }
+                    },
+                };
+                ctx.report("D4", verdict, detail);
                 return closed_at;
             }
         }

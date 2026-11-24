@@ -273,7 +273,7 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
                 for (i, fr) in arr.iter().enumerate() {
                     let p = format!("[{i}]");
                     for name in ["startLine", "endLine"] {
-                        if fr.get(name).and_then(|v| as_u64(Some(v))).is_some() {
+                        if as_uinteger(fr.get(name)).is_some() {
                             out.push(Found {
                                 uri: uri.to_string(),
                                 pointer: format!("{p}.{name}"),
@@ -285,7 +285,9 @@ pub fn positions(method: &str, params: &Value, result: Option<&Value>) -> Vec<Fo
                     // A `FoldingRange` with characters is a position on its
                     // line; without them it is a line alone.
                     for (line_name, char_name) in [("startLine", "startCharacter"), ("endLine", "endCharacter")] {
-                        if let (Some(line), Some(character)) = (as_u64(fr.get(line_name)), as_u64(fr.get(char_name))) {
+                        if let (Some(line), Some(character)) =
+                            (as_uinteger(fr.get(line_name)), as_uinteger(fr.get(char_name)))
+                        {
                             out.push(Found {
                                 uri: uri.to_string(),
                                 pointer: format!("{p}.{char_name}"),
@@ -514,18 +516,26 @@ fn push_range(out: &mut Vec<Found>, uri: &str, pointer: &str, ((sl, sc), (el, ec
     });
 }
 
-fn as_u64(v: Option<&Value>) -> Option<usize> {
-    v.and_then(|v| v.as_u64()).map(|n| n as usize)
+/// A `uinteger`, such as a position's `line` or `character`: a whole-valued
+/// JSON number from 0 to 2^31-1 however it is spelled (`1`, `1.0` and `1e0`
+/// are all 1), as K2 reads it.
+pub fn uinteger(v: &Value) -> Option<usize> {
+    let n = crate::message::integer_value(v.as_number()?)?;
+    (0..=i64::from(i32::MAX)).contains(&n).then_some(n as usize)
+}
+
+fn as_uinteger(v: Option<&Value>) -> Option<usize> {
+    v.and_then(uinteger)
 }
 
 fn as_str(v: Option<&Value>) -> Option<&str> {
     v.and_then(|v| v.as_str())
 }
 
-/// A `Position`: an object with non-negative integer `line` and `character`.
+/// A `Position`: an object with `uinteger` `line` and `character`.
 fn as_pos(v: Option<&Value>) -> Option<(usize, usize)> {
     let v = v?;
-    Some((as_u64(v.get("line"))?, as_u64(v.get("character"))?))
+    Some((as_uinteger(v.get("line"))?, as_uinteger(v.get("character"))?))
 }
 
 /// A `Range`: an object with `start` and `end` positions.
@@ -1281,6 +1291,35 @@ mod tests {
         let out = positions("textDocument/publishDiagnostics", &params, None);
         assert_eq!(out[0].at, [p(0, 1), p(0, 2)]);
         assert_eq!(out[1].at, [p(5, 6), p(5, 7)]);
+    }
+
+    #[test]
+    fn position_components_are_read_as_k2_reads_a_uinteger() {
+        // Any spelling of a whole number in range is that number, as K2 has
+        // it; a fraction, a negative number or one past 2^31-1 is not.
+        let n = |text: &str| uinteger(&serde_json::from_str(text).expect("valid JSON"));
+        for (text, want) in [("1", 1), ("1.0", 1), ("1e0", 1), ("4.1e1", 41), ("-0.0", 0), ("2147483647.0", 2147483647)]
+        {
+            assert_eq!(n(text), Some(want), "{text}");
+        }
+        for text in ["1.5", "-1", "2147483648", "1e999", "\"1\"", "null"] {
+            assert_eq!(n(text), None, "{text}");
+        }
+        let params = doc_params("file:///a.txt");
+        let result: Value = serde_json::from_str(
+            r#"{ "contents": "x", "range": { "start": { "line": 0.0, "character": 1.0 }, "end": { "line": 0, "character": 2e0 } } }"#,
+        )
+        .expect("valid JSON");
+        let p = |line, character| Position { line, character };
+        assert_eq!(positions("textDocument/hover", &params, Some(&result))[0].at, [p(0, 1), p(0, 2)]);
+        let result: Value =
+            serde_json::from_str(r#"[{ "startLine": 4.0, "endLine": 6, "startCharacter": 1e0 }]"#).expect("valid JSON");
+        let out = positions("textDocument/foldingRange", &params, Some(&result));
+        assert_eq!(
+            out.iter().map(|f| f.pointer.as_str()).collect::<Vec<_>>(),
+            ["[0].startLine", "[0].endLine", "[0].startCharacter"]
+        );
+        assert_eq!(out[2].at, [p(4, 1)]);
     }
 
     #[test]

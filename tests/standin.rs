@@ -2613,6 +2613,41 @@ fn stopping_after_an_unopened_request_fails_d4() {
 }
 
 #[test]
+fn a_server_that_exits_on_did_close_fails_d4() {
+    // The stand-in closes its stdin and exits with status 5 on reading
+    // doc.txt's didClose. lspcheck's request about the closed document is
+    // refused by the closed pipe, or written before it closed and never
+    // answered: either way the exit, seen after didClose was delivered, is a
+    // server that didn't keep serving, and D4 names it. What was read while
+    // the documents were open is judged as usual, so nothing else fails.
+    let r = fault("exit-on-close");
+    only_fails(&r, &["D4"]);
+    assert_eq!(r.status, 0, "D4 is a POLICY check\n{}", r.stdout);
+    let d4 = detail(&r, "D4");
+    assert!(d4.starts_with("the closed document"), "{d4}");
+    assert!(d4.contains("the server exited with status 5"), "{d4}");
+}
+
+#[test]
+fn positions_spelled_as_decimals_are_lawful() {
+    // `1.0` is the integer 1, to K2 and to the position checks alike, so
+    // the positions are judged, and nothing fails.
+    let r = fault("decimal-positions");
+    only_fails(&r, &[]);
+}
+
+#[test]
+fn positions_spelled_as_decimals_inside_a_character_fail_d1() {
+    // Code-point counting, spelled as decimals: the positions are judged as
+    // they are without the fraction. D1 and D6 fail, and D3 and D5 can't
+    // blame the change or the line split.
+    let r = run(&["--fault", "decimal-positions", "--fault", "codepoint-positions"], &[]);
+    passes_except(&r, &[("D1", "fail"), ("D3", "error"), ("D5", "error"), ("D6", "fail")]);
+    assert!(r.stdout.contains("inside a character of version 41"), "{}", r.stdout);
+    assert!(r.stdout.contains("on a boundary if counted in code points"), "{}", r.stdout);
+}
+
+#[test]
 fn positions_counted_in_the_wrong_units_fail_d1() {
     // Byte counting under UTF-16 runs past line ends (not judged) or lands
     // on boundaries after the change and on B; its selection ranges still
@@ -2840,6 +2875,15 @@ fn a_selection_range_outside_its_position_fails_d6() {
     let r = fault("selection-outside");
     only_fails(&r, &["D6"]);
     assert_eq!(r.status, 1, "D6 is a MUST check");
+    assert!(r.stdout.contains("doesn't contain the position"), "{}", r.stdout);
+}
+
+#[test]
+fn a_selection_range_outside_its_position_spelled_as_decimals_fails_d6() {
+    // The same ranges as selection-outside, with `line` and `character`
+    // spelled as `1.0`: D6 judges them, rather than counting them malformed.
+    let r = run(&["--fault", "decimal-positions", "--fault", "selection-outside"], &[]);
+    only_fails(&r, &["D6"]);
     assert!(r.stdout.contains("doesn't contain the position"), "{}", r.stdout);
 }
 
