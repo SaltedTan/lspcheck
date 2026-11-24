@@ -5852,8 +5852,10 @@ struct PushWatch {
 #[derive(Debug, Clone, PartialEq)]
 enum ProbeEnd {
     /// Seen to satisfy the recovery comparison this long after the restoration was
-    /// delivered; by its terminal probe if `terminal`.
-    Recovered { after: Duration, terminal: bool },
+    /// delivered; by its terminal probe if `terminal`. `since` is when the
+    /// publish that decided it was read, if before the restoration was
+    /// delivered: output lspcheck missed from then on may have superseded it.
+    Recovered { after: Duration, terminal: bool, since: Option<Duration> },
     /// Seen not to: a failure, unless lspcheck missed something between
     /// `from` and `to`.
     Failed { detail: String, from: Duration, to: Duration },
@@ -5868,6 +5870,19 @@ struct CaseRecovery {
     window: (Duration, Duration),
     /// Each stable probe's outcome, in the order of [`Recovery::stable`].
     outcomes: Vec<ProbeEnd>,
+}
+
+impl CaseRecovery {
+    /// The windows in which output lspcheck missed may have changed outcome
+    /// `i`: the recovery window, and before it, from when a deciding publish
+    /// read before the restoration was read.
+    fn windows(&self, i: usize) -> impl Iterator<Item = (Duration, Duration)> {
+        let before = match self.outcomes[i] {
+            ProbeEnd::Recovered { since: Some(at), .. } => Some((at, self.window.0)),
+            _ => None,
+        };
+        std::iter::once(self.window).chain(before)
+    }
 }
 
 /// What M3 judges: the probes with stable baselines and how each case's
@@ -6365,7 +6380,7 @@ async fn recover(
             ProbeEnd::Unseen(format!("case {k}: {} had malformed diagnostics during recovery", s.label))
         } else if s.params.is_some() {
             match (seen[i], &stopped, terminal[i]) {
-                (Some((after, terminal)), ..) => ProbeEnd::Recovered { after, terminal },
+                (Some((after, terminal)), ..) => ProbeEnd::Recovered { after, terminal, since: None },
                 (None, Some(why), _) => {
                     ProbeEnd::Unseen(format!("case {k}: {} wasn't seen to recover: {why}", s.label))
                 }
@@ -6378,7 +6393,7 @@ async fn recover(
                     match probe_answer(&ctx.s, request, s.probe, timeout) {
                         Ok(projected) if rec.recovered(i, &projected) => {
                             let at = ctx.s.answered_at(&request.id).unwrap_or(request.deadline_at);
-                            ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: true }
+                            ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: true, since: None }
                         }
                         Ok(projected) => {
                             let to = ctx.s.answered_at(&request.id).unwrap_or(request.deadline_at);
@@ -6412,7 +6427,7 @@ async fn recover(
             let version = docs[s.doc].version;
             match (w.matched, &stopped, w.latest) {
                 (Some(at), ..) if !rec.no_errors => {
-                    ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: false }
+                    ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: false, since: None }
                 }
                 (_, Some(why), _) => ProbeEnd::Unseen(format!("case {k}: {} wasn't seen to recover: {why}", s.label)),
                 _ if !drained => ProbeEnd::Unseen(format!(
@@ -6434,14 +6449,18 @@ async fn recover(
                     );
                     let error = rec.no_errors && recovery::first_error(&projected).is_some();
                     let read = format!("lspcheck read all the server sent in those {t} s, and polled {polls} time(s)");
+                    let since = (at < restored).then_some(at);
                     match (error, matched) {
                         (false, _) if rec.no_errors && rec.expect == Expect::Observe => ProbeEnd::Recovered {
                             after: w.clean_since.unwrap_or(at).saturating_sub(restored),
                             terminal: false,
+                            since,
                         },
-                        (false, Some(m)) => ProbeEnd::Recovered { after: m.saturating_sub(restored), terminal: false },
+                        (false, Some(m)) => {
+                            ProbeEnd::Recovered { after: m.saturating_sub(restored), terminal: false, since }
+                        }
                         (false, None) if rec.recovered(i, &projected) => {
-                            ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: false }
+                            ProbeEnd::Recovered { after: at.saturating_sub(restored), terminal: false, since }
                         }
                         _ => rec.differs(i, k, &deciding, &projected, (at, bound), interrupted.clone(), &read),
                     }
@@ -7338,12 +7357,12 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
                 continue;
             }
             match outcome {
-                ProbeEnd::Recovered { after, terminal } => {
+                ProbeEnd::Recovered { after, terminal, .. } => {
                     if slowest.is_none_or(|(t, ..)| *after > t) {
                         slowest = Some((*after, c.case, i, *terminal));
                     }
                     // As M3's pass: only with nothing missed in its windows.
-                    let windows: Vec<_> = std::iter::once(c.window).chain(stable.baseline_window).collect();
+                    let windows: Vec<_> = c.windows(i).chain(stable.baseline_window).collect();
                     if windows.iter().all(|&(from, to)| ctx.s.incomplete_within(from, to).is_none()) {
                         let mut t = Trouble::new(c.case, "M3", Verdict::Pass, &stable.label);
                         t.result.unless_missed = Some(Recheck::Recovered {
@@ -7422,8 +7441,12 @@ fn judge_m3(ctx: &mut Ctx<'_>, rec: &Recovery, interrupted: Option<&str>, capped
             "nothing failed, but lspcheck may have missed evidence in a recovery window or pushed baseline, because {why}: {pass}"
         )
     };
-    let windows: Vec<_> =
-        rec.cases.iter().map(|c| c.window).chain(rec.stable.iter().filter_map(|s| s.baseline_window)).collect();
+    let windows: Vec<_> = rec
+        .cases
+        .iter()
+        .flat_map(|c| (0..c.outcomes.len()).flat_map(|i| c.windows(i)))
+        .chain(rec.stable.iter().filter_map(|s| s.baseline_window))
+        .collect();
     match windows.iter().find_map(|&(from, to)| ctx.s.incomplete_within(from, to)) {
         Some(why) => ctx.report("M3", Verdict::Error, unless(&why)),
         None => {
@@ -9023,7 +9046,7 @@ while header := sys.stdin.buffer.readline():
             for case in 0..2 {
                 let window = (Duration::from_secs(4 + case * 2), Duration::from_secs(5 + case * 2));
                 let mut outcomes = vec![if recovered {
-                    ProbeEnd::Recovered { after: Duration::ZERO, terminal: false }
+                    ProbeEnd::Recovered { after: Duration::ZERO, terminal: false, since: None }
                 } else {
                     rec.differs(0, case, "the last publish", &json!([{"severity": 2}]), window, Ok(()), "read in full")
                 }];
@@ -9066,6 +9089,45 @@ while header := sys.stdin.buffer.readline():
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
+    async fn a_recovery_decided_by_a_publish_read_before_the_restoration_needs_nothing_missed_since() {
+        // Another seed's change at 3 s ends the baseline's hold, so output
+        // missed from 4 s to 4.5 s, before the restoration at 5 s, is outside
+        // the baseline's windows and the recovery window. A recovery decided
+        // by a publish read at 3.5 s rests on it: the missed output may have
+        // been a later publish. One decided after the restoration doesn't.
+        for since in [None, Some(Duration::from_millis(3500))] {
+            let cfg = mutation_test_config("exit 0");
+            let mut ctx = mutation_test_ctx(&cfg, 4096).await;
+            let docs = recovery_test_docs();
+            let publish = message::notification(
+                PUBLISH_DIAGNOSTICS,
+                Some(json!({"uri": docs[0].uri, "version": 1, "diagnostics": []})),
+            );
+            ctx.s.messages.push((Duration::ZERO, Message::parse(&serde_json::to_vec(&publish).unwrap()).unwrap()));
+            let mut rec = Recovery { expect: Expect::Baseline, pushes_pending: true, ..Recovery::default() };
+            rec.before_first_mutation(&ctx.s, &docs, Duration::from_secs(2));
+            assert_eq!(rec.stable.len(), 1);
+            rec.changed = vec![None, Some(Duration::from_secs(3))];
+            let window = (Duration::from_secs(5), Duration::from_secs(6));
+            let outcomes = vec![ProbeEnd::Recovered { after: Duration::ZERO, terminal: false, since }];
+            rec.cases.push(CaseRecovery { case: 0, window, outcomes });
+            judge_m3(&mut ctx, &rec, None, None);
+            let mut m3 = ctx.results.pop().unwrap();
+            assert_eq!(m3.verdict, Verdict::Pass, "{since:?}");
+            let mut finish = ctx.s.finish(Duration::from_millis(200)).await;
+            finish.lost = vec![(Duration::from_secs(4), Duration::from_millis(4500), "a frame was skipped".into())];
+            m3.recheck(&finish);
+            if since.is_some() {
+                assert_eq!(m3.verdict, Verdict::Error);
+                assert!(m3.detail.contains("a frame was skipped"), "{}", m3.detail);
+            } else {
+                assert_eq!(m3.verdict, Verdict::Pass, "{}", m3.detail);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
     async fn recovery_pushed_baseline_is_held_to_publishes_read_after_judgment() {
         // A publish labelled with version 1 read only after M3 was judged,
         // with a Warning the baseline lacks, turns what rested on that
@@ -9097,7 +9159,7 @@ while header := sys.stdin.buffer.readline():
             }
             let window = (Duration::from_secs(4), Duration::from_secs(5));
             let mut outcomes = vec![if recovered {
-                ProbeEnd::Recovered { after: Duration::ZERO, terminal: false }
+                ProbeEnd::Recovered { after: Duration::ZERO, terminal: false, since: None }
             } else {
                 rec.differs(0, 0, "the last publish", &json!([{"severity": 2}]), window, Ok(()), "read in full")
             }];

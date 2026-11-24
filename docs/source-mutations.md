@@ -697,7 +697,8 @@ Step 5 builds [Recovery](#recovery) and M3 as above. Where the rules leave a cho
   the baseline. For an unmutated document, the latest one read before the restoration counts only if it is still the
   last read by the end of `recovery_timeout`: a change to another seed document may change its diagnostics at the
   same version, so a profile with several seed documents may take the whole bound. With `no_errors`, its publishes are
-  read to the end of `recovery_timeout`, and the last decides, so each case takes the whole bound.
+  read to the end of `recovery_timeout`, and the last decides, so each case takes the whole bound. A recovery decided
+  by a publish read before the restoration is `ERROR` if lspcheck may have missed output from that read on.
 - Generated edits that leave all documents at their clean text establish the restoration boundary too; recovery
   is timed from that delivery even when no extra restoration write is needed.
 - Terminal probes are sent with or without an expectation; an answer equal to the baseline counts as recovered. An
