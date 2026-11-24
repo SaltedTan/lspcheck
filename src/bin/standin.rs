@@ -174,7 +174,7 @@ const FAULTS: &[(&str, &str)] = &[
     ("shutdown-error-wide-code", "answer shutdown with an error whose code, 2147483648, is outside LSP's integers"),
     ("shutdown-method-not-found", "answer shutdown with MethodNotFound (-32601)"),
     ("exit-on-shutdown", "exit right after replying to shutdown"),
-    ("exit-after-shutdown-reply", "send the shutdown reply directly, then exit without relay"),
+    ("crash-after-shutdown", "answer shutdown, then exit without replying to the next request"),
     (
         "close-stdin-before-initialize-reply",
         "on initialize, close stdin, then send the result and exit, so initialized can't be sent",
@@ -2017,6 +2017,10 @@ fn main() {
             out.frame(&err(&id, -32603, "the stand-in isn't configured: setting standin.mode isn't \"ready\""));
             continue;
         }
+        if shut_down && fault("crash-after-shutdown") {
+            eprintln!("standin: crash-after-shutdown");
+            std::process::exit(1);
+        }
         if shut_down && !fault("post-shutdown-results") {
             let mut reply = err(&id, -32600, "shutting down");
             if fault("post-shutdown-error-no-message") {
@@ -2218,12 +2222,6 @@ fn main() {
                 };
                 if fault("shutdown-error-no-message") {
                     answer["error"].as_object_mut().unwrap().remove("message");
-                }
-                if fault("exit-after-shutdown-reply") {
-                    // The reply is in the pipe before the process exits, as a
-                    // server that writes it and quits at once does.
-                    out.frame(&answer);
-                    std::process::exit(0);
                 }
                 if fault("exit-on-shutdown") {
                     // Exit first and have a helper deliver the reply, so the

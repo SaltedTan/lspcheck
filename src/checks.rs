@@ -2580,23 +2580,12 @@ async fn after_initialize(ctx: &mut Ctx<'_>) {
                 }
             }
         }
-        Err(e) => {
-            ctx.s.wait_exit(Instant::now() + Duration::from_millis(300)).await;
-            if ctx.s.is_alive() {
-                ctx.fail_call(
-                    "L5",
-                    since,
-                    format!("a request after shutdown went unanswered ({})", describe_call_error(&e, t)),
-                    &e,
-                );
-            } else {
-                return ctx.report(
-                    "L5",
-                    Verdict::NotExercised,
-                    "the server exited after shutdown, before exit (see L4)",
-                );
-            }
-        }
+        Err(e) => ctx.fail_call(
+            "L5",
+            since,
+            format!("a request after shutdown went unanswered ({})", describe_call_error(&e, t)),
+            &e,
+        ),
     }
     if ctx.s.notify("exit", None).await.is_ok() {
         let _ = ctx.s.serve_until_exit(Instant::now() + ctx.cfg.exit_timeout).await;
