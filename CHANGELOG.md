@@ -18,6 +18,12 @@
   rather than stopping at the first missing id.
 - **J1**, **J2**, **J5** and **J7** now report `error` rather than `not-exercised` when a frame couldn't be read or
   was cut short and no readable evidence was seen, matching K2.
+- **D1**, **D3**, **D5** and **D6** now read a position's `line` and `character` as K2 does, so a whole number
+  spelled as a decimal or with an exponent (`1.0`, `1e0`), as a server computing positions in floating point writes
+  them, is judged. Such positions were ignored before, so D1 could pass, and D6 be `not-exercised`, for a server
+  whose positions fall inside characters.
+- **D4** now fails, naming the exit status, when the server exits after `didClose`: before, a request lspcheck could
+  no longer write was reported as `error`, and whether the request could still be written depended on timing.
 - When the `documents` scenario fails to initialize or send `didOpen`, every document check (`D1`–`D6`) now reports
   that reason instead of `D4`, `D5` or `D6` falling through to the generic `"the scenario ended before reaching this
   check"` detail.

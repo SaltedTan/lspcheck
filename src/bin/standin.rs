@@ -45,6 +45,10 @@ const FAULTS: &[(&str, &str)] = &[
     ("extension-header", "lawful: send an X-Trace header before Content-Length"),
     ("long-header", "lawful: send a 200 KiB X-Pad header with every frame"),
     ("decimal-ids", "lawful: spell numeric response ids with a fraction, as 2.0"),
+    (
+        "decimal-positions",
+        "lawful: spell the lines and characters of every outgoing position and folding range with a fraction, as 1.0",
+    ),
     ("flood", "write 2 MiB of log messages before replying to initialize"),
     ("big-frame", "lawful: send one 2 MiB log message before replying to initialize"),
     ("big-frame-on-initialized", "lawful: send one 2 MiB log message on initialized"),
@@ -577,6 +581,10 @@ const FAULTS: &[(&str, &str)] = &[
     (
         "disk-diagnostics-after-close",
         "lawful: on didClose, publish unversioned diagnostics for the file on disk, which another tool changed to ASCII",
+    ),
+    (
+        "exit-on-close",
+        "on reading doc.txt's didClose, close stdin, then exit with status 5 without answering anything more",
     ),
     ("drop-first-request", "never answer the first request about a document, then answer normally"),
     ("exit-on-first-hover", "exit with status 17 without answering the first hover request"),
@@ -1134,6 +1142,12 @@ fn main() {
             if method == "textDocument/didClose"
                 && let Some(uri) = msg.pointer("/params/textDocument/uri").and_then(Value::as_str)
             {
+                if fault("exit-on-close") && uri.ends_with("/doc.txt") {
+                    // Closed first, so a request lspcheck hasn't yet written
+                    // can't be, and nothing written can be read.
+                    close_stdin(input);
+                    std::process::exit(5);
+                }
                 // The document is no longer open: requests about it are
                 // answered from disk (closed-from-disk) or not at all.
                 if docs.remove(uri).is_some() && fault("closed-from-disk") {
@@ -3323,6 +3337,32 @@ fn answer_on_sigterm(reply: &Value) -> ! {
     }
 }
 
+/// Spells the `line` and `character` of every position in `v`, and the
+/// lines and characters of every folding range, with a fraction, as `1.0`
+/// (decimal-positions): the same integers, as a server whose arithmetic is
+/// in floating point writes them.
+fn decimal_positions(v: &mut Value) {
+    match v {
+        Value::Object(o) => {
+            let position = o.get("line").is_some_and(Value::is_u64) && o.get("character").is_some_and(Value::is_u64);
+            let folding = o.contains_key("startLine") && o.contains_key("endLine");
+            let keys: &[&str] = match (position, folding) {
+                (true, _) => &["line", "character"],
+                (_, true) => &["startLine", "startCharacter", "endLine", "endCharacter"],
+                _ => &[],
+            };
+            for key in keys {
+                if let Some(n) = o.get(*key).filter(|n| n.is_u64()) {
+                    o[*key] = serde_json::from_str(&format!("{n}.0")).unwrap();
+                }
+            }
+            o.values_mut().for_each(decimal_positions);
+        }
+        Value::Array(a) => a.iter_mut().for_each(decimal_positions),
+        _ => {}
+    }
+}
+
 struct Writer<W: Write> {
     out: W,
     faults: Vec<String>,
@@ -3363,6 +3403,9 @@ impl<W: Write> Writer<W> {
             && v.get("method").is_none()
         {
             v["id"] = serde_json::from_str(&format!("{n}.0")).unwrap();
+        }
+        if fault("decimal-positions") {
+            decimal_positions(&mut v);
         }
         if fault("extra-properties") {
             let extra = |o: &mut Value| {

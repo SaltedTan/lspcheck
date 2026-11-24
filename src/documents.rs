@@ -966,29 +966,18 @@ pub struct SelectionReply {
 
 /// The `positions` of a `textDocument/selectionRange` request's params.
 pub fn request_positions(params: &Value) -> Vec<Position> {
-    params
-        .get("positions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|p| {
-            Some(Position {
-                line: p.get("line")?.as_u64()? as usize,
-                character: p.get("character")?.as_u64()? as usize,
-            })
-        })
-        .collect()
+    params.get("positions").and_then(Value::as_array).into_iter().flatten().filter_map(position).collect()
 }
 
-/// A `Range` from a JSON value: `start` and `end` positions, each a non-
-/// negative integer `line` and `character`.
+/// A `Position` from a JSON value: a `uinteger` `line` and `character`.
+fn position(p: &Value) -> Option<Position> {
+    Some(Position { line: text::uinteger(p.get("line")?)?, character: text::uinteger(p.get("character")?)? })
+}
+
+/// A `Range` from a JSON value: `start` and `end` positions.
 fn as_range(v: Option<&Value>) -> Option<Range> {
     let v = v?;
-    let pos = |name: &str| -> Option<Position> {
-        let p = v.get(name)?;
-        Some(Position { line: p.get("line")?.as_u64()? as usize, character: p.get("character")?.as_u64()? as usize })
-    };
-    Some(Range { start: pos("start")?, end: pos("end")? })
+    Some(Range { start: position(v.get("start")?)?, end: position(v.get("end")?)? })
 }
 
 /// A position clamped to its line's length, as a client would; `None` for a
@@ -2603,6 +2592,25 @@ mod tests {
         // A malformed position is skipped.
         let params = serde_json::json!({"positions": [{"line": 0}, {"line": 1, "character": 2}]});
         assert_eq!(request_positions(&params), sel_positions(&[(1, 2)]));
+        // A whole number spelled as a decimal is that number.
+        let params: Value = serde_json::from_str(r#"{"positions": [{"line": 1.0, "character": 2e0}]}"#).unwrap();
+        assert_eq!(request_positions(&params), sel_positions(&[(1, 2)]));
+    }
+
+    #[test]
+    fn d6_judges_ranges_spelled_as_decimals() {
+        // `5.0` is the integer 5: the entry is judged, not counted as
+        // malformed, and its range doesn't contain the position.
+        let result: Value = serde_json::from_str(
+            r#"[{"range": {"start": {"line": 0.0, "character": 0.0}, "end": {"line": 0, "character": 5.0}}}]"#,
+        )
+        .unwrap();
+        let r =
+            judge_selection_reply("hello world\n", Encoding::Utf16, 41, &sel_positions(&[(0, 6)]), &result).unwrap();
+        assert_eq!(r.malformed, 0);
+        let (v, d) = judge_d6(std::slice::from_ref(&r), None);
+        assert_eq!(v, Verdict::Fail, "{d}");
+        assert!(d.contains("doesn't contain the position"), "{d}");
     }
 
     // --- The mutation scenario's window of texts ---------------------------
