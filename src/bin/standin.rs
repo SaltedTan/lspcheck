@@ -2513,6 +2513,7 @@ fn main() {
             }
             "lspcheck/unknownRequest" if fault("exit-on-unknown-request") => {
                 eprintln!("standin: exit-on-unknown-request");
+                close_stdin(input);
                 std::process::exit(0);
             }
             "lspcheck/unknownRequest" if fault("big-frame-on-first-unknown-request") => {
