@@ -205,7 +205,9 @@ the client clamps it. Most language servers ignore a plain-text document, and th
 The same scenario also checks diagnostics versions (D2): when the server labels a `publishDiagnostics` for the opened
 document with a `version`, it must be one lspcheck sent for it before the notification was read — so a server that
 labels with its own counter, or with one the document never had, fails. An older version is lawful, a notification
-without a version leaves D2 `N/E`, and a `version` that is `null` or not an integer isn't judged here.
+without a version leaves D2 `N/E`, and a `version` that is `null` or not an integer isn't judged here. Nor is a
+publish the server may have written before it read the `didOpen`, such as one from a scan of the workspace at startup
+([D2's rule](docs/design.md#documents-and-positions)).
 
 The same scenario also checks positions after a change (D3): lspcheck sends a `didChange` the way the server's
 textDocumentSync kind asks (an incremental edit that replaces a 4-byte character and adds a line, or the full text),

@@ -312,8 +312,10 @@ A fully evidenced failure takes precedence over errors in other cases or probes.
   the written-bytes cap) left its recovery unjudged; a stated expectation was contradicted at baseline; malformed
   diagnostic evidence arrived during recovery; a publish labelled with version 1 since `didOpen`, and before a change
   to another seed document, differed from a pushed baseline (held only to `no_errors`, had an Error), or lspcheck
-  missed some of the server's output in that window, which makes that probe's outcomes `ERROR` whether they failed or recovered; or nothing failed
-  but evidence was missed in a recovery window.
+  missed some of the server's output in that window, which makes that probe's outcomes `ERROR` whether they failed or
+  recovered; the last publish of a seed document whose text never changed, labelled with version 1 and read after a
+  change to another seed document, differed from its baseline (held only to `no_errors`, had an Error; see
+  [step 5](#step-5)); or nothing failed but evidence was missed in a recovery window.
   Stop state is refreshed after draining recovery output and after the terminal probes, including when no terminal
   request was needed. Earlier completed cases' observed failures still stand.
 - *pass:* every case that reached restoration recovered, and each pushed baseline held as above, to the session's
